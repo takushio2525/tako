@@ -22,11 +22,26 @@
 //! 書き込み（`set_var` / `remove_var` / `Command::env`）は読み取りではないので数えない。
 //! コメントと文字列の中（この番犬自身の注入の断片・説明文）も数えない（`code_view` で潰した眺めで位置を決める）。
 //! 許すのは正本の `crates/tako-control/src/codex_session.rs` だけ。
+//!
+//! # `.codex` の決め打ちの join（#2810）
+//!
+//! env を素で読まなくても、**ホームへ `.codex` を join して codex の置き場を組む**と、空でない
+//! `CODEX_HOME`（例: `D:\codex`）を見ないので同じずれが起きる。#2798 の後も共通ルールの同期の書き先
+//! （`agents_sync::AgentKind::target_path` の `home.join(".codex/AGENTS.md")`）と導入計画の本体の置き場
+//! （`agent_install` の `payload_rel: Some(".codex/packages/standalone")`）がこの形で残っていた。
+//!
+//! 本番コード（`crates/*/src` の `#[cfg(test)]` の外。テスト専用のファイルも除く）で、**中身が `.codex` で
+//! 始まる文字列リテラル**（`".codex"` / `".codex/…"` / `".codex\\…"`）を `file:line` で名指す。
+//! 置き場は `codex_home()` から組むこと。`.codex` を名前として書いてよいもの（解決の正本の既定・プロジェクトの
+//! `.codex/config.toml`・検証プロセスの置き場など）は [`ALLOWED_DOT_CODEX`] に**理由つき**で載せる。
+//! 載せた行が消えたら（使われない例外）それも落とす。
 
 use std::path::{Path, PathBuf};
 
-#[path = "common/code_view.rs"]
-mod code_view;
+#[path = "common/production_range.rs"]
+mod production_range;
+
+use production_range::code_view;
 
 /// 素で読んでよい唯一のファイル（解決の正本）
 const RESOLVER: &str = "crates/tako-control/src/codex_session.rs";
@@ -316,6 +331,226 @@ fn 実ファイルへ素の読み出しを戻すと名指す() {
         let fragment_line = body[..at].matches('\n').count() + 1;
         let injected = body.replacen(fragment, &fragment.replacen(call, RAW, 1), 1);
         let hits = raw_reads(rel, &injected);
+        assert_eq!(hits.len(), 1, "{rel} の注入を 1 つ名指すはず: {hits:#?}");
+        assert!(
+            hits[0].starts_with(&format!("{rel}:{fragment_line} ")),
+            "{rel} の注入した行（{fragment_line}）を名指すはず: {hits:#?}"
+        );
+    }
+}
+
+// --- #2810: `.codex` の決め打ちの join ---------------------------------------------
+
+/// 本番コードで `.codex` を名前として書いてよいもの（ファイル, その行の断片, 理由）。
+/// 断片はコメントを潰した眺めの 1 行に含まれる形で書く（rustfmt の折り返しをまたがない）
+const ALLOWED_DOT_CODEX: &[(&str, &str, &str)] = &[
+    (
+        RESOLVER,
+        "h.join(\".codex\")",
+        "解決の正本の既定（`CODEX_HOME` が空・空白だけ・未設定のとき `<home>/.codex`）",
+    ),
+    (
+        "crates/tako-control/src/worker_mcp.rs",
+        "dir.join(\".codex\").join(\"config.toml\")",
+        "プロジェクトの `.codex/config.toml`（cwd から git の根までの各 dir。codex の置き場ではない）",
+    ),
+    (
+        "crates/tako-control/src/worker_mcp.rs",
+        "agent_config_home().map(|h| h.join(\".codex\"))",
+        "env 計画が `CODEX_HOME` を明示で外したとき / 検証プロセスの置き場（本物の `CODEX_HOME` を読まない意図）",
+    ),
+    (
+        "crates/tako-control/src/usage/index.rs",
+        "vec![normalize(&h.join(\".codex\"))]",
+        "検証プロセスの置き場（本物の `CODEX_HOME` を読まない意図。`codex_homes` の doc）",
+    ),
+    (
+        "crates/tako-control/src/usage/index.rs",
+        "\"\" | \".codex\" =>",
+        "置き場を組まない（既定の置き場の名前を表示名 `codex` へ読み替えるだけ）",
+    ),
+    (
+        "crates/tako-control/src/orchestrator/agent.rs",
+        "ensure_codex_trusted_at(&home.join(\".codex/config.toml\"), cwd)",
+        "既知の残り（#2810 の範囲外で直していない。worker の信頼の書き込みが `CODEX_HOME` を見ない）。\
+         直したらこの行を消す",
+    ),
+];
+
+/// 本番コードの眺め: `#[cfg(test)]` の領域とコメントを空白へ潰す（文字列は残す・行番号は原文のまま）
+fn production_text(src: &str) -> String {
+    code_view::without_comments(&production_range::scan(src).text)
+}
+
+/// 中身が `.codex` で始まる文字列リテラル（`".codex"` / `".codex/…"` / `".codex\…"`）を
+/// (行番号, その行) で返す。`text` は [`production_text`] の眺め
+fn dot_codex_literals(text: &str) -> Vec<(usize, String)> {
+    const NEEDLE: &str = "\".codex";
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = text[from..].find(NEEDLE) {
+        let start = from + at;
+        from = start + NEEDLE.len();
+        // 文字列の中のエスケープした引用符（`"…\".codex…"`）は開きの引用符ではない
+        if text[..start].ends_with('\\') {
+            continue;
+        }
+        // `.codexrc` のような別の名前は数えない（終わり・区切りが続くものだけ）
+        if !matches!(text[from..].chars().next(), Some('"' | '/' | '\\')) {
+            continue;
+        }
+        let line = text[..start].matches('\n').count() + 1;
+        out.push((line, lines.get(line - 1).unwrap_or(&"").to_string()));
+    }
+    out
+}
+
+/// 1 ファイルの名指し（例外に載っていない `.codex` のリテラル）と、使った例外の添字
+fn dot_codex_offenders(rel: &str, src: &str) -> (Vec<String>, Vec<usize>) {
+    let mut offenders = Vec::new();
+    let mut used = Vec::new();
+    for (line, text) in dot_codex_literals(&production_text(src)) {
+        let allowed = ALLOWED_DOT_CODEX
+            .iter()
+            .position(|(file, fragment, _)| *file == rel && text.contains(fragment));
+        match allowed {
+            Some(i) => used.push(i),
+            None => offenders.push(format!("{rel}:{line} {}", text.trim())),
+        }
+    }
+    (offenders, used)
+}
+
+/// `crates/*/src` の本番のファイル（テスト専用のファイルを除く）を (相対パス, 本文) で
+fn product_files() -> Vec<(String, String)> {
+    let files = production_range::product_sources();
+    let test_only = production_range::test_only_files(&files);
+    let root = repo_root();
+    files
+        .into_iter()
+        .filter(|rel| !test_only.contains(rel))
+        .map(|rel| {
+            let body = std::fs::read_to_string(root.join(&rel)).expect("本番のファイル");
+            (rel, body)
+        })
+        .collect()
+}
+
+#[test]
+fn issue2810_codexの置き場をdot_codexの決め打ちで組まない() {
+    let files = product_files();
+    assert!(
+        files.len() > 300,
+        "走査した本番のファイルが少なすぎる（走査に失敗している）: {} 本",
+        files.len()
+    );
+    let mut offenders = Vec::new();
+    let mut used = std::collections::BTreeSet::new();
+    for (rel, body) in &files {
+        let (named, hit) = dot_codex_offenders(rel, body);
+        offenders.extend(named);
+        used.extend(hit);
+    }
+    assert!(
+        offenders.is_empty(),
+        "codex の置き場を `.codex` の決め打ちで組んでいる: {offenders:#?}\n\
+         空でない `CODEX_HOME`（例: D:\\codex）を見ないので、診断・setup が見る置き場とずれる。\
+         置き場は tako_control::codex_session::codex_home() から組むこと（tako-core の中なら解決済みの値を\
+         引数で受ける = agent_install の payload_dir_in）。codex の置き場ではない `.codex`（プロジェクトの\
+         `.codex/config.toml` など）なら、理由を添えて ALLOWED_DOT_CODEX に載せる（#2810）"
+    );
+    let unused: Vec<String> = ALLOWED_DOT_CODEX
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !used.contains(i))
+        .map(|(_, (file, fragment, _))| format!("{file}: {fragment}"))
+        .collect();
+    assert!(
+        unused.is_empty(),
+        "使われていない例外（行が消えた・書き方が変わった）: {unused:#?}\n\
+         直したなら ALLOWED_DOT_CODEX から消し、書き方が変わったなら断片を直す"
+    );
+}
+
+/// 名指す形と、名指さない形（番犬自身の検出力）
+#[test]
+fn issue2810_注入したdot_codexの決め打ちを名指す() {
+    let named = |src: &str| dot_codex_offenders("x.rs", src).0;
+    for (src, line) in [
+        (
+            "fn a(h: &Path) -> PathBuf {\n    h.join(\".codex\")\n}\n",
+            2,
+        ),
+        (
+            "fn a(h: &Path) -> PathBuf { h.join(\".codex/AGENTS.md\") }\n",
+            1,
+        ),
+        (
+            "const R: Option<&str> = Some(\".codex/packages/standalone\");\n",
+            1,
+        ),
+        ("fn a() { Path::new(r\".codex\\config.toml\"); }\n", 1),
+        ("fn a() { Path::new(\".codex\\\\config.toml\"); }\n", 1),
+        ("fn a() { let p = r#\".codex\"#; }\n", 1),
+    ] {
+        let hits = named(src);
+        assert_eq!(hits.len(), 1, "名指す形: {src}");
+        assert!(hits[0].starts_with(&format!("x.rs:{line} ")), "{hits:?}");
+    }
+    let quiet = [
+        // コメント・doc の中
+        "fn a() {\n    // h.join(\".codex\")\n}\n",
+        "/// `home.join(\".codex/AGENTS.md\")` を組まない\nfn a() {}\n",
+        // 説明文の途中・別の名前・エスケープした引用符の中
+        "fn a() { msg(\"プロジェクトの .codex/config.toml と同名\"); }\n",
+        "fn a() { h.join(\".codexrc\"); h.join(\"x.codex\"); }\n",
+        "fn a() { msg(\"say \\\".codex/\\\"\"); }\n",
+        // テストの中（`#[cfg(test)]` の領域は本番コードではない）
+        "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn b(h: &Path) { h.join(\".codex\"); }\n}\n",
+    ];
+    for src in quiet {
+        assert_eq!(named(src), Vec::<String>::new(), "名指さない形: {src}");
+    }
+}
+
+/// 実ファイルへ修正前の決め打ちを戻すと、そのファイルの行で名指す（走査が実ファイルの形で生きている証拠）。
+/// 置き換える断片が見つからなければ、読み手の書き方が変わったので注入の表を直すこと
+#[test]
+fn issue2810_実ファイルへ決め打ちを戻すと名指す() {
+    // (ファイル, 今の断片, 修正前の形)
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "crates/tako-control/src/agents_sync.rs",
+            "crate::codex_session::codex_home()?.join(\"AGENTS.md\")",
+            "home.join(\".codex/AGENTS.md\")",
+        ),
+        (
+            "crates/tako-core/src/platform/agent_install.rs",
+            "payload_rel: Some(\"packages/standalone\"),",
+            "payload_rel: Some(\".codex/packages/standalone\"),",
+        ),
+        // 計画の根を正本を通さずに組む形
+        (
+            "crates/tako-control/src/setup_bootstrap.rs",
+            "crate::codex_session::codex_home().ok_or(SetupRefusal::BootstrapHomeUnresolved)?",
+            "home.join(\".codex\")",
+        ),
+    ];
+    let root = repo_root();
+    for (rel, fragment, before) in cases {
+        let body = std::fs::read_to_string(root.join(rel)).expect("読み手のファイル");
+        assert_eq!(
+            dot_codex_offenders(rel, &body).0,
+            Vec::<String>::new(),
+            "{rel} は今は通る"
+        );
+        let at = body.find(fragment).unwrap_or_else(|| {
+            panic!("{rel} に注入する断片が無い（読み手の書き方が変わった）: {fragment}")
+        });
+        let fragment_line = body[..at].matches('\n').count() + 1;
+        let injected = body.replacen(fragment, before, 1);
+        let hits = dot_codex_offenders(rel, &injected).0;
         assert_eq!(hits.len(), 1, "{rel} の注入を 1 つ名指すはず: {hits:#?}");
         assert!(
             hits[0].starts_with(&format!("{rel}:{fragment_line} ")),

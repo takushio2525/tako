@@ -310,6 +310,16 @@ impl InterpreterSpec {
     }
 }
 
+/// 実体の置き場（[`InstallRecipe::payload_rel`]）の根（#2810）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadRoot {
+    /// ホーム（`$HOME` / `%USERPROFILE%`）
+    Home,
+    /// codex の置き場（`CODEX_HOME`。空・未設定なら `~/.codex`）。インストーラ自身が
+    /// `${CODEX_HOME:-$HOME/.codex}/packages/standalone`（Windows も `$env:CODEX_HOME` → `%USERPROFILE%\.codex`）へ置く
+    CodexHome,
+}
+
 /// 1 エージェントぶんのインストール手順
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallRecipe {
@@ -318,11 +328,14 @@ pub struct InstallRecipe {
     pub source: InstallerSource,
     /// インストール後にランチャーが置かれるパス（`$HOME` からの相対）
     pub launcher_rel: &'static str,
-    /// 実体（バージョンごとのディレクトリ）が置かれるパス（`$HOME` からの相対）。
+    /// 実体（バージョンごとのディレクトリ）が置かれるパス（[`Self::payload_root`] からの相対）。
     ///
     /// **単一バイナリの系統は `None`**（agy はランチャー自身が本体なので、
     /// 「本体の置き場所」を別に見せると同じパスを 2 回言うことになる）
     pub payload_rel: Option<&'static str>,
+    /// [`Self::payload_rel`] の根（#2810）。codex のインストーラは実体を `CODEX_HOME` の下へ置くので、
+    /// ホームからの相対で書くと空でない `CODEX_HOME` のときに計画の置き場がずれる
+    pub payload_root: PayloadRoot,
     /// バックグラウンド自動更新が効くか（機械が読む側）
     pub auto_updates: bool,
     /// 以後どう更新されるかの 1 行（人が読む側）。**`auto_updates` の真偽から
@@ -375,9 +388,21 @@ impl InstallRecipe {
         rel_join(home, self.launcher_dir_rel())
     }
 
-    /// 実体ディレクトリの絶対パス（単一バイナリの系統は `None`）
-    pub fn payload_dir_in(&self, home: &std::path::Path) -> Option<PathBuf> {
-        self.payload_rel.map(|rel| rel_join(home, rel))
+    /// 実体ディレクトリの絶対パス（単一バイナリの系統は `None`）。
+    ///
+    /// `codex_home` は**解決済みの** codex の置き場（`CODEX_HOME`。空・未設定なら `<home>/.codex`）。
+    /// 解決の正本は tako-control の `codex_session::codex_home` で、tako-core はそれに依存できないので
+    /// 値で受ける（ここで `.codex` を組むと正本とずれる。#2798 / #2810）
+    pub fn payload_dir_in(
+        &self,
+        home: &std::path::Path,
+        codex_home: &std::path::Path,
+    ) -> Option<PathBuf> {
+        let root = match self.payload_root {
+            PayloadRoot::Home => home,
+            PayloadRoot::CodexHome => codex_home,
+        };
+        self.payload_rel.map(|rel| rel_join(root, rel))
     }
 
     /// 取得したインストーラを走らせる `Command`（**起こし方の 1 実装**。#2790）。
@@ -432,6 +457,7 @@ pub fn recipe(platform: Platform, agent: AgentKind) -> InstallRecipe {
             },
             launcher_rel: ".local/bin/claude",
             payload_rel: Some(".local/share/claude/versions"),
+            payload_root: PayloadRoot::Home,
             auto_updates: true,
             update_note: "Claude Code が自分でバックグラウンド更新します",
             shell_note: None,
@@ -456,6 +482,7 @@ pub fn recipe(platform: Platform, agent: AgentKind) -> InstallRecipe {
             },
             launcher_rel: ".local/bin/claude.exe",
             payload_rel: Some(".local/share/claude/versions"),
+            payload_root: PayloadRoot::Home,
             auto_updates: true,
             update_note: "Claude Code が自分でバックグラウンド更新します",
             // #2433: Git を隠したランナーで claude 2.1.319 が起動して 1 ターン走った（PowerShell ツール）
@@ -481,7 +508,9 @@ pub fn recipe(platform: Platform, agent: AgentKind) -> InstallRecipe {
                 official_command: "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
             },
             launcher_rel: ".local/bin/codex",
-            payload_rel: Some(".codex/packages/standalone"),
+            // インストーラが `CODEX_HOME` の下へ置く（ホームの `.codex` の決め打ちにしない。#2810）
+            payload_rel: Some("packages/standalone"),
+            payload_root: PayloadRoot::CodexHome,
             // 背景更新は無い。`codex doctor` が知らせるだけ（実測）
             auto_updates: false,
             update_note: "codex が新しい版を知らせます（`codex update` で更新します）",
@@ -508,7 +537,9 @@ pub fn recipe(platform: Platform, agent: AgentKind) -> InstallRecipe {
             },
             // `install.ps1` の `$defaultVisibleBinDir`（claude と違い `~\.local\bin` ではない）
             launcher_rel: "AppData/Local/Programs/OpenAI/Codex/bin/codex.exe",
-            payload_rel: Some(".codex/packages/standalone"),
+            // インストーラが `CODEX_HOME` の下へ置く（ホームの `.codex` の決め打ちにしない。#2810）
+            payload_rel: Some("packages/standalone"),
+            payload_root: PayloadRoot::CodexHome,
             auto_updates: false,
             update_note: "codex が新しい版を知らせます（`codex update` で更新します）",
             shell_note: None,
@@ -532,6 +563,7 @@ pub fn recipe(platform: Platform, agent: AgentKind) -> InstallRecipe {
             launcher_rel: ".local/bin/agy",
             // 単一バイナリなので実体ディレクトリが無い
             payload_rel: None,
+            payload_root: PayloadRoot::Home,
             auto_updates: true,
             update_note: "Antigravity CLI が実行のたびに自分で背景更新します",
             shell_note: None,
@@ -557,6 +589,7 @@ pub fn recipe(platform: Platform, agent: AgentKind) -> InstallRecipe {
             // 公式 docs の Windows 節（`C:\Users\<username>\AppData\Local\agy\bin`）
             launcher_rel: "AppData/Local/agy/bin/agy.exe",
             payload_rel: None,
+            payload_root: PayloadRoot::Home,
             auto_updates: true,
             update_note: "Antigravity CLI が実行のたびに自分で背景更新します",
             shell_note: None,
@@ -930,9 +963,39 @@ mod tests {
         assert_eq!(r.launcher_path_in(home), home.join(".local/bin/claude"));
         assert_eq!(r.launcher_dir_in(home), home.join(".local/bin"));
         assert_eq!(
-            r.payload_dir_in(home),
+            r.payload_dir_in(home, &home.join("codex-home")),
             Some(home.join(".local/share/claude/versions"))
         );
+    }
+
+    /// codex の実体は**渡された codex の置き場**の下（ホームの `.codex` を決め打ちしない。#2810）。
+    /// 両 OS の手順とも同じ根を持ち、claude / agy は codex の置き場に引きずられない
+    #[test]
+    fn issue2810_codexの本体はcodexの置き場の下() {
+        let home = std::path::Path::new("/tmp/h");
+        for platform in [Platform::MacOs, Platform::Windows] {
+            for codex_home in [
+                std::path::PathBuf::from("/tmp/custom-codex"),
+                std::path::PathBuf::from(r"D:\codex"),
+            ] {
+                let codex = recipe(platform, AgentKind::Codex);
+                assert_eq!(codex.payload_root, PayloadRoot::CodexHome, "{platform:?}");
+                assert_eq!(
+                    codex.payload_dir_in(home, &codex_home),
+                    Some(codex_home.join("packages").join("standalone")),
+                    "{platform:?} {codex_home:?}"
+                );
+                let claude = recipe(platform, AgentKind::Claude);
+                assert_eq!(claude.payload_root, PayloadRoot::Home, "{platform:?}");
+                assert!(claude
+                    .payload_dir_in(home, &codex_home)
+                    .is_some_and(|p| p.starts_with(home)));
+                assert_eq!(
+                    recipe(platform, AgentKind::Agy).payload_dir_in(home, &codex_home),
+                    None
+                );
+            }
+        }
     }
 
     /// macOS は 3 系統とも `~/.local/bin`（= tako の PATH ブロック 1 個で足りる。#989 の
@@ -1001,8 +1064,16 @@ mod tests {
                     "{who} の置き場所がホームの外"
                 );
                 assert!(r.launcher_dir_in(home).starts_with(home), "{who}");
-                if let Some(payload) = r.payload_dir_in(home) {
+                // codex の置き場が既定（ホームの中）のとき、本体もホームの中
+                if let Some(payload) = r.payload_dir_in(home, &home.join(".codex")) {
                     assert!(payload.starts_with(home), "{who} の本体がホームの外");
+                }
+                // 根からの相対も外へ出ない（`CODEX_HOME` を外へ向けたときに外へ出るのは根だけ）
+                if let Some(rel) = r.payload_rel {
+                    assert!(
+                        !rel.starts_with('/') && !rel.contains(':') && !rel.contains(".."),
+                        "{who} の payload_rel={rel}"
+                    );
                 }
                 assert!(!agent.product().is_empty(), "{who} の製品名が空");
             }

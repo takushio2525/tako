@@ -848,7 +848,7 @@ mod tests {
             // 既知のシェル（#2576 の「自分で足すしかない」は当たらない。当たる形は `next_step_with` で差し替える）
             shell: Some(tako_core::shell_profile::ShellKind::Zsh),
             step,
-            plan: plan_from(&recipe_for(agent), home),
+            plan: plan_from(&recipe_for(agent), home, &home.join(".codex")),
             auth_timeout: None,
             locate_timeout: None,
             path_timeout: None,
@@ -1020,7 +1020,11 @@ mod tests {
         }
         let codex = NextStep::Install {
             agent: Codex,
-            plan: plan_from(&recipe_for(Codex), Path::new("/home/testuser")),
+            plan: plan_from(
+                &recipe_for(Codex),
+                Path::new("/home/testuser"),
+                Path::new("/home/testuser/.codex"),
+            ),
         };
         assert!(matches!(
             launch_for(&codex, Posix),

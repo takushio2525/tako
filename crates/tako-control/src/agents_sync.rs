@@ -31,11 +31,14 @@ impl AgentKind {
         }
     }
 
+    /// 同期の書き先（診断の `instruction_path`・`tako setup` が書く先と同じ置き場）
     pub fn target_path(self) -> Option<PathBuf> {
         let home = tako_core::paths::home_dir()?;
         Some(match self {
             Self::Claude => home.join(".claude/CLAUDE.md"),
-            Self::Codex => home.join(".codex/AGENTS.md"),
+            // 空でない `CODEX_HOME` を見る（#2810。前は `~/.codex` を決め打ちし、診断・setup が見る置き場と
+            // ずれていた）。解決の正本は codex_session、空・空白だけは未設定と同じ `~/.codex`（#2798）
+            Self::Codex => crate::codex_session::codex_home()?.join("AGENTS.md"),
             Self::Agy => home.join(".gemini/GEMINI.md"),
         })
     }

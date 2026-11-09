@@ -1447,7 +1447,7 @@ pub const MATRIX: &[AgentFeature] = &[
         local: local_pending_first_class(),
         evidence: AgentEvidence::Source(
             "agents_sync.rs の AgentKind が 3 系統ぶんの書き先を持つ \
-             （~/.claude/CLAUDE.md / ~/.codex/AGENTS.md / ~/.gemini/GEMINI.md）",
+             （~/.claude/CLAUDE.md / $CODEX_HOME/AGENTS.md（既定 ~/.codex）/ ~/.gemini/GEMINI.md）",
         ),
     },
     AgentFeature {

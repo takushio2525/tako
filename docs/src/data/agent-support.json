@@ -896,7 +896,7 @@
       "key": "setup_rules_sync",
       "summary_ja": "共通ルールをこの CLI のグローバル指示ファイルへ同期する（#136）",
       "evidence": "source",
-      "evidence_detail": "agents_sync.rs の AgentKind が 3 系統ぶんの書き先を持つ （~/.claude/CLAUDE.md / ~/.codex/AGENTS.md / ~/.gemini/GEMINI.md）",
+      "evidence_detail": "agents_sync.rs の AgentKind が 3 系統ぶんの書き先を持つ （~/.claude/CLAUDE.md / $CODEX_HOME/AGENTS.md（既定 ~/.codex）/ ~/.gemini/GEMINI.md）",
       "agents": {
         "claude": {
           "status": "supported"

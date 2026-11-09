@@ -519,13 +519,25 @@ pub fn install_plan_for(agent: AgentKind) -> Result<InstallPlan, String> {
 
 /// [`install_plan_for`] の型の口（#2365）
 fn install_plan_for_typed(agent: AgentKind) -> Result<InstallPlan, SetupRefusal> {
-    let home = home_dir_typed()?;
-    Ok(plan_from(&recipe_for(agent), &home))
+    let (home, codex_home) = plan_roots()?;
+    Ok(plan_from(&recipe_for(agent), &home, &codex_home))
 }
 
-/// 手順 + home から計画を組む（**環境変数を読まない純粋関数**なので、
-/// 隔離 HOME のテストがそのまま書ける）
-pub fn plan_from(r: &InstallRecipe, home: &Path) -> InstallPlan {
+/// [`plan_from`] へ渡す 2 つの根（ホーム・codex の置き場）。
+///
+/// codex の置き場は**解決の正本** `codex_session::codex_home` から取る（#2810。前は導入計画だけが
+/// `~/.codex` を決め打ちし、空でない `CODEX_HOME` のとき診断・setup が見る置き場とずれていた）。
+/// 正本はホームが決まれば必ず置き場を返すので、`None` はホームが決まらないときだけ
+fn plan_roots() -> Result<(PathBuf, PathBuf), SetupRefusal> {
+    let home = home_dir_typed()?;
+    let codex_home =
+        crate::codex_session::codex_home().ok_or(SetupRefusal::BootstrapHomeUnresolved)?;
+    Ok((home, codex_home))
+}
+
+/// 手順 + home + codex の置き場から計画を組む（**環境変数を読まない純粋関数**なので、
+/// 隔離 HOME のテストがそのまま書ける）。`codex_home` は解決済みの値（[`plan_roots`]）
+pub fn plan_from(r: &InstallRecipe, home: &Path, codex_home: &Path) -> InstallPlan {
     InstallPlan {
         agent: r.agent.as_str(),
         product: r.agent.product(),
@@ -533,7 +545,7 @@ pub fn plan_from(r: &InstallRecipe, home: &Path) -> InstallPlan {
         official_command: r.source.official_command.to_string(),
         source_url: r.source.url.to_string(),
         launcher: r.launcher_path_in(home),
-        payload: r.payload_dir_in(home),
+        payload: r.payload_dir_in(home, codex_home),
         auto_updates: r.auto_updates,
         update_note: r.update_note,
         shell_note: r.shell_note,
@@ -873,9 +885,9 @@ fn status_with(
     agent: AgentKind,
     auth: impl FnOnce(&str) -> (AuthState, Option<tako_core::probe::TimeoutNotice>),
 ) -> Result<BootstrapState, SetupRefusal> {
-    let home = home_dir_typed()?;
+    let (home, codex_home) = plan_roots()?;
     let r = recipe_for(agent);
-    let plan = plan_from(&r, &home);
+    let plan = plan_from(&r, &home, &codex_home);
     // [`resolve_binary_for`] と同じ順（PATH → インストーラの置き場所）。PATH の探索の答えは
     // PATH の判定でもう一度使う（同じ問い合わせのログインシェルを 2 度起こさない。#1533）
     let found = tako_core::platform::exe::find_bounded(agent.as_str());
@@ -2514,6 +2526,91 @@ mod tests {
         }
     }
 
+    /// #2810: 共通ルールの同期の書き先（`agents_sync`）と導入計画の本体の置き場が、診断の
+    /// `instruction_path` と同じ codex の置き場（解決の正本 `codex_home`）を見る。前は 2 つだけが
+    /// `~/.codex` を決め打ちし、空でない `CODEX_HOME` のときに診断・setup の置き場とずれていた。
+    /// 未設定・空・空白だけは修正前と同じ置き場（`~/.codex`）。Windows の形（`D:\codex`）と末尾の区切りも見る
+    #[test]
+    fn issue2810_同期の書き先と導入計画は診断と同じcodexの置き場を見る() {
+        if tako_core::run_alone!(issue2810_同期の書き先と導入計画は診断と同じcodexの置き場を見る)
+        {
+            return;
+        }
+        let scratch = tako_core::test_residue::ScratchDir::new("codex-home-readers-2810");
+        let home = scratch.path().join("home");
+        let _home = crate::test_home::HomeGuard::set(&home);
+        let mut cases = crate::test_home::codex_home_cases(&home, scratch.path());
+        // 末尾に区切りの付いた値・Windows の形（unix では 1 つの相対の名前として値のまま読まれる）
+        let mut trailing = scratch.path().join("trailing-codex").into_os_string();
+        trailing.push(std::path::MAIN_SEPARATOR_STR);
+        for (label, value) in [
+            ("末尾に区切り", trailing),
+            ("Windows の形", r"D:\codex".into()),
+            ("Windows の形・末尾に区切り", r"D:\codex\".into()),
+        ] {
+            cases.push((label, Some(value.clone()), PathBuf::from(value)));
+        }
+        let codex = crate::agents_sync::AgentKind::Codex;
+        let standalone = |dir: &Path| dir.join("packages").join("standalone");
+        for (label, value, dir) in cases {
+            crate::test_home::set_codex_home(value.as_deref());
+            // 診断・setup が見る置き場（解決の正本）
+            assert_eq!(
+                crate::codex_session::codex_home(),
+                Some(dir.clone()),
+                "{label}"
+            );
+            let diagnosed = crate::diagnostics::instruction_path(AgentKind::Codex);
+            assert_eq!(diagnosed, Some(dir.join("AGENTS.md")), "{label}: 診断");
+            // 同期の書き先は診断と同じファイル
+            assert_eq!(codex.target_path(), diagnosed, "{label}: 同期の書き先");
+            // 導入計画（この OS の手順）の本体は同じ置き場の下
+            let plan = install_plan_for(AgentKind::Codex).expect("導入計画");
+            assert_eq!(plan.payload, Some(standalone(&dir)), "{label}: 導入計画");
+            // 両 OS の手順とも同じ根を使う（計画の根は `plan_roots` の 1 実装）
+            let (h, c) = plan_roots().expect("根");
+            assert_eq!(
+                (h.as_path(), c.as_path()),
+                (home.as_path(), dir.as_path()),
+                "{label}: 計画の根"
+            );
+            for platform in [Platform::MacOs, Platform::Windows] {
+                let r = agent_install::recipe(platform, AgentKind::Codex);
+                assert_eq!(
+                    plan_from(&r, &h, &c).payload,
+                    Some(standalone(&dir)),
+                    "{label}: {platform:?}"
+                );
+            }
+            // ランチャーと claude の置き場は codex の置き場に引きずられない
+            assert!(plan.launcher.starts_with(&home), "{label}");
+            let claude = install_plan_for(AgentKind::Claude).expect("claude の計画");
+            assert!(
+                claude
+                    .payload
+                    .as_deref()
+                    .is_some_and(|p| p.starts_with(&home)),
+                "{label}: claude の本体はホームの下"
+            );
+            // 未設定・空・空白だけは修正前の置き場（`~/.codex` の決め打ちと同じ）
+            if value
+                .as_deref()
+                .is_none_or(|v| v.to_string_lossy().trim().is_empty())
+            {
+                assert_eq!(
+                    codex.target_path(),
+                    Some(home.join(".codex/AGENTS.md")),
+                    "{label}: 修正前と同じ書き先"
+                );
+                assert_eq!(
+                    plan.payload,
+                    Some(home.join(".codex").join("packages").join("standalone")),
+                    "{label}: 修正前と同じ本体の置き場"
+                );
+            }
+        }
+    }
+
     /// #2550: 種別の分からない `$SHELL` を zsh と見なさない（空・未設定のときだけ OS の既定）
     #[test]
     fn 種別の分からないシェルはzshと見なさず空と未設定だけ既定を仮定する() {
@@ -2664,8 +2761,13 @@ mod tests {
         plan_of(platform, AgentKind::Claude, home)
     }
 
+    /// codex の置き場は既定（`<home>/.codex`）。空でない `CODEX_HOME` の形は #2810 のテストが見る
     fn plan_of(platform: Platform, agent: AgentKind, home: &Path) -> InstallPlan {
-        plan_from(&agent_install::recipe(platform, agent), home)
+        plan_from(
+            &agent_install::recipe(platform, agent),
+            home,
+            &home.join(".codex"),
+        )
     }
 
     /// 権限の呼び名がプラットフォームで変わること（#925）。
