@@ -85,15 +85,16 @@ agy だけが入っている環境でも `tako setup` は完了しますが、`t
 
 ## Claude Code との差分
 
-現時点で 67 件中 25 件が「対応」です（一部対応 5 件・未対応 25 件・対象外 12 件）。全件の内訳と理由は [Antigravity CLI を選ぶと落ちるもの](/agent-support/#antigravity-cli-を選ぶと落ちるもの) にあります。手元で最新を引くなら次を実行してください。
+現時点で 67 件中 25 件が「対応」です（一部対応 5 件・未対応 26 件・対象外 11 件）。全件の内訳と理由は [Antigravity CLI を選ぶと落ちるもの](/agent-support/#antigravity-cli-を選ぶと落ちるもの) にあります。手元で最新を引くなら次を実行してください。
 
 ```bash
 tako agent-support --agent agy
 ```
 
-master 関連（上記）と利用制限（上記）のほかで効くのは次の 3 点です。
+master 関連（上記）と利用制限（上記）のほかで効くのは次の 4 点です。
 
-- **worker は、あなたが agy に登録した MCP サーバーも全部持って起動します**。claude の worker は tako の MCP だけで起動して重い MCP を持ち込みませんが（[#2412](https://github.com/takushio2525/tako/issues/2412)）、agy の CLI には起動ごとに MCP を絞る手段がありません（1.4.7 の `--help` に `-c` / `--mcp-config` / `--settings` が無い）
+- **worker は、あなたが agy に登録した MCP サーバーも全部持って起動します**。claude の worker は tako の MCP だけで起動して重い MCP を持ち込みませんが（[#2412](https://github.com/takushio2525/tako/issues/2412)）、agy の CLI には起動ごとに MCP を絞る手段がありません（1.5.3 の `--settings` が受けるのは settings.json のキーだけで、MCP は別ファイルの `mcp_config.json` に定義するため、その回だけ外すことができない）
+- **プロファイルの `remote_control` は agy の worker には効きません**。agy にも公式のリモート操作（`--remote-control`。同じ Google アカウントで antigravity.google.com から会話を操作する）がありますが、tako の起動コマンドへはまだ配線していません（追跡: [#2835](https://github.com/takushio2525/tako/issues/2835)）。agy のペインの中で `/remote-control` を打てば、agy 自身の機能で繋げます
 
 - **PC 再起動後の復元は会話ごと戻りますが、会話の選び直しはまだできません**。再起動をまたぐ復元は [#1238](https://github.com/takushio2525/tako/issues/1238) で agy にも配線され、ペインは `agy --conversation <id>` で会話を持ったまま戻ります（会話 ID を `lsof` で採るので **Windows は対象外**です）。過去の会話を一覧から選び直す `tako sessions resume` と、会話を保ったまま CLI だけ建て直す `tako session-restart` は claude 専用のままです（追跡: [#975](https://github.com/takushio2525/tako/issues/975)）
 - **契約プランを検出できません**。認証済みかどうかは分かりますが、プランの規模が取れないので、`tako setup` の推奨プロファイルは agy 単独では規模を決められません

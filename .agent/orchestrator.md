@@ -119,7 +119,8 @@ tako が起こす **claude の worker**（spawn / run / git resolve / 会話を�
   で呼ばれた `mcp__<server>__*` のうち user scope のものを、そのプロジェクトの `mcp_servers` へ写す。
   写すのは名前だけで本文は残さない。元のファイルは `projects.yaml.pre-v1.bak`
 - **対象外**: master / solo のセッション・人が手で開く claude。agy の worker は
-  能力マトリクス `worker_mcp_scope`（agy = unsupported。起動ごとの手段が CLI に無い）
+  能力マトリクス `worker_mcp_scope`（agy = unsupported。起動ごとの手段が CLI に無い = 1.5.3 の
+  `--settings` は settings.json のキーだけを受け、MCP は別ファイルの `mcp_config.json`。#2831）
 - A/B は `TAKO_2412_LEGACY=1`（user scope を全部持ち込む #2412 前の起動。codex も戻る）
 
 #### 再開（resume）の worker（Issue #2447）
