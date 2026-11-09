@@ -675,6 +675,16 @@ jobs:
       # --nocapture は結果の行（TAKO2822_PANE*）をログへ残すため
       - name: 実行ペインの画面に 5.1 の包みの行が出ないかの実行検査（#2822）
         run: cargo test -p tako-core --test issue2822_run_pane_windows -- --nocapture
+      # #2827: 実行ペイン（platform::shell::run_pane_command）と split --command の失敗したときだけ止める形
+      # （hold_on_failure_command）を ConPTY で実物の 5.1 と pwsh 7 から立て、利用者のコマンドが最上位の終端エラー
+      # （throw / -ErrorAction Stop / $ErrorActionPreference = 'Stop'・& .\x.ps1 の中の throw）でも終了コード（非 0）が側路へ
+      # 書かれ、案内と Enter 待ちが出て、Enter で閉じる（対話の PS> に落ちない）ことを見る。文だけを止めるエラーの後ろ・
+      # 入れ子の関数・exit N・ネイティブの子の非 0 は修正前と同じ画面と終了コードであること、Ctrl+C の扱いも並べる。
+      # 同じバイナリの TAKO_2827_LEGACY=1（修正前の形）と並べる = A/B。外部に依らないので毎回走る。全数より手前に名指しで置く。
+      # --nocapture は結果の行（TAKO2827_*）をログへ残すため
+      # **終端エラーで包みごと止まる形・利用者のコマンドを try / trap で囲んで意味を変える形へ戻ったらここで落ちる**
+      - name: 実行ペインで利用者のコマンドが終端エラーでも終了コードと案内を出すかの実行検査（#2827）
+        run: cargo test -p tako-core --test issue2827_run_pane_terminating_windows -- --nocapture
       # #2791: Windows の codex / agy の導入代行を、公式の install.ps1 を本当に走らせて確かめる（製品の口
       # `tako setup bootstrap install --agent codex|agy` = MCP tako_setup_bootstrap と同じ経路）。導入の前後の
       # status・入った置き場・agy の取得物が残らない（起動片のスコープ）を、ポリシーなし / HKCU Restricted /
