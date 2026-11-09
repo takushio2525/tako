@@ -623,6 +623,73 @@ pub fn resolve_thread_id_for_backend(backend_session: &str) -> Option<String> {
     resolved
 }
 
+/// 器を持たないペイン → thread_id の解決（#2805）。**sticky**。
+///
+/// [`resolve_thread_id_for_backend`] は器のセッション名からペインの pid を引くので、
+/// 器の無い構成（tmux 不在 / persist OFF の macOS）では必ず空振りし、report の第 2 層も
+/// worker_status の一次シグナルも素通りしていた。#728 の claude と同じ二段構えで、
+/// 器なしのペインは PTY 直下の子 pid を根にして同じ辿り方（子孫の codex → ロック）をする。
+///
+/// `TAKO_2805_LEGACY=1` で修正前（器なしでは引かない）へ戻せる
+pub fn resolve_thread_id_for_pty(pane: u64, pty_pid: u32) -> Option<String> {
+    if legacy_screen_only() || legacy_2805() {
+        return None;
+    }
+    static STICKY: PtySticky = PtySticky::new();
+    STICKY.resolve(pane, pty_pid, find_codex_pid, thread_id_for_pid)
+}
+
+/// #2805 の A/B。`TAKO_2805_LEGACY=1` で器なしのペインの codex / agy の会話 ID を引かない
+/// （修正前 = report は失敗・status は画面の推定）。テストが子で切り替えられるよう毎回読む
+pub fn legacy_2805() -> bool {
+    std::env::var_os("TAKO_2805_LEGACY").is_some_and(|v| !v.is_empty())
+}
+
+/// 根の pid から agent の pid を選ぶ探索（[`find_codex_pid`] / `agy_session::find_agy_pid`）
+pub(crate) type FindAgentPid = fn(u32, &HashMap<u32, u32>, &HashMap<u32, String>) -> Option<u32>;
+
+/// 器を持たないペインの会話 ID の記憶（#2805。codex / agy が 1 つずつ持つ）。
+///
+/// 器のペインの記憶（[`sticky`]）は器のセッション名で持ち、器の一覧から消えたら捨てる。
+/// 器なしのペインには器のセッション名が無いので (tako のペイン ID, PTY 直下の子 pid) で持ち、
+/// 子 pid が居なくなったら捨てる（ペイン ID か pid の片方だけが使い回されても別のペインと分かる）
+pub(crate) struct PtySticky(std::sync::OnceLock<std::sync::Mutex<HashMap<(u64, u32), String>>>);
+
+impl PtySticky {
+    pub(crate) const fn new() -> Self {
+        Self(std::sync::OnceLock::new())
+    }
+
+    /// 根 `pty_pid` とその子孫から `find` で agent の pid を選び、`id_for_pid`（`lsof`）で会話 ID を引く。
+    /// 当てた対応は持ち続ける（照会のたびに `lsof` を起こさない = 器のペインと同じ方針）。
+    /// プロセス表は [`crate::agents::with_shared_scan`] の内側なら codex / agy で 1 回を共有する
+    pub(crate) fn resolve(
+        &self,
+        pane: u64,
+        pty_pid: u32,
+        find: FindAgentPid,
+        id_for_pid: fn(u32) -> Option<String>,
+    ) -> Option<String> {
+        let map = self.0.get_or_init(Default::default);
+        {
+            let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+            map.retain(|(_, pid), _| tako_core::platform::process::pid_alive(*pid));
+            if let Some(id) = map.get(&(pane, pty_pid)) {
+                return Some(id.clone());
+            }
+        }
+        if !tako_core::platform::process::pid_alive(pty_pid) {
+            return None;
+        }
+        let (parents, commands) = crate::agents::capture_process_table();
+        let id = id_for_pid(find(pty_pid, &parents, &commands)?)?;
+        map.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((pane, pty_pid), id.clone());
+        Some(id)
+    }
+}
+
 /// 器のペイン一覧（`session:window.pane`, pane_pid）から、そのセッションの
 /// 代表ペインの pid を取る（**純粋関数**）
 pub fn pane_pid_of(panes: &[(String, u32)], backend_session: &str) -> Option<u32> {

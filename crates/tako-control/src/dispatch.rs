@@ -9533,6 +9533,8 @@ fn verify_ctx_pane_identity(
         if ctx.pane_exists && ctx.backend_session.as_deref() != Some(expect) {
             ctx.pane_exists = false;
             ctx.backend_session = None;
+            // #2805: 器なしのペインの根も別の worker のもの
+            ctx.pty_pid = None;
             ctx.live_tail = None;
             ctx.full_screen = None;
             ctx.has_running_children = false;
@@ -19225,6 +19227,9 @@ pub struct ReportCtx {
     pane_id: u64,
     /// 同一性を確かめた後のペインの器（期待する器と食い違えば `None` = 別ペイン。#390）
     backend: Option<String>,
+    /// 器を持たないペインの PTY 直下の子 pid（#2805。codex / agy の会話 ID を器なしで辿る根）。
+    /// 期待する器がある（= 器の worker）のに器が無いペインは別ペインなので None
+    pty_pid: Option<u32>,
     /// レジストリ由来の期待する器（ペイン消失後の追跡に使う。#390）
     tmux_session: Option<String>,
     /// レジストリ由来の session_id（ペインから解決できないときの継続。#390）
@@ -19237,14 +19242,19 @@ pub struct ReportCtx {
 fn collect_report_ctx(host: &dyn ControlHost, query: WorkerQuery) -> ReportCtx {
     // pane ID 再利用の誤マッチ検証: 期待 tmux_session と現ペインの backend が
     // 食い違えば別ペインなので、backend ではなく期待セッション側を読む
-    let backend = host
-        .backend_session(PaneId::from_raw(query.pane_id))
-        .filter(|b| {
-            query
-                .tmux_session
-                .as_deref()
-                .is_none_or(|expect| expect == b)
-        });
+    let target = PaneId::from_raw(query.pane_id);
+    // #2805: 器なしの worker（期待する器が無い）だけ、器を持たないペインの PTY から辿る
+    let pty_pid = query
+        .tmux_session
+        .is_none()
+        .then(|| bare_pty_pid(host, target))
+        .flatten();
+    let backend = host.backend_session(target).filter(|b| {
+        query
+            .tmux_session
+            .as_deref()
+            .is_none_or(|expect| expect == b)
+    });
     // #2017: 同一性を確かめたペインの mod の報告だけを使う（別ペインの報告は別の worker のもの）
     let now = std::time::Instant::now();
     let mod_session = backend.as_ref().and_then(|_| {
@@ -19261,6 +19271,7 @@ fn collect_report_ctx(host: &dyn ControlHost, query: WorkerQuery) -> ReportCtx {
     ReportCtx {
         pane_id: query.pane_id,
         backend,
+        pty_pid,
         tmux_session: query.tmux_session,
         session_id: query.session_id,
         mod_session,
@@ -19279,6 +19290,7 @@ fn finish_orchestrator_report(
     let ReportCtx {
         pane_id,
         backend,
+        pty_pid,
         tmux_session,
         session_id,
         mod_session,
@@ -19330,10 +19342,10 @@ fn finish_orchestrator_report(
     });
     // #984: claude の会話ログが無ければ codex の実況を読む（`$CODEX_HOME/sessions/` の
     // rollout JSONL。`response_item` の `role == "assistant"` が発話本文）。
-    // これで `report --messages N` が codex worker でも実データを返す
+    // これで `report --messages N` が codex worker でも実データを返す。
+    // #2805: 器なしのペインは PTY 直下の子 pid から辿る（器なしでは第 1 層が無いのでここが唯一の出口）
     let transcript = transcript.or_else(|| {
-        let backend = backend.as_deref()?;
-        let tid = crate::codex_session::resolve_thread_id_for_backend(backend)?;
+        let tid = codex_thread_for_pane(pane_id, backend.as_deref(), pty_pid)?;
         let texts = crate::codex_session::last_assistant_texts(&tid, msg_count).ok()?;
         if texts.is_empty() {
             return None;
@@ -19347,8 +19359,7 @@ fn finish_orchestrator_report(
     // これで `report --messages N` が agy worker でも実データを返す
     // （北極星実測では agy だけ `messages` が 0 件だった）
     let transcript = transcript.or_else(|| {
-        let backend = backend.as_deref()?;
-        let cid = crate::agy_session::resolve_conversation_id_for_backend(backend)?;
+        let cid = agy_conversation_for_pane(pane_id, backend.as_deref(), pty_pid)?;
         let texts = crate::agy_session::last_agent_texts(&cid, msg_count).ok()?;
         if texts.is_empty() {
             return None;
@@ -21235,6 +21246,9 @@ pub struct WorkerStatusCtx {
     pane_id: u64,
     pane_exists: bool,
     backend_session: Option<String>,
+    /// 器を持たないペインの PTY 直下の子 pid（#2805。codex / agy の会話 ID を器なしで辿る根。
+    /// 器のあるペイン・同一性の確かめで別ペインと分かったときは None）
+    pty_pid: Option<u32>,
     /// ライブ画面の末尾（空行除去 + 最大 30 行に整形済み）。ペインが GUI に無ければ None
     live_tail: Option<String>,
     /// ライブ画面全体のテキスト（折りたたみ検出用。ペインが GUI に無ければ None）
@@ -21276,12 +21290,53 @@ pub struct WorkerStatusSeed {
     pane_id: u64,
     pane_exists: bool,
     backend_session: Option<String>,
+    /// 器を持たないペインの PTY 直下の子 pid（#2805。[`bare_pty_pid`]）
+    pty_pid: Option<u32>,
     /// ペインの画面を読む手（ペインが GUI に無ければ None）
     screen: Option<tako_core::PaneAccess>,
     /// 利用上限後の自動復帰の状態（#813）
     limit_resume: Value,
     /// tako mod の報告（#1880）
     mod_state: crate::claude_mod::ModSnapshot,
+}
+
+/// 器を持たないペインの PTY 直下の子 pid（#2805。UI スレッドでメモリだけを読む）。
+///
+/// codex / agy の会話 ID は器のセッション名からペインの pid を引いて辿る（#984 / #1033）ので、
+/// 器の無い構成（tmux 不在 / persist OFF）では report の第 2 層も status の一次シグナルも素通りしていた。
+/// #728 の claude と同じ二段構えで、器なしのペインはこの pid を根にする。器のあるペインでは None
+/// （PTY の子は器への attach クライアントで、agent の祖先ではない）
+fn bare_pty_pid(host: &dyn ControlHost, target: PaneId) -> Option<u32> {
+    if host.backend_session(target).is_some() {
+        return None;
+    }
+    host.session(target)?.child_pid()
+}
+
+/// ペインの codex の thread_id（#984）。器があれば器のセッションから、器なしは PTY 直下の子 pid から（#2805）
+fn codex_thread_for_pane(
+    pane_id: u64,
+    backend: Option<&str>,
+    pty_pid: Option<u32>,
+) -> Option<String> {
+    match (backend, pty_pid) {
+        (Some(backend), _) => crate::codex_session::resolve_thread_id_for_backend(backend),
+        (None, Some(pid)) => crate::codex_session::resolve_thread_id_for_pty(pane_id, pid),
+        (None, None) => None,
+    }
+}
+
+/// ペインの agy の会話 ID（#1033）。器があれば器のセッションから、器なしは PTY 直下の子 pid から（#2805）
+fn agy_conversation_for_pane(
+    pane_id: u64,
+    backend: Option<&str>,
+    pty_pid: Option<u32>,
+) -> Option<String> {
+    match (backend, pty_pid) {
+        (Some(backend), _) => crate::agy_session::resolve_conversation_id_for_backend(backend),
+        (None, Some(pid)) => crate::agy_session::resolve_conversation_id_for_pty(pane_id, pid),
+        (None, None) => None,
+    }
 }
 
 /// ペインの材料を写す（#2646。UI スレッド）
@@ -21298,6 +21353,7 @@ fn worker_status_seed(host: &dyn ControlHost, pane_id: u64) -> WorkerStatusSeed 
         pane_id,
         pane_exists: in_tree || host.workspace().is_shelved(target),
         backend_session: host.backend_session(target),
+        pty_pid: bare_pty_pid(host, target),
         screen: host.session(target).map(|session| session.access()),
         limit_resume: limit_resume_entry(host, target),
         mod_state: crate::claude_mod::ModSnapshot::capture(host, target),
@@ -21325,6 +21381,7 @@ impl WorkerStatusSeed {
             pane_id: self.pane_id,
             pane_exists: self.pane_exists,
             backend_session: self.backend_session,
+            pty_pid: self.pty_pid,
             // 子プロセスの有無は `tmux list-panes` + `ps` の 2 プロセスを起こすので、ここでは
             // 数えない。後段の [`probe_running_children`] が background で埋める（#1968）
             has_running_children: false,
@@ -21568,6 +21625,7 @@ fn finish_worker_status(
         pane_id,
         pane_exists,
         backend_session,
+        pty_pid,
         live_tail,
         full_screen,
         input_style,
@@ -21645,25 +21703,21 @@ fn finish_worker_status(
         resolved_sid = Some(sid.to_string());
         status_source = "agents";
     } else if pane_exists {
-        // pane→session 自動解決: backend_session から pid 祖先辿り
-        if let Some(ref backend) = backend_session {
-            if let Some(sid) = crate::agents::resolve_session_id_for_backend(backend) {
-                resolved_sid = Some(sid);
-                status_source = "agents-auto";
-            } else if let Some(tid) = crate::codex_session::resolve_thread_id_for_backend(backend) {
-                codex_thread = Some(tid);
-                resolved_sid = None;
-                status_source = "codex-session";
-            } else if let Some(cid) =
-                crate::agy_session::resolve_conversation_id_for_backend(backend)
-            {
-                agy_conversation = Some(cid);
-                resolved_sid = None;
-                status_source = "agy-session";
-            } else {
-                resolved_sid = None;
-                status_source = "screen";
-            }
+        // pane→session 自動解決: backend_session から pid 祖先辿り。
+        // #2805: codex / agy は器なしのペインでも PTY 直下の子 pid から辿る
+        // （claude の器なしは #728 でレジストリの会話 ID = 上の `session_id` の腕が答える）
+        let backend = backend_session.as_deref();
+        if let Some(sid) = backend.and_then(crate::agents::resolve_session_id_for_backend) {
+            resolved_sid = Some(sid);
+            status_source = "agents-auto";
+        } else if let Some(tid) = codex_thread_for_pane(pane_id, backend, pty_pid) {
+            codex_thread = Some(tid);
+            resolved_sid = None;
+            status_source = "codex-session";
+        } else if let Some(cid) = agy_conversation_for_pane(pane_id, backend, pty_pid) {
+            agy_conversation = Some(cid);
+            resolved_sid = None;
+            status_source = "agy-session";
         } else {
             resolved_sid = None;
             status_source = "screen";
@@ -42772,6 +42826,7 @@ mod tests {
             pane_id: 0,
             pane_exists: true,
             backend_session: None,
+            pty_pid: None,
             live_tail: Some(live_tail.into()),
             full_screen: Some(live_tail.into()),
             input_style: None,
@@ -43402,6 +43457,7 @@ mod tests {
             pane_id: 0,
             pane_exists: false,
             backend_session: None,
+            pty_pid: None,
             live_tail: None,
             full_screen: None,
             input_style: None,
@@ -43423,6 +43479,7 @@ mod tests {
             pane_id: 0,
             pane_exists: true,
             backend_session: None,
+            pty_pid: None,
             full_screen: Some(lines.join("\n")),
             live_tail: Some(tail_join(lines)),
             input_style: None,
@@ -43496,6 +43553,7 @@ mod tests {
                 pane_id: 0,
                 pane_exists: true,
                 backend_session: None,
+                pty_pid: None,
                 live_tail: Some("done\n❯ ".into()),
                 full_screen: None,
                 input_style: None,
@@ -43515,6 +43573,7 @@ mod tests {
                 pane_id: 0,
                 pane_exists: true,
                 backend_session: None,
+                pty_pid: None,
                 live_tail: Some("Thinking…\nesc to interrupt".into()),
                 full_screen: None,
                 input_style: None,
@@ -43533,6 +43592,7 @@ mod tests {
                 pane_id: 0,
                 pane_exists: true,
                 backend_session: None,
+                pty_pid: None,
                 live_tail: None,
                 full_screen: None,
                 input_style: None,
@@ -43555,6 +43615,7 @@ mod tests {
                 pane_id: 0,
                 pane_exists: true,
                 backend_session: None,
+                pty_pid: None,
                 live_tail: Some(
                     "  ⎿  API Error: Connection closed mid-response. The response above may be incomplete.\n\n❯ ".into(),
                 ),
@@ -43582,6 +43643,7 @@ mod tests {
                 pane_id: 0,
                 pane_exists: true,
                 backend_session: None,
+                pty_pid: None,
                 live_tail: Some(
                     "■ You've hit your usage limit. Upgrade to Pro or try again at 4:24 AM.\n\n› 1. Switch to gpt-5.4-mini".into(),
                 ),
@@ -43605,6 +43667,7 @@ mod tests {
                 pane_id: 0,
                 pane_exists: true,
                 backend_session: None,
+                pty_pid: None,
                 live_tail: Some("done\n❯ ".into()),
                 full_screen: None,
                 input_style: None,
@@ -43625,6 +43688,7 @@ mod tests {
                 pane_id: 0,
                 pane_exists: true,
                 backend_session: None,
+                pty_pid: None,
                 live_tail: Some(
                     "  ⎿  API Error (Connection error.) · Retrying in 4 seconds… (attempt 3/10)\nesc to interrupt".into(),
                 ),
@@ -43650,6 +43714,7 @@ mod tests {
                 pane_id: 0,
                 pane_exists: true,
                 backend_session: None,
+                pty_pid: None,
                 live_tail: Some(
                     "テストを追加しますか？\n❯ 1. はい\n  2. いいえ\n❯ \n──────".into(),
                 ),
@@ -43676,6 +43741,7 @@ mod tests {
                 pane_id: 0,
                 pane_exists: true,
                 backend_session: None,
+                pty_pid: None,
                 live_tail: Some(
                     "⎿ Claude Opus 4.6 limit reached, now using Claude Sonnet 4.5\n\n❯ \n──────"
                         .into(),
@@ -43704,6 +43770,7 @@ mod tests {
                 pane_id: 0,
                 pane_exists: true,
                 backend_session: None,
+                pty_pid: None,
                 live_tail: Some("done\n❯ ".into()),
                 full_screen: None,
                 input_style: None,
@@ -53553,6 +53620,7 @@ tako | pane 2 [ compact ]       [-]
                 pane_id: pane,
                 pane_exists: true,
                 backend_session: None,
+                pty_pid: None,
                 live_tail: Some("Welcome to Claude Code\n❯ ".into()),
                 full_screen: None,
                 input_style: None,
@@ -53583,6 +53651,7 @@ tako | pane 2 [ compact ]       [-]
                 pane_id: pane,
                 pane_exists: true,
                 backend_session: None,
+                pty_pid: None,
                 live_tail: Some("Thinking…\nesc to interrupt".into()),
                 full_screen: None,
                 input_style: None,
@@ -53621,6 +53690,7 @@ tako | pane 2 [ compact ]       [-]
                 pane_id: pane,
                 pane_exists: true,
                 backend_session: None,
+                pty_pid: None,
                 live_tail: Some("done\n❯ ".into()),
                 full_screen: None,
                 input_style: None,
@@ -53679,6 +53749,7 @@ tako | pane 2 [ compact ]       [-]
                 pane_id: pane,
                 pane_exists: true,
                 backend_session: None,
+                pty_pid: None,
                 live_tail: Some("error: option invalid\n[test@host:work]$ ".into()),
                 full_screen: None,
                 input_style: None,
@@ -53768,6 +53839,7 @@ tako | pane 2 [ compact ]       [-]
                     pane_id: pane,
                     pane_exists: true,
                     backend_session: None,
+                    pty_pid: None,
                     live_tail: Some("Welcome to Claude Code\n❯ ".into()),
                     full_screen: None,
                     input_style: None,
@@ -53873,6 +53945,7 @@ tako | pane 2 [ compact ]       [-]
                 pane_id: pane,
                 pane_exists: true,
                 backend_session: None,
+                pty_pid: None,
                 live_tail: Some("agy\n> ".into()),
                 full_screen: None,
                 input_style: None,
@@ -53919,6 +53992,7 @@ tako | pane 2 [ compact ]       [-]
                 pane_id: pane,
                 pane_exists: true,
                 backend_session: None,
+                pty_pid: None,
                 live_tail: Some("Thinking…\nesc to interrupt".into()),
                 full_screen: None,
                 input_style: None,
@@ -53974,6 +54048,7 @@ tako | pane 2 [ compact ]       [-]
                 pane_id: pane,
                 pane_exists: true,
                 backend_session: None,
+                pty_pid: None,
                 live_tail: Some(CODEX_BG_WAIT_NARROW_1015.into()),
                 full_screen: Some(CODEX_BG_WAIT_NARROW_1015.into()),
                 input_style: None,
@@ -54033,6 +54108,7 @@ tako | pane 2 [ compact ]       [-]
                 pane_id: pane,
                 pane_exists: true,
                 backend_session: None,
+                pty_pid: None,
                 live_tail: Some("• You have 1 usage limit reset available.\n\n› Ask Codex to do anything\n\n  gpt-5.6-sol high · /private/tmp/probe".into()),
                 full_screen: None,
                 input_style: None,
@@ -54099,6 +54175,7 @@ tako | pane 2 [ compact ]       [-]
                 pane_id: pane,
                 pane_exists: true,
                 backend_session: None,
+                pty_pid: None,
                 live_tail: Some(
                     "testuser@host tmp % TAKO_ORCHESTRATOR_ROLE='worker:p983' codex\n\
                      zsh: command not found: codex\n\
@@ -54132,6 +54209,7 @@ tako | pane 2 [ compact ]       [-]
                 pane_id: pane,
                 pane_exists: true,
                 backend_session: None,
+                pty_pid: None,
                 live_tail: Some("Not logged in\n".into()),
                 full_screen: None,
                 input_style: None,
@@ -54162,6 +54240,7 @@ tako | pane 2 [ compact ]       [-]
                 pane_id: pane,
                 pane_exists: true,
                 backend_session: None,
+                pty_pid: None,
                 live_tail: Some("zsh: command not found: codex\n".into()),
                 full_screen: None,
                 input_style: None,
@@ -54207,6 +54286,7 @@ tako | pane 2 [ compact ]       [-]
                     pane_id: pane,
                     pane_exists: true,
                     backend_session: None,
+                    pty_pid: None,
                     live_tail: Some(screen.into()),
                     full_screen: None,
                     input_style: None,
@@ -54345,6 +54425,7 @@ tako | pane 2 [ compact ]       [-]
                     pane_id: pane,
                     pane_exists: true,
                     backend_session: None,
+                    pty_pid: None,
                     live_tail: Some(screen.clone()),
                     full_screen: None,
                     has_running_children: false,
@@ -54428,6 +54509,7 @@ tako | pane 2 [ compact ]       [-]
             pane_id: pane,
             pane_exists: true,
             backend_session: None,
+            pty_pid: None,
             // SIGSEGV 後のシェルプロンプト画面（claude TUI の ❯ ではない）
             live_tail: Some("zsh: segmentation fault  claude\n% ".into()),
             full_screen: None,
@@ -62838,6 +62920,323 @@ tako | pane 2 [ compact ]       [-]
             true,
             "CSI 18 t は端末が答える"
         );
+    }
+
+    // ---- #2805: 器なしのペインの codex / agy の会話 ID ----
+
+    /// #2805 の偽 agent（perl を argv[0] = codex / agy で起こす。tako は実行ファイル名の位置で系統を見る）。
+    ///
+    /// 本物と同じく `T2805_HOLD` を開いたまま持つ（codex = 会話の書き手のロック・agy = 会話ディレクトリ）。
+    /// `T2805_GO` が現れるまでは開かない = 会話 ID がまだ決まっていない起動直後の形。
+    /// 起きたら `<T2805_READY>.started`、開いたら `T2805_READY` に自分の pid を書く。上限 120 秒で自分で終わる
+    #[cfg(target_os = "macos")]
+    const FAKE_AGENT_2805: &str = r#"
+        $SIG{HUP} = sub { exit 0 };
+        my $end = time + 120;
+        sub mark { my ($p) = @_; open(my $f, ">", "$p.tmp") or die "mark: $!"; print $f $$; close $f; rename("$p.tmp", $p) or die "rename: $!"; }
+        mark("$ENV{T2805_READY}.started");
+        until (-e $ENV{T2805_GO}) { exit 0 if time > $end; select(undef, undef, undef, 0.05); }
+        our $h;
+        if (-d $ENV{T2805_HOLD}) { opendir($h, $ENV{T2805_HOLD}) or die "opendir: $!"; }
+        else { open($h, ">>", $ENV{T2805_HOLD}) or die "open: $!"; }
+        mark($ENV{T2805_READY});
+        while (time < $end) { sleep 1; }
+    "#;
+
+    /// 器なしのペイン（MockHost に本物の PTY）の中の「bash → 偽 agent」の木（#2805）
+    #[cfg(target_os = "macos")]
+    struct FakeTree2805 {
+        go: std::path::PathBuf,
+        ready: std::path::PathBuf,
+        /// 片付ける pid（PTY 直下の bash と偽 agent。自分が起こしたものだけ）
+        pids: Vec<u32>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl FakeTree2805 {
+        /// `dir` に印を置き、`pane` に PTY を張って偽 agent を bash の子として起こす
+        fn spawn(
+            host: &mut MockHost,
+            pane: u64,
+            argv0: &str,
+            hold: &std::path::Path,
+            dir: &std::path::Path,
+        ) -> Self {
+            let go = dir.join(format!("{argv0}.go"));
+            let ready = dir.join(format!("{argv0}.ready"));
+            let env = |k: &str, v: &std::path::Path| (k.to_string(), v.display().to_string());
+            let (session, _rx) = TerminalSession::spawn(
+                80,
+                24,
+                SpawnOptions {
+                    command: Some(tako_core::SpawnCommand {
+                        program: "/bin/bash".to_string(),
+                        // ペインのシェル（PTY 直下の子）の子として agent が動く実物の形
+                        args: vec![
+                            "-c".to_string(),
+                            r#"(exec -a "$T2805_ARGV0" /usr/bin/perl -e "$T2805_PERL") & wait"#
+                                .to_string(),
+                        ],
+                    }),
+                    env: vec![
+                        ("T2805_ARGV0".to_string(), argv0.to_string()),
+                        ("T2805_PERL".to_string(), FAKE_AGENT_2805.to_string()),
+                        env("T2805_HOLD", hold),
+                        env("T2805_GO", &go),
+                        env("T2805_READY", &ready),
+                    ],
+                    ..SpawnOptions::default()
+                },
+            )
+            .expect("PTY を張れる");
+            let root = session.child_pid().expect("PTY 直下の子の pid");
+            host.sessions.insert(pane, session);
+            let mut tree = Self {
+                go,
+                ready,
+                pids: vec![root],
+            };
+            let started = tree.ready.with_extension("ready.started");
+            let agent = wait_pid_file_2805(&started, "偽 agent の起動");
+            tree.pids.push(agent);
+            tree
+        }
+
+        /// 会話 ID を決めさせる（偽 agent がロック / 会話ディレクトリを開いて持つまで待つ）
+        fn open_conversation(&self) {
+            std::fs::write(&self.go, b"go").expect("go の印を置ける");
+            wait_pid_file_2805(&self.ready, "偽 agent が会話を開く");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for FakeTree2805 {
+        fn drop(&mut self) {
+            for pid in &self.pids {
+                // SAFETY: 自分が起こした pid へ送るだけ（名前一致の一括 kill はしない）
+                unsafe {
+                    libc::kill(*pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    /// 偽 agent が書く pid の印を待つ（状態で待つ。上限は機の混み具合で伸ばすだけ）
+    #[cfg(target_os = "macos")]
+    fn wait_pid_file_2805(path: &std::path::Path, what: &str) -> u32 {
+        use std::time::{Duration, Instant};
+        let budget = tako_core::wait_budget::state_wait_budget(
+            Duration::from_secs(20),
+            tako_core::wait_budget::machine_busy(),
+        );
+        let deadline = Instant::now() + budget;
+        loop {
+            if let Some(pid) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                return pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what} を待ちきれない（{budget:?}）"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// 器なしの worker の report（照会の入口と同じ: UI スレッドの写し → background の続き）
+    #[cfg(target_os = "macos")]
+    fn report_2805(host: &MockHost, pane: u64) -> Result<Value, DispatchError> {
+        let ctx = collect_report_ctx(
+            host,
+            WorkerQuery {
+                pane_id: pane,
+                session_id: None,
+                tmux_session: None,
+            },
+        );
+        crate::agents::with_shared_scan(|| finish_orchestrator_report(ctx, 200, 1))
+    }
+
+    /// 器なしの worker の status（同上）
+    #[cfg(target_os = "macos")]
+    fn status_2805(host: &MockHost, pane: u64) -> Value {
+        let ctx = collect_worker_status_ctx(host, pane);
+        crate::agents::with_shared_scan(|| finish_worker_status(ctx, None, None))
+            .expect("状態を返す")
+    }
+
+    /// #2805: 器なしの codex の worker は report が rollout（`transcript_agent: codex`）を返し、
+    /// status の一次シグナルも rollout（`codex-session`）になる。
+    /// 修正前は会話 ID を器のセッションからしか引かず、report は失敗・status は画面の推定だった。
+    /// 起動直後（ロックをまだ持たない）は修正前と同じ落ち方で、決まった後は引ける（空振りを覚えない）。
+    /// `TAKO_2805_LEGACY=1` で修正前へ戻る
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn issue2805_器なしのcodexのworkerはreportもstatusも会話の記録から読む() {
+        if tako_core::run_alone!(
+            issue2805_器なしのcodexのworkerはreportもstatusも会話の記録から読む
+        ) {
+            return;
+        }
+        const TID: &str = "2805c0de-0000-4000-8000-000000000001";
+        const REPLY: &str = "REPORT-2805 codex";
+        let scratch = tako_core::test_residue::ScratchDir::new("codex-2805");
+        let _home = crate::test_home::HomeGuard::set(&scratch.path().join("home"));
+        let codex_home = scratch.path().join("codex-home");
+        crate::test_home::set_codex_home(Some(codex_home.as_os_str()));
+        let locks = codex_home.join("thread-writer-locks");
+        let day = codex_home.join("sessions/2026/11/09");
+        std::fs::create_dir_all(&locks).unwrap();
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(
+            day.join(format!("rollout-2026-11-09T00-00-00-{TID}.jsonl")),
+            format!(
+                "{}\n{}\n{}\n",
+                r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#,
+                json!({"type":"response_item","payload":{"type":"message","role":"assistant",
+                    "content":[{"type":"output_text","text":REPLY}]}}),
+                json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"t1",
+                    "last_agent_message":REPLY}}),
+            ),
+        )
+        .unwrap();
+
+        let mut host = MockHost::new();
+        let pane = host.ws.active_tab().tree().focused().as_u64();
+        let tree = FakeTree2805::spawn(
+            &mut host,
+            pane,
+            "codex",
+            &locks.join(format!("{TID}.lock")),
+            scratch.path(),
+        );
+        // 前提: 器なしのペイン = 器の名前が無く、PTY 直下の子（bash）が根になる
+        assert_eq!(host.backend_session(PaneId::from_raw(pane)), None);
+
+        // 起動直後（codex は居るがロックをまだ持たない）: 会話 ID は決まらない
+        assert!(
+            report_2805(&host, pane).is_err(),
+            "会話 ID が無ければ器なしの report は読めるものが無い"
+        );
+        assert_eq!(status_2805(&host, pane)["status_source"], "screen");
+
+        tree.open_conversation();
+        let v = report_2805(&host, pane).expect("器なしでも会話の記録から報告を返す（#2805）");
+        assert_eq!(v["source"], "transcript", "{v}");
+        assert_eq!(v["transcript_agent"], "codex", "{v}");
+        assert_eq!(v["session_id"], TID, "{v}");
+        assert_eq!(v["text"], REPLY, "{v}");
+        let s = status_2805(&host, pane);
+        assert_eq!(s["status_source"], "codex-session", "{s}");
+        assert_eq!(s["status"], "idle", "{s}");
+
+        // A/B: 修正前（器なしでは引かない）へ戻す
+        std::env::set_var("TAKO_2805_LEGACY", "1");
+        assert!(
+            report_2805(&host, pane).is_err(),
+            "旧: 器なしの report は失敗"
+        );
+        assert_eq!(
+            status_2805(&host, pane)["status_source"],
+            "screen",
+            "旧: 画面の推定"
+        );
+        drop(tree);
+    }
+
+    /// #2805: agy も同じ形（偽 agy が会話ディレクトリを開いたまま持つ = 本物の形）。
+    /// report は実況 JSONL（`transcript_agent: agy`）、status は `agy-session`
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn issue2805_器なしのagyのworkerはreportもstatusも会話の記録から読む() {
+        if tako_core::run_alone!(issue2805_器なしのagyのworkerはreportもstatusも会話の記録から読む)
+        {
+            return;
+        }
+        const CID: &str = "2805a9a9-0000-4000-8000-000000000002";
+        const REPLY: &str = "REPORT-2805 agy";
+        let scratch = tako_core::test_residue::ScratchDir::new("agy-2805");
+        let home = scratch.path().join("home");
+        let _home = crate::test_home::HomeGuard::set(&home);
+        let brain = home.join(".gemini/antigravity-cli/brain").join(CID);
+        let logs = brain.join(".system_generated/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("transcript.jsonl"),
+            format!(
+                "{}\n{}\n",
+                json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE",
+                    "content":"<USER_REQUEST>\nT2805\n</USER_REQUEST>"}),
+                json!({"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE",
+                    "content":REPLY}),
+            ),
+        )
+        .unwrap();
+
+        let mut host = MockHost::new();
+        let pane = host.ws.active_tab().tree().focused().as_u64();
+        let tree = FakeTree2805::spawn(&mut host, pane, "agy", &brain, scratch.path());
+        assert_eq!(host.backend_session(PaneId::from_raw(pane)), None);
+        // agy は会話が生まれる最初のターンの後から開く（それまでは決まらない）
+        assert!(report_2805(&host, pane).is_err());
+        assert_eq!(status_2805(&host, pane)["status_source"], "screen");
+
+        tree.open_conversation();
+        let v = report_2805(&host, pane).expect("器なしでも agy の実況から報告を返す（#2805）");
+        assert_eq!(v["source"], "transcript", "{v}");
+        assert_eq!(v["transcript_agent"], "agy", "{v}");
+        assert_eq!(v["session_id"], CID, "{v}");
+        assert_eq!(v["text"], REPLY, "{v}");
+        let s = status_2805(&host, pane);
+        assert_eq!(s["status_source"], "agy-session", "{s}");
+        assert_eq!(s["status"], "idle", "{s}");
+
+        std::env::set_var("TAKO_2805_LEGACY", "1");
+        assert!(
+            report_2805(&host, pane).is_err(),
+            "旧: 器なしの report は失敗"
+        );
+        assert_eq!(
+            status_2805(&host, pane)["status_source"],
+            "screen",
+            "旧: 画面の推定"
+        );
+        drop(tree);
+    }
+
+    /// #2805: 器なしの根（PTY 直下の子 pid）を写すのは「器の無いペイン」で「器の worker ではない」ときだけ。
+    /// 器の worker（期待する器がある）のペイン ID を器の無いペインが使い回していたら別の worker なので辿らない
+    /// （#390 と同じ同一性の約束）。器のあるペインの PTY の子は attach クライアントなので根にしない
+    #[cfg(unix)]
+    #[test]
+    fn issue2805_器なしの根は器の無いペインで器のworkerでないときだけ写す() {
+        let mut host = MockHost::new();
+        let pane = host.ws.active_tab().tree().focused().as_u64();
+        let (session, _rx) =
+            TerminalSession::spawn(80, 24, i2415_session_options()).expect("PTY を張れる");
+        let child = session.child_pid().expect("PTY 直下の子の pid");
+        host.sessions.insert(pane, session);
+        let query = |tmux: Option<&str>| WorkerQuery {
+            pane_id: pane,
+            session_id: None,
+            tmux_session: tmux.map(str::to_string),
+        };
+        assert_eq!(collect_report_ctx(&host, query(None)).pty_pid, Some(child));
+        assert_eq!(collect_worker_status_ctx(&host, pane).pty_pid, Some(child));
+        // 器の worker の記録（期待する器）があるのに器の無いペイン = 別の worker
+        assert_eq!(
+            collect_report_ctx(&host, query(Some("tako-gone"))).pty_pid,
+            None
+        );
+        let ctx =
+            verify_ctx_pane_identity(collect_worker_status_ctx(&host, pane), Some("tako-gone"));
+        assert_eq!(ctx.pty_pid, None);
+        // 器のあるペインは器のセッションから辿る（PTY の子は根にしない）
+        host.backend_sessions.insert(pane, "tako-s2805".into());
+        assert_eq!(collect_report_ctx(&host, query(None)).pty_pid, None);
+        assert_eq!(collect_worker_status_ctx(&host, pane).pty_pid, None);
     }
 }
 

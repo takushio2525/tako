@@ -328,6 +328,11 @@ worker_agents:               # エージェント別の worker 設定（任意�
     入るまで作られない）。「まだ何も言えない」を idle と誤認しないための正しい側
   - `TAKO_984_LEGACY=1`（codex）/ `TAKO_1033_LEGACY=1`（agy）で同一バイナリのまま
     画面推定だけの旧挙動へ戻せる
+  - **器（tmux / psmux）の無いペインでも同じ**（#2805）。ペイン → 会話 ID は器のペインの pid からでは
+    なく PTY 直下の子 pid から辿る（#728 の claude と同じ二段構え。分岐は `dispatch.rs` の
+    `codex_thread_for_pane` / `agy_conversation_for_pane`）。report の第 2 層（transcript）もこれを通るので、
+    器なしでも `report` は `source: transcript`（`transcript_agent: codex` / `agy`）を返す。
+    `TAKO_2805_LEGACY=1` で器なしでは引かない旧挙動へ戻せる
 - **codex の背景ターミナル待ち（#1015）**: `• Waiting for background terminal (1m 04s …)` は
   **走っている**行、`• Waited for background terminal · <cmd>` は**完了済みの履歴**行で、
   どちらも `• ` で始まる。狭いペインでは codex が行末を `…` で切って `esc to interrupt` が

@@ -456,6 +456,18 @@ pub fn resolve_conversation_id_for_backend(backend_session: &str) -> Option<Stri
     resolved
 }
 
+/// 器を持たないペイン → 会話 ID の解決（#2805。**sticky**）。
+///
+/// codex の [`crate::codex_session::resolve_thread_id_for_pty`] と同じ形で、PTY 直下の子 pid を根に
+/// 子孫の agy → 開いている会話ディレクトリと辿る。`TAKO_2805_LEGACY=1` で修正前（器なしでは引かない）
+pub fn resolve_conversation_id_for_pty(pane: u64, pty_pid: u32) -> Option<String> {
+    if legacy_screen_only() || crate::codex_session::legacy_2805() {
+        return None;
+    }
+    static STICKY: crate::codex_session::PtySticky = crate::codex_session::PtySticky::new();
+    STICKY.resolve(pane, pty_pid, find_agy_pid, conversation_id_for_pid)
+}
+
 /// 解決済み backend → 会話 ID の記憶（sticky）
 fn sticky() -> &'static std::sync::Mutex<HashMap<String, String>> {
     static STICKY: std::sync::OnceLock<std::sync::Mutex<HashMap<String, String>>> =
