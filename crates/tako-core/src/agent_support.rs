@@ -487,12 +487,6 @@ pub mod notes {
         "State is inferred from the screen only, so completion is confirmed slowly; a footer string has also caused false busy detection before (#120)",
     );
 
-    /// #512 / #558。claude だけが config dir 切替に追従する
-    pub const FIXED_CONFIG_PATH: Note = Note::new(
-        "設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない",
-        "The config file location is fixed, so tako's account switching has no effect for this agent",
-    );
-
     /// #2820: codex の置き場は固定ではない（`CODEX_HOME` から解決する = #2798）が、
     /// アカウントが注入するのは `CLAUDE_CONFIG_DIR` だけ（#512 / #558）
     pub const CODEX_HOME_NOT_SWITCHED: Note = Note::new(
@@ -2112,15 +2106,19 @@ pub const MATRIX: &[AgentFeature] = &[
         ),
         claude: S::Supported,
         codex: S::Supported,
-        agy: degraded(notes::FIXED_CONFIG_PATH),
+        agy: S::Supported,
         local: pending(notes::LOCAL_HARNESS_UNDECIDED, 990),
         evidence: AgentEvidence::Source(
             "orchestrator/agent.rs の ensure_trusted_in が worker に渡る env 計画から 3 系統ぶん \
              書き分けてある（claude = <config dir>/.claude.json = アカウントの CLAUDE_CONFIG_DIR / \
              codex = $CODEX_HOME/config.toml = worker_mcp::codex_home_for（プロファイルの env → \
-             tako の CODEX_HOME → ~/.codex。#2816）/ agy = ~/.gemini/antigravity-cli/settings.json）。\
-             codex は #2816 から worker が読む置き場へ書く（前は ~/.codex/config.toml の決め打ちで縮退）。\
-             agy だけ固定パス",
+             tako の CODEX_HOME → ~/.codex。#2816）/ agy = ~/.gemini/antigravity-cli/settings.json の \
+             trustedWorkspaces）。codex は #2816 から worker が読む置き場へ書く（前は \
+             ~/.codex/config.toml の決め打ちで縮退）。agy の書き先は固定だが、agy もこの 1 か所しか\
+             読まない（agy 1.5.3 の --help に置き場を動かすフラグが無く、同梱の文書も設定の置き場を\
+             このファイルと書き、設定の型に trustedWorkspaces の欄がある）ので縮退ではない（#2829。\
+             前は「claude 以外は固定パス」の類推で縮退としていた）。書けなかったときは 3 系統とも\
+             信頼ダイアログの検出 → 承諾へ落ちる",
         ),
     },
 ];
@@ -2378,17 +2376,44 @@ mod tests {
         }
     }
 
-    /// #2820: codex の置き場は `CODEX_HOME` から解決する（#2798 / #2810 / #2816）ので、
-    /// 「設定ファイルの場所が固定」を codex の理由にしない（docs と診断が実装と食い違う）
+    /// #2820 / #2829: 「設定ファイルの場所が固定」をどの系統の理由にもしない。
+    /// codex の置き場は `CODEX_HOME` から解決し（#2798 / #2810 / #2816）、agy の置き場は固定でも
+    /// agy 自身がそこしか読まない。どちらも効かない・落ちる理由は置き場ではなかった
+    /// （理由文 `FIXED_CONFIG_PATH` は #2829 で使い手が無くなったので消した。文で見る）
     #[test]
-    fn issue2820_codexに置き場が固定という理由を付けない() {
+    fn issue2820_置き場が固定という理由をどの系統にも付けない() {
         for f in MATRIX {
-            assert_ne!(
-                f.on(Agent::Codex).note(),
-                Some(notes::FIXED_CONFIG_PATH),
-                "{} の codex の理由が「設定ファイルの場所が固定」になっている。\
-                 codex の置き場は CODEX_HOME から解決するので、本当の理由を書くこと（#2820）",
-                f.key
+            for agent in Agent::ALL {
+                let Some(note) = f.on(agent).note() else {
+                    continue;
+                };
+                assert!(
+                    !note.ja().contains("場所が固定") && !note.en().contains("location is fixed"),
+                    "{} の {} の理由が「設定ファイルの場所が固定」になっている。\
+                     tako の書き先・アカウントの注入と CLI の読み先を確かめて、本当の理由を書くこと\
+                     （#2820 / #2829）: {}",
+                    f.key,
+                    agent.as_str(),
+                    note.ja()
+                );
+            }
+        }
+    }
+
+    /// #2829: 事前信頼は「tako の書き先 = CLI が読む先」なら claude と同じに効く。
+    /// agy の書き先（`~/.gemini/antigravity-cli/settings.json` の `trustedWorkspaces`）は固定だが、
+    /// agy 自身もそこしか読まないので、固定パスであることだけを理由に縮退へ戻さない
+    /// （戻すなら書き先と読み先がずれる実例を根拠に書く）
+    #[test]
+    fn issue2829_事前信頼は書き先と読み先が一致する3系統とも対応() {
+        for agent in Agent::TUI {
+            assert_eq!(
+                support_for(agent, keys::WORKER_TRUST),
+                Some(AgentSupport::Supported),
+                "worker_trust の {} が Supported ではない。tako は agent ごとに CLI が読む設定へ \
+                 信頼を書く（orchestrator/agent.rs の ensure_trusted_in）。縮退させるなら書き先と \
+                 読み先がずれる実例を根拠に書くこと（#2829）",
+                agent.as_str()
             );
         }
     }

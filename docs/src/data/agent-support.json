@@ -1581,7 +1581,7 @@
       "key": "worker_trust",
       "summary_ja": "作業フォルダを起動前に信頼済みにしておく（信頼ダイアログで止まらない）",
       "evidence": "source",
-      "evidence_detail": "orchestrator/agent.rs の ensure_trusted_in が worker に渡る env 計画から 3 系統ぶん 書き分けてある（claude = <config dir>/.claude.json = アカウントの CLAUDE_CONFIG_DIR / codex = $CODEX_HOME/config.toml = worker_mcp::codex_home_for（プロファイルの env → tako の CODEX_HOME → ~/.codex。#2816）/ agy = ~/.gemini/antigravity-cli/settings.json）。codex は #2816 から worker が読む置き場へ書く（前は ~/.codex/config.toml の決め打ちで縮退）。agy だけ固定パス",
+      "evidence_detail": "orchestrator/agent.rs の ensure_trusted_in が worker に渡る env 計画から 3 系統ぶん 書き分けてある（claude = <config dir>/.claude.json = アカウントの CLAUDE_CONFIG_DIR / codex = $CODEX_HOME/config.toml = worker_mcp::codex_home_for（プロファイルの env → tako の CODEX_HOME → ~/.codex。#2816）/ agy = ~/.gemini/antigravity-cli/settings.json の trustedWorkspaces）。codex は #2816 から worker が読む置き場へ書く（前は ~/.codex/config.toml の決め打ちで縮退）。agy の書き先は固定だが、agy もこの 1 か所しか読まない（agy 1.5.3 の --help に置き場を動かすフラグが無く、同梱の文書も設定の置き場をこのファイルと書き、設定の型に trustedWorkspaces の欄がある）ので縮退ではない（#2829。前は「claude 以外は固定パス」の類推で縮退としていた）。書けなかったときは 3 系統とも信頼ダイアログの検出 → 承諾へ落ちる",
       "agents": {
         "claude": {
           "status": "supported"
@@ -1590,8 +1590,7 @@
           "status": "supported"
         },
         "agy": {
-          "status": "degraded",
-          "note_ja": "設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない"
+          "status": "supported"
         },
         "local": {
           "status": "pending",
