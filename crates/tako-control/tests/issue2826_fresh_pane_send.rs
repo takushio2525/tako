@@ -39,6 +39,7 @@ use tako_control::{
     PreviewHost, RemoteHost, SessionHost, SystemHost, TmuxHost, UiStateHost, WebViewHost,
     WorkspaceHost,
 };
+use tako_core::platform::shell_dialect::ShellDialect;
 use tako_core::shell_send::{ShellObservation, ShellSendAction, ShellSendFlow};
 use tako_core::terminal::SessionEvent;
 use tako_core::{Pane, PaneId, PaneOrigin, SpawnOptions, TerminalSession, Workspace};
@@ -191,26 +192,15 @@ impl UiStateHost for Host {}
 impl WebViewHost for Host {}
 impl RemoteHost for Host {}
 
-/// シェルの方言（送る行と、実行されたときにだけ出る行）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// 片方の OS の組み合わせしか作らない（unix は Posix・Windows は PowerShell）
-#[allow(dead_code)]
-enum Dialect {
-    PowerShell,
-    Posix,
-}
-
-impl Dialect {
-    /// 送る行と、実行されたときにだけ画面に出る行。送った行のエコーには `40+2` が
-    /// そのまま写るので、`42` の行が出たら**実行された**と言える
-    fn probe(self, round: usize) -> (String, String) {
-        let expected = format!("TAKO2826-R{round}-42");
-        let line = match self {
-            Self::PowerShell => format!("echo \"TAKO2826-R{round}-$(40+2)\""),
-            Self::Posix => format!("echo TAKO2826-R{round}-$((40+2))"),
-        };
-        (line, expected)
-    }
+/// 送る行と、実行されたときにだけ画面に出る行（方言は正本の `ShellDialect` = #873）。
+/// 送った行のエコーには `40+2` がそのまま写るので、`42` の行が出たら**実行された**と言える
+fn probe(dialect: ShellDialect, round: usize) -> (String, String) {
+    let expected = format!("TAKO2826-R{round}-42");
+    let line = match dialect {
+        ShellDialect::PowerShell => format!("echo \"TAKO2826-R{round}-$(40+2)\""),
+        ShellDialect::Posix => format!("echo TAKO2826-R{round}-$((40+2))"),
+    };
+    (line, expected)
 }
 
 /// 1 回の結果
@@ -332,7 +322,7 @@ fn send(host: &mut Host, line: String) -> serde_json::Value {
 }
 
 /// 1 つの組み合わせを `rounds` 回 × 3 腕で測り、修正後の約束を確かめる
-fn measure(combo: &str, dialect: Dialect, spawn: &mut Spawner<'_>) {
+fn measure(combo: &str, dialect: ShellDialect, spawn: &mut Spawner<'_>) {
     let rounds = env_number("TAKO2826_ROUNDS", 1) as usize;
     // 作ってから送るまでの遅れ（ms）。0 = TabNew の応答の直後（外部のフロントエンドの形）。
     // `tako master --tab` は TabNew → TabRename → Title → Send の往復を挟む
@@ -374,7 +364,7 @@ fn measure(combo: &str, dialect: Dialect, spawn: &mut Spawner<'_>) {
             // 送る時点で最初のプロンプトの印を受けていたか（遅れがあると器なしの zsh は 300 ms で
             // 出している = 作りたてではない = 修正前と同じ経路が正しい）
             let prompts_at_send = host.term.shell_marks().prompts;
-            let (line, expected) = dialect.probe(round);
+            let (line, expected) = probe(dialect, round);
             let reply = match arm {
                 Arm::Send | Arm::Prompted => send(&mut host, line),
                 Arm::Flow => {
@@ -484,7 +474,7 @@ fn 器なしのログインシェルの作りたてのペイン() {
     }
     let scratch = tako_core::test_residue::ScratchDir::new("2826-direct");
     sandbox_home(scratch.path());
-    measure("unix/direct", Dialect::Posix, &mut |_, pane| {
+    measure("unix/direct", ShellDialect::Posix, &mut |_, pane| {
         let (term, rx) = TerminalSession::spawn(120, 40, shell_options(scratch.path(), pane))
             .expect("PTY を張れる");
         (term, rx, None)
@@ -505,7 +495,7 @@ fn 器ありのログインシェルの作りたてのペイン() {
     sandbox_home(scratch.path());
     let socket = tmux_e2e::socket_for("2826");
     let backend = tako_core::backend::TmuxBackend::with_socket(socket.to_string());
-    measure("unix/tmux", Dialect::Posix, &mut |seq, pane| {
+    measure("unix/tmux", ShellDialect::Posix, &mut |seq, pane| {
         let name = format!("tako2826-{}-{seq}", std::process::id());
         let session = SessionRef::new(name.clone()).expect("器の名前");
         let options = backend.wrap_spawn(shell_options(scratch.path(), pane), &session);
@@ -628,7 +618,7 @@ mod windows {
     }
 
     pub(super) fn direct(dir: &Path, command: Option<SpawnCommand>, combo: &str) {
-        measure(combo, Dialect::PowerShell, &mut |_, pane| {
+        measure(combo, ShellDialect::PowerShell, &mut |_, pane| {
             let (term, rx) =
                 TerminalSession::spawn_in(120, 40, options(dir, command.clone(), pane), None)
                     .expect("ConPTY を起動できる");
@@ -642,7 +632,7 @@ mod windows {
             return;
         };
         let mut names = Vec::new();
-        measure(combo, Dialect::PowerShell, &mut |seq, pane| {
+        measure(combo, ShellDialect::PowerShell, &mut |seq, pane| {
             let name = format!("tako-2826-{tag}-{seq}");
             names.push(name.clone());
             let (term, rx) = vessel.pane(&name, options(dir, command.clone(), pane));

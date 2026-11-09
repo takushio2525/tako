@@ -15442,18 +15442,25 @@ mod tests {
         );
     }
 
-    /// #2826: 作りたてのシェルへの送信を送達フローへ寄せた応答は `[shell-wait]` の 1 行で出す。
-    /// 即時に書いた応答（`null`）・TUI 向けの送達フローの応答には出さない
+    /// #2826: 作りたてのシェルへの送信を送達フローへ寄せた応答は `[delivery]` に続けて
+    /// `[shell-wait]` の 1 行を出す。即時に書いた応答（`null`）・TUI 向けの送達フローの応答には出さない
     #[test]
     fn issue2826_送達フローへ寄せた送信は_shell_waitの1行を出す() {
-        let result = serde_json::json!({ "queued": true, "pane": 7, "shell_wait": "first_prompt" });
+        // dispatch の応答の形（積んだ応答は `queued_json` の 1 箇所で組む = delivery は queued）
+        let result = serde_json::json!({
+            "queued": true,
+            "pane": 7,
+            "delivery": tako_core::prompt_delivery::Status::queued().to_json(),
+            "shell_wait": "first_prompt",
+        });
         assert_eq!(
             shell_wait_line(&result).as_deref(),
             Some("[shell-wait] reason=first_prompt")
         );
-        assert!(
-            delivery_line(&result).is_none(),
-            "送達フローの顛末（delivery）は載せない"
+        assert_eq!(
+            delivery_line(&result).as_deref(),
+            Some("[delivery] state=queued elapsed=0s"),
+            "積んだ時点の delivery の行も出る"
         );
         assert!(shell_wait_line(&serde_json::Value::Null).is_none());
         let tui = serde_json::json!({

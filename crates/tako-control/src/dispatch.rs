@@ -17896,14 +17896,14 @@ fn queued_json(pane: Option<PaneId>, predecessor: Option<Value>) -> Value {
 ///
 /// `shell_wait` = 寄せた理由（`first_prompt` = まだ最初のプロンプトを出していない /
 /// `previous_flow` = 先に積んだ送達フローの後ろに並ぶ）。本文はシェルの準備を待ってから
-/// 送るので、呼び手は待ちを重ねなくてよい。`delivery` は載せない（顛末を `tako_read_pane` の
-/// `delivery` で追う TUI 向けの送達フローとは別の経路 = 結果は画面で見る）
+/// 送るので、呼び手は待ちを重ねなくてよい。`delivery` は積んだ時点の `queued` だけで、この経路の
+/// 顛末は `tako_read_pane` の `delivery` には出ない（TUI 向けの送達フローとは別の経路 = 結果は画面で見る）
 fn shell_wait_json(pane: PaneId, wait: tako_core::shell_send::ShellWait) -> Value {
-    json!({
-        "queued": true,
-        "pane": pane.as_u64(),
-        "shell_wait": wait.as_str(),
-    })
+    // 積んだ応答の組み立ては `queued_json` の 1 箇所（#1292）。TUI 向けの送達フローの前任は
+    // この経路の前に並ばない（そちらが送達フローの決着を待つ = `hold_for_command_flow`）ので None
+    let mut out = queued_json(Some(pane), None);
+    out["shell_wait"] = Value::from(wait.as_str());
+    out
 }
 
 fn spawn_tmux_delivery(session: String, text: String, wait_ready: bool) {
@@ -32668,9 +32668,14 @@ mod tests {
         i2826_fresh_pane(&mut host, pane);
         let out = i2826_send(&mut host, pane, "tako master", true);
         assert_eq!(
-            out,
-            json!({ "queued": true, "pane": pane, "shell_wait": "first_prompt" }),
-            "作りたてのペインへの送信が送達フローへ寄っていない（即時に書くと器が落とす。#2826）"
+            out["shell_wait"], "first_prompt",
+            "作りたてのペインへの送信が送達フローへ寄っていない（即時に書くと器が落とす。#2826）: {out}"
+        );
+        assert_eq!(out["queued"], true, "{out}");
+        assert_eq!(out["pane"], pane, "{out}");
+        assert_eq!(
+            out["delivery"]["state"], "queued",
+            "積んだ応答は queued_json の 1 箇所で組む（#1292）: {out}"
         );
         assert_eq!(
             host.command_flows,
@@ -32773,10 +32778,8 @@ mod tests {
         // 1 本目の途中でシェルがプロンプトを出した・作りたての上限を過ぎた、でも並ぶ
         host.fresh_shell_ages.remove(&pane);
         let out = i2826_send(&mut host, pane, "tako master", true);
-        assert_eq!(
-            out,
-            json!({ "queued": true, "pane": pane, "shell_wait": "previous_flow" })
-        );
+        assert_eq!(out["shell_wait"], "previous_flow", "{out}");
+        assert_eq!(out["pane"], pane, "{out}");
         assert_eq!(
             host.command_flows
                 .iter()
@@ -32804,7 +32807,12 @@ mod tests {
         };
         let (session, mut rx) = TerminalSession::spawn(80, 24, options).expect("PTY を張れる");
         host.sessions.insert(pane, session);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        // 上限は混み具合で伸ばすだけの 1 実装（#1308。固定窓に戻さない）
+        let budget = tako_core::wait_budget::state_wait_budget(
+            std::time::Duration::from_secs(15),
+            tako_core::wait_budget::machine_busy(),
+        );
+        let deadline = std::time::Instant::now() + budget;
         loop {
             while let Ok(event) = rx.try_recv() {
                 let _ = host
@@ -32854,14 +32862,18 @@ mod tests {
             let out = i2826_send(&mut host, pane, "echo hi", true);
             assert_eq!(out, Value::Null, "即時書き込みの応答（legacy={legacy}）");
             assert!(host.command_flows.is_empty(), "送達フローを積んだ");
-            let mut got = Vec::new();
-            for _ in 0..1000 {
-                got = std::fs::read(&file).unwrap_or_default();
-                if got.len() >= b"echo hi\r".len() {
-                    break;
+            let budget = tako_core::wait_budget::state_wait_budget(
+                std::time::Duration::from_secs(10),
+                tako_core::wait_budget::machine_busy(),
+            );
+            let deadline = std::time::Instant::now() + budget;
+            let got = loop {
+                let got = std::fs::read(&file).unwrap_or_default();
+                if got.len() >= b"echo hi\r".len() || std::time::Instant::now() >= deadline {
+                    break got;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
-            }
+            };
             eprintln!(
                 "[2826] legacy={legacy} 書いたバイト={:?}",
                 String::from_utf8_lossy(&got)

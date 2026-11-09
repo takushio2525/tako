@@ -289,10 +289,12 @@ Windows CI の実 ConPTY の実測: 器（psmux 3.4.0）のペインへ作って
 - 寄せないもの（従来どおり）: 改行なし・複数行・器の注入口で入れる本文（#907。送達フローは打鍵で書く）・
   終わった端末・プロンプトを出したシェル・作ってから 30 秒を過ぎたシェル（統合の印を出さないシェル
   でも待ちを足し続けない）・明示コマンドのペイン・器のセッションへの繋ぎ直し・復元したペイン
-- 応答: `{"queued": true, "pane": N, "shell_wait": "first_prompt" | "previous_flow"}`。本文はシェルの
-  準備を待ってから送るので呼び手は待ちを重ねない。`delivery` は載せない（顛末を `tako_read_pane` の
-  `delivery` で追う TUI 向けの送達フローとは別の経路）。CLI の `tako send` は `[shell-wait] reason=…` の
-  1 行を stderr へ。`tako master --tab` / `tako solo --tab` の出力は変えない（応答を表示しない）
+- 応答: `queued: true`・`pane`・`delivery`（積んだ時点の `queued`。積んだ応答は `queued_json` の 1 箇所で
+  組む = #1292）に `shell_wait`（`first_prompt` / `previous_flow`）を足す。本文はシェルの準備を待ってから
+  送るので呼び手は待ちを重ねない。この経路の顛末は `tako_read_pane` の `delivery` には出ない（TUI 向けの
+  送達フローとは別の経路 = 結果は画面で見る）。CLI の `tako send` は `[delivery] state=queued elapsed=0s` に続けて
+  `[shell-wait] reason=…` の 1 行を stderr へ。`tako master --tab` / `tako solo --tab` の出力は変えない
+  （応答を表示しない）
 - GUI は素のシェルとして起こしたペインと時刻を `spawn_session` で控える（`fresh_shell_spawns`）。
   配線は番犬 `crates/tako-control/tests/issue2826_fresh_shell_wiring_watchdog.rs`、実 PTY / 実 ConPTY の
   実測は `crates/tako-control/tests/issue2826_fresh_pane_send.rs`（`TAKO2826_ROUNDS` / `TAKO2826_DELAY_MS`）

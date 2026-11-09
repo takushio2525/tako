@@ -1,5 +1,5 @@
 //! 実経路: `tako master --tab` / `tako solo --tab` の出力は、起動行の `Request::Send` の応答が
-//! 送達フローへ寄せた形（#2826 の `{"queued": true, "shell_wait": "first_prompt"}`）でも修正前の
+//! 送達フローへ寄せた形（#2826 の `queued` + `shell_wait: "first_prompt"`）でも修正前の
 //! 即時書き込みの形（`null`）でも**バイト一致**する（Issue #2826）。
 //!
 //! #2826 で作りたてのペインへの起動行は dispatch が送達フローへ寄せる（判断は
@@ -183,7 +183,12 @@ fn check(command: &str) {
     let (after, after_requests) = sb.run(
         &format!("{command}1"),
         &args,
-        json!({ "queued": true, "pane": PANE, "shell_wait": "first_prompt" }),
+        json!({
+            "queued": true,
+            "pane": PANE,
+            "delivery": tako_core::prompt_delivery::Status::queued().to_json(),
+            "shell_wait": "first_prompt",
+        }),
     );
     eprintln!(
         "[2826] tako {command} --tab: code={} stdout={:?}\nstderr:\n{}",
