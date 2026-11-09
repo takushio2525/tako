@@ -4506,9 +4506,16 @@ Dock のピン留めは `.app` への **file URL ブックマーク**（`com.app
 （`/var/folders/…/T/`）は**再起動でも消えない**ため `cargo test` 1 回につき 1 dir が
 積もっていた（実測 2026-09-11: `tako-test-data-*` 2,188 件 + `tako-agent-config-*` 784 件）。
 
-- 後始末は 2 段構え: `tako_core::test_residue::arm_self_cleanup`（`libc::atexit` =
+- 後始末は 2 段構え: `tako_core::test_residue::arm_self_cleanup`（unix の `libc::atexit` =
   正常終了と `std::process::exit` の両方で走る）+ `sweep_stale_on_start`
   （SIGKILL / abort で 1 が走らなかった回を、次のテストプロセスが回収する）
+- **Windows の `std::process::exit` は `ExitProcess` を直接呼び、CRT の `atexit` を飛ばす**（#1581）。
+  libtest は 1 本でも落ちると `process::exit(101)` で終わるので、`atexit` だけでは失敗した回の置き場が
+  全部残る（Windows CI の実測: 一巡の子が 1 本落ちた回に 3 種とも残り、子の `atexit` は 1 度も呼ばれていない）。
+  `arm_self_cleanup` は Windows で TLS コールバック（`.CRT$XLM` の `DLL_PROCESS_DETACH`）からも同じ後始末を
+  呼ぶ。**終了時の後始末を足すなら `atexit` だけに頼らない**（Windows では `main` から戻る経路でしか走らない）。
+  番犬は一巡の番犬 `test_residue::tests::テストを一巡してもtmpdirに残骸が残らない`（注入で失敗の経路を
+  毎回通す）。A/B は `TAKO_1581_LEGACY=1`（Windows では 3 種とも残る / macOS は変わらない）
 - **消してよいのは自分の pid のものと、pid が生きていないものだけ**。名前の一致で
   消すと**並行して走る別 worker の `cargo test`** を巻き込む（#625 の事故クラス）。
   pid は再利用されるので、生きていても「dir の作成時刻より後に始まったプロセス」は
