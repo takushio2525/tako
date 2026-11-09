@@ -1181,6 +1181,29 @@ mod tests {
         }
     }
 
+    /// OS の cmd.exe（版リソースを持つ）を `dir` に claude.exe の名前で写し、写しのパスと版を返す。
+    ///
+    /// 期待値は**写しから**読む: System32 の OS のファイルは、Windows 10 を名乗るマニフェストを持たない
+    /// プロセス（このテストバイナリ）には版を 6.2.x と返す（CI の実測: その場は `6.2.26100.7309`・
+    /// 写しは `10.0.26100.7309`）。写しが cmd.exe の版リソースそのものであることは 3 成分目以降の一致で見る
+    #[cfg(windows)]
+    fn place_cmd_as_claude(dir: &Path) -> (PathBuf, String) {
+        let system = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot がある"))
+            .join("System32")
+            .join("cmd.exe");
+        let copy = place_claude(dir, &std::fs::read(&system).expect("cmd.exe を読める"));
+        let reader = tako_core::platform::exe::file_version;
+        let at_system = reader(&system).expect("前提: cmd.exe は版リソースを持つ");
+        let at_copy = reader(&copy).expect("前提: 写した cmd.exe も版リソースを持つ");
+        let build = |v: &str| v.split('.').skip(2).collect::<Vec<_>>().join(".");
+        assert_eq!(
+            build(&at_copy),
+            build(&at_system),
+            "写しの版リソースが cmd.exe のものでない: {at_copy} / {at_system}"
+        );
+        (copy, at_copy)
+    }
+
     /// Windows の実ファイルで、版リソースを持つ exe からは版を読み、持たない・読めない exe は `None`。
     /// 置き場には空白と日本語を含める（利用者名に空白・日本語がある PC の `~\.local\bin` と同じ形）
     #[cfg(windows)]
@@ -1190,14 +1213,7 @@ mod tests {
         let odd = scratch.join("空白 と 日本語");
         let reader = tako_core::platform::exe::file_version;
         // 版リソースを持つ exe（OS の cmd.exe を claude.exe の名前で置く）
-        let system = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot がある"))
-            .join("System32")
-            .join("cmd.exe");
-        let expected = reader(&system).expect("前提: cmd.exe は版リソースを持つ");
-        let with_info = place_claude(
-            &odd.join("with"),
-            &std::fs::read(&system).expect("cmd.exe を読める"),
-        );
+        let (with_info, expected) = place_cmd_as_claude(&odd.join("with"));
         // 版リソースを持たない exe（Rust のテストバイナリ自身。名前は問わないのでその場で使う）
         let no_info = std::env::current_exe().expect("テストバイナリのパス");
         assert_eq!(
@@ -1265,14 +1281,8 @@ mod tests {
         };
         #[cfg(windows)]
         let (want_new, want_legacy) = {
-            let system = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot がある"))
-                .join("System32")
-                .join("cmd.exe");
-            place_claude(
-                &local_bin,
-                &std::fs::read(&system).expect("cmd.exe を読める"),
-            );
-            (tako_core::platform::exe::file_version(&system), None)
+            let (_, version) = place_cmd_as_claude(&local_bin);
+            (Some(version), None)
         };
         let empty_path = scratch.join("empty-path");
         std::fs::create_dir_all(&empty_path).unwrap();
