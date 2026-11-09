@@ -34,7 +34,7 @@
         },
         "codex": {
           "status": "pending",
-          "note_ja": "設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない",
+          "note_ja": "tako のアカウント切替は CLAUDE_CONFIG_DIR しか動かさないので、codex の置き場（CODEX_HOME）は切り替わらない",
           "issue": 975
         },
         "agy": {

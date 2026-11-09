@@ -38,7 +38,7 @@ codex login
 tako setup-mcp --agent codex
 ```
 
-引数なしの `tako setup-mcp` でも、導入済みなら codex は対象に入ります。書き込み先は `~/.codex/config.toml` の `[mcp_servers.tako]` です。
+引数なしの `tako setup-mcp` でも、導入済みなら codex は対象に入ります。書き込み先は `~/.codex/config.toml`（`CODEX_HOME` を設定していれば `$CODEX_HOME/config.toml`）の `[mcp_servers.tako]` です。
 
 codex は MCP サーバーへ環境変数をそのまま渡さないので、**転送する変数名の一覧**（`TAKO_SOCKET` / `TAKO_TOKEN` / `TAKO_PANE_ID` / `TAKO_ORCHESTRATOR_ROLE`）も一緒に書き込みます。**書くのは変数名だけで、トークンの値は設定ファイルに残りません。**
 
@@ -51,7 +51,7 @@ tako orchestrator profiles set default --master-agent codex
 tako master
 ```
 
-master として起動するときは、tako が MCP の設定を**起動コマンドへその場で渡します**（`~/.codex/config.toml` の恒久登録とは別経路です）。tako の外で立ち上げた codex に tako の操作ツールが見えないようにするための線引きです。
+master として起動するときは、tako が MCP の設定を**起動コマンドへその場で渡します**（`config.toml` への恒久登録とは別経路です）。tako の外で立ち上げた codex に tako の操作ツールが見えないようにするための線引きです。
 
 ## worker として使う
 
@@ -87,7 +87,7 @@ tako agent-support --agent codex
 とくに効くのは次の 3 点です。
 
 - **PC 再起動後の復元は会話ごと戻りますが、会話の選び直しはまだできません**。再起動をまたぐ復元は [#1238](https://github.com/takushio2525/tako/issues/1238) で codex にも配線され、ペインは `codex resume <id>` で会話を持ったまま戻ります（会話 ID を `lsof` で採るので **Windows は対象外**です）。戻った worker も新しく立てる worker と同じく tako の MCP だけを持ち、あなたが codex に登録した MCP サーバーは持ち込みません（[#2418](https://github.com/takushio2525/tako/issues/2418) / [#2447](https://github.com/takushio2525/tako/issues/2447)。要る MCP は `tako orchestrator projects mcp <プロジェクト> add <名前>` で足します）。モデル・effort・プロファイルの `worker_agents.codex.args` と `env:` も、新しく立てたときと同じ値で戻ります（[#2473](https://github.com/takushio2525/tako/issues/2473)。master として立てた codex の再開はまだ記録済みの会話の設定のままです）。過去の会話を一覧から選び直す `tako sessions resume` と、会話を保ったまま CLI だけ建て直す `tako session-restart` は claude 専用のままです（追跡: [#975](https://github.com/takushio2525/tako/issues/975)）
-- **tako 側からアカウントを切り替えられません**。設定ファイルの置き場が固定のためです（[#975](https://github.com/takushio2525/tako/issues/975)）
+- **tako 側からアカウントを切り替えられません**。tako のアカウント切り替えは claude の設定の置き場（`CLAUDE_CONFIG_DIR`）しか動かさず、codex の置き場（`CODEX_HOME`）は切り替わらないためです（[#975](https://github.com/takushio2525/tako/issues/975)）
 - **ワークスペースのクレジットが尽きたときは自動で再開しません**。5 時間 / 週の枠は解除を待って自分で再開しますが、クレジット切れには「待つ」出口が無いので tako は何も選ばずに止まります
 
 利用制限の残量はステータスバーに表示されます（[#985](https://github.com/takushio2525/tako/issues/985) で 5 時間枠と週枠の実データを読むようになりました）。どのプロジェクトが利用制限をどれだけ使ったかは `tako usage` で見られ、codex が残す記録から**過去の分まで**さかのぼれます（[#2204](https://github.com/takushio2525/tako/issues/2204)。codex のモデルは API 換算の単価表に無いので、% はトークン数の比で配ります）。

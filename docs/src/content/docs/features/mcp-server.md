@@ -23,7 +23,7 @@ MCP は、AI エージェントが外部ツールを操作するための共通�
 | エージェント | 書き込み先 | 手段 | 環境変数の渡し方 |
 |---|---|---|---|
 | claude | `~/.claude.json` / `<cwd>/.mcp.json` | `claude mcp add` | そのまま継承する |
-| codex | `~/.codex/config.toml` の `[mcp_servers.tako]` | `codex mcp add` + `env_vars` の追記 | 転送する変数名を書いたものだけ |
+| codex | `~/.codex/config.toml`（`CODEX_HOME` を設定していれば `$CODEX_HOME/config.toml`）の `[mcp_servers.tako]` | `codex mcp add` + `env_vars` の追記 | 転送する変数名を書いたものだけ |
 | agy | `~/.gemini/config/mcp_config.json` | `agy mcp add` | そのまま継承する |
 
 tako の MCP サーバーは、**tako の中から起動されたこと**を環境変数（`TAKO_SOCKET` / `TAKO_TOKEN`）で確認してから 162 個のツールを公開します。tako の外で立ち上がったエージェントに画面操作をさせないための線引きです（後述の[アクセス制御](#アクセス制御)）。
