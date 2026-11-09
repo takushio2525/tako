@@ -1346,11 +1346,17 @@ pub fn run_installer(
                 program: shell.clone(),
                 error: e.to_string(),
             })?;
-        let mut log = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        // PowerShell は捕捉された出力の改行を CRLF で書く。断りの文・応答へは LF で載せる（#2828。
+        // bash / sh のインストーラは借用のまま = 1 バイトも変えない）
+        let stdout_raw = String::from_utf8_lossy(&output.stdout);
+        let mut log = tako_core::platform::shell::powershell_captured_text(&shell, &stdout_raw)
+            .trim()
+            .to_string();
         let stderr_raw = String::from_utf8_lossy(&output.stderr);
         // Windows PowerShell 5.1 は `-EncodedCommand` + stderr の捕捉で進捗・警告・エラーを CLIXML で書く
         // （#2790）。断りの文へ XML のまま載せないよう平文へ戻す（CLIXML でなければ素通り）
-        let stderr = tako_core::platform::shell::powershell_stderr_text(&stderr_raw);
+        let stderr_plain = tako_core::platform::shell::powershell_stderr_text(&stderr_raw);
+        let stderr = tako_core::platform::shell::powershell_captured_text(&shell, &stderr_plain);
         if !stderr.trim().is_empty() {
             if !log.is_empty() {
                 log.push('\n');

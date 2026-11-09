@@ -1499,6 +1499,44 @@ pub fn powershell_stderr_text(raw: &str) -> std::borrow::Cow<'_, str> {
     powershell_stderr_text_in(raw, !legacy_2812())
 }
 
+/// 導入代行（`setup_bootstrap::run_installer`）が捕捉した出力 1 本（stdout か、[`powershell_stderr_text`] を通した
+/// stderr）を、断りの文と応答へ載せる改行にする（#2828）。`program` は起こしたインタプリタ。
+///
+/// Windows の PowerShell（5.1 / pwsh 7）は捕捉された stdout / stderr へ改行を CRLF で書く（`Write-Host`・起動片の
+/// `[Console]::Error.WriteLine`・host のエラー）。[`powershell_stderr_text`] が LF へ揃えるのは CLIXML を戻したときだけ
+/// （CLIXML でない入力は 1 バイトも変えない = #2800。受け入れゲートの evidence も同じ口を通る）なので、pwsh 7 の平文と
+/// stdout の CR が断りの文（`SetupRefusal` の `log`）へ残り、CLI / MCP / 設定画面へ返る文の行が CR で割れていた
+/// （#2790 から。Windows の CI のログで実測）。
+///
+/// - インタプリタが PowerShell のときだけ揃える（判定は [`ShellDialect::from_program`] の 1 実装）。bash / sh の
+///   インストーラ（macOS ほか）の出力は借用のまま返す = 修正前とバイト一致
+/// - CRLF を LF に、**単独の CR も LF に**する（[`newlines_to_lf`]）。単独の CR はネイティブの子の進捗表示などが行頭へ
+///   戻るのに使うもので、端末の上書きを真似て前の文字を捨てると本文が消えうる。LF にすれば 1 文字も落とさない
+/// - `TAKO_2828_LEGACY=1` で揃えない形（#2828 前）に戻る。ゲートの evidence（[`powershell_stderr_text`] だけを通る）には
+///   届かない
+pub fn powershell_captured_text<'a>(program: &str, text: &'a str) -> std::borrow::Cow<'a, str> {
+    if legacy_2828() || ShellDialect::from_program(program) != Some(ShellDialect::PowerShell) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    newlines_to_lf(text)
+}
+
+/// CRLF と単独の CR を LF へ揃える（純粋関数。#2828）。CR を含まなければ借用のまま返す
+pub fn newlines_to_lf(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('\r') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    std::borrow::Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+}
+
+/// #2828 の A/B の env（`1` で #2828 前の形 = 導入代行が捕捉した PowerShell の出力の CR を断りの文へそのまま載せる）。
+/// #2790 / #2812 / #2822 / #2827 とは独立
+pub const ISSUE2828_LEGACY_ENV: &str = "TAKO_2828_LEGACY";
+
+fn legacy_2828() -> bool {
+    std::env::var_os(ISSUE2828_LEGACY_ENV).is_some()
+}
+
 /// [`powershell_stderr_text`] の本体（純粋関数。`strip_ansi` = 塊から戻した文字の色の符号を除く = #2812）
 pub fn powershell_stderr_text_in(raw: &str, strip_ansi: bool) -> std::borrow::Cow<'_, str> {
     const MARK: &str = POWERSHELL_CLIXML_MARK;
@@ -4261,5 +4299,123 @@ mod tests_2827 {
         );
         assert!(!pane.contains("$MyInvocation"), "{pane}");
         std::env::remove_var(ISSUE2822_LEGACY_ENV);
+    }
+}
+
+#[cfg(test)]
+mod tests_2828 {
+    use super::*;
+    use std::borrow::Cow;
+
+    /// CRLF も単独の CR も LF に揃え、CR 以外の文字は 1 つも落とさない（受け入れ条件: 本文は消えない）
+    #[test]
+    fn issue2828_改行はcrlfも単独のcrもlfへ揃え本文を落とさない() {
+        for (raw, want) in [
+            ("a\r\nb\r\n", "a\nb\n"),
+            // 進捗の上書き（単独の CR）と本文の途中の CRLF
+            (
+                "50%\r100%\r\ninstall failed: x\r\ndone",
+                "50%\n100%\ninstall failed: x\ndone",
+            ),
+            ("x\r\r\ny", "x\n\ny"),
+            ("end\r", "end\n"),
+            ("\r", "\n"),
+        ] {
+            let got = newlines_to_lf(raw);
+            assert_eq!(got, want, "{raw:?}");
+            assert!(!got.contains('\r'), "{raw:?}");
+            assert_eq!(
+                got.replace('\n', ""),
+                raw.replace(['\r', '\n'], ""),
+                "改行以外の文字が消えた: {raw:?}"
+            );
+        }
+        let plain = "no cr\nhere";
+        assert!(matches!(newlines_to_lf(plain), Cow::Borrowed(r) if r == plain));
+    }
+
+    /// 揃えるのはインタプリタが PowerShell（5.1 / pwsh 7）のときだけ。bash / sh のインストーラ（macOS ほか）は
+    /// 借用のまま = 修正前とバイト一致（受け入れ条件: macOS の経路）
+    #[test]
+    fn issue2828_揃えるのはpowershellのインタプリタだけ() {
+        for program in [
+            "powershell",
+            "powershell.exe",
+            "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+            "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+            "pwsh",
+        ] {
+            assert_eq!(
+                powershell_captured_text(program, "a\r\nb\rc"),
+                "a\nb\nc",
+                "{program}"
+            );
+        }
+        let raw = "a\r\nb\rc";
+        for program in ["bash", "/bin/bash", "sh", "/bin/sh"] {
+            assert!(
+                matches!(powershell_captured_text(program, raw), Cow::Borrowed(r) if r == raw),
+                "{program}"
+            );
+        }
+    }
+
+    /// 製品のレシピの表（`agent_install::recipe`）で: macOS の 3 系統のインタプリタ（bash / sh）は借用のまま、
+    /// Windows の 3 系統（PowerShell）は揃える。表が変わってもここが追う
+    #[test]
+    fn issue2828_レシピの表でmacosは借用のままwindowsは揃える() {
+        use crate::platform::agent_install::{recipe, AgentKind};
+        use crate::platform::support::Platform;
+        let raw = "progress 10%\rprogress 100%\r\ninstall failed";
+        for agent in AgentKind::ALL {
+            let mac = recipe(Platform::MacOs, agent).runner;
+            for program in mac.candidates.iter().copied().chain([mac.fallback]) {
+                assert!(
+                    matches!(powershell_captured_text(program, raw), Cow::Borrowed(r) if r == raw),
+                    "{agent:?} {program}"
+                );
+            }
+            let win = recipe(Platform::Windows, agent).runner;
+            for program in win.candidates.iter().copied().chain([win.fallback]) {
+                assert_eq!(
+                    powershell_captured_text(program, raw),
+                    "progress 10%\nprogress 100%\ninstall failed",
+                    "{agent:?} {program}"
+                );
+            }
+        }
+    }
+
+    /// 受け入れゲートの evidence が通る平文化（`powershell_stderr_text`）は #2828 で変えない
+    /// （CLIXML でない入力は借用のまま = #2800）
+    #[test]
+    fn issue2828_ゲートの平文化は変えない() {
+        let raw = "line 1\r\nline 2\r";
+        assert!(matches!(powershell_stderr_text(raw), Cow::Borrowed(r) if r == raw));
+    }
+
+    /// 既定の入口は修正後の形。`TAKO_2828_LEGACY=1` で走らせるとここが名指しで落ちる
+    #[test]
+    fn issue2828_既定の入口は修正後の形() {
+        assert_eq!(
+            powershell_captured_text("pwsh.exe", "a\r\nb"),
+            "a\nb",
+            "導入代行の出力の CR が残る（{ISSUE2828_LEGACY_ENV} が立っている？）"
+        );
+    }
+
+    /// `TAKO_2828_LEGACY=1` は CR を残す形（#2828 前）に戻す。#2827 の門は #2828 に効かない（独立した A/B）
+    #[test]
+    fn issue2828_旧形の門は2827と独立() {
+        if crate::run_alone!(issue2828_旧形の門は2827と独立) {
+            return;
+        }
+        let raw = "a\r\nb";
+        std::env::set_var(ISSUE2828_LEGACY_ENV, "1");
+        assert!(matches!(powershell_captured_text("pwsh.exe", raw), Cow::Borrowed(r) if r == raw));
+        std::env::remove_var(ISSUE2828_LEGACY_ENV);
+        std::env::set_var(ISSUE2827_LEGACY_ENV, "1");
+        assert_eq!(powershell_captured_text("pwsh.exe", raw), "a\nb");
+        std::env::remove_var(ISSUE2827_LEGACY_ENV);
     }
 }
