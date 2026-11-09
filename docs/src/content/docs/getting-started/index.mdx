@@ -542,7 +542,7 @@ tako setup undo
 | 外すもの | 置き場 |
 |---|---|
 | AI エージェントへの MCP 登録（名前が `tako` で tako を指すものだけ） | `~/.claude.json`（アカウントごとの設定 dir も）・`~/.codex/config.toml`（`CODEX_HOME` を設定していれば `$CODEX_HOME/config.toml`）・`~/.gemini/config/mcp_config.json` |
-| 指示ファイルへ同期した共通ルールのブロック（`tako agents sync-rules`） | `~/.claude/CLAUDE.md`・`~/.codex/AGENTS.md`・`~/.gemini/GEMINI.md` |
+| 指示ファイルへ同期した共通ルールのブロック（`tako agents sync-rules`） | `~/.claude/CLAUDE.md`・`~/.codex/AGENTS.md`（`CODEX_HOME` を設定していれば `$CODEX_HOME/AGENTS.md`）・`~/.gemini/GEMINI.md` |
 | tako mod の skills（tako が置いた印つきの写しだけ） | `~/.claude/skills/tako` |
 | `tako` コマンドの PATH | macOS: `~/.local/bin/tako` と `~/.zprofile` などの tako のブロック / Windows: ユーザー環境変数 `Path` の tako を入れた先 |
 | WebView2 のキャッシュ（Windows） | `%LOCALAPPDATA%\tako\WebView2` |
