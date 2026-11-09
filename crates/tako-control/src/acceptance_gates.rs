@@ -505,7 +505,9 @@ fn check_pr_merged(pr_number: u32, repo: Option<&str>) -> CheckResult {
 /// CLIXML で書く**（#2800 の CI で実測）。#2800 より前はそれをそのまま載せていたので、失敗したゲートの
 /// 理由が XML の中に埋もれていた。平文化は導入代行（`setup_bootstrap::run_installer`）と同じ 1 実装
 /// （[`tako_core::platform::shell::powershell_stderr_text`]）で、順番は [`plain_stderr_window`] を参照。
-/// `false` は `TAKO_2800_LEGACY=1`（捕捉したまま載せる = #2800 前の形）
+/// pwsh 7 がエラーの文に付ける色の符号（ANSI の ESC 列）も同じ 1 実装が除く（#2812。`TAKO_2812_LEGACY=1`
+/// で残す）。`false` は `TAKO_2800_LEGACY=1`（捕捉したまま載せる = #2800 前の形。XML の中の色の符号は
+/// `_x001B_` の文字のままなので ESC のバイトは載らない）
 fn format_evidence(exit_code: i32, stdout: &str, stderr: &str, plain_stderr: bool) -> String {
     let stdout_trimmed = stdout.trim();
     let stderr_trimmed = stderr.trim();
@@ -1015,5 +1017,177 @@ mod tests_2800 {
         let r = execute_command(cmd, true, None);
         assert!(!r.passed, "evidence: {}", r.evidence);
         assert_eq!(r.evidence, "exit 1; stderr: gate wiring 2800");
+    }
+}
+
+/// ゲートの evidence の色の符号と 5.1 の包みの行（#2812）
+#[cfg(test)]
+mod tests_2812 {
+    use super::*;
+    use tako_core::platform::shell::ISSUE2812_LEGACY_ENV;
+
+    /// pwsh 7 がゲートの述語（`Get-Item` の失敗）で書いた stderr の実物（PR #2807 の Windows の CI の
+    /// `TAKO2800_EVIDENCE_LEGACY arm=default case=cmdlet`。置き場は架空のパス）。ConciseView の各行が
+    /// `$PSStyle` の色の符号（`_x001B_[31;1m` ほか）で飾られている
+    const PWSH7_GATE_CLIXML: &str = "#< CLIXML\r\n<Objs Version=\"1.1.0.1\" xmlns=\"http://schemas.microsoft.com/powershell/2004/04\"><S S=\"Error\">_x001B_[31;1mGet-Item: _x001B_[0m_x000D__x000A_</S><S S=\"Error\">_x001B_[31;1m_x001B_[36;1mLine |_x001B_[0m_x000D__x000A_</S><S S=\"Error\">_x001B_[31;1m_x001B_[36;1m_x001B_[36;1m   4 | _x001B_[0m _x001B_[36;1mGet-Item -LiteralPath 'C:\\tako-2800-no-such\\missing.txt'_x001B_[0m_x000D__x000A_</S><S S=\"Error\">_x001B_[31;1m_x001B_[36;1m_x001B_[36;1m_x001B_[0m_x001B_[36;1m_x001B_[0m_x001B_[36;1m     | _x001B_[31;1m ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~_x001B_[0m_x000D__x000A_</S><S S=\"Error\">_x001B_[31;1m_x001B_[36;1m_x001B_[36;1m_x001B_[0m_x001B_[36;1m_x001B_[0m_x001B_[36;1m_x001B_[31;1m_x001B_[31;1m_x001B_[36;1m     | _x001B_[31;1mCannot find path 'C:\\tako-2800-no-such\\missing.txt' because it does not exist._x001B_[0m_x000D__x000A_</S></Objs>";
+
+    /// 5.1 が #2812 の包み（`$MyInvocation` を外す）で最上位の `Write-Error` を 2 回呼んだときの stderr の実物
+    /// （#2812 の Windows の CI の実測）。#2812 前はここの各レコードの頭に包みの 9 行が付いていた
+    const PS51_WRITE_ERROR_CLIXML: &str = "#< CLIXML\r\n<Objs Version=\"1.1.0.1\" xmlns=\"http://schemas.microsoft.com/powershell/2004/04\"><S S=\"Error\">Write-Error : first error 2812_x000D__x000A_</S><S S=\"Error\">At line:4 char:1_x000D__x000A_</S><S S=\"Error\">+ Write-Error 'first error 2812'; Write-Error 'second error 2812'_x000D__x000A_</S><S S=\"Error\">+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~_x000D__x000A_</S><S S=\"Error\">    + CategoryInfo          : NotSpecified: (:) [Write-Error], WriteErrorException_x000D__x000A_</S><S S=\"Error\">    + FullyQualifiedErrorId : Microsoft.PowerShell.Commands.WriteErrorException,Microsoft.PowerShell.Commands.WriteErr _x000D__x000A_</S><S S=\"Error\">   orCommand_x000D__x000A_</S><S S=\"Error\"> _x000D__x000A_</S><S S=\"Error\">Write-Error : second error 2812_x000D__x000A_</S><S S=\"Error\">At line:4 char:33_x000D__x000A_</S><S S=\"Error\">+ Write-Error 'first error 2812'; Write-Error 'second error 2812'_x000D__x000A_</S><S S=\"Error\">+                                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~_x000D__x000A_</S><S S=\"Error\">    + CategoryInfo          : NotSpecified: (:) [Write-Error], WriteErrorException_x000D__x000A_</S><S S=\"Error\">    + FullyQualifiedErrorId : Microsoft.PowerShell.Commands.WriteErrorException,Microsoft.PowerShell.Commands.WriteErr _x000D__x000A_</S><S S=\"Error\">   orCommand_x000D__x000A_</S><S S=\"Error\"> _x000D__x000A_</S></Objs>";
+
+    /// pwsh 7 の色の符号は evidence に残らない。本文と利用者のコマンドの位置（`4 |`）は残る。
+    /// `TAKO_2812_LEGACY=1` で走らせるとここが名指しで落ちる
+    #[test]
+    fn issue2812_pwsh7の色の符号はevidenceに残らない() {
+        let evidence = format_evidence(1, "", PWSH7_GATE_CLIXML, true);
+        assert!(
+            !evidence.contains('\u{1b}'),
+            "evidence に pwsh 7 の色の符号（ESC）が残っている（#2812。{ISSUE2812_LEGACY_ENV} が立っている？）: {evidence:?}"
+        );
+        assert_eq!(
+            evidence,
+            format!(
+                "exit 1; stderr: Get-Item: \n\
+                 Line |\n   \
+                 4 |  Get-Item -LiteralPath 'C:\\tako-2800-no-such\\missing.txt'\n     \
+                 |  {}\n     \
+                 | Cannot find path 'C:\\tako-2800-no-such\\missing.txt' because it does not exist.",
+                "~".repeat(56)
+            )
+        );
+    }
+
+    /// 5.1 の最上位の `Write-Error`（#2812 の包み）は、cmdlet の失敗と同じ形で本文と利用者のコマンドの位置を残し、
+    /// 包みの行を含まない
+    #[test]
+    fn issue2812_51の最上位のwrite_errorは本文と位置だけが載る() {
+        let evidence = format_evidence(1, "", PS51_WRITE_ERROR_CLIXML, true);
+        assert_eq!(
+            evidence,
+            "exit 1; stderr: Write-Error : first error 2812\n\
+             At line:4 char:1\n\
+             + Write-Error 'first error 2812'; Write-Error 'second error 2812'\n\
+             + ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n    \
+             + CategoryInfo          : NotSpecified: (:) [Write-Error], WriteErrorException\n    \
+             + FullyQualifiedErrorId : Microsoft.PowerShell.Commands.WriteErrorException,Microsoft.PowerShell.Commands.WriteErr \n   \
+             orCommand\n \n\
+             Write-Error : second error 2812\n\
+             At line:4 char:33\n\
+             + Write-Error 'first error 2812'; Write-Error 'second error 2812'\n\
+             +                                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n    \
+             + CategoryInfo          : NotSpecified: (:) [Write-Error], WriteErrorException\n    \
+             + FullyQualifiedErrorId : Microsoft.PowerShell.Commands.WriteErrorException,Microsoft.PowerShell.Commands.WriteErr \n   \
+             orCommand"
+        );
+        for wrapper in [
+            "[Console]::OutputEncoding",
+            "$ProgressPreference",
+            "$__tako_ok",
+            "exit $__tako_code",
+        ] {
+            assert!(
+                !evidence.contains(wrapper),
+                "包みの行（{wrapper}）が載っている: {evidence}"
+            );
+        }
+    }
+
+    /// 実際の述語の実行（境界 B1 の `sh -c`）から evidence まで色の符号を除く段が通っている（配線の確かめ）。
+    /// 子の中で A/B（`TAKO_2812_LEGACY` / `TAKO_2800_LEGACY` の 4 通り）も並べる
+    #[cfg(unix)]
+    #[test]
+    fn issue2812_ゲートの実行はclixmlの色の符号を除く() {
+        if tako_core::run_alone!(issue2812_ゲートの実行はclixmlの色の符号を除く) {
+            return;
+        }
+        let cmd = "printf '%s\\n' '#< CLIXML' '<Objs Version=\"1.1.0.1\"><S S=\"Error\">_x001B_[31;1mWrite-Error: _x001B_[31;1mgate wiring 2812_x001B_[0m_x000D__x000A_</S></Objs>' >&2; exit 1";
+        let run = |legacy_2800: bool, legacy_2812: bool| {
+            for (name, on) in [
+                (ISSUE2800_LEGACY_ENV, legacy_2800),
+                (ISSUE2812_LEGACY_ENV, legacy_2812),
+            ] {
+                if on {
+                    std::env::set_var(name, "1");
+                } else {
+                    std::env::remove_var(name);
+                }
+            }
+            let r = execute_command(cmd, true, None);
+            std::env::remove_var(ISSUE2800_LEGACY_ENV);
+            std::env::remove_var(ISSUE2812_LEGACY_ENV);
+            assert!(!r.passed, "{}", r.evidence);
+            r.evidence
+        };
+        // 修正後: 平文 + 色の符号なし
+        assert_eq!(
+            run(false, false),
+            "exit 1; stderr: Write-Error: gate wiring 2812"
+        );
+        // TAKO_2812_LEGACY だけ: 平文（#2800）だが色の符号が残る = #2812 前（#2800 の後）の形
+        assert_eq!(
+            run(false, true),
+            "exit 1; stderr: \u{1b}[31;1mWrite-Error: \u{1b}[31;1mgate wiring 2812\u{1b}[0m"
+        );
+        // TAKO_2800_LEGACY が立つと平文化しない = XML のまま（色の符号は `_x001B_` の文字で、ESC のバイトは無い）。
+        // TAKO_2812_LEGACY の有無に依らず同じ
+        let raw_2800 = run(true, false);
+        assert!(
+            raw_2800.starts_with("exit 1; stderr: #< CLIXML\n<Objs"),
+            "{raw_2800}"
+        );
+        assert!(
+            raw_2800.contains("_x001B_[31;1m") && !raw_2800.contains('\u{1b}'),
+            "{raw_2800}"
+        );
+        assert_eq!(run(true, true), raw_2800);
+    }
+
+    /// macOS / Linux（`sh -c`）のゲートの evidence は #2812 の前とバイト一致する。色の符号・切れた列・
+    /// 多い行・空・非 ASCII を、修正後と `TAKO_2812_LEGACY=1`（#2812 前の形）で並べ、#2812 前の答え（字面）と比べる
+    #[cfg(unix)]
+    #[test]
+    fn issue2812_shのゲートのevidenceは修正前とバイト一致() {
+        if tako_core::run_alone!(issue2812_shのゲートのevidenceは修正前とバイト一致)
+        {
+            return;
+        }
+        let cases: [(&str, bool, &str); 6] = [
+            (
+                "printf '\\033[31mred err 2812\\033[0m\\n' >&2; exit 1",
+                false,
+                "exit 1; stderr: \u{1b}[31mred err 2812\u{1b}[0m",
+            ),
+            (
+                "printf '\\033[32mgreen out 2812\\033[0m\\n'",
+                true,
+                "exit 0; stdout: \u{1b}[32mgreen out 2812\u{1b}[0m",
+            ),
+            (
+                "printf 'cut \\033[31' >&2; exit 1",
+                false,
+                "exit 1; stderr: cut \u{1b}[31",
+            ),
+            (
+                "i=1; while [ $i -le 7 ]; do echo \"line $i\" >&2; i=$((i+1)); done; exit 2",
+                false,
+                "exit 2; stderr (last 5/7 lines): line 3\nline 4\nline 5\nline 6\nline 7",
+            ),
+            ("exit 3", false, "exit 3"),
+            (
+                "echo 日本語のエラー 2812 >&2; exit 1",
+                false,
+                "exit 1; stderr: 日本語のエラー 2812",
+            ),
+        ];
+        for (cmd, passed, want) in cases {
+            std::env::remove_var(ISSUE2812_LEGACY_ENV);
+            let new = execute_command(cmd, true, None);
+            std::env::set_var(ISSUE2812_LEGACY_ENV, "1");
+            let old = execute_command(cmd, true, None);
+            std::env::remove_var(ISSUE2812_LEGACY_ENV);
+            assert_eq!(new.evidence, want, "{cmd}");
+            assert_eq!(new.evidence.as_bytes(), old.evidence.as_bytes(), "{cmd}");
+            assert_eq!((new.passed, old.passed), (passed, passed), "{cmd}");
+        }
     }
 }

@@ -1090,17 +1090,51 @@ fn powershell_output_argv(program: &str, script: &str) -> SpawnCommand {
 /// （`-OutputFormat Text` も見ない = #2790 で Windows の CI が実測）。この argv は `-OutputFormat Text` を
 /// 付けないので pwsh 7 も同じく CLIXML で書く（#2800 の CI で実測）。#2800 からは捕捉した側
 /// （`acceptance_gates::format_evidence`）が [`powershell_stderr_text`] で平文へ戻してから evidence へ
-/// 載せる（導入代行と同じ 1 実装。版に依らない）。情報レコードは平文化が捨てるが、`Write-Host` の文字は
-/// stdout にも出る（#2800 の CI で 5.1 / pwsh 7 とも実測）。判定は終了コードで決まるので、平文化の
-/// 前後で合否は変わらない
+/// 載せる（導入代行と同じ 1 実装。版に依らない）。pwsh 7 がエラーの文に付ける色の符号もそこで除く
+/// （#2812）。情報レコードは平文化が捨てるが、`Write-Host` の文字は stdout にも出る（#2800 の CI で
+/// 5.1 / pwsh 7 とも実測）。判定は終了コードで決まるので、平文化の前後で合否は変わらない
+///
+/// 4. **5.1 では `$MyInvocation` を外す**（#2812）。5.1 の `Write-Error` はエラーレコードの呼び出し元を
+///    その場の `$MyInvocation` にし、エラーの表示（NormalView）はそれが Script ならスクリプトの本文を
+///    「コマンド」として前に付ける。述語の最上位ではそれがこの包み全体（9 行）になり、本文の前に
+///    包みの行が並んでいた。外すと呼び出し元は `Write-Error` 自身になり、cmdlet の失敗と同じ
+///    `Write-Error : <本文>` + `At line:4 char:1`（利用者のコマンドの位置）の形になる（Windows の CI で
+///    実測。終了コードは 9 通りの述語で変わらない）。2 行目の末尾へ置くので利用者のコマンドは 4 行目の
+///    まま。pwsh 7 は `$MyInvocation` を外すとエラーの表示が長くなる（`Line |` の位置の行が付く）ので
+///    外さない。代償として述語の最上位で読む `$MyInvocation` は 5.1 では `$null` になる
+///    （`-EncodedCommand` の述語にはもともとスクリプトのパスが無い）。
+///    `TAKO_2812_LEGACY=1` で外さない形（#2812 前）に戻る
 #[cfg_attr(not(windows), allow(dead_code))]
 fn powershell_output_script(command: &str) -> String {
+    powershell_output_script_in(command, legacy_2812())
+}
+
+/// [`powershell_output_script`] の本体（純粋関数。`legacy_2812` = #2812 前の形 = 5.1 でも `$MyInvocation` を外さない）
+#[cfg_attr(not(windows), allow(dead_code))]
+fn powershell_output_script_in(command: &str, legacy_2812: bool) -> String {
+    let forget_invocation = if legacy_2812 {
+        ""
+    } else {
+        POWERSHELL_51_FORGET_INVOCATION
+    };
     format!(
         "try {{ [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 }} catch {{ }}\n\
-         $ProgressPreference = 'SilentlyContinue'\n\
+         $ProgressPreference = 'SilentlyContinue'{forget_invocation}\n\
          {}exit $__tako_code\n",
         powershell_exit_code_script(command)
     )
+}
+
+/// [`powershell_output_script`] の 2 行目の末尾へ足す片（#2812。5.1 のときだけ `$MyInvocation` を外す）
+const POWERSHELL_51_FORGET_INVOCATION: &str =
+    "; if ($PSVersionTable.PSVersion.Major -le 5) { $MyInvocation = $null }";
+
+/// #2812 の A/B の env（`1` で #2812 前の形 = PTY 無しの包みで 5.1 の `$MyInvocation` を外さず、
+/// [`powershell_stderr_text`] が CLIXML から戻した文字の色の符号を残す）
+pub const ISSUE2812_LEGACY_ENV: &str = "TAKO_2812_LEGACY";
+
+fn legacy_2812() -> bool {
+    std::env::var_os(ISSUE2812_LEGACY_ENV).is_some()
 }
 
 /// [`output_command`] の共通部分（argv を `Command` へ移して副作用の抑止を掛ける）
@@ -1201,7 +1235,7 @@ pub fn powershell_script_text_command_in(script: &std::path::Path, legacy_2791: 
 /// PowerShell が CLIXML で書く stderr の見出しの行（[`powershell_stderr_text`] はこれの有無で平文化するかを決める）
 pub const POWERSHELL_CLIXML_MARK: &str = "#< CLIXML";
 
-/// PowerShell が CLIXML で書いた stderr を、人が読む平文へ戻す（純粋関数。#2790）。
+/// PowerShell が CLIXML で書いた stderr を、人が読む平文へ戻す（#2790）。
 ///
 /// `-EncodedCommand` で起こした Windows PowerShell 5.1 は、stderr がリダイレクトされていると進捗・警告・
 /// エラーの各レコードを `#< CLIXML` + `<Objs …>` で書く（`-OutputFormat Text` を見ない。Windows の CI で
@@ -1212,11 +1246,22 @@ pub const POWERSHELL_CLIXML_MARK: &str = "#< CLIXML";
 /// - ストリームの `<S S="Error|warning|verbose|debug">` だけを文字にする（警告などは host と同じ
 ///   `WARNING: ` 等の前置き）。進捗（`<Obj S="progress">`）は捨てる
 /// - 文字は XML の実体参照と PowerShell の `_xHHHH_`（UTF-16 の 1 単位）を戻し、改行は LF へ揃える
+/// - **塊から戻した文字の端末の制御の列（ANSI の色の符号）は除く**（#2812。[`strip_ansi_escapes`]）。
+///   pwsh 7 はエラーの文を `$PSStyle` の色（`ESC[31;1m` ほか）で飾った文字のまま CLIXML へ直列化する
+///   （`_x001B_`。ゲートの経路 = Windows の CI の pwsh 7.6.9 で実測）。`$PSStyle.OutputRendering =
+///   'PlainText'` も env の `NO_COLOR` もこの直列化には効かない（同じ CI と手元の pwsh 7.6.4 で実測）ので、
+///   起こし方ではなくここで除く。塊の外の素のテキストの制御の列は残す（ネイティブの子の出力。#2800 から
+///   「CLIXML でない stderr は 1 バイトも変えない」）。`TAKO_2812_LEGACY=1` で残す形（#2812 前）に戻る
 /// - `#< CLIXML` を含まない入力（bash のインストーラ・pwsh 7 の平文）は借用のまま返す
 ///
 /// 呼び手は 2 つ: 導入代行（`setup_bootstrap::run_installer`）と受け入れゲートの evidence（#2800。
 /// `acceptance_gates::format_evidence`）
 pub fn powershell_stderr_text(raw: &str) -> std::borrow::Cow<'_, str> {
+    powershell_stderr_text_in(raw, !legacy_2812())
+}
+
+/// [`powershell_stderr_text`] の本体（純粋関数。`strip_ansi` = 塊から戻した文字の色の符号を除く = #2812）
+pub fn powershell_stderr_text_in(raw: &str, strip_ansi: bool) -> std::borrow::Cow<'_, str> {
     const MARK: &str = POWERSHELL_CLIXML_MARK;
     if !raw.contains(MARK) {
         return std::borrow::Cow::Borrowed(raw);
@@ -1231,7 +1276,12 @@ pub fn powershell_stderr_text(raw: &str) -> std::borrow::Cow<'_, str> {
             rest = "";
             break;
         };
-        out.push_str(&clixml_streams_text(&block[..end]));
+        let streams = clixml_streams_text(&block[..end]);
+        if strip_ansi {
+            out.push_str(&strip_ansi_escapes(&streams));
+        } else {
+            out.push_str(&streams);
+        }
         rest = &block[end + "</Objs>".len()..];
     }
     out.push_str(rest);
@@ -1304,6 +1354,84 @@ fn clixml_unescape(text: &str) -> String {
     }
     units.extend(rest.encode_utf16());
     String::from_utf16_lossy(&units)
+}
+
+/// 端末の制御の列（ANSI の ESC 列）を除く（純粋関数。#2812）。
+///
+/// [`powershell_stderr_text`] が CLIXML の塊から戻した文字（pwsh 7 のエラーの色の符号）にだけ掛ける。
+///
+/// - CSI（`ESC [` + 引数 0x30–0x3F・中間 0x20–0x2F + 終端 0x40–0x7E。色の `ESC[31;1m` / `ESC[0m`）
+/// - OSC（`ESC ]` … BEL か `ESC \`。リンク）。閉じないまま改行に当たったらそこで止める（後ろの行を食わない）
+/// - 2 文字の列（`ESC` + 0x40–0x7E）と、中間つきの列（`ESC (` `B` ほか）
+/// - 終わらないまま切れた列（文字列の終わり・改行・知らない文字に当たった）も ESC ごと捨て、当たった文字は
+///   残す。**結果に ESC（0x1B）は 1 つも残らない**
+///
+/// ESC を含まない入力は借用のまま返す
+pub fn strip_ansi_escapes(text: &str) -> std::borrow::Cow<'_, str> {
+    const ESC: char = '\u{1b}';
+    if !text.contains(ESC) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != ESC {
+            out.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('[') => {
+                chars.next();
+                while let Some(&n) = chars.peek() {
+                    match n {
+                        '\u{20}'..='\u{3f}' => {
+                            chars.next();
+                        }
+                        '\u{40}'..='\u{7e}' => {
+                            chars.next();
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                while let Some(&n) = chars.peek() {
+                    match n {
+                        '\u{07}' => {
+                            chars.next();
+                            break;
+                        }
+                        ESC => {
+                            chars.next();
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                        '\n' => break,
+                        _ => {
+                            chars.next();
+                        }
+                    }
+                }
+            }
+            Some('\u{20}'..='\u{2f}') => {
+                while chars
+                    .next_if(|n| ('\u{20}'..='\u{2f}').contains(n))
+                    .is_some()
+                {}
+                chars.next_if(|n| ('\u{30}'..='\u{7e}').contains(n));
+            }
+            Some('\u{40}'..='\u{7e}') => {
+                chars.next();
+            }
+            // 後ろの無い・知らない文字が続く ESC は ESC だけを捨てる
+            _ => {}
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// `-EncodedCommand` が要求する UTF-16LE + base64。
@@ -3086,12 +3214,13 @@ mod tests_2790 {
         }
     }
 
-    /// 文字の戻し方: XML の実体参照・`_xHHHH_`（制御文字・`_` そのもの・サロゲートの対）・非 ASCII
+    /// 文字の戻し方: XML の実体参照・`_xHHHH_`（制御文字・`_` そのもの・サロゲートの対）・非 ASCII。
+    /// 色の符号を除く段（#2812）を切って、戻し方だけを見る（除いた形は `tests_2812`）
     #[test]
     fn issue2790_clixmlの文字の符号を戻す() {
         let raw = "#< CLIXML\n<Objs><S S=\"Error\">&quot;a&apos; &amp;amp; _x001B_[31m _x005F_x0041_ _xD83D__xDE00_ 日本語 _x41_ tako_x86_64</S></Objs>";
         assert_eq!(
-            powershell_stderr_text(raw),
+            powershell_stderr_text_in(raw, false),
             "\"a' &amp; \u{1b}[31m _x0041_ \u{1f600} 日本語 _x41_ tako_x86_64"
         );
     }
@@ -3101,5 +3230,145 @@ mod tests_2790 {
     fn issue2790_閉じていないclixmlは残す() {
         let raw = "#< CLIXML\n<Objs><S S=\"Error\">cut";
         assert_eq!(powershell_stderr_text(raw), "<Objs><S S=\"Error\">cut");
+    }
+}
+
+#[cfg(test)]
+mod tests_2812 {
+    use super::*;
+
+    /// Windows の CI の pwsh 7.6 がゲートの経路（`-EncodedCommand` + stderr の捕捉・`-OutputFormat` なし）で
+    /// 書いた実物（#2800 の CI の `TAKO2800_EVIDENCE_LEGACY arm=default case=cmdlet`。置き場は架空のパス）。
+    /// ConciseView の各行が `$PSStyle` の色の符号（`_x001B_[31;1m` ほか）で飾られている
+    const PWSH7_CMDLET_CLIXML: &str = "#< CLIXML\r\n<Objs Version=\"1.1.0.1\" xmlns=\"http://schemas.microsoft.com/powershell/2004/04\"><S S=\"Error\">_x001B_[31;1mGet-Item: _x001B_[0m_x000D__x000A_</S><S S=\"Error\">_x001B_[31;1m_x001B_[36;1mLine |_x001B_[0m_x000D__x000A_</S><S S=\"Error\">_x001B_[31;1m_x001B_[36;1m_x001B_[36;1m   4 | _x001B_[0m _x001B_[36;1mGet-Item -LiteralPath 'C:\\tako-2800-no-such\\missing.txt'_x001B_[0m_x000D__x000A_</S><S S=\"Error\">_x001B_[31;1m_x001B_[36;1m_x001B_[36;1m_x001B_[0m_x001B_[36;1m_x001B_[0m_x001B_[36;1m     | _x001B_[31;1m ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~_x001B_[0m_x000D__x000A_</S><S S=\"Error\">_x001B_[31;1m_x001B_[36;1m_x001B_[36;1m_x001B_[0m_x001B_[36;1m_x001B_[0m_x001B_[36;1m_x001B_[31;1m_x001B_[31;1m_x001B_[36;1m     | _x001B_[31;1mCannot find path 'C:\\tako-2800-no-such\\missing.txt' because it does not exist._x001B_[0m_x000D__x000A_</S></Objs>";
+
+    /// 同じ CI の `case=two-errors`（最上位の `Write-Error` を 2 回）
+    const PWSH7_WRITE_ERROR_CLIXML: &str = "#< CLIXML\r\n<Objs Version=\"1.1.0.1\" xmlns=\"http://schemas.microsoft.com/powershell/2004/04\"><S S=\"Error\">_x001B_[31;1mWrite-Error: _x001B_[31;1mfirst error 2800_x001B_[0m_x000D__x000A_</S><S S=\"Error\">_x001B_[31;1mWrite-Error: _x001B_[31;1msecond error 2800_x001B_[0m_x000D__x000A_</S></Objs>";
+
+    #[test]
+    fn issue2812_pwsh7のclixmlから戻した文字の色の符号を除く() {
+        let got = powershell_stderr_text_in(PWSH7_CMDLET_CLIXML, true);
+        assert_eq!(
+            got,
+            format!(
+                "Get-Item: \n\
+                 Line |\n   \
+                 4 |  Get-Item -LiteralPath 'C:\\tako-2800-no-such\\missing.txt'\n     \
+                 |  {}\n     \
+                 | Cannot find path 'C:\\tako-2800-no-such\\missing.txt' because it does not exist.",
+                "~".repeat(56)
+            )
+        );
+        assert_eq!(
+            powershell_stderr_text_in(PWSH7_WRITE_ERROR_CLIXML, true),
+            "Write-Error: first error 2800\nWrite-Error: second error 2800"
+        );
+    }
+
+    /// A/B: 除かない形（#2812 前）は ESC が残る = #2812 の症状
+    #[test]
+    fn issue2812_除かない形は色の符号が残る() {
+        assert_eq!(
+            powershell_stderr_text_in(PWSH7_WRITE_ERROR_CLIXML, false),
+            "\u{1b}[31;1mWrite-Error: \u{1b}[31;1mfirst error 2800\u{1b}[0m\n\
+             \u{1b}[31;1mWrite-Error: \u{1b}[31;1msecond error 2800\u{1b}[0m"
+        );
+        let cmdlet = powershell_stderr_text_in(PWSH7_CMDLET_CLIXML, false);
+        assert_eq!(cmdlet.matches('\u{1b}').count(), 32, "{cmdlet:?}");
+    }
+
+    /// 既定の入口（env を読む）は除く形を使う。`TAKO_2812_LEGACY=1` で走らせるとここが名指しで落ちる
+    #[test]
+    fn issue2812_既定の入口は色の符号を除く() {
+        let got = powershell_stderr_text(PWSH7_CMDLET_CLIXML);
+        assert!(
+            !got.contains('\u{1b}'),
+            "powershell_stderr_text が pwsh 7 の色の符号（ESC）を残した（#2812。{ISSUE2812_LEGACY_ENV} が立っている？）: {got:?}"
+        );
+    }
+
+    /// 塊の外の素のテキスト（ネイティブの子が同じ stderr へ書いたもの）の制御の列は残す（#2800 から不変）
+    #[test]
+    fn issue2812_塊の外の素の行の制御の列は残す() {
+        let raw = "\u{1b}[32mnative ok\u{1b}[0m\r\n#< CLIXML\r\n\
+                   <Objs><S S=\"Error\">_x001B_[31;1mboom 2812_x001B_[0m_x000D__x000A_</S></Objs>";
+        assert_eq!(
+            powershell_stderr_text_in(raw, true),
+            "\u{1b}[32mnative ok\u{1b}[0m\nboom 2812"
+        );
+    }
+
+    /// 制御の列の形ごと。終わらないまま切れた列・後ろの無い ESC も含め、結果に ESC は残らない
+    #[test]
+    fn issue2812_制御の列の形ごとに除く() {
+        let cases = [
+            ("\u{1b}[31;1mred\u{1b}[0m", "red"),
+            ("a\u{1b}[?25lb", "ab"),
+            (
+                "\u{1b}]8;;https://example.com\u{7}link\u{1b}]8;;\u{7}",
+                "link",
+            ),
+            ("\u{1b}]0;title\u{1b}\\after", "after"),
+            ("x\u{1b}(By", "xy"),
+            ("x\u{1b}Mz", "xz"),
+            ("\u{1b}\u{1b}[0mx", "x"),
+            ("日本語\u{1b}[1m太字\u{1b}[0m", "日本語太字"),
+            // 窓の端で切れた列: 文字列の終わり・改行・知らない文字で止め、当たった文字は残す
+            ("cut at end \u{1b}[31;", "cut at end "),
+            ("cut at end \u{1b}", "cut at end "),
+            ("\u{1b}[", ""),
+            ("cut \u{1b}[31\nnext", "cut \nnext"),
+            ("osc \u{1b}]unterminated\nnext", "osc \nnext"),
+            ("cut \u{1b}[31日本", "cut 日本"),
+        ];
+        for (input, want) in cases {
+            let got = strip_ansi_escapes(input);
+            assert_eq!(got, want, "{input:?}");
+            assert!(!got.contains('\u{1b}'), "{input:?} → {got:?}");
+        }
+        for plain in [
+            "",
+            "no escape 日本語",
+            "_x001B_ は戻す前の文字なので触らない",
+        ] {
+            assert!(
+                matches!(strip_ansi_escapes(plain), std::borrow::Cow::Borrowed(_)),
+                "{plain:?}"
+            );
+        }
+    }
+
+    /// 包みは 5.1 のときだけ `$MyInvocation` を外し、利用者のコマンドを 4 行目のまま置く（位置の行番号を変えない）
+    #[test]
+    fn issue2812_pty無しの包みは51でだけ呼び出し元を外す() {
+        let script = powershell_output_script_in("cargo test", false);
+        let lines: Vec<&str> = script.lines().collect();
+        assert_eq!(
+            lines[1],
+            "$ProgressPreference = 'SilentlyContinue'; if ($PSVersionTable.PSVersion.Major -le 5) { $MyInvocation = $null }"
+        );
+        assert_eq!(lines[3], "cargo test", "{script}");
+        // 外すのは利用者のコマンドより前（後ろでは最上位の Write-Error が包みを拾ったまま）
+        let forget = script.find("$MyInvocation = $null").expect("外す片が無い");
+        assert!(forget < script.find("cargo test").expect("コマンドが無い"));
+
+        // A/B: #2812 前の形は 2 行目に何も足さない。差はその片だけ
+        let legacy = powershell_output_script_in("cargo test", true);
+        assert_eq!(
+            legacy.lines().nth(1),
+            Some("$ProgressPreference = 'SilentlyContinue'")
+        );
+        assert_eq!(legacy.lines().nth(3), Some("cargo test"));
+        assert!(!legacy.contains("$MyInvocation"), "{legacy}");
+        assert_eq!(script.replace(POWERSHELL_51_FORGET_INVOCATION, ""), legacy);
+    }
+
+    /// 既定の入口（env を読む）は修正後の包みを使う。`TAKO_2812_LEGACY=1` で走らせるとここが名指しで落ちる
+    #[test]
+    fn issue2812_既定の入口の包みは呼び出し元を外す() {
+        assert!(
+            powershell_output_script("cargo test").contains(POWERSHELL_51_FORGET_INVOCATION),
+            "powershell_output_script が 5.1 の $MyInvocation を外していない（#2812。{ISSUE2812_LEGACY_ENV} が立っている？）"
+        );
     }
 }

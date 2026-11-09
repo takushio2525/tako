@@ -101,10 +101,11 @@ fn issue2800_evidenceのstderrは平文化の1実装を通す() {
         "{GATES}:{window_line}: 見出しを platform::shell::POWERSHELL_CLIXML_MARK から引いていない（#2800）"
     );
     let shell = read(SHELL);
-    let (text, text_line) = fn_body(&shell, SHELL, "powershell_stderr_text");
+    // 本体は #2812 から `_in`（色の符号を除くかを引数で受ける純粋関数）。入口はそれへ委ねるだけ
+    let (text, text_line) = fn_body(&shell, SHELL, "powershell_stderr_text_in");
     assert!(
         text.contains("const MARK: &str = POWERSHELL_CLIXML_MARK;"),
-        "{SHELL}:{text_line}: powershell_stderr_text が見出しを POWERSHELL_CLIXML_MARK から引いていない（#2800）"
+        "{SHELL}:{text_line}: powershell_stderr_text_in が見出しを POWERSHELL_CLIXML_MARK から引いていない（#2800）"
     );
 }
 

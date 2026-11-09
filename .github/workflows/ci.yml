@@ -652,6 +652,14 @@ jobs:
       # **ゲートの evidence が CLIXML のまま載る形へ戻ったらここで落ちる**
       - name: 受け入れゲートの述語の 5.1 の stderr が平文で読めるかの実行検査（#2800）
         run: cargo test -p tako-control --test issue2800_gate_clixml_windows -- --nocapture
+      # #2812: 同じ受け入れゲートの述語を実物の 5.1 と pwsh 7 で失敗させ、evidence に pwsh 7 の色の符号（ESC）が
+      # 1 バイトも残らないこと、5.1 の最上位の Write-Error でゲートを包むスクリプトの行が出ないこと、本文と利用者の
+      # コマンドの位置（At line:4 / 4 |）が残ることを見る。同じバイナリの TAKO_2812_LEGACY=1（修正前の形）と並べ、
+      # TAKO_2800_LEGACY との 4 通りの組み合わせも残す = A/B。外部に依らないので毎回走る。全数より手前に名指しで置く。
+      # --nocapture は結果の行（TAKO2812_ESC / TAKO2812_EVIDENCE ほか）をログへ残すため
+      # **pwsh 7 の色の符号か 5.1 の包みの行が evidence へ戻ったらここで落ちる**
+      - name: 受け入れゲートの evidence に色の符号と包みの行が載らないかの実行検査（#2812）
+        run: cargo test -p tako-control --test issue2812_gate_ansi_windows -- --nocapture
       # #2791: Windows の codex / agy の導入代行を、公式の install.ps1 を本当に走らせて確かめる（製品の口
       # `tako setup bootstrap install --agent codex|agy` = MCP tako_setup_bootstrap と同じ経路）。導入の前後の
       # status・入った置き場・agy の取得物が残らない（起動片のスコープ）を、ポリシーなし / HKCU Restricted /
