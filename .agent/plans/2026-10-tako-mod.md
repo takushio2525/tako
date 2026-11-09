@@ -659,7 +659,10 @@ S2〜S5 は S1 の後なら並行できるが、`progress.md` の衝突（#1228�
   `bounded_claude_version`）が置いた `skills\tako` の写しから読まれる（-p の init の `plugins` のパスで出どころを確認）・
   ConPTY のペイン（command 直起動とペインの PowerShell 5.1 から打つ形）へ渡した env がバイト一致で届く・報告が
   名前付きパイプで届き `mod_turn` が idle → permission（`pending_tool=Bash`・classic 系も届く）→ idle（`last_turn`）・
-  `/exit` で ended・注入しない対照は 0 本。**罠 2 つ**: (1) 信頼の確認が通るまで hooks module は読まれない
+  `/exit` で ended・注入しない対照は 0 本。同じ回で、ターンを始める前に製品の `tako events --kind turn_changed
+  --wait-ms 30000`（#2731 の長ポーリング = FR-2.45）を同じ名前付きパイプで待たせると、上限まで待たずに最初の
+  ターンの移りで起きて返り、出来事のバッファの turn_changed は報告のターンの移りと 1 対 1（source=mod）
+  → `tako_events` の Windows も Supported へ上げた。**罠 2 つ**: (1) 信頼の確認が通るまで hooks module は読まれない
   （debug の記録 `hooks modules not loaded until workspace trust is accepted`）。Windows の claude は `projects` の鍵を
   作業 dir の `\` を `/` にした形で持ち、tako の事前信頼の `\` 区切りの鍵は信頼済みと読まれなかった → 事前信頼の鍵を
   claude の形へ寄せた（`claude_tui::claude_project_key`。A/B `TAKO_1886_LEGACY=1`）。(2) 2.1.319 の対話の既定は

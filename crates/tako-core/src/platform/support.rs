@@ -133,13 +133,6 @@ pub mod notes {
         "tako does not appear in Explorer's \"Open with\" list because the installer registers no file associations. Registering it without taking over default apps (OpenWithProgids) is planned but unverified on real Windows hardware (#2134). Inside tako, files open from the file tree or with `tako open`",
     );
 
-    /// #2731。長ポーリングの受け口（`ipc::submit`）は OS に依らないが、`turn_changed` の書き手は
-    /// tako mod の報告だけで、Windows の mod の報告は実測待ち（#1886）
-    pub const WIN_EVENTS_TURN_FROM_MOD: Note = Note::new(
-        "長ポーリングは named pipe でも HTTP MCP でも同じ受け口で待つ（Windows 実機の named pipe では未実測）。turn_changed は tako mod の報告から積むので、Windows で mod の報告を実測するまで（#1886）出るかは確かめていない。ターン状態は tako_orchestrator_worker_status（画面からの推定）で読める",
-        "Long polls wait in the same handler over the named pipe and HTTP MCP (not yet exercised over the named pipe on real Windows hardware). turn_changed comes from tako mod reports, and mod reports on Windows are still being measured (#1886), so whether it fires there is unconfirmed. Read the turn state with tako_orchestrator_worker_status (estimated from the screen)",
-    );
-
     /// #521。動画は macOS の AVFoundation 実装しかなく、非 macOS はスタブ
     pub const WIN_VIDEO: Note = Note::new(
         "動画デコーダの Windows 実装が無く、動画ファイルを開くとエラーになる",
@@ -650,11 +643,10 @@ pub const MATRIX: &[Feature] = &[
         // #2731: 変化の出来事の購読（長ポーリング）
         key: "tako_events",
         macos: Support::Supported,
-        windows: Support::Degraded {
-            note: notes::WIN_EVENTS_TURN_FROM_MOD,
-        },
+        // #1886 で Degraded（mod 由来の turn_changed は Windows の mod の報告の実測待ち）から上げた
+        windows: Support::Supported,
         windows_evidence: Evidence::UnitTest(
-            "issue2731_events_long_poll の HTTP MCP の段（UI の受け口を読まない状態での長ポーリング・時間切れ・丸め・9 本目）と issue2731_events_no_body が Windows CI でも緑。named pipe の段は unix のソケットで確かめ、受け口（ipc::submit）は同じ",
+            "issue2731_events_long_poll の HTTP MCP の段（UI の受け口を読まない状態での長ポーリング・時間切れ・丸め・9 本目）と issue2731_events_no_body が Windows CI でも緑。#1886: Windows CI（windows-latest・build 26100）で本物の Claude Code 2.1.319 の mod の報告が名前付きパイプで ModHub::accept（turn_changed の書き手）へ届き（run 42624715941）、同じ実測（issue1886_windows_claude_loads_tako_mod_and_reports の inline の回）で、その名前付きパイプに製品の `tako events --kind turn_changed --wait-ms 30000` を待たせると上限まで待たずに最初のターンの移りで起きて返り（受け口は ipc::submit = UI の受け口を通らない）、積まれた turn_changed は報告のターンの移り（idle → permission → idle を含む・source=mod）と 1 対 1。実機の GUI での通しは未実測（#1886）",
         ),
     },
     Feature {

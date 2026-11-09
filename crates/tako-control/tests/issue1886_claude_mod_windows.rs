@@ -31,6 +31,9 @@
 //! （`claude_tui::ensure_trusted_in`。鍵は claude の形 = `claude_project_key`）で確認が出ないことを見て、最後に
 //! 修正前の鍵の形（A/B の腕 = `\` 区切り）では確認が出ることを確かめる。対話の claude は `--permission-mode default`
 //! で起こす（2.1.319 の対話の既定は auto mode で、偽の API の経路ではサーバ側の安全確認が通らず標準でない確認が出る）。
+//! inline の回では、ターンを始める前に製品の `tako events --kind turn_changed --wait-ms 30000`（#2731 の長ポーリング）を
+//! 同じ名前付きパイプで待たせ、mod の報告で起きて返ること（受け口は `ipc::submit` が UI の受け口へ渡す前に答える）と、
+//! 出来事のバッファに積まれた turn_changed が報告の移りと 1 対 1 であることも見る。
 //! 結果は `TAKO1886_*` の行で CI のログへ残す（パスは `<scratch>` / `<home>` / `<run>` に置き換える）。
 
 #![cfg(windows)]
@@ -174,6 +177,8 @@ struct Seen {
     claude_version: Option<String>,
     mod_version: String,
     config_dir: Option<String>,
+    /// 受け取った時刻（#2731 の購読が起きるまでの間を出す）
+    at: Instant,
 }
 
 #[derive(Default)]
@@ -243,6 +248,141 @@ impl Receiver {
     fn record_spawn(&self, pane: u64, injection: &cm::Injection) {
         self.state.lock().unwrap().hub.record_spawn(pane, injection);
     }
+
+    /// `since` より後にこのペインで積まれた turn_changed（from → to・source）と、同じ間に受けた報告から
+    /// 期待されるターンの移り（前の報告と turn が違う回）。`accept` は state の錠の中で出来事を積むので、
+    /// 錠を握ったまま両方を読めば食い違わない
+    fn turn_changes_since(&self, pane: u64, since: u64, since_at: Instant) -> TurnChanges {
+        let state = self.state.lock().unwrap();
+        let page = tako_core::events::log().read(
+            &tako_core::events::Query {
+                since,
+                kinds: vec![tako_core::events::Kind::TurnChanged],
+                panes: vec![pane],
+                wait_ms: 0,
+            },
+            false,
+        );
+        let emitted = page
+            .events
+            .iter()
+            .filter_map(|e| match &e.detail {
+                tako_core::events::Detail::TurnChanged {
+                    from, to, source, ..
+                } => Some(format!("{}->{to}:{source}", from.unwrap_or("-"))),
+                _ => None,
+            })
+            .collect();
+        let stored: Vec<&Seen> = state
+            .seen
+            .iter()
+            .filter(|s| s.pane == Some(pane) && s.accepted == "stored")
+            .collect();
+        let mut prev = stored
+            .iter()
+            .rev()
+            .find(|s| s.at < since_at)
+            .map(|s| s.turn.clone());
+        let mut expected = Vec::new();
+        for s in stored.iter().filter(|s| s.at >= since_at) {
+            if prev.as_deref() != Some(s.turn.as_str()) {
+                expected.push(format!(
+                    "{}->{}:mod",
+                    prev.as_deref().unwrap_or("-"),
+                    s.turn
+                ));
+            }
+            prev = Some(s.turn.clone());
+        }
+        TurnChanges { emitted, expected }
+    }
+}
+
+/// 出来事のバッファに積まれたターンの移りと、報告から期待される移り（どちらも `from->to:source`）
+#[derive(Debug, Default)]
+struct TurnChanges {
+    emitted: Vec<String>,
+    expected: Vec<String>,
+}
+
+/// 外の購読者（#2731 の `tako events` の長ポーリング）。製品の CLI をペインと同じ env（`TAKO_SOCKET` =
+/// 名前付きパイプ）で起こして待たせる。受け口は GUI と同じ `IpcServer` で、購読は `ipc::submit` が
+/// UI の受け口へ渡す前に接続のスレッドで答える（= GUI の中で待つのと同じ経路）
+struct Subscriber {
+    started: Instant,
+    handle: std::thread::JoinHandle<SubscriberExit>,
+}
+
+struct SubscriberExit {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    done: Instant,
+}
+
+/// 購読の待ちの長さ（ms）。上限（30000）で待たせ、ターンの移りで起きたことを「出来事が載って返った」で見る
+const EVENTS_WAIT_MS: u64 = tako_core::events::MAX_WAIT_MS;
+
+impl Subscriber {
+    fn start(cli: &Path, env: &[(String, String)], since: u64, pane: u64) -> Self {
+        let cli = cli.to_path_buf();
+        let env = env.to_vec();
+        let started = Instant::now();
+        let handle = std::thread::spawn(move || {
+            let out = Command::new(&cli)
+                .args([
+                    "events".to_string(),
+                    "--since".into(),
+                    since.to_string(),
+                    "--kind".into(),
+                    "turn_changed".into(),
+                    "--pane".into(),
+                    pane.to_string(),
+                    "--wait-ms".into(),
+                    EVENTS_WAIT_MS.to_string(),
+                ])
+                .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output();
+            let done = Instant::now();
+            match out {
+                Ok(o) => SubscriberExit {
+                    code: o.status.code(),
+                    stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+                    done,
+                },
+                Err(e) => SubscriberExit {
+                    code: None,
+                    stdout: String::new(),
+                    stderr: e.to_string(),
+                    done,
+                },
+            }
+        });
+        Self { started, handle }
+    }
+}
+
+/// 購読の結末（判定に要る値だけ。応答は出来事の種類・ペイン・from / to・source しか持たない）
+#[derive(Debug, Default)]
+struct EventsPoll {
+    /// 受け口で待ちに入ったか（`EventLog::waiters`）
+    waiting: bool,
+    code: Option<i32>,
+    /// 応答の events の 1 件目（`kind pane from->to:source`）
+    first: Option<String>,
+    events: usize,
+    /// 応答に載った待ちの長さ（丸め後）
+    wait_ms: Option<u64>,
+    wait_skipped: bool,
+    /// 起こしてから返るまで
+    waited: Duration,
+    /// 1 件目の移りを起こした報告を受けてから、購読が返るまで
+    wake: Option<Duration>,
+    stderr: String,
 }
 
 fn answer(state: &Mutex<State>, request: Request) -> Result<Value, DispatchError> {
@@ -268,6 +408,7 @@ fn answer(state: &Mutex<State>, request: Request) -> Result<Value, DispatchError
                 claude_version: report.claude_version.clone(),
                 mod_version: report.mod_version.clone(),
                 config_dir: report.config_dir.clone(),
+                at: Instant::now(),
             };
             let accepted = state
                 .hub
@@ -499,6 +640,10 @@ struct Outcome {
     expected_env: Vec<String>,
     trust_dialog: bool,
     others: Vec<String>,
+    /// #2731: 名前付きパイプで待たせた `tako events` の結末（inline の回だけ）
+    events_poll: Option<EventsPoll>,
+    /// #2731: 出来事のバッファに積まれたターンの移りと、報告からの期待（inline の回だけ）
+    turn_changes: Option<TurnChanges>,
 }
 
 /// ペインの env（GUI の `spawn_session` と同じ順: TAKO_PANE_ID → IPC → mod の注入）と、
@@ -938,6 +1083,8 @@ fn run_case(sb: &Sandbox, given: &Given, rx: &Receiver, case: &Case) -> Outcome 
 
     // 対話のペイン
     let (env, injection) = pane_env(sb, given, rx, case, case.pane, &cfg);
+    // #2731 の購読者はペインの中のエージェントと同じ env で起こす
+    let subscriber_env = env.clone();
     rx.record_spawn(case.pane, &injection);
     let expected_env = vec![
         plugin_dirs_value(&env).unwrap_or_default(),
@@ -1001,6 +1148,8 @@ fn run_case(sb: &Sandbox, given: &Given, rx: &Receiver, case: &Case) -> Outcome 
     let mut saw_busy = false;
     let mut permission_dialog = false;
     let mut ended = false;
+    let mut events_poll = None;
+    let mut turn_changes = None;
     let first_mod_turn;
     let mod_reason;
     if case.load == Load::Off {
@@ -1050,6 +1199,25 @@ fn run_case(sb: &Sandbox, given: &Given, rx: &Receiver, case: &Case) -> Outcome 
             case.name, first_mod_turn, mod_reason
         );
         if got && case.load == Load::Inline {
+            // #2731: 外の購読者（製品の `tako events --wait-ms`）を同じ名前付きパイプで待たせてからターンを始める。
+            // mod の報告が `ModHub::accept`（turn_changed の書き手）へ届けば、待っている長ポーリングが起きる
+            let since = tako_core::events::log().cursor();
+            let since_at = Instant::now();
+            let subscriber = Subscriber::start(&sb.cli, &subscriber_env, since, case.pane);
+            let deadline = Instant::now() + STATE_WAIT;
+            while tako_core::events::log().waiters() == 0
+                && Instant::now() < deadline
+                && !subscriber.handle.is_finished()
+            {
+                pane.pump();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let waiting = tako_core::events::log().waiters() > 0;
+            println!(
+                "TAKO1886_EVENTS_WAITING case={} waiting={waiting} after_ms={}",
+                case.name,
+                subscriber.started.elapsed().as_millis()
+            );
             // ターン: 偽の API はシェルのツールの tool_use を返す = 権限の確認が出る → 許す → 1 ターン終わる
             pane.wait(Duration::from_secs(2));
             pane.type_line("tako1886 hello");
@@ -1107,6 +1275,73 @@ fn run_case(sb: &Sandbox, given: &Given, rx: &Receiver, case: &Case) -> Outcome 
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
+            // 出来事のバッファに積まれた移り（/exit の前 = ended で報告が消える前に読む）
+            let changes = rx.turn_changes_since(case.pane, since, since_at);
+            println!(
+                "TAKO1886_TURN_EVENTS case={} emitted={:?} expected={:?}",
+                case.name, changes.emitted, changes.expected
+            );
+            turn_changes = Some(changes);
+            // 購読の結末（最初の移りで起きていれば、もう返っている）
+            let exit = subscriber.handle.join().expect("購読のスレッドが返ること");
+            let page: Option<Value> = exit
+                .stdout
+                .find('{')
+                .and_then(|i| serde_json::from_str(&exit.stdout[i..]).ok());
+            let first = page.as_ref().and_then(|p| p["events"].get(0)).map(|e| {
+                format!(
+                    "{} pane={} {}->{}:{}",
+                    e["kind"].as_str().unwrap_or("?"),
+                    e["pane"],
+                    e["data"]["from"].as_str().unwrap_or("-"),
+                    e["data"]["to"].as_str().unwrap_or("?"),
+                    e["data"]["source"].as_str().unwrap_or("?"),
+                )
+            });
+            // 1 件目の移りを起こした報告（受けた時刻から購読が返るまで = 起きるまでの間）
+            let mut prev: Option<String> = None;
+            let mut trigger = None;
+            for s in rx
+                .seen_for(case.pane)
+                .into_iter()
+                .filter(|s| s.accepted == "stored")
+            {
+                if s.at >= since_at && prev.as_deref() != Some(s.turn.as_str()) {
+                    trigger = Some(s.at);
+                    break;
+                }
+                prev = Some(s.turn);
+            }
+            let poll = EventsPoll {
+                waiting,
+                code: exit.code,
+                first,
+                events: page
+                    .as_ref()
+                    .and_then(|p| p["events"].as_array())
+                    .map_or(0, Vec::len),
+                wait_ms: page.as_ref().and_then(|p| p["wait_ms"].as_u64()),
+                wait_skipped: page
+                    .as_ref()
+                    .is_some_and(|p| p.get("wait_skipped").is_some_and(|v| !v.is_null())),
+                waited: exit.done.saturating_duration_since(subscriber.started),
+                wake: trigger.map(|at| exit.done.saturating_duration_since(at)),
+                stderr: sb.masker.mask(exit.stderr.trim()),
+            };
+            println!(
+                "TAKO1886_EVENTS case={} waiting={} code={:?} events={} first={:?} wait_ms={:?} wait_skipped={} waited_ms={} wake_ms={:?} stderr=[{}]",
+                case.name,
+                poll.waiting,
+                poll.code,
+                poll.events,
+                poll.first,
+                poll.wait_ms,
+                poll.wait_skipped,
+                poll.waited.as_millis(),
+                poll.wake.map(|d| d.as_millis()),
+                poll.stderr
+            );
+            events_poll = Some(poll);
         }
         if got {
             // 終わり: /exit → session.end の最後の報告（ended）。開いている確認があれば Esc で閉じてから打つ
@@ -1170,6 +1405,8 @@ fn run_case(sb: &Sandbox, given: &Given, rx: &Receiver, case: &Case) -> Outcome 
         expected_env,
         trust_dialog,
         others,
+        events_poll,
+        turn_changes,
     }
 }
 
@@ -1347,6 +1584,36 @@ fn verdict(sb: &Sandbox, case: &Case, o: &Outcome) -> Vec<String> {
             if o.saw_last_turn.is_none() {
                 why.push("ターンの終わりの last_turn が報告されない".into());
             }
+            // #2731: 本物の claude の報告から積まれた turn_changed が報告の移りと 1 対 1 で、権限の確認と
+            // ターンの終わり（idle へ戻る）を含む
+            match &o.turn_changes {
+                Some(c)
+                    if !c.emitted.is_empty()
+                        && c.emitted == c.expected
+                        && c.emitted.iter().any(|e| e.contains("->permission:"))
+                        && c.emitted.last().is_some_and(|e| e.ends_with("->idle:mod")) => {}
+                other => why.push(format!(
+                    "turn_changed（#2731）が報告の移りと合わない・権限の確認かターンの終わりを含まない: {other:?}"
+                )),
+            }
+            // #2731: 名前付きパイプで待たせた `tako events` が、上限まで待たずに最初の移りで起きて返る
+            match &o.events_poll {
+                Some(p)
+                    if p.waiting
+                        && p.code == Some(0)
+                        && p.events > 0
+                        && !p.wait_skipped
+                        && p.wait_ms == Some(EVENTS_WAIT_MS)
+                        && p.first.as_deref()
+                            == o.turn_changes
+                                .as_ref()
+                                .and_then(|c| c.expected.first())
+                                .map(|e| format!("turn_changed pane={} {e}", case.pane))
+                                .as_deref() => {}
+                other => why.push(format!(
+                    "名前付きパイプの長ポーリング（tako events --wait-ms {EVENTS_WAIT_MS}）が最初のターンの移りで起きて返らない: {other:?}"
+                )),
+            }
         }
         Load::InlineConcat => {
             if !o
@@ -1421,7 +1688,7 @@ fn issue1886_windows_claude_loads_tako_mod_and_reports() {
         let o = run_case(&sb, &given, &rx, case);
         let why = verdict(&sb, case, &o);
         rows.push(format!(
-            "| {} | {:?} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {:?} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             o.name,
             case.launch,
             o.print_plugins.len(),
@@ -1434,6 +1701,10 @@ fn issue1886_windows_claude_loads_tako_mod_and_reports() {
             o.ended,
             o.probe_loaded,
             o.trust_dialog,
+            o.events_poll
+                .as_ref()
+                .and_then(|p| p.first.as_deref())
+                .unwrap_or("-"),
         ));
         for w in why {
             failures.push(format!("[#1886 {}] {w}", case.name));
@@ -1446,14 +1717,14 @@ fn issue1886_windows_claude_loads_tako_mod_and_reports() {
         failures.push("[#1886 trust-legacy] 修正前の形の鍵だけでは信頼の確認が出るはずが出ない（事前信頼の A/B に検出力が無い）".into());
     }
     println!("== 表（#1886）==");
-    println!("| case | 起こし方 | -p の plugins | -p の報告 | 対話の報告 | 最初の turn | busy | permission の tool | last_turn | ended | 利用者の plugin | 信頼の確認 |");
-    println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
+    println!("| case | 起こし方 | -p の plugins | -p の報告 | 対話の報告 | 最初の turn | busy | permission の tool | last_turn | ended | 利用者の plugin | 信頼の確認 | tako events（名前付きパイプ）|");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|");
     for row in &rows {
         println!("{row}");
     }
     if failures.is_empty() {
         println!(
-            "TAKO1886_VERDICT mod_loads=true report_reaches=true conpty_env=true claude={} sep={:?}",
+            "TAKO1886_VERDICT mod_loads=true report_reaches=true conpty_env=true claude={} sep={:?} events_over_pipe=true",
             sb.claude_version,
             cm::LIST_SEP
         );
