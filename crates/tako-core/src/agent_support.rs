@@ -493,6 +493,13 @@ pub mod notes {
         "The config file location is fixed, so tako's account switching has no effect for this agent",
     );
 
+    /// #2820: codex の置き場は固定ではない（`CODEX_HOME` から解決する = #2798）が、
+    /// アカウントが注入するのは `CLAUDE_CONFIG_DIR` だけ（#512 / #558）
+    pub const CODEX_HOME_NOT_SWITCHED: Note = Note::new(
+        "tako のアカウント切替は CLAUDE_CONFIG_DIR しか動かさないので、codex の置き場（CODEX_HOME）は切り替わらない",
+        "tako's account switching only changes CLAUDE_CONFIG_DIR, so codex's home (CODEX_HOME) is not switched",
+    );
+
     /// #985: codex はクレジット切れの出口が課金しか無い
     pub const CODEX_CREDITS_NEED_PURCHASE: Note = Note::new(
         "5h / 週の枠は解除を待って自分で再開するが、ワークスペースのクレジットが尽きた場合は「待つ」出口が無い（増枠申請・購入・獲得済みリセットの引き換えしか無いので、tako は何も選ばずに止まる）",
@@ -786,7 +793,7 @@ pub const MATRIX: &[AgentFeature] = &[
             "Honours tako's account (credential) switching",
         ),
         claude: S::Supported,
-        codex: pending(notes::FIXED_CONFIG_PATH, 975),
+        codex: pending(notes::CODEX_HOME_NOT_SWITCHED, 975),
         agy: pending(notes::FIXED_CONFIG_PATH, 975),
         local: local_pending(),
         evidence: AgentEvidence::Source(
@@ -2355,6 +2362,21 @@ mod tests {
                 );
                 assert_ne!(note.ja(), note.en(), "{} の日英が同一", f.key);
             }
+        }
+    }
+
+    /// #2820: codex の置き場は `CODEX_HOME` から解決する（#2798 / #2810 / #2816）ので、
+    /// 「設定ファイルの場所が固定」を codex の理由にしない（docs と診断が実装と食い違う）
+    #[test]
+    fn issue2820_codexに置き場が固定という理由を付けない() {
+        for f in MATRIX {
+            assert_ne!(
+                f.on(Agent::Codex).note(),
+                Some(notes::FIXED_CONFIG_PATH),
+                "{} の codex の理由が「設定ファイルの場所が固定」になっている。\
+                 codex の置き場は CODEX_HOME から解決するので、本当の理由を書くこと（#2820）",
+                f.key
+            );
         }
     }
 

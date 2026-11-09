@@ -300,7 +300,7 @@ AI 連携に必要な設定を、**1 コマンドで自動的に**行います�
 1. **シェル統合の用意** — ペインの作業ディレクトリ追従・コマンドの実行状態・入力予測が効くように、シェル統合のスクリプトを用意します。**どの OS も設定ファイルは 1 バイトも書き換えません**。macOS / Linux は tako が開くシェルへ環境変数を渡すだけで効き（`[OK] シェル統合: 環境変数の注入で有効です` と 1 行出るだけです）、Windows は tako がペインの PowerShell を開くときに読み込ませます（`[OK] シェル統合: tako が開く PowerShell へ起動時に読ませます` と 1 行出るだけで、`$PROFILE` は書き換えず、実行ポリシーが Restricted の PC でも効きます）。以前の版が `$PROFILE` に足した管理ブロックは、この前の移行の段が取り除きます。用意できなかったときも setup は最後まで走り、`tako shell-integration install` を「残り」として案内します
 2. **エージェント CLI と依存ツールのチェック** — claude / codex / agy をすべて検出します。認証済み CLI が1つなら自動選択し、複数なら前回値または安全な既定を採用します。**1 つも使える系統が無いときだけ**、その場で導入を案内します（上の tip 参照）。tmux / git / Tailscale などの任意依存は、見つからなければ「何をどのコマンドで入れるか」を表示したうえで `tmux をインストールしますか？ [y/N]:` と **1 回だけ確認し、`y` ならその場で導入して再検出します**（`--yes` は確認を省いて導入、パイプ越しなど端末のない実行では導入せず案内だけを出します）。Windows は `winget` で導入します（git は Windows の管理者の確認（UAC）が出るので、その旨を同じ 1 回の確認に添えます。`y` か `--yes` が同意です）
 3. **認証・プラン確認** — Claude は認証と Pro / Max 等、Codex は認証と ChatGPT プランを取得できる範囲で自動判定します。検出不能でも安全に未指定にできる情報は `unknown` を採用します。token やアカウント情報は保存・表示しません
-4. **MCP 接続の準備** — 検出したエージェント CLI すべてへ tako の MCP サーバーを登録します。書き込み先は claude が `~/.claude.json`、codex が `~/.codex/config.toml` の `[mcp_servers.tako]`、agy が `~/.gemini/config/mcp_config.json` です（claude だけは `tako setup-mcp --project` で `<cwd>/.mcp.json` にも入れられます）。**書き先が `~/.claude/settings.json` だったのは古い tako で、いまはそこに残った設定を掃除する側です。** codex はこれに加えて、master / worker として起動するときに起動コマンドへその場でも MCP 設定を渡します（tako の外で立ち上げた codex にツールを出さないための経路です）
+4. **MCP 接続の準備** — 検出したエージェント CLI すべてへ tako の MCP サーバーを登録します。書き込み先は claude が `~/.claude.json`、codex が `~/.codex/config.toml`（`CODEX_HOME` を設定していれば `$CODEX_HOME/config.toml`）の `[mcp_servers.tako]`、agy が `~/.gemini/config/mcp_config.json` です（claude だけは `tako setup-mcp --project` で `<cwd>/.mcp.json` にも入れられます）。**書き先が `~/.claude/settings.json` だったのは古い tako で、いまはそこに残った設定を掃除する側です。** codex はこれに加えて、master / worker として起動するときに起動コマンドへその場でも MCP 設定を渡します（tako の外で立ち上げた codex にツールを出さないための経路です）
 5. **推奨 profile の生成** — プラン規模に応じて master / worker、effort、worker ポリシーを `profiles/default.yaml` へ生成します。モデル名は固定せず、各 CLI の最新の既定モデルを使います。既存 profile はそのまま維持します
 6. **指示とテンプレートの準備** — 指示ファイルが未作成なら安全な開発ルールの既定値を作り、セットアップ用ファイル一式を tako のデータディレクトリ配下（macOS は `~/Library/Application Support/tako/setup/`、Windows は `%APPDATA%\tako\setup\`）に展開します。既存の指示は上書きしません
 7. **同梱推奨ルールとの比較** — 既存の指示ファイルを、tako が同梱する推奨ルール（言語 / 対話スタイル / Git 運用 / コード品質 / 安全ルール / 提案品質 / 完了検証の 7 項目）と項目レベルで突き合わせ、不足の可能性を具体的に表示します。差分がなければ「差分なし」と明示します。表示のみで、ファイルは書き換えません
@@ -483,7 +483,7 @@ claude と、この環境に導入済みの codex / agy へ tako の MCP サー�
 | エージェント | 書き込み先 |
 |---|---|
 | claude | `~/.claude.json`（`--project` なら `<cwd>/.mcp.json`） |
-| codex | `~/.codex/config.toml` の `[mcp_servers.tako]` |
+| codex | `~/.codex/config.toml`（`CODEX_HOME` を設定していれば `$CODEX_HOME/config.toml`）の `[mcp_servers.tako]` |
 | agy | `~/.gemini/config/mcp_config.json` の `mcpServers.tako` |
 
 1 つに絞りたいときは `tako setup-mcp --agent codex` のように指定します（未導入の CLI を明示すると、理由と次の一手つきのエラーになります）。`tako setup-mcp --project` は claude のみ対応で、現在のディレクトリの `.mcp.json` だけに登録します。
@@ -541,7 +541,7 @@ tako setup undo
 
 | 外すもの | 置き場 |
 |---|---|
-| AI エージェントへの MCP 登録（名前が `tako` で tako を指すものだけ） | `~/.claude.json`（アカウントごとの設定 dir も）・`~/.codex/config.toml`・`~/.gemini/config/mcp_config.json` |
+| AI エージェントへの MCP 登録（名前が `tako` で tako を指すものだけ） | `~/.claude.json`（アカウントごとの設定 dir も）・`~/.codex/config.toml`（`CODEX_HOME` を設定していれば `$CODEX_HOME/config.toml`）・`~/.gemini/config/mcp_config.json` |
 | 指示ファイルへ同期した共通ルールのブロック（`tako agents sync-rules`） | `~/.claude/CLAUDE.md`・`~/.codex/AGENTS.md`・`~/.gemini/GEMINI.md` |
 | tako mod の skills（tako が置いた印つきの写しだけ） | `~/.claude/skills/tako` |
 | `tako` コマンドの PATH | macOS: `~/.local/bin/tako` と `~/.zprofile` などの tako のブロック / Windows: ユーザー環境変数 `Path` の tako を入れた先 |

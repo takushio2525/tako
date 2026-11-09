@@ -306,7 +306,7 @@ tako setup-mcp --project         # 現在のディレクトリだけに登録（
 | エージェント | 書き込み先 | 手段 |
 |---|---|---|
 | claude | `~/.claude.json`（`--project` 時は `<cwd>/.mcp.json`） | `claude mcp add`（無ければ JSON を直接マージ） |
-| codex | `~/.codex/config.toml` の `[mcp_servers.tako]` | `codex mcp add` + `env_vars` の追記 |
+| codex | `~/.codex/config.toml`（`CODEX_HOME` を設定していれば `$CODEX_HOME/config.toml`）の `[mcp_servers.tako]` | `codex mcp add` + `env_vars` の追記 |
 | agy | `~/.gemini/config/mcp_config.json` の `mcpServers.tako` | `agy mcp add` |
 
 codex / agy は各 CLI の `mcp add` に書き込みを任せています。自分で TOML / JSON を書くと CLI 側の正規化と二重にずれるため、利用者が手で `codex mcp add` を打ったのと同じ結果になる経路へ寄せてあります。何度実行しても設定は同じ内容に収束します（`--project` は codex / agy が対応していないので、明示指定すると理由を出して止まります）。
@@ -1618,7 +1618,7 @@ tako orchestrator projects remove --key webapp
 
 **worker は tako の MCP だけを持って起動します。** あなたが Claude Code に登録した MCP サーバー
 （user scope。playwright や github など）は、worker 1 本ごとに数百 MB を使うので持ち込みません。
-codex の worker も同じで、`~/.codex/config.toml` に登録した MCP は持ち込みません。
+codex の worker も同じで、`~/.codex/config.toml`（`CODEX_HOME` を設定していれば `$CODEX_HOME/config.toml`）に登録した MCP は持ち込みません。
 そのリポジトリの `.mcp.json`（codex は `.codex/config.toml`）に書いた MCP は今までどおり使えます。worker にも使わせたい MCP は
 プロジェクトごとに足します。
 
