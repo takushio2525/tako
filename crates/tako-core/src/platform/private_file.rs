@@ -36,6 +36,11 @@
 //! これまでどおりそのまま返る（呼び手の `?` も修正前と同じ）。効いているかは [`inspect`] で読み戻せる
 //! （Windows の CI が Win32 と icacls の 2 通りで確かめる = `remote::tests::issue1632_*` / `issue2581_*`）。
 //!
+//! **長いパス（#2824）**: Win32 へ渡すパスは、MAX_PATH に近い長さ（248 単位以上）なら verbatim の
+//! 前置き（`\\?\`）を付ける（[`long_path_form`]）。tako は longPathAware の manifest を持たないので、
+//! 前置きなしの長いパスは `SetNamedSecurityInfoW` が断り、上の「当てられないとき」へ黙って落ちていた
+//! （深い作業ディレクトリへの添付 = `uploads::stage_all`。A/B `TAKO_2824_LEGACY=1`）。
+//!
 //! Windows の腕は、既に同じ DACL（継承を切った本人 + SYSTEM の 2 つだけ）が当たっていれば当て直さない。
 //! 置き場へ当てるたびに `SetNamedSecurityInfoW` が中身全体へ受け継ぎを配り直すので、data dir
 //! （control.json の置き場 = GUI の起動ごとに呼ぶ）では 2 回目以降をその手間なしで済ませる（#2581）。
@@ -56,6 +61,42 @@ use std::path::Path;
 
 /// A/B の旧経路（`TAKO_1632_LEGACY=1`）。Windows は DACL に触らない（#1632 前）。unix は変わらない
 pub const ENV_LEGACY: &str = "TAKO_1632_LEGACY";
+
+/// A/B の旧経路（`TAKO_2824_LEGACY=1`）。Windows の長いパスにも verbatim の前置きを付けない
+/// （#2824 前 = MAX_PATH を超えるパスには DACL を当てられず、継承のまま続いていた）。unix は変わらない
+pub const ENV_LEGACY_LONG_PATH: &str = "TAKO_2824_LEGACY";
+
+/// これ以上の長さ（UTF-16 の単位数）のパスに verbatim の前置きを付ける。std の fs と同じ 248
+/// （MAX_PATH = 260 から、ディレクトリを作る API の 8.3 名の余白 12 を引いた値）
+#[cfg_attr(not(windows), allow(dead_code))]
+const LONG_PATH_FROM: usize = 248;
+
+/// Win32 のパス API（`SetNamedSecurityInfoW` / `GetNamedSecurityInfoW`）へ渡す長いパスの形（#2824。
+/// 純粋関数 = macOS でも検査できる）。
+///
+/// tako の実行ファイルは longPathAware の manifest を持たないので、OS の `LongPathsEnabled` が立って
+/// いても、前置きの無い長いパスはこれらの API が断る（Windows CI の実測: ERROR_INVALID_NAME = 123）。
+/// std の fs は自分で `\\?\` を付けるので、添付の置き場の長いパスでも写せはするのに、本人だけの
+/// DACL を当てられないまま継承へ落ちていた。
+///
+/// `abs` は正規化済みの絶対パス（`std::path::absolute` の結果。verbatim の形は正規化されない）。
+/// ドライブ（`C:\…`）は `\\?\C:\…`、UNC（`\\server\share\…`）は `\\?\UNC\server\share\…`。
+/// 短いパス・既に verbatim / デバイスの形（`\\?\…` / `\\.\…`）・相対パスは `None`（そのまま渡す）
+#[cfg_attr(not(windows), allow(dead_code))]
+fn long_path_form(abs: &str) -> Option<String> {
+    if abs.encode_utf16().count() < LONG_PATH_FROM
+        || abs.starts_with(r"\\?\")
+        || abs.starts_with(r"\\.\")
+    {
+        return None;
+    }
+    if let Some(rest) = abs.strip_prefix(r"\\") {
+        return Some(format!(r"\\?\UNC\{rest}"));
+    }
+    let b = abs.as_bytes();
+    (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\')
+        .then(|| format!(r"\\?\{abs}"))
+}
 
 /// 読み戻した結果
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -582,11 +623,19 @@ mod imp {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
+    /// Win32 のパス API へ渡す形。長いパスは verbatim の前置きを付ける（#2824。[`super::long_path_form`]）。
+    /// 正規化（`/` と `.` / `..` を畳む）は `std::path::absolute` = GetFullPathNameW に任せる
     fn wide_path(path: &Path) -> Vec<u16> {
-        path.as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
+        let plain: Vec<u16> = path.as_os_str().encode_wide().collect();
+        let legacy = std::env::var(super::ENV_LEGACY_LONG_PATH).is_ok_and(|v| v == "1");
+        let long = (!legacy && plain.len() >= super::LONG_PATH_FROM)
+            .then(|| std::path::absolute(path).ok())
+            .flatten()
+            .and_then(|abs| abs.to_str().and_then(super::long_path_form));
+        match long {
+            Some(form) => wide(&form),
+            None => plain.into_iter().chain(std::iter::once(0)).collect(),
+        }
     }
 }
 
@@ -844,5 +893,80 @@ mod tests {
             // unix は置き場の 0700 が中へ辿らせない。中のファイルの mode は変えない（修正前と同じ）
             assert_eq!(before.detail, inner.detail);
         }
+    }
+
+    /// #2824: 長いパスの形（純粋関数）。ドライブと UNC だけに前置きを付け、短いパス・既に verbatim /
+    /// デバイスの形・相対パスはそのまま
+    #[test]
+    fn issue2824_長いパスだけにverbatimの前置きを付ける() {
+        let tail = "a\\".repeat(130);
+        let drive = format!("C:\\{tail}x.png");
+        assert_eq!(
+            long_path_form(&drive).as_deref(),
+            Some(format!(r"\\?\{drive}").as_str())
+        );
+        let unc = format!(r"\\server\share\{tail}x.png");
+        assert_eq!(
+            long_path_form(&unc).as_deref(),
+            Some(format!(r"\\?\UNC\server\share\{tail}x.png").as_str())
+        );
+        // 長さは UTF-16 の単位で数える（日本語 1 字 = 1 単位。UTF-8 のバイト数では数えない）
+        let jp = format!("C:\\{}", "あ".repeat(LONG_PATH_FROM - 4));
+        assert_eq!(
+            long_path_form(&jp),
+            None,
+            "{} 単位",
+            jp.encode_utf16().count()
+        );
+        let jp_long = format!("{jp}い");
+        assert!(long_path_form(&jp_long).is_some());
+        for unchanged in [
+            r"C:\short\x.png".to_string(),
+            format!(r"\\?\{drive}"),
+            format!(r"\\.\{drive}"),
+            tail.clone(),
+        ] {
+            assert_eq!(long_path_form(&unchanged), None, "{unchanged}");
+        }
+    }
+
+    /// #2824: MAX_PATH を超える長いパスにも本人だけの DACL を当て、読み戻せる。同じ回の A/B
+    /// （`TAKO_2824_LEGACY=1` = 前置きなし）で作ったファイルは継承のまま（当てられなかった）
+    #[cfg(windows)]
+    #[test]
+    fn issue2824_長いパスにも本人だけのdaclを当てる() {
+        use std::os::windows::ffi::OsStrExt as _;
+        if crate::run_alone!(issue2824_長いパスにも本人だけのdaclを当てる) {
+            return;
+        }
+        let held = scratch("long-2824");
+        let mut dir = held.path().to_path_buf();
+        while dir.as_os_str().encode_wide().count() < 280 {
+            dir.push("long-segment-2824");
+        }
+        std::fs::create_dir_all(&dir).expect("std は長いパスを作れる");
+        let legacy = dir.join("legacy.png");
+        std::env::set_var(ENV_LEGACY_LONG_PATH, "1");
+        drop(create_new(&legacy).expect("旧経路でも開けはする"));
+        std::env::remove_var(ENV_LEGACY_LONG_PATH);
+        let before = inspect(&legacy).expect("前置きを付ければ読み戻せる");
+        let fixed = dir.join("fixed.png");
+        drop(create_new(&fixed).expect("作れる"));
+        let after = inspect(&fixed).expect("読み戻せる");
+        restrict_dir(&dir).expect("長いパスの置き場も絞れる");
+        let shaped = inspect(&dir).expect("読み戻せる");
+        for (label, got) in [("legacy", &before), ("fixed", &after), ("dir", &shaped)] {
+            println!(
+                "TAKO2824_LONG_PATH {label} units={} owner_only={} inherits={} {}",
+                dir.as_os_str().encode_wide().count(),
+                got.owner_only,
+                got.inherits,
+                got.detail
+            );
+        }
+        // 旧経路は DACL を当てられず親から受け継いだまま（受け継ぐ中身はランナーの %TEMP% の ACL 次第）
+        assert!(before.inherits, "A/B の旧経路: {before:?}");
+        assert!(after.owner_only && !after.inherits, "{after:?}");
+        assert!(shaped.owner_only && !shaped.inherits, "{shaped:?}");
     }
 }

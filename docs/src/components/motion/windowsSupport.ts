@@ -27,7 +27,7 @@ export interface WindowsSupport {
 	total: number;
 	percent: number;
 	areas: Area[];
-	/** 機能（MCP ツール名）→ 状態 */
+	/** 機能（MCP ツール名。引数の行は `<ツール名>.<引数名>` = #2824）→ 状態 */
 	rows: Map<string, Status>;
 }
 
@@ -65,7 +65,8 @@ function parse(): WindowsSupport {
 	if (areas.length < 5) fail(`節ごとの件数（${areas.length} 節しか読めない）`);
 
 	const rows = new Map<string, Status>();
-	for (const m of raw.matchAll(/^\| `(tako_[a-z0-9_]+)` \| (対応|一部対応|未対応 \/ 未実測|対象外) \|/gm)) {
+	// 引数の行（`<ツール名>.<引数名>`。例 `tako_send_input.keys` = #2824）も 1 行として数える
+	for (const m of raw.matchAll(/^\| `(tako_[a-z0-9_]+(?:\.[a-z0-9_]+)?)` \| (対応|一部対応|未対応 \/ 未実測|対象外) \|/gm)) {
 		rows.set(m[1], m[2] as Status);
 	}
 	if (rows.size !== total) fail(`機能の行（${rows.size} 行。全体の表は ${total}）`);

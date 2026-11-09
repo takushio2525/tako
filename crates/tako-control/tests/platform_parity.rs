@@ -57,17 +57,50 @@ fn t1_全mcpツールがマトリクスに分類されている() {
     );
 }
 
-/// T2 逆被覆: マトリクスに、もう存在しない機能が残っていないこと
+/// T2 逆被覆: マトリクスに、もう存在しない機能が残っていないこと。
+/// 引数の行（`<ツール名>.<引数名>`。#2824）は、ツールが公開されていて、その inputSchema に
+/// 引数が在ることを見る（引数を消す・改名したのに行が残ると落ちる）
 #[test]
 fn t2_マトリクスに存在しない機能が残っていない() {
+    let tools = advertised_tools();
     let stale: Vec<_> = matrix_keys()
-        .difference(&advertised_tools())
-        .cloned()
+        .into_iter()
+        .filter(|key| match key.split_once('.') {
+            None => !tools.contains(key),
+            Some((tool, arg)) => !tool_has_argument(tool, arg),
+        })
         .collect();
     assert!(
         stale.is_empty(),
         "MCP に存在しないキーがマトリクスに残っている: {stale:?}\n\
-         → 機能を削除したなら MATRIX からも消してください"
+         → 機能を削除したなら MATRIX からも消してください（引数の行は <ツール名>.<引数名> で、\n\
+         その引数がツールの inputSchema に在ること）"
+    );
+}
+
+/// `tool` が公開されていて、その inputSchema の properties に `arg` が在るか
+fn tool_has_argument(tool: &str, arg: &str) -> bool {
+    mcp::tools()
+        .iter()
+        .find(|t| t["name"].as_str() == Some(tool))
+        .is_some_and(|t| t["inputSchema"]["properties"].get(arg).is_some())
+}
+
+/// #2824: 引数の行の判定が空振りしていない（実在の引数は通し、無い引数・無いツールは落とす）
+#[test]
+fn t2_引数の行はツールのinputschemaの引数で判定する() {
+    assert!(tool_has_argument("tako_send_input", "keys"));
+    assert!(tool_has_argument("tako_send_input", "attachments"));
+    assert!(!tool_has_argument("tako_send_input", "no_such_argument"));
+    assert!(!tool_has_argument("tako_no_such_tool", "keys"));
+    let rows: Vec<_> = matrix_keys()
+        .into_iter()
+        .filter(|k| k.contains('.'))
+        .collect();
+    assert!(
+        rows.iter().any(|k| k == "tako_send_input.keys")
+            && rows.iter().any(|k| k == "tako_send_input.attachments"),
+        "send_input の keys / attachments の行が無い（#2824）: {rows:?}"
     );
 }
 

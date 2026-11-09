@@ -1696,7 +1696,7 @@ pub fn tools() -> Vec<Value> {
             "description": "エージェント CLI へ tako MCP サーバーの接続設定を足す（初回セットアップ時に呼ぶ。設定済みなら\
                 何もしない）。agent 省略で claude + 導入済みの codex / agy へまとめて登録し（未導入は理由つきで \
                 skip）、明示したときだけ未導入・非対応スコープをエラーで返す。書き込み先は \
-                claude = ~/.claude.json、codex = codex mcp add（~/.codex/config.toml。トークンは残らない）、\
+                claude = ~/.claude.json、codex = codex mcp add（$CODEX_HOME か ~/.codex の config.toml。トークンは残らない）、\
                 agy = agy mcp add（~/.gemini/config/mcp_config.json）。scope=project は呼び出し元ペインの cwd の \
                 .mcp.json（claude のみ）。応答の agents 配列が各エージェントの結果（skipped / error_kind つき）。",
             "inputSchema": {

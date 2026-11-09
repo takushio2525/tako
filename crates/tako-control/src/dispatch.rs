@@ -46252,11 +46252,27 @@ tako | pane 2 [ compact ]       [-]
     }
 
     // --- #2743: tako_send_input の keys / attachments（実 PTY の子が受け取ったバイトを見る） ---
+    //
+    // #2824: 同じテストを Windows の ConPTY でも回す。unix の子は `/bin/sh` + `stty raw`、Windows の
+    // 子はこのテストバイナリ自身（記録係 `i2824_conpty_recorder_child`）。どちらも「入力を raw に
+    // してから画面を描き、受け取った入力を `out` へ書いて眠る」を同じ形で行うので、テストの本体は
+    // OS を問わない（Windows で形が変わる所だけ cfg で名指す）
+
+    /// 記録係の子が入力をどの形で読むか（#2824）
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum I2824View {
+        /// 受け取ったバイト列（unix の raw の端末・Windows の `ENABLE_VIRTUAL_TERMINAL_INPUT` = libuv の
+        /// raw モード = node / claude が読む形。#729 の実測）
+        Bytes,
+        /// Windows のキーイベント（`ReadConsoleInputW`。VT 入力を立てない raw = PSReadLine など Win32 の
+        /// コンソールアプリが読む形）。1 回の押下を `vk=.. ch=.... mods=..` の 1 行で書く
+        #[cfg(windows)]
+        KeyEvents,
+    }
 
     /// 実 PTY の子: 端末を raw にしてから `screen` を描き、受け取ったバイトを `out` へ `count`
     /// バイトだけ書いて眠る。画面の最後の行が見えるまで待ってから返す（raw にする前に送った
     /// バイトは cooked の端末に食われうるので、描画 = raw の後を待つ）
-    #[cfg(unix)]
     fn i2743_recorder(
         host: &mut MockHost,
         screen: &str,
@@ -46264,24 +46280,31 @@ tako | pane 2 [ compact ]       [-]
         count: usize,
         cwd: Option<PathBuf>,
     ) -> u64 {
+        i2824_recorder_as(host, screen, out, count, cwd, I2824View::Bytes)
+    }
+
+    /// [`i2743_recorder`] の読み方を選べる版（#2824。`count` はキーイベントなら押下の数）
+    fn i2824_recorder_as(
+        host: &mut MockHost,
+        screen: &str,
+        out: &Path,
+        count: usize,
+        cwd: Option<PathBuf>,
+        view: I2824View,
+    ) -> u64 {
         use std::time::{Duration, Instant};
         let pane = host.root_pane();
-        let script = format!(
-            "stty raw -echo; printf '%s' \"$I2743_SCREEN\"; \
-             dd bs=1 count={count} of=\"$I2743_OUT\" 2>/dev/null; sleep 60"
-        );
         let (session, _rx) = TerminalSession::spawn(
             120,
             30,
             SpawnOptions {
-                command: Some(tako_core::SpawnCommand {
-                    program: "/bin/sh".to_string(),
-                    args: vec!["-c".to_string(), script],
-                }),
+                command: Some(i2824_recorder_command(count)),
                 cwd,
                 env: vec![
                     ("I2743_SCREEN".into(), screen.replace('\n', "\r\n")),
                     ("I2743_OUT".into(), out.display().to_string()),
+                    ("I2743_COUNT".into(), count.to_string()),
+                    ("I2824_VIEW".into(), format!("{view:?}")),
                 ],
                 ..SpawnOptions::default()
             },
@@ -46308,8 +46331,260 @@ tako | pane 2 [ compact ]       [-]
         }
     }
 
-    /// `out` に `n` バイト溜まるまで待って中身を返す（状態で待つ）
+    /// unix の記録係: `stty raw` の後で画面を描き、`dd` で `count` バイトだけ受け取る
     #[cfg(unix)]
+    fn i2824_recorder_command(count: usize) -> tako_core::SpawnCommand {
+        let script = format!(
+            "stty raw -echo; printf '%s' \"$I2743_SCREEN\"; \
+             dd bs=1 count={count} of=\"$I2743_OUT\" 2>/dev/null; sleep 60"
+        );
+        tako_core::SpawnCommand {
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), script],
+        }
+    }
+
+    /// Windows の記録係（#2824）: このテストバイナリ自身を、記録係の 1 本だけが走る形で起こす。
+    /// 走っているバイナリなので、新しい実行ファイルを時計の内側で初めて起こすこと（#2228）にならない
+    #[cfg(windows)]
+    fn i2824_recorder_command(_count: usize) -> tako_core::SpawnCommand {
+        let exe = std::env::current_exe().expect("テストバイナリのパス");
+        let child = tako_core::test_child::libtest_name(concat!(
+            module_path!(),
+            "::i2824_conpty_recorder_child"
+        ));
+        tako_core::SpawnCommand {
+            program: exe.display().to_string(),
+            args: [
+                "--ignored",
+                "--exact",
+                child,
+                "--nocapture",
+                "--test-threads=1",
+            ]
+            .map(String::from)
+            .to_vec(),
+        }
+    }
+
+    /// #2824: Windows の記録係の本体（ConPTY の子として起こされたときだけ働く）。
+    /// 親（[`i2824_recorder_as`]）が渡す env が無ければ何もしない（手で `--ignored` を回しただけ）
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "#2824: ConPTY の子として起こされたときだけ働く記録係（親は i2824_recorder_as）"]
+    fn i2824_conpty_recorder_child() {
+        let Some(out) = std::env::var_os("I2743_OUT") else {
+            return;
+        };
+        let screen = std::env::var("I2743_SCREEN").unwrap_or_default();
+        let count = std::env::var("I2743_COUNT")
+            .ok()
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        let key_events = std::env::var("I2824_VIEW").as_deref() == Ok("KeyEvents");
+        i2824_conpty::record(&screen, Path::new(&out), count, key_events);
+    }
+
+    /// #2824: ConPTY の子の側（Win32 のコンソール API を直に呼ぶ。`windows-sys` は足さない方針 =
+    /// `platform::private_file` と同じ）
+    #[cfg(windows)]
+    mod i2824_conpty {
+        use std::ffi::c_void;
+        use std::io::Write as _;
+        use std::path::Path;
+
+        type Handle = isize;
+        const INVALID_HANDLE: Handle = -1;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        const OPEN_EXISTING: u32 = 3;
+        /// 入力: 簡易編集を外すために立てる（他の旗 = 行入力・エコー・Ctrl+C の処理は立てない）
+        const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
+        const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+        const ENABLE_PROCESSED_OUTPUT: u32 = 0x0001;
+        const ENABLE_WRAP_AT_EOL_OUTPUT: u32 = 0x0002;
+        const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+        const KEY_EVENT: u16 = 0x0001;
+        /// `dwControlKeyState` のうち修飾（右 Alt / 左 Alt / 右 Ctrl / 左 Ctrl / Shift）だけ。
+        /// NumLock などの状態の旗はランナーの状態で変わるので書かない
+        const MODIFIERS: u32 = 0x001f;
+
+        /// `INPUT_RECORD`（`KEY_EVENT_RECORD` を開いた形。20 バイト）
+        #[repr(C)]
+        #[derive(Clone, Copy, Default)]
+        struct InputRecord {
+            event_type: u16,
+            _pad: u16,
+            key_down: i32,
+            repeat: u16,
+            vk: u16,
+            _scan: u16,
+            ch: u16,
+            control: u32,
+        }
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CreateFileW(
+                name: *const u16,
+                access: u32,
+                share: u32,
+                security: *mut c_void,
+                disposition: u32,
+                flags: u32,
+                template: Handle,
+            ) -> Handle;
+            fn SetConsoleMode(handle: Handle, mode: u32) -> i32;
+            fn WriteConsoleW(
+                handle: Handle,
+                buf: *const u16,
+                len: u32,
+                written: *mut u32,
+                reserved: *mut c_void,
+            ) -> i32;
+            fn ReadConsoleW(
+                handle: Handle,
+                buf: *mut u16,
+                len: u32,
+                read: *mut u32,
+                control: *mut c_void,
+            ) -> i32;
+            fn ReadConsoleInputW(
+                handle: Handle,
+                buf: *mut InputRecord,
+                len: u32,
+                read: *mut u32,
+            ) -> i32;
+        }
+
+        fn wide(s: &str) -> Vec<u16> {
+            s.encode_utf16().chain(std::iter::once(0)).collect()
+        }
+
+        /// 疑似コンソールの入力 / 出力（std のハンドルは ConPTY では空のことがあるので名前で開く）
+        fn open(name: &str) -> Handle {
+            let name = wide(name);
+            // SAFETY: name は NUL 終端の生存するバッファ。セキュリティ属性とテンプレートは使わない
+            let handle = unsafe {
+                CreateFileW(
+                    name.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null_mut(),
+                    OPEN_EXISTING,
+                    0,
+                    0,
+                )
+            };
+            assert!(
+                handle != INVALID_HANDLE,
+                "{} を開けない: {}",
+                String::from_utf16_lossy(&name),
+                std::io::Error::last_os_error()
+            );
+            handle
+        }
+
+        /// 入力を raw にしてから `screen` を描き、受け取った入力を `out` へ足していく。
+        /// `count`（バイト列ならバイト数・キーイベントなら押下の数）に届いたら眠る
+        pub(super) fn record(screen: &str, out: &Path, count: usize, key_events: bool) {
+            let input = open("CONIN$");
+            let output = open("CONOUT$");
+            let in_mode = if key_events {
+                ENABLE_EXTENDED_FLAGS
+            } else {
+                ENABLE_EXTENDED_FLAGS | ENABLE_VIRTUAL_TERMINAL_INPUT
+            };
+            // SAFETY: どちらも上で開いたコンソールのハンドル
+            unsafe {
+                assert!(SetConsoleMode(input, in_mode) != 0, "入力を raw にできない");
+                SetConsoleMode(
+                    output,
+                    ENABLE_PROCESSED_OUTPUT
+                        | ENABLE_WRAP_AT_EOL_OUTPUT
+                        | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+                );
+            }
+            let mut file = std::fs::File::create(out).expect("記録の置き場を作れる");
+            // libtest の見出しの行を消してから描く（親は画面の最後の行で描画 = raw の後を待つ）
+            let text: Vec<u16> = format!("\x1b[2J\x1b[H{screen}").encode_utf16().collect();
+            let mut written = 0u32;
+            // SAFETY: text は生存するバッファで、長さはその要素数
+            unsafe {
+                WriteConsoleW(
+                    output,
+                    text.as_ptr(),
+                    text.len() as u32,
+                    &mut written,
+                    std::ptr::null_mut(),
+                );
+            }
+            let mut got = 0usize;
+            while got < count {
+                let chunk = if key_events {
+                    read_key_events(input, &mut got)
+                } else {
+                    let s = read_text(input);
+                    got += s.len();
+                    s
+                };
+                file.write_all(chunk.as_bytes()).expect("記録を書ける");
+                file.flush().expect("記録を書ける");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+
+        /// VT 入力のモードで読めた文字（UTF-16 を UTF-8 へ戻す = 親が送ったバイト列と比べられる）
+        fn read_text(input: Handle) -> String {
+            let mut buf = [0u16; 512];
+            let mut read = 0u32;
+            // SAFETY: buf は生存するバッファで、長さはその要素数
+            let ok = unsafe {
+                ReadConsoleW(
+                    input,
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                    &mut read,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert!(ok != 0, "ReadConsoleW: {}", std::io::Error::last_os_error());
+            String::from_utf16_lossy(&buf[..read as usize])
+        }
+
+        /// キーイベントで読めた押下（離す側は書かない）
+        fn read_key_events(input: Handle, got: &mut usize) -> String {
+            let mut buf = [InputRecord::default(); 64];
+            let mut read = 0u32;
+            // SAFETY: buf は生存する `INPUT_RECORD` の並びで、長さはその要素数
+            let ok =
+                unsafe { ReadConsoleInputW(input, buf.as_mut_ptr(), buf.len() as u32, &mut read) };
+            assert!(
+                ok != 0,
+                "ReadConsoleInputW: {}",
+                std::io::Error::last_os_error()
+            );
+            let mut lines = String::new();
+            for r in &buf[..read as usize] {
+                if r.event_type == KEY_EVENT && r.key_down != 0 {
+                    for _ in 0..r.repeat.max(1) {
+                        lines.push_str(&format!(
+                            "vk={:02x} ch={:04x} mods={:x}\n",
+                            r.vk,
+                            r.ch,
+                            r.control & MODIFIERS
+                        ));
+                        *got += 1;
+                    }
+                }
+            }
+            lines
+        }
+    }
+
+    /// `out` に `n` バイト溜まるまで待って中身を返す（状態で待つ）
     fn i2743_received(out: &Path, n: usize) -> Vec<u8> {
         use std::time::{Duration, Instant};
         let budget = tako_core::wait_budget::state_wait_budget(
@@ -46330,7 +46605,6 @@ tako | pane 2 [ compact ]       [-]
         }
     }
 
-    #[cfg(unix)]
     fn i2743_keys(pane: u64, keys: &[&str]) -> Request {
         Request::SendKeys {
             pane: Some(pane),
@@ -46339,7 +46613,6 @@ tako | pane 2 [ compact ]       [-]
         }
     }
 
-    #[cfg(unix)]
     fn i2743_send(pane: u64, text: &str, attachments: &[&Path]) -> Request {
         Request::Send {
             pane: Some(pane),
@@ -46357,7 +46630,6 @@ tako | pane 2 [ compact ]       [-]
 
     /// 受け入れ条件 2: 選択肢ダイアログの表示中の keys は断り、選択を確定させない。
     /// Escape・矢印も含めて例外は無い（`Send` の生の ESC の素通し = #748 とは違う）
-    #[cfg(unix)]
     #[test]
     fn issue2743_ダイアログ中のkeysは断り選択を確定させない() {
         let tmp = tako_core::test_residue::ScratchDir::new("i2743-dialog");
@@ -46381,7 +46653,6 @@ tako | pane 2 [ compact ]       [-]
     }
 
     /// keys は名前の順にバイト列で届く。知らない名前・空の列は 1 バイトも送らずに断る
-    #[cfg(unix)]
     #[test]
     fn issue2743_keysは名前の順に届き知らない名前は何も送らない() {
         let tmp = tako_core::test_residue::ScratchDir::new("i2743-keys");
@@ -46423,7 +46694,7 @@ tako | pane 2 [ compact ]       [-]
 
     /// #729: keys の修飾付き Enter の形を決めるのは**ペイン単位**の判定（そのペインの器）。
     /// dispatch の `SendKeys` は `pane_extended_keys` → `keys_to_bytes` の順に引くので、その組を
-    /// 両 OS で見る（実 PTY の受信は下の unix のテスト）
+    /// 両 OS で見る（実 PTY の受信は下のテスト。#2824 から Windows の ConPTY でも回る）
     #[test]
     fn issue729_keysの修飾付きenterの形はそのペインの器で決まる() {
         let mut host = MockHost::new();
@@ -46449,7 +46720,6 @@ tako | pane 2 [ compact ]       [-]
 
     /// #729: 実 PTY の子が受け取るバイト列。器なしのペインへは CSI u、CSI u を運べない器
     /// （psmux の能力）のペインへは ESC CR が届き、素の Enter はどちらも CR のまま
-    #[cfg(unix)]
     #[test]
     fn issue729_keysの修飾付きenterは器がcsi_uを運べないペインへesc_crで届く() {
         let tmp = tako_core::test_residue::ScratchDir::new("i729-keys");
@@ -46481,7 +46751,6 @@ tako | pane 2 [ compact ]       [-]
 
     /// 受け入れ条件 3: 添付は置き場へ写り、送った本文にそのパスが入る。同期の腕と、IPC / MCP の
     /// 受け口と同じ offload の 3 段（準備 → 写す = background → 送る = 着地）の両方を通す
-    #[cfg(unix)]
     #[test]
     fn issue2743_添付は置き場へ写し本文にパスを足して送る() {
         let tmp = tako_core::test_residue::ScratchDir::new("i2743-attach");
@@ -46551,7 +46820,6 @@ tako | pane 2 [ compact ]       [-]
     }
 
     /// 選択肢ダイアログの表示中の添付つきの送信は、写す前（準備の段）で断る
-    #[cfg(unix)]
     #[test]
     fn issue2743_ダイアログ中の添付は写す前に断る() {
         let tmp = tako_core::test_residue::ScratchDir::new("i2743-attach-dialog");
@@ -46572,6 +46840,209 @@ tako | pane 2 [ compact ]       [-]
         let err = dispatch(&mut host, request, PaneOrigin::Mcp).expect_err("同期の腕も断る");
         assert!(err.to_string().contains("usage_limit"), "{err}");
         assert!(!cwd.join(tako_core::uploads::DIR_NAME).exists());
+    }
+
+    /// #2824: 日本語と空白を含む作業ディレクトリ・ファイル名でも添付は写り、送った本文に写した先の
+    /// パスがそのまま入る（空白を含むので `"…"` で囲む）。Windows ではドライブ文字から始まり `\` で
+    /// 区切った形のまま（verbatim の前置き `\\?\` を付けない）。境界の断り（相対パス・20 MB 超）は
+    /// 何も写さず何も送らない
+    #[test]
+    fn issue2824_添付は日本語と空白を含むパスでも写り本文にそのパスが入る() {
+        let tmp = tako_core::test_residue::ScratchDir::new("i2824-attach");
+        let cwd = tmp.path().join("作業 フォルダ");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let src = tmp.path().join("画面 写真.png");
+        std::fs::write(&src, b"\x89PNG-2824").unwrap();
+        let dir = cwd.join(tako_core::uploads::DIR_NAME);
+        let copied = dir.join("画面 写真.png");
+        let expected = format!("見て \"{}\"\r", copied.display());
+        let out = tmp.path().join("got");
+        let mut host = MockHost::new();
+        let pane = i2743_recorder(
+            &mut host,
+            "$ ready-2824",
+            &out,
+            expected.len(),
+            Some(cwd.clone()),
+        );
+
+        let err = dispatch(
+            &mut host,
+            i2743_send(pane, "見て", &[Path::new("rel.png")]),
+            PaneOrigin::Mcp,
+        )
+        .expect_err("相対パス");
+        assert!(err.to_string().contains("rel.png"), "{err}");
+        let big = tmp.path().join("big.bin");
+        let file = std::fs::File::create(&big).unwrap();
+        file.set_len(tako_core::uploads::MAX_BYTES + 1).unwrap();
+        drop(file);
+        let err = dispatch(
+            &mut host,
+            i2743_send(pane, "見て", &[&big]),
+            PaneOrigin::Mcp,
+        )
+        .expect_err("20 MB 超");
+        assert!(err.to_string().contains("big.bin"), "{err}");
+        assert!(!dir.exists(), "断った送信のために置き場を作った");
+
+        let reply = dispatch(
+            &mut host,
+            i2743_send(pane, "見て", &[&src]),
+            PaneOrigin::Mcp,
+        )
+        .expect("送れる");
+        let path = reply["attachments"][0]["path"].as_str().unwrap_or_default();
+        assert_eq!(path, copied.display().to_string());
+        #[cfg(windows)]
+        {
+            let b = path.as_bytes();
+            assert!(
+                b.len() > 3 && b[0].is_ascii_alphabetic() && &b[1..3] == br":\",
+                "ドライブ文字から始まる絶対パスではない: {path}"
+            );
+            assert!(
+                !path.starts_with(r"\\?\") && !path.contains('/'),
+                "本文に入るパスの形が Windows の素のパスではない: {path}"
+            );
+        }
+        assert_eq!(std::fs::read(&copied).unwrap(), b"\x89PNG-2824");
+        let got = i2743_received(&out, expected.len());
+        assert_eq!(String::from_utf8_lossy(&got), expected);
+    }
+
+    /// #2824: keys の語彙の各名前は、1 つずつ送ると tako が書いたのと同じバイト列で子に届く。
+    /// unix の raw の端末と、Windows の ConPTY の VT 入力（`ENABLE_VIRTUAL_TERMINAL_INPUT` = node / claude が
+    /// 読む形。#729 の実測と同じ条件）の両方で見る。Windows CI の実測では ConPTY はどの名前も変えない・落とさない
+    #[test]
+    fn issue2824_keysの語彙は名前ごとに同じバイト列で子に届く() {
+        const NAMES: &[&str] = &[
+            "Escape",
+            "Enter",
+            "C-m",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Tab",
+            "Space",
+            "C-a",
+            "C-c",
+            "C-z",
+            "1",
+            "y",
+            "S-Enter",
+            "C-Enter",
+            "M-Enter",
+            "C-S-Enter",
+        ];
+        let expected: Vec<Vec<u8>> = NAMES
+            .iter()
+            .map(|k| tako_core::backend::key_name_bytes_in(k, true).expect("語彙の名前"))
+            .collect();
+        let total = expected.iter().map(Vec::len).sum();
+        let tmp = tako_core::test_residue::ScratchDir::new("i2824-vocab");
+        let out = tmp.path().join("got");
+        let mut host = MockHost::new();
+        let pane = i2743_recorder(&mut host, "$ ready-2824", &out, total, None);
+        let mut seen = 0;
+        for (name, want) in NAMES.iter().zip(&expected) {
+            eprintln!("TAKO2824_KEY {name} -> {want:02x?}");
+            dispatch(&mut host, i2743_keys(pane, &[name]), PaneOrigin::Mcp).expect("送れる");
+            let got = i2743_received(&out, seen + want.len());
+            assert_eq!(
+                &got[seen..],
+                &want[..],
+                "{name}: 子が受け取ったバイト列が tako の書いた形と違う（全体 {got:02x?}）"
+            );
+            seen += want.len();
+        }
+    }
+
+    /// `out` の行（キーイベントの記録）が `n` 行溜まるまで待って全行を返す（状態で待つ）
+    #[cfg(windows)]
+    fn i2824_event_lines(out: &Path, n: usize) -> Vec<String> {
+        use std::time::{Duration, Instant};
+        let budget = tako_core::wait_budget::state_wait_budget(
+            Duration::from_secs(20),
+            tako_core::wait_budget::machine_busy(),
+        );
+        let deadline = Instant::now() + budget;
+        loop {
+            let got = std::fs::read_to_string(out).unwrap_or_default();
+            let lines: Vec<String> = got.lines().map(str::to_string).collect();
+            if lines.len() >= n {
+                return lines;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "子が {n} 件の押下を受け取らない（budget={budget:?}・受け取った分 {lines:?}）"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// #2824: ConPTY のキーイベント（VT 入力を立てない raw = PSReadLine など Win32 のコンソールアプリが
+    /// 読む形）。keys の名前を 1 つずつ送ると、それぞれ正しい仮想キーの押下で届く。ConPTY が変える所を
+    /// 名指す（Windows CI の実測。VT 入力の子 = node / claude には上のテストのとおりバイト列のまま届く）:
+    ///
+    /// - 修飾付き Enter（CSI u の `S-Enter` / `C-Enter` / `M-Enter`）は 1 件も届かない
+    /// - `ESC` と次のキーが ConPTY の 1 回の読み取りに入ると Alt+そのキーへ畳む（Escape の押下は消える）。
+    ///   keys は 1 キーずつ書くが、続けて送ると 1 回に読まれうる（FR-2.2.2 追補 3 の `["Escape", "1"]`）
+    /// - `C-<英字>` は Ctrl の押下を伴う 2 件（`C-c` だけは 1 件）
+    #[cfg(windows)]
+    #[test]
+    fn issue2824_conptyのキーイベントは修飾付きenterを落としescと次のキーをaltへ畳む() {
+        // vk = 仮想キー・ch = 文字・mods = 左右の Alt / Ctrl / Shift（2 = 左 Alt・8 = 左 Ctrl）
+        let enter = "vk=0d ch=000d mods=0";
+        let steps: &[(&[&str], &[&str])] = &[
+            (&["Escape"], &["vk=1b ch=001b mods=0"]),
+            (&["Enter"], &[enter]),
+            (&["Up"], &["vk=26 ch=0000 mods=0"]),
+            (&["Down"], &["vk=28 ch=0000 mods=0"]),
+            (&["Left"], &["vk=25 ch=0000 mods=0"]),
+            (&["Right"], &["vk=27 ch=0000 mods=0"]),
+            (&["Tab"], &["vk=09 ch=0009 mods=0"]),
+            (&["Space"], &["vk=20 ch=0020 mods=0"]),
+            (&["C-c"], &["vk=43 ch=0003 mods=8"]),
+            (&["1"], &["vk=31 ch=0031 mods=0"]),
+            (&["C-a"], &["vk=11 ch=0000 mods=8", "vk=41 ch=0001 mods=8"]),
+            // 修飾付き Enter は 1 件も届かず、後ろの素の Enter だけが届く
+            (&["S-Enter", "C-Enter", "M-Enter", "Enter"], &[enter]),
+        ];
+        // 1 回の書き込みの `ESC 1` は Alt の押下 + Alt+1
+        let folded: &[&str] = &["vk=12 ch=0000 mods=2", "vk=31 ch=0031 mods=2"];
+        let total = steps.iter().map(|(_, want)| want.len()).sum::<usize>() + folded.len() + 1;
+        let tmp = tako_core::test_residue::ScratchDir::new("i2824-events");
+        let out = tmp.path().join("got");
+        let mut host = MockHost::new();
+        let pane = i2824_recorder_as(
+            &mut host,
+            "$ ready-2824",
+            &out,
+            total,
+            None,
+            I2824View::KeyEvents,
+        );
+        let mut seen = 0;
+        let check = |label: &str, want: &[&str], seen: &mut usize| {
+            let lines = i2824_event_lines(&out, *seen + want.len());
+            assert_eq!(
+                &lines[*seen..*seen + want.len()],
+                want,
+                "{label}: ConPTY が届けた押下が違う（全体 {lines:?}）"
+            );
+            *seen += want.len();
+        };
+        for (keys, want) in steps {
+            dispatch(&mut host, i2743_keys(pane, keys), PaneOrigin::Mcp).expect("送れる");
+            check(&format!("{keys:?}"), want, &mut seen);
+        }
+        host.sessions[&pane].write(b"\x1b1".to_vec());
+        check("1 回の書き込みの ESC 1", folded, &mut seen);
+        // 最後に素の Enter: 前の段の後ろに余計な押下が紛れていない（届いた順は保たれる）
+        dispatch(&mut host, i2743_keys(pane, &["Enter"]), PaneOrigin::Mcp).expect("送れる");
+        check("後ろの Enter", &[enter], &mut seen);
     }
 
     #[test]

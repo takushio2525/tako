@@ -4419,6 +4419,7 @@ A/B は `TAKO_1038_LEGACY=1`（UDS 固定 + 自己疎通チェック無し = #10
 | `ShortcutsFile::save_to` | `remote/remote_shortcuts.json`（管理トークンと同じ置き場） | `restrict_dir` → `restrict` |
 | `remote::save_received_file` | スマホから受け取ったファイル（#287 P2-1。置き場 `.tako-remote-uploads/` はペインの作業ディレクトリなので絞らない） | `create` → `restrict` |
 | `tmux_backend::ensure_pane_died_dir` | ペインの最後の出力の置き場（#2085） | `restrict_dir` |
+| `uploads::stage_all`（`tako_send_input` の `attachments`。#2743） | 添付の写し（置き場 `.tako-remote-uploads/` は同じく絞らない） | `create_new` |
 
 | | unix | Windows |
 |---|---|---|
@@ -4436,6 +4437,12 @@ A/B は `TAKO_1038_LEGACY=1`（UDS 固定 + 自己疎通チェック無し = #10
   トークンが Err だと GUI は IPC / MCP ごと立たず、control.json が書けないと CLI が GUI を見つけられない
   ので、ACL が無いだけの置き場でそれを起こさない（#2581）。unix の腕の失敗はこれまでどおり返る。
   効いているかは `private_file::inspect` で読み戻せる
+- **長いパス（#2824）**: tako の実行ファイルは longPathAware の manifest を持たないので、OS の
+  `LongPathsEnabled` が立っていても、前置きの無い MAX_PATH 超のパスは `SetNamedSecurityInfoW` /
+  `GetNamedSecurityInfoW` が断る（Windows CI の実測: ERROR_INVALID_NAME = 123）。std の fs は自分で `\\?\` を
+  付けるので作れはするのに、上の「当てられないとき」へ黙って落ちて継承のままだった（深い作業ディレクトリへの
+  添付で再現）。Win32 へ渡すパスは 248 単位以上なら `std::path::absolute` で正規化してから verbatim の前置き
+  （`\\?\` / UNC は `\\?\UNC\`）を付ける（`private_file::long_path_form`。A/B `TAKO_2824_LEGACY=1`）
 - control.json の置き場は data dir そのもの（unix は起動のたびに 0700）。Windows の継承を切った
   OI / CI の DACL は、`SetNamedSecurityInfoW` が data dir の中身全体へ受け継ぎを配り直す = unix の
   0700 と同じく data dir の中は本人だけになる。配り直しを毎回しないよう、既に同じ DACL なら当て直さない

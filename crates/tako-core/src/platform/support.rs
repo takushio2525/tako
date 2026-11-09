@@ -11,6 +11,10 @@
 //! - キーは **MCP ツール名と 1:1**。tako の開発不変条件「新機能は必ず MCP / CLI から
 //!   操作できる」により、新機能は必ず MCP ツールを増やす。したがってツール表と
 //!   突き合わせれば**分類し忘れは必ず検出できる**（パリティテスト T1）
+//! - 例外は**引数の行**（`<ツール名>.<引数名>`。#2824）: ツールを増やさず引数で足した機能の
+//!   Windows の対応を、親のツールの行とは別に宣言・実証したいときだけ置く（例:
+//!   `tako_send_input.keys`）。親のツールの行は必ず残し、引数がそのツールの inputSchema に
+//!   在ることをパリティテスト T2 が見る（引数を消す・改名すると落ちる）
 //! - 判定は**純粋関数**。`Platform` を引数で受けるので、**macOS 上でも Windows 側の
 //!   縮退表を検証できる**。これが無いと「Windows でどう見えるか」をテストできない
 //! - 使えない機能を一覧から消してはいけない。消すと AI は「そんな機能は無い」と誤認し、
@@ -1646,6 +1650,27 @@ pub const MATRIX: &[Feature] = &[
         ),
     },
     Feature {
+        // #2824: 添付（#2743）。Windows のパスのまま本文に入り、長いパスでも本人だけの DACL が当たる
+        key: "tako_send_input.attachments",
+        macos: Support::Supported,
+        windows: Support::Supported,
+        windows_evidence: Evidence::UnitTest(
+            "#2824: Windows CI で、添付が対象ペインの作業ディレクトリの .tako-remote-uploads へ写り、送った本文にドライブ文字から始まり \\ で区切った写し先のパスが入る（日本語と空白を含むパスは \"…\" で囲む。verbatim の前置きは付けない）ことを実 ConPTY の子が受け取った本文で確認（issue2743_添付は置き場へ写し本文にパスを足して送る・issue2824_添付は日本語と空白を含むパスでも写り本文にそのパスが入る）。ダイアログ中・相対パス・無い・20 MB 超の断りも unix と同じ（issue2743_ダイアログ中の添付は写す前に断る）。置き場がジャンクションなら書かない（uploads::tests::置き場がジャンクションなら書かない）。MAX_PATH を超える作業ディレクトリでも写り本人だけの DACL が当たる（#2824 で境界 B32 の長いパスを直した。uploads::tests::長いパスの作業ディレクトリでも写して本人だけの形にする・platform::private_file::tests::issue2824_長いパスにも本人だけのdaclを当てる）。実機の Claude Code が添付の画像を読むかは #937 で未実測",
+        ),
+    },
+    Feature {
+        // #2824: 生のキー（#2743）。器なしのペインへは ConPTY でも unix と同じバイト列で VT 入力の子に
+        // 届く。器（psmux）のペインの修飾付き Enter は親の行と同じく ESC CR へ畳む（#729）ので Degraded
+        key: "tako_send_input.keys",
+        macos: Support::Supported,
+        windows: Support::Degraded {
+            note: notes::WIN_PSMUX_MODIFIED_ENTER,
+        },
+        windows_evidence: Evidence::UnitTest(
+            "#2824: Windows CI の実 ConPTY（build 26100 の inbox の conhost）で、器なしのペインへ送った keys の語彙の全名前（Escape / Enter / 矢印 / Tab / Space / C-<英字> / 1 文字 / 修飾付き Enter）が、VT 入力の子（node / claude と同じ条件）に tako の書いたバイト列のまま届く（issue2824_keysの語彙は名前ごとに同じバイト列で子に届く・issue2743_keysは名前の順に届き知らない名前は何も送らない・issue729_keysの修飾付きenterは器がcsi_uを運べないペインへesc_crで届く）。ダイアログ中の断り・知らない名前 / 空の列の断りも unix と同じ（issue2743_ダイアログ中のkeysは断り選択を確定させない）。キーイベントで読む子（VT 入力を立てない Win32 のコンソールアプリ）には、ConPTY が CSI u の修飾付き Enter を落とし、ESC と次のキーが 1 回の読み取りに入ると Alt+そのキーへ畳む（issue2824_conptyのキーイベントは修飾付きenterを落としescと次のキーをaltへ畳む）。器（psmux）のペインは CI に psmux が無く未実測。実機の Claude Code で Esc が生成を止めるかは #937 で未実測",
+        ),
+    },
+    Feature {
         // #1067: エージェントペインの「セッションを引き継いで再起動」2 種。
         // 引き継ぎ再起動（handoff）は master ペインへ定型文を送るだけなので両 OS 共通。
         // ハーネス更新（harness）は旧プロセスへ終了要求を出す必要があり、境界 B5 の
@@ -2211,18 +2236,31 @@ mod tests {
         assert_eq!(dedup.len(), keys.len(), "MATRIX のキーが重複している");
     }
 
-    /// キーは MCP ツール名なので命名規約に従う
+    /// キーは MCP ツール名なので命名規約に従う（引数の行は `<ツール名>.<引数名>` = #2824）
     #[test]
     fn t4_キーはmcpツール名の形をしている() {
+        let snake = |s: &str| {
+            !s.is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        };
         for f in MATRIX {
+            let (tool, arg) = match f.key.split_once('.') {
+                Some((tool, arg)) => (tool, Some(arg)),
+                None => (f.key, None),
+            };
             assert!(
-                f.key.starts_with("tako_")
-                    && f.key
-                        .chars()
-                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
-                "キーの形式が MCP ツール名と違う: {}",
+                tool.starts_with("tako_") && snake(tool) && arg.is_none_or(snake),
+                "キーの形式が MCP ツール名（引数の行は <ツール名>.<引数名>）と違う: {}",
                 f.key
             );
+            if arg.is_some() {
+                assert!(
+                    MATRIX.iter().any(|parent| parent.key == tool),
+                    "引数の行 {} の親のツールの行が無い",
+                    f.key
+                );
+            }
         }
     }
 
