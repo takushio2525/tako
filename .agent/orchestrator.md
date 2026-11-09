@@ -385,9 +385,12 @@ worker_agents:               # エージェント別の worker 設定（任意�
 - **持ち込む MCP（#2412）**: claude の worker は tako の MCP だけで起動し、user scope の MCP は
   `--settings` の `deniedMcpServers` で止める（`.mcp.json` / local scope はそのまま）。足すのは
   プロジェクトの `mcp_servers`。詳細は上の「worker の MCP」
-- **事前信頼**: spawn 時に各 CLI の信頼設定（claude: `~/.claude.json` / codex:
-  `~/.codex/config.toml` / agy: `~/.gemini/antigravity-cli/settings.json`）へ書き込み、
-  信頼ダイアログ自体を出さない。書けなかった場合もダイアログ検出 → Enter 承諾でフォールバック
+- **事前信頼**: spawn 時に各 CLI の信頼設定（claude: `<config dir>/.claude.json` / codex:
+  `$CODEX_HOME/config.toml` / agy: `~/.gemini/antigravity-cli/settings.json`）へ書き込み、
+  信頼ダイアログ自体を出さない。書けなかった場合もダイアログ検出 → Enter 承諾でフォールバック。
+  書き先は worker に渡る env 計画から決める（`orchestrator::agent::ensure_trusted_in`）: claude の config dir は
+  アカウント指定の `CLAUDE_CONFIG_DIR`（#558）、codex の `CODEX_HOME` は worker の MCP と同じ
+  `worker_mcp::codex_home_for`（プロファイルの env → tako の `CODEX_HOME` → `~/.codex`。相対は worker の cwd から。#2816）
 - **タスク振り分け**: `worker_model_policy: delegate` + `delegate_guidance` に
   「軽い調査は codex (gpt-5.6-luna)、重実装は claude」等と書くと、master がタスクごとに
   agent / model を選んで spawn する（system prompt に Available Worker Agents 一覧が注入される）

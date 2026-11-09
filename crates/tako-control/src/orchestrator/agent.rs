@@ -562,29 +562,49 @@ impl std::fmt::Display for TrustWriteError {
 /// いずれも best-effort: 失敗しても PromptFlow のダイアログ検出 → 承諾が
 /// フォールバックするため、呼び出し側は警告ログのみで継続する
 pub fn ensure_trusted(agent: WorkerAgent, cwd: &str) -> Result<bool, TrustWriteError> {
-    ensure_trusted_in(agent, None, cwd)
+    ensure_trusted_in(agent, &EMPTY_ENV_PLAN, cwd)
 }
 
-/// claude の config ディレクトリを明示する版（Issue #558）。
-/// アカウント指定で `CLAUDE_CONFIG_DIR` を注入して起動する場合、信頼はその
-/// config dir 配下の `.claude.json` に書かないと効かない（claude は config dir 配下を読む）。
-/// codex / agy は config dir の概念が異なるため従来どおり固定パスへ書く
+/// 起動する worker に渡る env 計画から書き先を決める版。
+/// 信頼は**起動する CLI が読む設定ファイル**へ書かないと効かない:
+/// claude は config dir 配下の `.claude.json`（アカウント指定の `CLAUDE_CONFIG_DIR`。Issue #558）、
+/// codex は `CODEX_HOME` の `config.toml`（プロファイルの env の `CODEX_HOME`。#2816）。
+/// agy は置き場を変える手段が無いので固定パスへ書く
 pub fn ensure_trusted_in(
     agent: WorkerAgent,
-    claude_config_dir: Option<&str>,
+    env: &EnvPlan,
     cwd: &str,
 ) -> Result<bool, TrustWriteError> {
     match agent {
-        WorkerAgent::Claude => crate::claude_tui::ensure_trusted_in(claude_config_dir, cwd),
-        WorkerAgent::Codex => ensure_codex_trusted(cwd),
+        WorkerAgent::Claude => {
+            crate::claude_tui::ensure_trusted_in(env.claude_config_dir().as_deref(), cwd)
+        }
+        WorkerAgent::Codex => ensure_codex_trusted(env, cwd),
         WorkerAgent::Agy => ensure_agy_trusted(cwd),
     }
 }
 
-/// codex: `~/.codex/config.toml` に `[projects."<cwd>"] trust_level = "trusted"` を追記する
-fn ensure_codex_trusted(cwd: &str) -> Result<bool, TrustWriteError> {
-    let home = crate::orchestrator::agent_config_home().ok_or(TrustWriteError::HomeUnresolved)?;
-    ensure_codex_trusted_at(&home.join(".codex/config.toml"), cwd)
+/// codex: worker が読む `config.toml` に `[projects."<cwd>"] trust_level = "trusted"` を追記する。
+///
+/// 置き場は worker の MCP の絞り込み（#2418）と同じ [`crate::worker_mcp::codex_home_for`]
+/// （env 計画の export → 明示の unset / 検証プロセスは検証用のホーム → tako の `CODEX_HOME` → `~/.codex`）。
+/// 前は `<home>/.codex/config.toml` に決め打ちしていたので、`CODEX_HOME` を立てて codex を使う
+/// 利用者では codex が読まないファイルへ書いていた（#2816）
+fn ensure_codex_trusted(env: &EnvPlan, cwd: &str) -> Result<bool, TrustWriteError> {
+    ensure_codex_trusted_with(env, tako_core::paths::is_verification_process(), cwd)
+}
+
+/// [`ensure_codex_trusted`] の検証プロセスの判定を引数で受ける版（テストから本番の枝を通す口）。
+/// 相対の `CODEX_HOME` は **worker の cwd から**読む（codex は自分の cwd から解決する。
+/// tako の cwd から読むと別の場所を指す）
+fn ensure_codex_trusted_with(
+    env: &EnvPlan,
+    verification: bool,
+    cwd: &str,
+) -> Result<bool, TrustWriteError> {
+    let codex_home = crate::worker_mcp::codex_home_for_in(env, verification)
+        .ok_or(TrustWriteError::HomeUnresolved)?;
+    ensure_codex_trusted_at(&Path::new(cwd).join(codex_home).join("config.toml"), cwd)
 }
 
 fn ensure_codex_trusted_at(path: &Path, cwd: &str) -> Result<bool, TrustWriteError> {
@@ -1149,6 +1169,144 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("[projects.\"/fresh\"]"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2816: worker に渡る env 計画（プロファイルの `env:`）が `CODEX_HOME` を決めていれば、信頼は
+    /// その `config.toml` へ書く。tako 自身の `CODEX_HOME` より計画が勝つ（worker の codex は計画の env で
+    /// 起動する）。前は `<home>/.codex/config.toml` に決め打ちしていたので、codex が読まないファイルへ書いていた
+    #[test]
+    fn issue2816_codexの信頼はworkerの計画のcodex_homeへ書く() {
+        if tako_core::run_alone!(issue2816_codexの信頼はworkerの計画のcodex_homeへ書く) {
+            return;
+        }
+        let scratch = tako_core::test_residue::ScratchDir::new("codex-trust-plan-2816");
+        let home = scratch.path().join("home");
+        let _home = crate::test_home::HomeGuard::set(&home);
+        let process = scratch.path().join("process-codex");
+        crate::test_home::set_codex_home(Some(process.as_os_str()));
+        let planned = scratch.path().join("profile-codex");
+        // 別の信頼の項目と設定が既にある config.toml へ足す（消さない・重ねない）
+        std::fs::create_dir_all(&planned).unwrap();
+        std::fs::write(
+            planned.join("config.toml"),
+            "model = \"m\"\n\n[projects.\"/other\"]\ntrust_level = \"trusted\"\n",
+        )
+        .unwrap();
+        let plan = EnvPlan {
+            exports: vec![("CODEX_HOME".into(), planned.display().to_string())],
+            unsets: vec![],
+        };
+
+        // spawn / handoff / git resolve が通る公開の口
+        assert_eq!(
+            ensure_trusted_in(WorkerAgent::Codex, &plan, "/work/proj"),
+            Ok(true)
+        );
+        let written = std::fs::read_to_string(planned.join("config.toml")).unwrap();
+        assert!(
+            written.contains("[projects.\"/work/proj\"]\ntrust_level = \"trusted\""),
+            "計画の CODEX_HOME の config.toml に書く: {written}"
+        );
+        assert!(
+            written.starts_with("model = \"m\"\n"),
+            "既存の設定を保つ: {written}"
+        );
+        assert_eq!(
+            written.matches("[projects.\"/other\"]").count(),
+            1,
+            "{written}"
+        );
+        // 2 回目は重ねない
+        assert_eq!(
+            ensure_trusted_in(WorkerAgent::Codex, &plan, "/work/proj"),
+            Ok(true)
+        );
+        assert_eq!(
+            std::fs::read_to_string(planned.join("config.toml")).unwrap(),
+            written
+        );
+        for other in [
+            process.join("config.toml"),
+            home.join(".codex").join("config.toml"),
+            crate::orchestrator::agent_config_home()
+                .unwrap()
+                .join(".codex")
+                .join("config.toml"),
+        ] {
+            assert!(!other.exists(), "計画以外の置き場へ書かない: {other:?}");
+        }
+        // 本番の枝（検証プロセスでない = tako の CODEX_HOME を読む）でも計画が勝つ
+        assert_eq!(
+            ensure_codex_trusted_with(&plan, false, "/work/prod"),
+            Ok(true)
+        );
+        let written = std::fs::read_to_string(planned.join("config.toml")).unwrap();
+        assert!(written.contains("[projects.\"/work/prod\"]"), "{written}");
+        assert!(
+            !process.join("config.toml").exists(),
+            "tako の CODEX_HOME へ書かない"
+        );
+        // 計画の値が空・空白だけなら決めていないと読み、tako の CODEX_HOME へ倒す（#2798 の読み方）
+        for (i, blank) in ["", " \t "].into_iter().enumerate() {
+            let plan = EnvPlan {
+                exports: vec![("CODEX_HOME".into(), blank.into())],
+                unsets: vec![],
+            };
+            let cwd = format!("/work/blank{i}");
+            assert_eq!(ensure_codex_trusted_with(&plan, false, &cwd), Ok(true));
+            let written = std::fs::read_to_string(process.join("config.toml")).unwrap();
+            assert!(
+                written.contains(&format!("[projects.\"{cwd}\"]")),
+                "{blank:?}: {written}"
+            );
+        }
+    }
+
+    /// #2816: 計画が `CODEX_HOME` を決めていなければ tako の `CODEX_HOME`（解決の正本 `codex_home`）の
+    /// `config.toml` へ書く。未設定・空・空白だけは**修正前と同じ** `<home>/.codex/config.toml`。
+    /// 相対の値は worker の cwd から読む（codex は自分の cwd から解決する）。
+    /// テストのプロセスは検証プロセス（本物の `CODEX_HOME` を読まない）なので、本番の枝は
+    /// 判定を引数で受ける `ensure_codex_trusted_with(…, false, …)` で通す
+    #[test]
+    fn issue2816_codexの信頼はtakoのcodex_homeへ書き空なら修正前と同じ() {
+        if tako_core::run_alone!(issue2816_codexの信頼はtakoのcodex_homeへ書き空なら修正前と同じ)
+        {
+            return;
+        }
+        let scratch = tako_core::test_residue::ScratchDir::new("codex-trust-env-2816");
+        let home = scratch.path().join("home");
+        let _home = crate::test_home::HomeGuard::set(&home);
+        let cwd = scratch.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd_text = cwd.display().to_string();
+        let header = format!("[projects.{}]", toml_quote(&cwd_text));
+        // 修正前の書き先（`orchestrator::home_dir()` の `.codex/config.toml`）
+        let before_fix = home.join(".codex").join("config.toml");
+        for (label, value, dir) in crate::test_home::codex_home_cases(&home, scratch.path()) {
+            crate::test_home::set_codex_home(value.as_deref());
+            let want = cwd.join(&dir).join("config.toml");
+            let _ = std::fs::remove_file(&want);
+            let _ = std::fs::remove_file(&before_fix);
+            assert_eq!(
+                ensure_codex_trusted_with(&EMPTY_ENV_PLAN, false, &cwd_text),
+                Ok(true),
+                "{label}"
+            );
+            let written = std::fs::read_to_string(&want)
+                .unwrap_or_else(|e| panic!("{label}: {want:?} に書くはず: {e}"));
+            assert!(written.contains(&header), "{label}: {written}");
+            if value
+                .as_deref()
+                .is_none_or(|v| v.to_string_lossy().trim().is_empty())
+            {
+                assert_eq!(want, before_fix, "{label}: 修正前と同じ書き先");
+            } else {
+                assert!(
+                    !before_fix.exists(),
+                    "{label}: 空でない CODEX_HOME では <home>/.codex へ書かない"
+                );
+            }
+        }
     }
 
     #[test]

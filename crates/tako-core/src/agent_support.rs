@@ -790,9 +790,11 @@ pub const MATRIX: &[AgentFeature] = &[
         agy: pending(notes::FIXED_CONFIG_PATH, 975),
         local: local_pending(),
         evidence: AgentEvidence::Source(
-            "orchestrator/agent.rs の事前信頼は claude だけ CLAUDE_CONFIG_DIR（#512 / #558）を \
-             見て書き先を決め、codex は ~/.codex/config.toml、agy は \
-             ~/.gemini/antigravity-cli/settings.json を固定で開く（同ファイルのコメントが明示）",
+            "accounts.yaml のアカウントは CLAUDE_CONFIG_DIR だけを注入・解除する \
+             （orchestrator/mod.rs の resolved_env_plan_with_account。#512 / #558）。codex の置き場 \
+             （CODEX_HOME）はアカウントでは切り替わらず、事前信頼はプロファイルの env の CODEX_HOME に \
+             追従するだけ（orchestrator/agent.rs の ensure_trusted_in。#2816）。agy は \
+             ~/.gemini/antigravity-cli/settings.json を固定で開く",
         ),
     },
     AgentFeature {
@@ -1368,7 +1370,8 @@ pub const MATRIX: &[AgentFeature] = &[
         local: local_pending(),
         evidence: AgentEvidence::Measured(
             "#979（main の 63a7c26）で `tako setup-mcp` が 3 系統へ登録するようになった。\
-             書き先は claude = ~/.claude.json / codex = ~/.codex/config.toml の \
+             書き先は claude = ~/.claude.json / codex = $CODEX_HOME/config.toml（既定 ~/.codex。\
+             置き場は解決の正本 codex_session::codex_home = #2798）の \
              [mcp_servers.tako] / agy = ~/.gemini/config/mcp_config.json で、codex は \
              env_vars 許可リストまで足して実セッションから tako_list_panes が通ることを実測。\
              正本は tako-control::agent_mcp",
@@ -2092,9 +2095,11 @@ pub const MATRIX: &[AgentFeature] = &[
         agy: degraded(notes::FIXED_CONFIG_PATH),
         local: pending(notes::LOCAL_HARNESS_UNDECIDED, 990),
         evidence: AgentEvidence::Source(
-            "orchestrator/agent.rs の ensure_trusted_in が 3 系統ぶん書き分けてある \
-             （claude = <config dir>/.claude.json / codex = ~/.codex/config.toml / \
-             agy = ~/.gemini/antigravity-cli/settings.json）。claude 以外は固定パス",
+            "orchestrator/agent.rs の ensure_trusted_in が worker に渡る env 計画から 3 系統ぶん \
+             書き分けてある（claude = <config dir>/.claude.json = アカウントの CLAUDE_CONFIG_DIR / \
+             codex = $CODEX_HOME/config.toml = worker_mcp::codex_home_for（プロファイルの env → \
+             tako の CODEX_HOME → ~/.codex。#2816）/ agy = ~/.gemini/antigravity-cli/settings.json）。\
+             agy だけ固定パス",
         ),
     },
 ];
