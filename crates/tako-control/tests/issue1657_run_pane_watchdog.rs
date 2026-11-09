@@ -278,8 +278,9 @@ fn 実行ペインのマーカーは退避路でだけ出す() {
             "posix_exit_report(marker_prefix, exit_file)",
             "posix_exit_hint_line(lang)",
         ),
+        // #2822 から本体は純粋関数 `_in`（入口は `legacy_2822()` を渡すだけ）
         (
-            "fn powershell_run_pane_script(",
+            "fn powershell_run_pane_script_in(",
             "powershell_exit_report(marker_prefix, exit_file)",
             "powershell_exit_hint_line(lang)",
         ),
