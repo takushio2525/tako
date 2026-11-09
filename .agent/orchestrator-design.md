@@ -250,13 +250,26 @@ Windows 固有の要件が 3 つある（どれも実測）:
   `-OutputFormat Text` を付けないので pwsh 7 も同じく CLIXML で書く（#2800 の CI で実測）。
   `format_evidence` は導入代行と同じ 1 実装 `platform::shell::powershell_stderr_text` で
   平文へ戻してから載せる（版に依らない）。`Write-Host` の文字は stdout にも出るので、
-  平文化が情報レコードを捨てても evidence から消えない。pwsh 7 のエラーの文に入る
-  ANSI の色の符号は残る（修正前も XML の中の `_x001B_` として載っていた）。
+  平文化が情報レコードを捨てても evidence から消えない。
   **範囲（5 行を超えたら末尾 5 行）は捕捉したままの行で選び、選んだ範囲を平文へ戻す**:
   5.1 は CLIXML を終了時に 1 行で書き、平文にしたエラーレコードは 1 件で 6 行以上・本文が
   先頭なので、逆の順だと本文が落ちる。CLIXML でない stderr（POSIX・ネイティブコマンド）は
   1 バイトも変えない。A/B は `TAKO_2800_LEGACY=1`、実物の 5.1 での検査は Windows の CI の
-  `tests/issue2800_gate_clixml_windows.rs`、番犬 `issue2800_gate_clixml_watchdog`
+  `tests/issue2800_gate_clixml_windows.rs`、番犬 `issue2800_gate_clixml_watchdog`。
+  **pwsh 7 の色の符号と 5.1 の包みの行も載せない（#2812）**: pwsh 7 はエラーの文を `$PSStyle` の
+  色（`ESC[31;1m` ほか）で飾った文字のまま CLIXML へ直列化するので、同じ平文化
+  （`powershell_stderr_text`）が塊から戻した文字の ANSI の ESC 列を除く（evidence に ESC は 1 バイトも
+  残らない）。`$PSStyle.OutputRendering = 'PlainText'` も `NO_COLOR` もこの直列化には効かない
+  （Windows の CI の pwsh 7.6 で実測）ので起こし方では止めない。塊の外の素のテキスト（ネイティブの子の
+  出力）の色の符号は残す（macOS の `sh -c` と同じ）。5.1 の最上位の `Write-Error` は `$MyInvocation`
+  （= 述語を包むスクリプト全体）を「コマンド」として本文の前に出していたので、包み
+  （`powershell_output_script`）が 5.1 のときだけ 2 行目の末尾で `$MyInvocation` を外す。表示は cmdlet の
+  失敗と同じ `Write-Error : <本文>` + `At line:4 char:1`（利用者のコマンドの位置）になり、終了コードは
+  変わらない。代償として述語の最上位の `$MyInvocation` は 5.1 では `$null`。A/B は
+  `TAKO_2812_LEGACY=1`（色の符号を残し、`$MyInvocation` を外さない）。`TAKO_2800_LEGACY=1` は平文化
+  そのものを切るので XML のまま（色の符号は `_x001B_` の文字で ESC のバイトは無い）になり、5.1 の
+  包みの行の有無だけを `TAKO_2812_LEGACY` が決める（両方立てると #2800 前の形）。実物の 5.1 / pwsh 7 での検査は Windows の CI の
+  `tests/issue2812_gate_ansi_windows.rs`、番犬 `issue2812_gate_ansi_watchdog`
 
 #### タスク状態機械との統合
 
