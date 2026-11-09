@@ -455,7 +455,8 @@ watch_of() {
 # `TAKO_2804_LEGACY=1` の器なしの腕（none / off）だけは修正前（常に false）を期待する
 children_expect() {
   local arm="$1" who="$2" tag="$3" alive="$4" got want
-  got="$(jq -r '.has_running_children // "なし"' <<<"$STATUS_JSON" 2>/dev/null)"
+  # `//` は false も「無い」と読むので has で分ける
+  got="$(jq -r 'if has("has_running_children") then .has_running_children | tostring else "なし" end' <<<"$STATUS_JSON" 2>/dev/null)"
   want=false
   [ "$alive" = 1 ] && want=true
   if [ -n "$LEGACY_2804" ] && [ "$arm" != tmux ]; then
