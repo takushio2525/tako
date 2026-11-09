@@ -7563,12 +7563,13 @@ pub fn prepare_offload(
                 q.tmux_session.as_deref(),
             );
             // A/B の `TAKO_1968_LEGACY=1` だけ、修正前と同じく子プロセスの有無を
-            // ここ（UI スレッド）で数える。通常は background の後段が数える（#1968）
-            let children_probed = crate::diag::issue1968_legacy();
-            let ctx = if children_probed {
-                probe_running_children(ctx)
+            // ここ（UI スレッド）で数える。通常は background の後段が数える（#1968）。
+            // 条件は `if …legacy() {` の形に置く（#1984 の番犬が A/B の旧経路の腕として読む。
+            // #2804 で後段の呼び出しが明示になり、番犬の辿りに写るようになった）
+            let (ctx, children_probed) = if crate::diag::issue1968_legacy() {
+                (probe_running_children(ctx), true)
             } else {
-                ctx
+                (ctx, false)
             };
             Some(Ok(OffloadJob::WorkerStatus {
                 ctx,
@@ -63374,8 +63375,9 @@ tako | pane 2 [ compact ]       [-]
     #[cfg(unix)]
     #[test]
     fn issue2804_器なしのworkerはagentが生きている間has_running_childrenがtrue() {
-        if tako_core::run_alone!(issue2804_器なしのworkerはagentが生きている間has_running_childrenがtrue)
-        {
+        if tako_core::run_alone!(
+            issue2804_器なしのworkerはagentが生きている間has_running_childrenがtrue
+        ) {
             return;
         }
         let mut host = MockHost::new();
@@ -63403,8 +63405,7 @@ tako | pane 2 [ compact ]       [-]
         let other =
             verify_ctx_pane_identity(collect_worker_status_ctx(&host, pane), Some("tako-gone"));
         assert!(
-            !crate::agents::with_shared_scan(|| probe_running_children(other))
-                .has_running_children
+            !crate::agents::with_shared_scan(|| probe_running_children(other)).has_running_children
         );
 
         // agent が終わってシェルだけ残ったペイン
