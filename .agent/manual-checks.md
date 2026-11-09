@@ -551,6 +551,20 @@ CSI u のまま届くこと・注入（`TAKO_729_INJECT=no-extended-keys`）で 
 - [ ] persist OFF の直接ペイン（ConPTY）の claude で Shift+Enter → 改行（CSI u のまま届く）
 - [ ] 器のペインの素の PowerShell で Enter → 従来どおりコマンドが実行される（素の Enter は CR のまま）
 
+### Windows の claude を keys で止め、添付を読ませる（#2824 / #937）
+
+器なしのペイン（ConPTY）へ送った `keys` が VT 入力の子に unix と同じバイト列で届くこと・添付が Windows の
+パスのまま本文へ入ること・長いパスでも本人だけの DACL が当たることは Windows CI の実 ConPTY で確認済み
+（FR-2.2.2 追補 4）。残るのは本物の claude の解釈。
+
+- [ ] persist OFF の直接ペインで claude に長い出力を頼み、生成中に `tako send --pane <N> --key Escape` →
+  生成が止まる（`Interrupted` が出る）。MCP `tako_send_input` の `keys: ["Escape"]` も同じ
+- [ ] 同じペインへ `tako send --pane <N> --attach C:\…\shot.png "これは何？"` → 置き場
+  `<cwd>\.tako-remote-uploads\shot.png` に写り、claude が画像を読んで答える
+- [ ] 器（psmux）のペインで同じ 2 つ → 止まる・読める（器のペインの Escape の到達は CI では未実測）
+- [ ] 素の PowerShell（キーイベントで読む子）へ `--key S-Enter` → 何も起きない（ConPTY が CSI u を落とす =
+  FR-2.2.2 追補 4 の既知の形）。`--key Escape --key 1` は Alt+1 として読まれうる
+
 ## sleep-guard 状態チップ + 詳細ポップオーバー（#440、2026-07-22）
 
 チップ文言の選択ロジック・ポップオーバー文言の組み立て・絵文字ゼロは unit test で

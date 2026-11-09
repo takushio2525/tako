@@ -454,6 +454,78 @@ mod tests {
         assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
     }
 
+    /// #2824: Windows では置き場がジャンクション（管理者権限なしで作れるディレクトリのリンク）でも
+    /// 書かない（std の `is_symlink` はジャンクションも名前の代理 = リンクとして返す）
+    #[cfg(windows)]
+    #[test]
+    fn 置き場がジャンクションなら書かない() {
+        let tmp = ScratchDir::new("uploads-junction");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let cwd = tmp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut mklink = std::process::Command::new("cmd");
+        crate::platform::process::no_console_window(&mut mklink);
+        let made = mklink
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(cwd.join(DIR_NAME))
+            .arg(&elsewhere)
+            .output()
+            .expect("cmd を起こせる");
+        assert!(
+            made.status.success(),
+            "ジャンクションを作れない: {}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let src = tmp.path().join("a.txt");
+        write(&src, b"x");
+        assert!(matches!(
+            stage_all(&cwd, &[src]),
+            Err(StageRefusal::DirSymlink(_))
+        ));
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+
+    /// #2824: 作業ディレクトリが MAX_PATH（260 文字）を超える長いパスでも写り、本人だけの形になる。
+    /// 本文に入るパスに verbatim の前置き（`\\?\`）を付けない
+    #[cfg(windows)]
+    #[test]
+    fn 長いパスの作業ディレクトリでも写して本人だけの形にする() {
+        use std::os::windows::ffi::OsStrExt as _;
+        let units = |p: &Path| p.as_os_str().encode_wide().count();
+        let tmp = ScratchDir::new("uploads-long");
+        let src = tmp.path().join("a.png");
+        write(&src, b"long");
+        // 対照: 短いパスでは本人だけの形になる
+        let short = stage_all(tmp.path(), std::slice::from_ref(&src)).expect("短いパス");
+        let baseline =
+            crate::platform::private_file::inspect(&short[0].path).expect("ACL を読める");
+        assert!(baseline.owner_only, "{}", baseline.detail);
+        let mut cwd = tmp.path().to_path_buf();
+        while units(&cwd) < 280 {
+            cwd.push("long-segment-2824");
+        }
+        std::fs::create_dir_all(&cwd).expect("長いパスの作業ディレクトリを作れる");
+        let staged = stage_all(&cwd, std::slice::from_ref(&src)).expect("長いパスでも写す");
+        assert!(units(&staged[0].path) > 260, "{}", staged[0].path.display());
+        assert_eq!(std::fs::read(&staged[0].path).unwrap(), b"long");
+        let text = compose_text("", &staged);
+        assert!(!text.starts_with(r"\\?\"), "{text}");
+        let inspection =
+            crate::platform::private_file::inspect(&staged[0].path).expect("ACL を読める");
+        eprintln!(
+            "TAKO2824_LONG_PATH units={} owner_only={} detail={}",
+            units(&staged[0].path),
+            inspection.owner_only,
+            inspection.detail
+        );
+        assert!(
+            inspection.owner_only,
+            "長いパスの添付が本人だけの形にならない: {}",
+            inspection.detail
+        );
+    }
+
     #[test]
     fn 空白を含むパスは囲む() {
         let staged = [Staged {

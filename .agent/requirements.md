@@ -236,6 +236,38 @@ FR-2.2.2 追補 3（Issue #2743・2026-11-05）: **生のキーと添付**。外
   送る本体は着地 `OffloadContinuation::SendAttached`（同期の腕と同じ `send_reply`）
 - remote daemon の `{keys}` / `/api/upload` の挙動は変えていない（置き場の名前と上限は共有）
 
+FR-2.2.2 追補 4（Issue #2824・2026-11-09）: **`keys` / `attachments` の Windows（ConPTY）**。
+#2743 の実 PTY テストを Windows CI の実 ConPTY でも回す（記録係 = テストバイナリ自身を ConPTY の子として
+起こし、Win32 のコンソール API で入力を読む `i2824_recorder_command`。形は番犬
+`issue2824_conpty_keys_watchdog` が縛る）。実測は Windows CI（build 26100 の inbox の conhost。tako は
+conpty.dll を同梱しないので利用者の PC も OS の conhost を通る）。
+
+- `keys`（器なしのペイン）: 語彙の全名前（Escape・Enter・矢印・Tab・Space・`C-<英字>`・1 文字・修飾付き
+  Enter）が、**VT 入力の子**（`ENABLE_VIRTUAL_TERMINAL_INPUT` = libuv の raw モード = node / claude と同じ
+  条件。#729 の実測と同じ）に **tako が書いたバイト列のまま**届く。続けて送った keys（`["Escape", "C-c", "Up"]`）
+  のバイト列も unix と同じ。ダイアログ中の断り・知らない名前 / 空の列の断りも unix と同じ
+- **キーイベントで読む子**（VT 入力を立てない Win32 のコンソールアプリ。PSReadLine など）には ConPTY が形を
+  変える（テスト `issue2824_conptyのキーイベントは修飾付きenterを落としescと次のキーをaltへ畳む` が名指す）:
+  修飾付き Enter（CSI u）は 1 件も届かない／`ESC` と次のキーが ConPTY の 1 回の読み取りに入ると Alt+そのキーへ
+  畳み、Escape の押下は消える（上の `["Escape", "1"]` の注意は Windows ではキーイベントの子にも効く）／
+  `C-<英字>` は Ctrl の押下を伴う 2 件（`C-c` だけは 1 件）。単独の Escape・Enter・矢印・Tab・Space・`C-c` は
+  正しい仮想キー（VK_ESCAPE・VK_UP など）で届く。**tako 側では直さない**: VT 入力の子（claude）には影響が無く、
+  直すなら Windows だけの間合い（Escape の後で待つ）か win32-input-mode の符号化になり、送る形そのものを
+  OS で分けることになる。生成を止めるだけなら `["Escape"]` を単独で送る
+- 器（psmux）のペイン: 修飾付き Enter は追補 3 のとおり `ESC CR` へ畳む。その他の名前の到達は、CI に psmux が
+  無いので未実測（#729 の 8 月の実測表では矢印・Tab・Enter は psmux を越える）
+- `attachments`: 写した先のパスは Windows の形のまま（ドライブ文字から始まり `\` で区切る。verbatim の前置き
+  `\\?\` を付けない）本文へ入り、日本語と空白を含むパスは `"…"` で囲む。置き場がジャンクション（管理者権限なしで
+  作れるディレクトリのリンク）でも書かない（std の `is_symlink` がジャンクションを名前の代理 = リンクとして返す）。
+  作業ディレクトリが MAX_PATH を超えても写る（std の fs が前置きを付ける）が、**本人だけの DACL は当たって
+  いなかった**（境界 B32 の Win32 API が前置きなしの長いパスを断り、黙って継承へ落ちていた）ので、
+  `platform::private_file` が Win32 へ渡すパスに前置きを付けるよう直した（`.agent/architecture.md` の
+  境界 B32 の節。A/B `TAKO_2824_LEGACY=1`）
+- 対応表（`tako platform`）に引数の行を置く: `tako_send_input.keys`（Windows は Degraded = 器の修飾付き Enter。
+  理由文は親の行と同じ `WIN_PSMUX_MODIFIED_ENTER`）・`tako_send_input.attachments`（Supported）。引数の行の
+  規則は `.agent/plans/2026-07-windows-port-architecture.md` §3.2
+- 実機の Claude Code で Esc が生成を止めるか・画像を読むかは #937（Windows 実機）の人の確認に回す
+
 FR-2.2.8 の「明確なエラー」は FR-2.2.9 の解決順（環境変数 → 接続情報ファイル）を
 すべて試した上での不在を意味する（tako が起動していれば、tako の外からでも接続できる）。
 **隔離の印（#2531）**: `TAKO_ISOLATED=1` の CLI / MCP ブリッジ / remote daemon は、`TAKO_DISCOVERY_DIR` /
