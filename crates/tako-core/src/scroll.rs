@@ -204,13 +204,18 @@ fn send_copy_command(target: &ScrollTarget, command: &str, count: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // ここから `top_line_number_of` までは、器（tmux）を実際に起こす unix の e2e だけが使う（#1537）
+    #[cfg(unix)]
     use crate::terminal::{SpawnCommand, SpawnOptions};
+    #[cfg(unix)]
     use crate::tmux_backend::{wrap_options, TmuxTestGuard};
 
+    #[cfg(unix)]
     fn lines_command() -> String {
         "i=0; while [ $i -lt 100 ]; do echo LINE-$i; i=$((i+1)); done; exec sleep 60".into()
     }
 
+    #[cfg(unix)]
     fn wait_until(session: &crate::TerminalSession, pred: impl Fn(&[String]) -> bool) -> bool {
         for _ in 0..100 {
             if pred(&session.visible_lines()) {
@@ -417,6 +422,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn top_line_number_of(lines: &[String]) -> Option<usize> {
         lines.first().and_then(|l| {
             l.trim_end()

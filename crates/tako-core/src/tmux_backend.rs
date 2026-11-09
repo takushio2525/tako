@@ -1528,6 +1528,8 @@ fn alternate_on(socket: &str, session: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 素の `Command` は unix のテスト（`sync_confは稼働中サーバーへ設定を再適用する`）だけが使う（#1537）
+    #[cfg(unix)]
     use std::process::Command;
 
     // ── #1252: 器（tmux）越しの状態待ちの共通部品 ────────────────────────────

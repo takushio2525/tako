@@ -418,6 +418,8 @@ pub struct Carried {
 }
 
 impl Carried {
+    /// 呼び手は unix の exec し直し（[`reexec`]）とテストだけ（#1537）
+    #[cfg(any(unix, test))]
     fn encode(from_pane: Option<&str>, names: &[&str]) -> String {
         format!("{}\t{}", from_pane.unwrap_or_default(), names.join(","))
     }

@@ -2753,7 +2753,6 @@ pub fn run_daemon() -> io::Result<()> {
         .map_err(|e| io::Error::other(format!("トークンファイルの書き出しに失敗: {e}")))?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_for_signal = shutdown.clone();
 
     // SIGTERM / SIGINT ハンドラ
     #[cfg(unix)]
@@ -2780,7 +2779,7 @@ pub fn run_daemon() -> io::Result<()> {
         }
 
         // シグナル待ちスレッド
-        let shutdown_clone = shutdown_for_signal;
+        let shutdown_clone = shutdown.clone();
         std::thread::Builder::new()
             .name("signal-watcher".into())
             .spawn(move || loop {

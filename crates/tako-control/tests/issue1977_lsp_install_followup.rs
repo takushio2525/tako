@@ -131,7 +131,8 @@ impl Drop for Scratch {
     }
 }
 
-/// ディレクトリの下を全部（symlink は辿らない）
+/// ディレクトリの下を全部（symlink は辿らない）。使い手は unix の権限の戻しだけ（#1537）
+#[cfg(unix)]
 fn walk(dir: &Path) -> Vec<PathBuf> {
     let mut out = vec![dir.to_path_buf()];
     let Ok(entries) = std::fs::read_dir(dir) else {

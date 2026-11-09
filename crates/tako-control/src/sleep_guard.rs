@@ -1497,7 +1497,9 @@ fn assertion_reason(mode: SleepGuardMode, busy_agents: usize) -> String {
 }
 
 /// 残留解除を行うべきかを判定する（#449: テスト可能な純粋関数）。
-/// Ok(()) なら解除すべき、Err(理由) ならスキップ
+/// Ok(()) なら解除すべき、Err(理由) ならスキップ。呼び手は macOS の残留解除とテストだけ
+/// （Windows は `platform::lid::should_clear_residual`。#1537）
+#[cfg(any(target_os = "macos", test))]
 fn should_clear_residual(
     is_isolated: bool,
     other_instance_running: bool,

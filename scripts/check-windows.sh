@@ -10,6 +10,9 @@
 # 使い方:
 #   scripts/check-windows.sh            # 全クレートを検査
 #   scripts/check-windows.sh -p tako-core   # cargo の追加引数はそのまま渡る
+#
+# 終了コード: 0 = エラーも警告も無い / 3 = 警告がある（エラーは無い。#1537）/
+#             2 = 前提ツールが足りない / それ以外 = cargo のエラー
 set -euo pipefail
 
 TARGET="x86_64-pc-windows-msvc"
@@ -72,8 +75,11 @@ echo "target: $TARGET"
 echo "gpui:   $GPUI_DIR"
 echo
 
-# 注: エラーのみをゲートする。macOS 専用実装に対する dead_code 警告は、
-# 各抽象境界の Windows 実装が入るにつれて自然に消える性質のもの
+# **警告も 0 件に保つ**（#1537 / #1827）。以前はエラーだけを見ていて、Windows の cfg の内側
+# だけで出る警告（unix 向けの補助が Windows で未使用 など）が 9 月に 31 件・11 月に 36 件まで
+# 積み上がり、新しい警告が埋もれていた。数え方は CI の Windows ジョブと同じ 1 実装
+# （scripts/warning-gate.sh）を通す。JSON などで出力を取りたいときは `--message-format` を
+# 渡せば、ゲートを通さずに cargo の出力をそのまま返す
 #
 # **`--all-targets` を既定にする**（#1441）。既定（lib / bin のみ）だと `tests/` が
 # 検査対象に入らず、統合テストの `std::os::unix` を `cfg(unix)` で囲い忘れても
@@ -89,5 +95,11 @@ for arg in "$@"; do
     break
   fi
 done
+GATE=(bash "${REPO_ROOT}/scripts/warning-gate.sh")
+for arg in "$@"; do
+  case "$arg" in
+    --message-format*) GATE=() ;;
+  esac
+done
 PATH="${LLVM_BIN}:$PATH" INCLUDE="$GPUI_DIR" \
-  cargo xwin check --workspace --target "$TARGET" ${ALL_TARGETS[@]+"${ALL_TARGETS[@]}"} "$@"
+  ${GATE[@]+"${GATE[@]}"} cargo xwin check --workspace --target "$TARGET" ${ALL_TARGETS[@]+"${ALL_TARGETS[@]}"} "$@"

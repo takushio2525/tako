@@ -1513,9 +1513,6 @@ mod key_monitor {
     pub(super) fn holds_key_focus(_view: *const c_void) -> bool {
         false
     }
-    pub(super) fn owner_class(_view: *const c_void) -> String {
-        String::new()
-    }
     pub(super) fn return_to_app(_view: *const c_void) -> bool {
         false
     }
@@ -1547,7 +1544,9 @@ pub fn webview_holds_key_focus(handle: &WindowHandleBox) -> bool {
 }
 
 /// キー入力の宛先の素性（診断用。`クラス名@アドレス`。gpui の描画ビュー = tako に届く /
-/// `WKWebView` 系 = ページに奪われている。アドレスは 2 枚のどちらかを言い分けるため）
+/// `WKWebView` 系 = ページに奪われている。アドレスは 2 枚のどちらかを言い分けるため）。
+/// 呼び手は macOS のセルフテストだけ（#1537）
+#[cfg(target_os = "macos")]
 pub fn key_focus_owner(handle: &WindowHandleBox) -> String {
     key_monitor::owner_class(handle.ns_view_ptr())
 }

@@ -34643,7 +34643,9 @@ mod self_test {
             && delta.clock == 0
     }
 
-    /// 項目 113（#816 / #2344）の材料 = 測る窓のあいだの差分
+    /// 項目 113（#816 / #2344）の材料 = 測る窓のあいだの差分。
+    /// 項目 113 は unix だけで走るので、判定の型と関数は unix とテストにだけ置く（#1537）
+    #[cfg(any(unix, test))]
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub(crate) struct HiddenDeliveryDelta {
         /// 窓の長さ
@@ -34659,6 +34661,7 @@ mod self_test {
     }
 
     /// 項目 113 の判定（純粋関数。#2344）。3 本に割ってあり、どれで落ちたかが出力から決まる
+    #[cfg(any(unix, test))]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) struct HiddenDeliveryVerdict {
         /// 合図の往復（`hops − forced`）の上限 = 窓 / 再確認の間隔 + 2
@@ -34694,6 +34697,7 @@ mod self_test {
     ///
     /// 旧判定（「省いた数 ≥ 渡した数」）は比で、1 行の間隔と描き直しに制御列が付く割合で
     /// 割れていた（#2344 の実測: 4 回中 3 回）
+    #[cfg(any(unix, test))]
     pub(crate) fn hidden_delivery_verdict(
         d: HiddenDeliveryDelta,
         recheck: Duration,

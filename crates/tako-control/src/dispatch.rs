@@ -46531,8 +46531,9 @@ tako | pane 2 [ compact ]       [-]
         use std::io::Write as _;
         use std::path::Path;
 
-        type Handle = isize;
-        const INVALID_HANDLE: Handle = -1;
+        // 製品の `platform::named_pipe` と同じ `CreateFileW` を同じ型で宣言する
+        // （型が違うと `clashing_extern_declarations` の警告になる。#1537）
+        type Handle = *mut c_void;
         const GENERIC_READ: u32 = 0x8000_0000;
         const GENERIC_WRITE: u32 = 0x4000_0000;
         const FILE_SHARE_READ: u32 = 0x1;
@@ -46613,11 +46614,11 @@ tako | pane 2 [ compact ]       [-]
                     std::ptr::null_mut(),
                     OPEN_EXISTING,
                     0,
-                    0,
+                    std::ptr::null_mut(),
                 )
             };
             assert!(
-                handle != INVALID_HANDLE,
+                handle as isize != -1,
                 "{} を開けない: {}",
                 String::from_utf16_lossy(&name),
                 std::io::Error::last_os_error()

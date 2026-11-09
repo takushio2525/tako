@@ -103,11 +103,17 @@ pub enum PlaybackState {
 /// CMTime のタイムスケール（1/600 秒。NTSC / PAL 双方のフレームレートを割り切れる慣例値）
 #[cfg(target_os = "macos")]
 const TIMESCALE: i32 = 600;
-/// シーク完了とみなす許容誤差（秒）。正確シークなら 1 フレーム以内に収束する
+/// シーク完了とみなす許容誤差（秒）。正確シークなら 1 フレーム以内に収束する。
+/// この下の `SEEK_SETTLE_TIMEOUT` / `END_EPS` / `cm_seconds` / `seek_settled` / `at_end` は
+/// 使い手が macOS の `VideoPlayer`（AVFoundation）とテストだけなので同じ cfg に置く。
+/// Windows のプレイヤー（#521）が使うときに cfg を広げる（#1537）
+#[cfg(any(target_os = "macos", test))]
 pub const SEEK_SETTLE_EPS: f64 = 0.05;
 /// シーク完了を待つ上限（秒）。到達しないまま表示が固まるのを防ぐ保険
+#[cfg(any(target_os = "macos", test))]
 pub const SEEK_SETTLE_TIMEOUT: f64 = 1.5;
 /// 末尾に到達したとみなす残り時間（秒）
+#[cfg(any(target_os = "macos", test))]
 pub const END_EPS: f64 = 0.05;
 /// ドラッグ中のシークに与える許容誤差（秒）。正確シークの連打はデコードが重く
 /// つまみが引っかかるため、スクラブ中だけ粗く飛ばして離した時点で正確に合わせる
@@ -115,6 +121,7 @@ pub const SCRUB_TOLERANCE: f64 = 0.15;
 
 /// CMTime の生値から秒を求める。無効値（valid フラグ無し / timescale <= 0 /
 /// 非有限）は None を返す。indefinite（生放送等）もここで弾かれる
+#[cfg(any(target_os = "macos", test))]
 pub fn cm_seconds(value: i64, timescale: i32, flags: u32) -> Option<f64> {
     // kCMTimeFlags_Valid = 1 << 0
     if flags & 1 == 0 || timescale <= 0 {
@@ -187,6 +194,7 @@ pub fn time_label(seconds: f64) -> String {
 
 /// シークが完了した（プレイヤーの実位置が要求位置に追いついた）かを判定する。
 /// 許容誤差内に収まるか、待ち時間が上限を超えたら完了扱いにする
+#[cfg(any(target_os = "macos", test))]
 pub fn seek_settled(actual: Option<f64>, target: f64, tolerance: f64, elapsed_secs: f64) -> bool {
     if elapsed_secs >= SEEK_SETTLE_TIMEOUT {
         return true;
@@ -208,6 +216,7 @@ pub fn tooltip_left(rel_x: f32, bar_width: f32, tip_width: f32) -> f32 {
 }
 
 /// 末尾に到達しているか（長さ不明なら常に false）
+#[cfg(any(target_os = "macos", test))]
 pub fn at_end(current: f64, duration: f64) -> bool {
     duration.is_finite() && duration > 0.0 && current >= duration - END_EPS
 }

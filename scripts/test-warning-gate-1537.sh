@@ -34,6 +34,9 @@ assert_eq() { if [[ "$2" == "$3" ]]; then ok "$1"; else ng "$1" "期待 '$3' / �
 assert_has() { if grep -qF -- "$2" <<<"$3"; then ok "$1"; else ng "$1" "出力に無い: $2"; fi; }
 assert_lacks() { if grep -qF -- "$2" <<<"$3"; then ng "$1" "出力にある: $2"; else ok "$1"; fi; }
 
+# shellcheck source=lib/fake-exec.sh
+. "${REPO_ROOT}/scripts/lib/fake-exec.sh"
+
 TMP="$(mktemp -d)"
 trap 'rm -rf "${TMP:?}"' EXIT
 
@@ -44,7 +47,7 @@ cat >"$FAKE" <<'EOF'
 cat "$FAKE_OUT"
 exit "${FAKE_RC:-0}"
 EOF
-chmod +x "$FAKE"
+fake_exec_warm "$FAKE"
 
 run_fake() { # $1 = 出力のファイル, $2 = 終了コード, 残り = ゲートへの追加の env（VAR=値）
   local file="$1" rc="$2"
