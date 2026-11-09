@@ -45,7 +45,8 @@ const START_LIMIT: Duration = Duration::from_secs(120);
 struct Case {
     id: &'static str,
     cmd: &'static str,
-    /// 側路に書かれる終了コード（`None` = 終端エラーで包みごと止まり、側路へ書かれない = #2822 の前から）
+    /// 側路に書かれる終了コード（`None` = 側路へ書かれずに終わる。#2827 の前は終端エラーで包みごと止まってここが
+    /// `None` だった。#2827 からは終端エラーでも 1 が書かれる = `issue2827_run_pane_terminating_windows`）
     exit: Option<i32>,
     /// 画面に読めるべきエラーの本文
     needle: &'static str,
@@ -70,7 +71,7 @@ const CASES: &[Case] = &[
     Case {
         id: "stop",
         cmd: "Write-Error 'pane stop 2822' -ErrorAction Stop",
-        exit: None,
+        exit: Some(1),
         needle: "pane stop 2822",
         wrapper_51_before: true,
         position_51: Some("At line:2 char:1"),

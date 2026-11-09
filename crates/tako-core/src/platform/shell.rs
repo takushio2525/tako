@@ -516,6 +516,7 @@ mod imp {
             marker_prefix,
             exit_file,
             lang,
+            super::legacy_2827(),
         )
     }
 
@@ -713,7 +714,13 @@ fn posix_hold_on_failure_command(
 /// 終了コードの決め方は [`powershell_exit_code_script`] に、伝え方は実行ペインと同じ
 /// [`powershell_exit_report`] / [`powershell_exit_hint_line`] に任せる（規則を 2 つ持たない。#1778）。
 /// argv は呼び出し演算子（`&`）で起こす: `Invoke-Expression` と違って**語のリストのまま**
-/// 渡せるので、空白や日本語を含む引数が割れない
+/// 渡せるので、空白や日本語を含む引数が割れない。
+///
+/// #2827 から実行ペインと同じく、argv がこのプロセスの中で最上位の終端エラーになっても（`& .\x.ps1` の中の
+/// `throw` など）止まる: 1 行目の先頭に「最後まで来なかったとき」の口 [`powershell_unfinished_hook`] を置き、
+/// `-NoExit` で起こす（[`powershell_pane_args`]）。#2827 の前は包みごと止まり、ペインが黙って消えていた
+/// = #1031 の症状。あわせて 1 行目の末尾で 5.1 の `$MyInvocation` を外す（#2822 と同じ片。argv が
+/// `Write-Error` のとき包みの行が画面に出ていた）。argv は 2 行目のまま。`legacy_2827` = #2827 前の形
 #[cfg_attr(not(windows), allow(dead_code))]
 fn powershell_hold_on_failure_command(
     program: &str,
@@ -721,6 +728,7 @@ fn powershell_hold_on_failure_command(
     marker_prefix: &str,
     exit_file: Option<&std::path::Path>,
     lang: crate::i18n::Lang,
+    legacy_2827: bool,
 ) -> SpawnCommand {
     let invocation = std::iter::once(&command.program)
         .chain(command.args.iter())
@@ -728,22 +736,26 @@ fn powershell_hold_on_failure_command(
         .collect::<Vec<_>>()
         .join(" ");
     let (report, cleanup) = powershell_exit_report(marker_prefix, exit_file);
+    let hint = powershell_exit_hint_line(lang);
+    let invocation = format!("& {invocation}");
+    let (hook, exit_code) = if legacy_2827 {
+        (String::new(), powershell_exit_code_script(&invocation))
+    } else {
+        (
+            powershell_unfinished_hook(&report, &hint, &cleanup),
+            powershell_pane_exit_code_script(&invocation, false),
+        )
+    };
     let script = format!(
-        "{}if ($__tako_code -ne 0) {{\n\
+        "{hook}{exit_code}if ($__tako_code -ne 0) {{\n\
          {report}\n\
          {hint}\n\
          try {{ $null = [Console]::ReadLine() }} catch {{ }}\n\
          {cleanup}}}\nexit $__tako_code\n",
-        powershell_exit_code_script(&format!("& {invocation}")),
-        hint = powershell_exit_hint_line(lang),
     );
     SpawnCommand {
         program: program.to_string(),
-        args: vec![
-            "-NoLogo".to_string(),
-            "-EncodedCommand".to_string(),
-            encode_powershell_command(&script),
-        ],
+        args: powershell_pane_args(&script),
     }
 }
 
@@ -866,23 +878,21 @@ fn powershell_run_pane_command_1657(
 ) -> SpawnCommand {
     SpawnCommand {
         program: program.to_string(),
-        args: vec![
-            "-NoLogo".to_string(),
-            "-EncodedCommand".to_string(),
-            encode_powershell_command(&powershell_run_pane_script(
-                command,
-                marker_prefix,
-                exit_file,
-                lang,
-            )),
-        ],
+        args: powershell_pane_args(&powershell_run_pane_script(
+            command,
+            marker_prefix,
+            exit_file,
+            lang,
+        )),
     }
 }
 
 /// [`powershell_run_pane_command_1657`] が走らせるスクリプト。
 ///
 /// 5.1 の最上位の `Write-Error` で包みの行が画面に出ないよう、終了コードの片は
-/// [`powershell_pane_exit_code_script`] を通す（#2822。`TAKO_2822_LEGACY=1` で #2822 前の形）
+/// [`powershell_pane_exit_code_script`] を通す（#2822。`TAKO_2822_LEGACY=1` で #2822 前の形）。
+/// 利用者のコマンドが最上位の終端エラーで止まっても終了コード・案内・入力待ちを出す口は
+/// [`powershell_unfinished_hook`]（#2827。`TAKO_2827_LEGACY=1` で #2827 前の形）
 #[cfg_attr(not(windows), allow(dead_code))]
 fn powershell_run_pane_script(
     command: &str,
@@ -890,26 +900,46 @@ fn powershell_run_pane_script(
     exit_file: Option<&std::path::Path>,
     lang: crate::i18n::Lang,
 ) -> String {
-    powershell_run_pane_script_in(command, marker_prefix, exit_file, lang, legacy_2822())
+    powershell_run_pane_script_in(
+        command,
+        marker_prefix,
+        exit_file,
+        lang,
+        legacy_2827(),
+        legacy_2822(),
+    )
 }
 
-/// [`powershell_run_pane_script`] の本体（純粋関数。`legacy_2822` = #2822 前の形）
+/// [`powershell_run_pane_script`] の本体（純粋関数。`legacy_2827` / `legacy_2822` = それぞれの Issue の前の形。
+/// 2 つは独立 = #2827 の口は 1 行目の先頭、#2822 の片は 1 行目の末尾）。
+///
+/// #2827 の形は「1 行目の先頭に口・最後に `exit $__tako_code`」の 2 か所だけを足す。最後まで来たときの
+/// 終了コードの書き込み・案内・入力待ちは #2827 の前と 1 バイトも変わらず、最後の `exit` で `-NoExit` の
+/// ホストを抜ける（抜けないと口が 2 度目の案内を出す）
 #[cfg_attr(not(windows), allow(dead_code))]
 fn powershell_run_pane_script_in(
     command: &str,
     marker_prefix: &str,
     exit_file: Option<&std::path::Path>,
     lang: crate::i18n::Lang,
+    legacy_2827: bool,
     legacy_2822: bool,
 ) -> String {
     let (report, cleanup) = powershell_exit_report(marker_prefix, exit_file);
-    format!(
+    let hint = powershell_exit_hint_line(lang);
+    let body = format!(
         "{}{report}\n\
          {hint}\n\
          try {{ $null = [Console]::ReadLine() }} catch {{ }}\n\
          {cleanup}",
         powershell_pane_exit_code_script(command, legacy_2822),
-        hint = powershell_exit_hint_line(lang),
+    );
+    if legacy_2827 {
+        return body;
+    }
+    format!(
+        "{}{body}exit $__tako_code\n",
+        powershell_unfinished_hook(&report, &hint, &cleanup)
     )
 }
 
@@ -954,6 +984,84 @@ fn powershell_exit_hint_line(lang: crate::i18n::Lang) -> String {
         q(head),
         q(tail),
     )
+}
+
+/// 利用者のコマンドが**最後まで来なかったとき**（最上位の終端エラー = `throw` / `-ErrorAction Stop` /
+/// `$ErrorActionPreference = 'Stop'` の失敗・Ctrl+C）に、終了コード・案内・入力待ちを出す口（純粋関数。#2827）。
+/// 実行ペイン（[`powershell_run_pane_script_in`]）と失敗したときだけ止める形（[`powershell_hold_on_failure_command`]）の
+/// 1 行目の**先頭**に置き（利用者のコマンドは 2 行目のまま = `At line:2` / `2 |` の行番号を変えない）、
+/// [`powershell_pane_args`] が `-NoExit` で起こす。
+///
+/// #2827 の前は終端エラーで包みのスクリプト全体が止まり、後ろの側路への書き込み・案内・入力待ちが走らなかった
+/// （Windows の CI で 5.1 / pwsh 7 とも側路が空 = `code=None`、ペインはエラーを出してすぐ閉じる）。
+///
+/// - **利用者のコマンドを `try` / `trap` で囲まない**: どれも PowerShell の意味を変える（pwsh 7.6 で実測）。
+///   `try { } catch { }`・`try { } finally { }`・最上位の `trap` のどれかがあると、文だけを止めるエラー
+///   （`[int]::Parse('x')` やコマンドの打ち間違い）が囲いまで巻き上がり、修正前は続きが走っていた形
+///   （`f; Write-Host 後` の `f` の中の残り、`& .\x.ps1` の中の残り、同じ行の後ろの文）が走らなくなる
+/// - **代わりにホストに任せる**: `-NoExit` のホストは、スクリプトが終端エラーで止まるといつもの形でエラーを表示し、
+///   対話へ移る前に `prompt` を呼ぶ。ここで `prompt` を差し替えておき、最後まで来なかったときだけ案内と入力待ちを出す。
+///   エラーの表示はホスト自身のもの（修正前と同じ字面・同じ色・同じ位置の行）
+/// - 最後まで来たかは `$__tako_code` で見る（口と同じ 1 行目で `$null` にし、最後まで来た包みの判定の行が値を入れる。
+///   利用者が `Set-StrictMode` を立てても未定義の参照で止まらない）。来なかったときの終了コードは共有の片の失敗の腕と
+///   同じ規則（[`POWERSHELL_UNFINISHED_CODE`]。`cmd /c exit 7; throw 'x'` は 7）
+/// - **`prompt` の中の `exit` はホストに飲まれて終わらない**（既定の `PS>` が出て対話シェルに落ちる。pwsh 7.6 で実測）
+///   ので `[Environment]::Exit` で抜ける。制約付き言語モードで .NET の呼び出しが止められたら `Stop-Process -Id $PID`。
+///   入力待ちで Ctrl+C を押しても対話へ落ちないよう、抜けるのは `finally`
+/// - 利用者のコマンドの `exit N` は `-NoExit` でもそのまま N で抜ける（口は呼ばれない = 修正前と同じ）。最後まで来た
+///   包みは最後に `exit $__tako_code` で抜ける（口は呼ばれない）
+/// - Ctrl+C で利用者のコマンドを止めたときも口に来る（ホストは止めたパイプラインを `$Error` に残さないので
+///   終端エラーと見分けられない）。修正前はペインが閉じていた。#2827 からは終了コード（`$LASTEXITCODE` か 1）と
+///   案内を出して Enter を待つ
+#[cfg_attr(not(windows), allow(dead_code))]
+fn powershell_unfinished_hook(report: &str, hint: &str, cleanup: &str) -> String {
+    let tell = [
+        POWERSHELL_UNFINISHED_CODE,
+        report,
+        &hint.replace('\n', "; "),
+        "try { $null = [Console]::ReadLine() } catch { }",
+    ]
+    .join("; ");
+    let cleanup = cleanup.trim_end();
+    let leave = if cleanup.is_empty() {
+        POWERSHELL_UNFINISHED_EXIT.to_string()
+    } else {
+        format!("{cleanup}; {POWERSHELL_UNFINISHED_EXIT}")
+    };
+    format!(
+        "{POWERSHELL_UNFINISHED_HEAD}try {{ if ($null -eq $__tako_code) {{ {tell} }} }} finally {{ {leave} }} }}; \
+         $__tako_code = $null; "
+    )
+}
+
+/// [`powershell_unfinished_hook`] の書き出し（[`powershell_pane_args`] はスクリプトがこれで始まるときだけ `-NoExit` を付ける）
+#[cfg_attr(not(windows), allow(dead_code))]
+const POWERSHELL_UNFINISHED_HEAD: &str = "function global:prompt { ";
+
+/// 最後まで来なかったときの終了コード（#2827）。共有の片（[`powershell_exit_code_script_in`]）の
+/// `$__tako_ok` が偽の腕と同じ規則（ネイティブの子の非 0 が残っていればその値、無ければ 1）
+#[cfg_attr(not(windows), allow(dead_code))]
+const POWERSHELL_UNFINISHED_CODE: &str = "if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { $__tako_code = $LASTEXITCODE } else { $__tako_code = 1 }";
+
+/// 口から抜ける片（#2827。`prompt` の中の `exit` は効かない。制約付き言語モードでは `Stop-Process`）
+#[cfg_attr(not(windows), allow(dead_code))]
+const POWERSHELL_UNFINISHED_EXIT: &str =
+    "try { [Environment]::Exit($__tako_code) } catch { Stop-Process -Id $PID }";
+
+/// 実行ペインと失敗したときだけ止める形の PowerShell の引数（#2827）。
+///
+/// `-NoExit` は包みが [`powershell_unfinished_hook`] で始まるときだけ付ける。口と `-NoExit` を同じ字面から決めるので、
+/// 「口が無いのに `-NoExit` でホストが対話に落ちる」「口があるのに `-NoExit` が無くて呼ばれない」形を組めない。
+/// `TAKO_2827_LEGACY=1`（口を置かない）では #2827 前と同じ `-NoLogo -EncodedCommand <本文>`
+#[cfg_attr(not(windows), allow(dead_code))]
+fn powershell_pane_args(script: &str) -> Vec<String> {
+    let mut args = vec!["-NoLogo".to_string()];
+    if script.starts_with(POWERSHELL_UNFINISHED_HEAD) {
+        args.push("-NoExit".to_string());
+    }
+    args.push("-EncodedCommand".to_string());
+    args.push(encode_powershell_command(script));
+    args
 }
 
 /// Windows の実行ペイン用コマンド（純粋関数。**macOS 上でもテストできる**）。
@@ -1202,6 +1310,17 @@ fn legacy_2822() -> bool {
     std::env::var_os(ISSUE2822_LEGACY_ENV).is_some()
 }
 
+/// #2827 の A/B の env（`1` で #2827 前の形 = 実行ペインと失敗したときだけ止める形が `-NoExit` も
+/// [`powershell_unfinished_hook`] も持たず、利用者のコマンドの最上位の終端エラーで包みごと止まる。失敗したときだけ止める形は
+/// 5.1 の `$MyInvocation` も外さない）。#2822 / #2812 / #2790 / #2828 とは独立（#2822 の片は 1 行目の末尾、#2827 の口は先頭）。
+/// #1657 前の形（`TAKO_1657_LEGACY=1` の [`powershell_run_script`]）は #2827 でも変えない
+pub const ISSUE2827_LEGACY_ENV: &str = "TAKO_2827_LEGACY";
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn legacy_2827() -> bool {
+    std::env::var_os(ISSUE2827_LEGACY_ENV).is_some()
+}
+
 /// [`output_command`] の共通部分（argv を `Command` へ移して副作用の抑止を掛ける）
 fn build_output_command(spawn: &SpawnCommand) -> std::process::Command {
     let mut command = std::process::Command::new(&spawn.program);
@@ -1378,6 +1497,44 @@ pub const POWERSHELL_CLIXML_MARK: &str = "#< CLIXML";
 /// `acceptance_gates::format_evidence`）
 pub fn powershell_stderr_text(raw: &str) -> std::borrow::Cow<'_, str> {
     powershell_stderr_text_in(raw, !legacy_2812())
+}
+
+/// 導入代行（`setup_bootstrap::run_installer`）が捕捉した出力 1 本（stdout か、[`powershell_stderr_text`] を通した
+/// stderr）を、断りの文と応答へ載せる改行にする（#2828）。`program` は起こしたインタプリタ。
+///
+/// Windows の PowerShell（5.1 / pwsh 7）は捕捉された stdout / stderr へ改行を CRLF で書く（`Write-Host`・起動片の
+/// `[Console]::Error.WriteLine`・host のエラー）。[`powershell_stderr_text`] が LF へ揃えるのは CLIXML を戻したときだけ
+/// （CLIXML でない入力は 1 バイトも変えない = #2800。受け入れゲートの evidence も同じ口を通る）なので、pwsh 7 の平文と
+/// stdout の CR が断りの文（`SetupRefusal` の `log`）へ残り、CLI / MCP / 設定画面へ返る文の行が CR で割れていた
+/// （#2790 から。Windows の CI のログで実測）。
+///
+/// - インタプリタが PowerShell のときだけ揃える（判定は [`ShellDialect::from_program`] の 1 実装）。bash / sh の
+///   インストーラ（macOS ほか）の出力は借用のまま返す = 修正前とバイト一致
+/// - CRLF を LF に、**単独の CR も LF に**する（[`newlines_to_lf`]）。単独の CR はネイティブの子の進捗表示などが行頭へ
+///   戻るのに使うもので、端末の上書きを真似て前の文字を捨てると本文が消えうる。LF にすれば 1 文字も落とさない
+/// - `TAKO_2828_LEGACY=1` で揃えない形（#2828 前）に戻る。ゲートの evidence（[`powershell_stderr_text`] だけを通る）には
+///   届かない
+pub fn powershell_captured_text<'a>(program: &str, text: &'a str) -> std::borrow::Cow<'a, str> {
+    if legacy_2828() || ShellDialect::from_program(program) != Some(ShellDialect::PowerShell) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    newlines_to_lf(text)
+}
+
+/// CRLF と単独の CR を LF へ揃える（純粋関数。#2828）。CR を含まなければ借用のまま返す
+pub fn newlines_to_lf(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('\r') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    std::borrow::Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+}
+
+/// #2828 の A/B の env（`1` で #2828 前の形 = 導入代行が捕捉した PowerShell の出力の CR を断りの文へそのまま載せる）。
+/// #2790 / #2812 / #2822 / #2827 とは独立
+pub const ISSUE2828_LEGACY_ENV: &str = "TAKO_2828_LEGACY";
+
+fn legacy_2828() -> bool {
+    std::env::var_os(ISSUE2828_LEGACY_ENV).is_some()
 }
 
 /// [`powershell_stderr_text`] の本体（純粋関数。`strip_ansi` = 塊から戻した文字の色の符号を除く = #2812）
@@ -1862,14 +2019,17 @@ mod tests_1031 {
         );
         assert!(!script.contains("rm -f"), "{script}");
         let ps = decode_powershell_command(
-            &powershell_hold_on_failure_command(
+            powershell_hold_on_failure_command(
                 "pwsh.exe",
                 &cmd(&["npm", "run", "dev"]),
                 "__TAKO_EXIT=",
                 None,
                 Lang::En,
+                false,
             )
-            .args[2],
+            .args
+            .last()
+            .expect("本文"),
         );
         assert!(
             ps.contains("Write-Host ('__TAKO_EXIT=' + $__tako_code)\n"),
@@ -2011,12 +2171,14 @@ mod tests_1031 {
     fn 失敗時だけ止めるpowershell片の構造() {
         let file =
             std::path::Path::new("C:\\Users\\winuser\\AppData\\Roaming\\tako\\run-exit\\12.code");
+        // #1031 の形そのものを見る（#2827 の口と 5.1 の片は 1 行目に足すだけ = tests_2827）
         let got = powershell_hold_on_failure_command(
             "pwsh.exe",
             &cmd(&["npm", "run dev", "it's"]),
             "__TAKO_EXIT=",
             Some(file),
             Lang::Ja,
+            true,
         );
         assert_eq!(got.program, "pwsh.exe");
         assert_eq!(got.args[0], "-NoLogo");
@@ -3145,12 +3307,13 @@ mod tests_1657 {
         let got =
             powershell_run_pane_command_1657(PWSH, "cargo test", MARKER, Some(file), Lang::Ja);
         assert_eq!(got.program, PWSH);
-        // 切り出し安全: args は引数の Vec
-        assert_eq!(&got.args[..2], ["-NoLogo", "-EncodedCommand"]);
-        let script = decode_powershell_command(&got.args[2]);
-        // 終了コードの決め方は PTY 無しの実行と同じ 1 実装（#935。ペインは 1 行目に 5.1 の片を足す = #2822）
+        // 切り出し安全: args は引数の Vec。`-NoExit` は最後まで来なかったときの口のため（#2827）
+        assert_eq!(&got.args[..3], ["-NoLogo", "-NoExit", "-EncodedCommand"]);
+        let script = decode_powershell_command(&got.args[3]);
+        // 終了コードの決め方は PTY 無しの実行と同じ 1 実装（#935。ペインは 1 行目に 5.1 の片を足す = #2822、
+        // 先頭に #2827 の口を足す）
         assert!(
-            script.starts_with(&powershell_pane_exit_code_script("cargo test", false)),
+            script.contains(&powershell_pane_exit_code_script("cargo test", false)),
             "{script}"
         );
         let quoted = "'C:\\Users\\winuser\\AppData\\Roaming\\tako\\run-exit\\12.code'";
@@ -3174,10 +3337,10 @@ mod tests_1657 {
             .expect("後片付け");
         assert!(read_at < rm_at, "{script}");
         // 引用符・空白を含んでも符号化の外へ漏れない（#906 の二重パディングも無い）
-        assert!(got.args[2]
+        assert!(got.args[3]
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b)));
-        assert!(!got.args[2].ends_with("=="));
+        assert!(!got.args[3].ends_with("=="));
     }
 
     /// 書き先の単引用符は PowerShell 流に二重化する（`tako's` のようなフォルダ名）
@@ -3633,11 +3796,13 @@ mod tests_2822 {
         for (what, new, old) in [
             (
                 "#1657 の形",
+                // #2822 の片だけを見る（#2827 の口は 1 行目の先頭に足すだけ = tests_2827 が見る）
                 powershell_run_pane_script_in(
                     "Write-Error 'x'",
                     "__TAKO_EXIT=",
                     Some(file),
                     Lang::Ja,
+                    true,
                     false,
                 ),
                 powershell_run_pane_script_in(
@@ -3645,6 +3810,7 @@ mod tests_2822 {
                     "__TAKO_EXIT=",
                     Some(file),
                     Lang::Ja,
+                    true,
                     true,
                 ),
             ),
@@ -3740,5 +3906,516 @@ mod tests_2822 {
             "TAKO_2812_LEGACY がゲートの包みを戻さない"
         );
         std::env::remove_var(ISSUE2812_LEGACY_ENV);
+    }
+}
+
+#[cfg(test)]
+mod tests_2827 {
+    use super::*;
+    use crate::i18n::Lang;
+
+    const FILE: &str = "C:\\Users\\winuser\\AppData\\Roaming\\tako\\run-exit\\3.code";
+
+    /// 実行ペインの包みの #2827 前の字面（#2822 の後。修正前のコードで採った値）
+    const PANE_BEFORE_JA: &str = "$global:LASTEXITCODE = $null; if ($PSVersionTable.PSVersion.Major -le 5) { $MyInvocation = $null }\n\
+        Write-Error 'x'\n\
+        $__tako_ok = $?\n\
+        if ($__tako_ok) { $__tako_code = 0 }\n\
+        elseif ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { $__tako_code = $LASTEXITCODE }\n\
+        else { $__tako_code = 1 }\n\
+        try { Set-Content -LiteralPath 'C:\\Users\\winuser\\AppData\\Roaming\\tako\\run-exit\\3.code' -Value ([string]$__tako_code) -Encoding ascii -ErrorAction Stop } catch { }\n\
+        Write-Host ''\n\
+        Write-Host ('[tako] 終了コード ' + $__tako_code + ' / Enter でこのペインを閉じます') -ForegroundColor DarkGray\n\
+        try { $null = [Console]::ReadLine() } catch { }\n\
+        Remove-Item -LiteralPath 'C:\\Users\\winuser\\AppData\\Roaming\\tako\\run-exit\\3.code' -ErrorAction SilentlyContinue\n";
+
+    /// 同じく側路の無い英語の形（画面のマーカーで伝える退避路）
+    const PANE_BEFORE_EN_NO_FILE: &str = "$global:LASTEXITCODE = $null; if ($PSVersionTable.PSVersion.Major -le 5) { $MyInvocation = $null }\n\
+        Write-Error 'x'\n\
+        $__tako_ok = $?\n\
+        if ($__tako_ok) { $__tako_code = 0 }\n\
+        elseif ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { $__tako_code = $LASTEXITCODE }\n\
+        else { $__tako_code = 1 }\n\
+        Write-Host ('__TAKO_EXIT=' + $__tako_code)\n\
+        Write-Host ''\n\
+        Write-Host ('[tako] Exit code ' + $__tako_code + ' / Press Enter to close this pane') -ForegroundColor DarkGray\n\
+        try { $null = [Console]::ReadLine() } catch { }\n";
+
+    /// `split --command` の失敗したときだけ止める形の #2827 前の字面（修正前のコードで採った値）
+    const HOLD_BEFORE_JA: &str = "$global:LASTEXITCODE = $null\n\
+        & 'Write-Error' 'x y'\n\
+        $__tako_ok = $?\n\
+        if ($__tako_ok) { $__tako_code = 0 }\n\
+        elseif ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { $__tako_code = $LASTEXITCODE }\n\
+        else { $__tako_code = 1 }\n\
+        if ($__tako_code -ne 0) {\n\
+        try { Set-Content -LiteralPath 'C:\\Users\\winuser\\AppData\\Roaming\\tako\\run-exit\\3.code' -Value ([string]$__tako_code) -Encoding ascii -ErrorAction Stop } catch { }\n\
+        Write-Host ''\n\
+        Write-Host ('[tako] 終了コード ' + $__tako_code + ' / Enter でこのペインを閉じます') -ForegroundColor DarkGray\n\
+        try { $null = [Console]::ReadLine() } catch { }\n\
+        Remove-Item -LiteralPath 'C:\\Users\\winuser\\AppData\\Roaming\\tako\\run-exit\\3.code' -ErrorAction SilentlyContinue\n\
+        }\n\
+        exit $__tako_code\n";
+
+    fn write_error_argv() -> SpawnCommand {
+        SpawnCommand {
+            program: "Write-Error".into(),
+            args: vec!["x y".into()],
+        }
+    }
+
+    fn file() -> &'static std::path::Path {
+        std::path::Path::new(FILE)
+    }
+
+    /// argv の本文（最後の引数）を復号する（符号化は `==` を避けて末尾に空白を 1 つ足すことがある = #906）
+    fn script_of(args: &[String]) -> String {
+        let script = decode_powershell_command(args.last().expect("本文"));
+        script
+            .strip_suffix(' ')
+            .map(str::to_string)
+            .unwrap_or(script)
+    }
+
+    /// A/B: `TAKO_2827_LEGACY=1` の形は #2827 前の製品の包み・argv と 1 バイトも違わない
+    #[test]
+    fn issue2827_旧形は修正前とバイト一致() {
+        assert_eq!(
+            powershell_run_pane_script_in(
+                "Write-Error 'x'",
+                "__TAKO_EXIT=",
+                Some(file()),
+                Lang::Ja,
+                true,
+                false
+            ),
+            PANE_BEFORE_JA
+        );
+        assert_eq!(
+            powershell_run_pane_script_in(
+                "Write-Error 'x'",
+                "__TAKO_EXIT=",
+                None,
+                Lang::En,
+                true,
+                false
+            ),
+            PANE_BEFORE_EN_NO_FILE
+        );
+        assert_eq!(
+            powershell_pane_args(PANE_BEFORE_JA),
+            vec![
+                "-NoLogo".to_string(),
+                "-EncodedCommand".to_string(),
+                encode_powershell_command(PANE_BEFORE_JA)
+            ]
+        );
+        let hold = powershell_hold_on_failure_command(
+            "powershell.exe",
+            &write_error_argv(),
+            "__TAKO_EXIT=",
+            Some(file()),
+            Lang::Ja,
+            true,
+        );
+        assert_eq!(hold.program, "powershell.exe");
+        assert_eq!(
+            hold.args,
+            vec![
+                "-NoLogo".to_string(),
+                "-EncodedCommand".to_string(),
+                encode_powershell_command(HOLD_BEFORE_JA)
+            ]
+        );
+    }
+
+    /// 受け入れゲートの経路（PTY 無しの包みと argv）と macOS の経路は #2827 の前後でバイト一致（受け入れ条件 5）
+    #[test]
+    fn issue2827_ゲートとmacosの経路は修正前とバイト一致() {
+        let shared = "$global:LASTEXITCODE = $null\n\
+            cargo test\n\
+            $__tako_ok = $?\n\
+            if ($__tako_ok) { $__tako_code = 0 }\n\
+            elseif ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { $__tako_code = $LASTEXITCODE }\n\
+            else { $__tako_code = 1 }\n";
+        assert_eq!(powershell_exit_code_script("cargo test"), shared);
+        let gate = format!(
+            "try {{ [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 }} catch {{ }}\n\
+             $ProgressPreference = 'SilentlyContinue'; if ($PSVersionTable.PSVersion.Major -le 5) {{ $MyInvocation = $null }}\n\
+             {shared}exit $__tako_code\n"
+        );
+        assert_eq!(powershell_output_script_in("cargo test", false), gate);
+        let argv = powershell_output_argv("pwsh.exe", "cargo test");
+        assert_eq!(
+            // 切り出し安全: args は引数の Vec（文字列の添字ではない）
+            &argv.args[..3],
+            ["-NoLogo", "-NoProfile", "-EncodedCommand"],
+            "ゲートは -NoExit を持たない（終わったら親へ終了コードを返す）"
+        );
+        assert!(!script_of(&argv.args).contains(POWERSHELL_UNFINISHED_HEAD));
+
+        let pfile = std::path::Path::new("/tmp/tako-2827/run-exit/1.code");
+        assert_eq!(
+            posix_run_pane_script("cargo test", "__TAKO_EXIT=", Some(pfile), Lang::Ja),
+            "cargo test\n\
+             __tako_code=$?\n\
+             { printf '%s\\n' \"$__tako_code\" > /tmp/tako-2827/run-exit/1.code; } 2>/dev/null\n\
+             printf '\\n\\033[2m%s%s%s\\033[0m\\n' '[tako] 終了コード ' \"$__tako_code\" ' / Enter でこのペインを閉じます'\n\
+             read -r __TAKO_DUMMY__ 2>/dev/null || true\n\
+             rm -f /tmp/tako-2827/run-exit/1.code 2>/dev/null"
+        );
+        let hold = posix_hold_on_failure_command(
+            &write_error_argv(),
+            "__TAKO_EXIT=",
+            Some(pfile),
+            Lang::Ja,
+        );
+        assert_eq!(
+            (hold.program.as_str(), hold.args.as_slice()),
+            (
+                "/bin/sh",
+                &[
+                    "-c".to_string(),
+                    "Write-Error 'x y'\n\
+                     __tako_code=$?\n\
+                     if [ \"$__tako_code\" -ne 0 ]; then\n\
+                     { printf '%s\\n' \"$__tako_code\" > /tmp/tako-2827/run-exit/1.code; } 2>/dev/null\n\
+                     printf '\\n\\033[2m%s%s%s\\033[0m\\n' '[tako] 終了コード ' \"$__tako_code\" ' / Enter でこのペインを閉じます'\n\
+                     read -r __TAKO_HOLD__ 2>/dev/null || true\n\
+                     rm -f /tmp/tako-2827/run-exit/1.code 2>/dev/null\n\
+                     fi\n\
+                     exit \"$__tako_code\""
+                        .to_string()
+                ][..]
+            )
+        );
+    }
+
+    /// 実行ペインの新しい形（#2827）: 足すのは「1 行目の先頭の口」と「最後の `exit`」の 2 か所だけ。
+    /// 利用者のコマンドは 2 行目のまま（`At line:2` / `2 |` を変えない）
+    #[test]
+    fn issue2827_実行ペインは1行目の先頭に口を置き利用者のコマンドは2行目のまま() {
+        for (lang, exit_file, before) in [
+            (Lang::Ja, Some(file()), PANE_BEFORE_JA),
+            (Lang::En, None, PANE_BEFORE_EN_NO_FILE),
+        ] {
+            let got = powershell_run_pane_script_in(
+                "Write-Error 'x'",
+                "__TAKO_EXIT=",
+                exit_file,
+                lang,
+                false,
+                false,
+            );
+            let (report, cleanup) = powershell_exit_report("__TAKO_EXIT=", exit_file);
+            let hook =
+                powershell_unfinished_hook(&report, &powershell_exit_hint_line(lang), &cleanup);
+            assert_eq!(got, format!("{hook}{before}exit $__tako_code\n"));
+            let lines: Vec<&str> = got.lines().collect();
+            assert!(lines[0].starts_with(POWERSHELL_UNFINISHED_HEAD), "{got}");
+            assert!(
+                lines[0].ends_with(POWERSHELL_51_FORGET_INVOCATION),
+                "#2822 の片は 1 行目の末尾のまま: {got}"
+            );
+            assert_eq!(
+                lines[1], "Write-Error 'x'",
+                "利用者のコマンドが 2 行目でない: {got}"
+            );
+            let args = powershell_pane_args(&got);
+            // 切り出し安全: args は引数の Vec（文字列の添字ではない）
+            assert_eq!(&args[..3], ["-NoLogo", "-NoExit", "-EncodedCommand"]);
+            assert_eq!(script_of(&args), got);
+        }
+    }
+
+    /// 口（#2827）の中身: 1 行に収まり、最後まで来なかったときだけ終了コード・側路・案内・入力待ちを出し、
+    /// `finally` で後片付けして `[Environment]::Exit`（`prompt` の中の `exit` は効かない）で抜ける
+    #[test]
+    fn issue2827_口は最後まで来なかったときだけ伝えてfinallyで抜ける() {
+        let (report, cleanup) = powershell_exit_report("__TAKO_EXIT=", Some(file()));
+        let hint = powershell_exit_hint_line(Lang::Ja);
+        let hook = powershell_unfinished_hook(&report, &hint, &cleanup);
+        assert!(
+            !hook.contains('\n'),
+            "口は 1 行目に収める（利用者のコマンドの行番号を変えない）: {hook}"
+        );
+        assert!(
+            hook.starts_with("function global:prompt { try { if ($null -eq $__tako_code) { "),
+            "{hook}"
+        );
+        assert!(hook.ends_with("}; $__tako_code = $null; "), "{hook}");
+        let gate_at = hook
+            .find("if ($null -eq $__tako_code)")
+            .expect("最後まで来たかの判定");
+        let code_at = hook
+            .find(POWERSHELL_UNFINISHED_CODE)
+            .expect("終了コードの規則");
+        let report_at = hook.find(&report).expect("側路へ書く");
+        let hint_at = hook.find(&hint.replace('\n', "; ")).expect("案内");
+        let read_at = hook.find("[Console]::ReadLine()").expect("入力待ち");
+        let finally_at = hook.find("} finally { ").expect("finally");
+        let rm_at = hook.find(cleanup.trim_end()).expect("後片付け");
+        let exit_at = hook.find(POWERSHELL_UNFINISHED_EXIT).expect("抜ける");
+        assert!(
+            gate_at < code_at
+                && code_at < report_at
+                && report_at < hint_at
+                && hint_at < read_at
+                && read_at < finally_at
+                && finally_at < rm_at
+                && rm_at < exit_at,
+            "並びが違う: {hook}"
+        );
+        assert!(
+            POWERSHELL_UNFINISHED_EXIT.contains("[Environment]::Exit($__tako_code)")
+                && POWERSHELL_UNFINISHED_EXIT.contains("Stop-Process -Id $PID"),
+            "{POWERSHELL_UNFINISHED_EXIT}"
+        );
+        assert!(
+            !hook.contains("exit $"),
+            "prompt の中の exit はホストに飲まれる: {hook}"
+        );
+        // 側路が無いときは画面のマーカー（退避路）と案内、後片付けは無い
+        let (marker, none) = powershell_exit_report("__TAKO_EXIT=", None);
+        let bare = powershell_unfinished_hook(&marker, &powershell_exit_hint_line(Lang::En), &none);
+        assert!(
+            bare.contains("Write-Host ('__TAKO_EXIT=' + $__tako_code)"),
+            "{bare}"
+        );
+        assert!(
+            bare.contains("} finally { try { [Environment]::Exit"),
+            "{bare}"
+        );
+        assert!(!bare.contains("Remove-Item"), "{bare}");
+    }
+
+    /// 最後まで来なかったときの終了コードは、共有の片の `$__tako_ok` が偽の腕と同じ規則（規則を 2 つに割らない）
+    #[test]
+    fn issue2827_最後まで来なかったときの終了コードは共有の片の失敗の腕と同じ規則() {
+        let shared = powershell_exit_code_script("x");
+        for piece in [
+            "($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { $__tako_code = $LASTEXITCODE }",
+            "{ $__tako_code = 1 }",
+        ] {
+            assert!(shared.contains(piece), "共有の片: {shared}");
+            assert!(
+                POWERSHELL_UNFINISHED_CODE.contains(piece),
+                "{POWERSHELL_UNFINISHED_CODE}"
+            );
+        }
+    }
+
+    /// 失敗したときだけ止める形の新しい形（#2827）: 1 行目の先頭に口、末尾に 5.1 の片（#2822 と同じ）を足すだけ。
+    /// argv は 2 行目のまま
+    #[test]
+    fn issue2827_失敗時だけ止める形も口と51の片を1行目に足すだけ() {
+        let got = powershell_hold_on_failure_command(
+            "powershell.exe",
+            &write_error_argv(),
+            "__TAKO_EXIT=",
+            Some(file()),
+            Lang::Ja,
+            false,
+        );
+        // 切り出し安全: args は引数の Vec（文字列の添字ではない）
+        assert_eq!(&got.args[..3], ["-NoLogo", "-NoExit", "-EncodedCommand"]);
+        let script = script_of(&got.args);
+        let (report, cleanup) = powershell_exit_report("__TAKO_EXIT=", Some(file()));
+        let hook =
+            powershell_unfinished_hook(&report, &powershell_exit_hint_line(Lang::Ja), &cleanup);
+        assert_eq!(
+            script,
+            format!(
+                "{hook}{}",
+                HOLD_BEFORE_JA.replacen(
+                    "$global:LASTEXITCODE = $null\n",
+                    &format!("$global:LASTEXITCODE = $null{POWERSHELL_51_FORGET_INVOCATION}\n"),
+                    1
+                )
+            )
+        );
+        let lines: Vec<&str> = script.lines().collect();
+        assert_eq!(
+            lines[1], "& 'Write-Error' 'x y'",
+            "argv が 2 行目でない: {script}"
+        );
+    }
+
+    /// `-NoExit` は口で始まる包みにだけ付く（口と `-NoExit` を食い違わせない）
+    #[test]
+    fn issue2827_noexitは口で始まる包みにだけ付く() {
+        assert_eq!(
+            powershell_pane_args("Write-Host x"),
+            vec![
+                "-NoLogo".to_string(),
+                "-EncodedCommand".to_string(),
+                encode_powershell_command("Write-Host x")
+            ]
+        );
+        let hooked = format!("{POWERSHELL_UNFINISHED_HEAD}}}\nWrite-Host x");
+        assert!(powershell_pane_args(&hooked).iter().any(|a| a == "-NoExit"));
+        // #1657 前の形（TAKO_1657_LEGACY）は #2827 でも変えない
+        let legacy_1657 = powershell_run_pane_command("pwsh.exe", "x", "__TAKO_EXIT=");
+        // 切り出し安全: args は引数の Vec（文字列の添字ではない）
+        assert_eq!(&legacy_1657.args[..2], ["-NoLogo", "-EncodedCommand"]);
+    }
+
+    /// 既定の入口（env を読む）は修正後の形。`TAKO_2827_LEGACY=1` で走らせるとここが名指しで落ちる
+    #[test]
+    fn issue2827_既定の入口は修正後の形() {
+        let pane =
+            powershell_run_pane_command_1657("pwsh.exe", "x", "__TAKO_EXIT=", None, Lang::En);
+        assert!(
+            pane.args.iter().any(|a| a == "-NoExit")
+                && script_of(&pane.args).starts_with(POWERSHELL_UNFINISHED_HEAD),
+            "実行ペインが #2827 前の形（{ISSUE2827_LEGACY_ENV} が立っている？）: {:?}",
+            pane.args
+        );
+    }
+
+    /// `TAKO_2827_LEGACY=1` は #2827 の口だけを戻し、#2822 の片とゲートの包みは動かさない。
+    /// 逆に `TAKO_2822_LEGACY=1` は #2827 の口を動かさない（独立した A/B）
+    #[test]
+    fn issue2827_旧形の門は2822と独立() {
+        if crate::run_alone!(issue2827_旧形の門は2822と独立) {
+            return;
+        }
+        let gate = powershell_output_script("cargo test");
+        std::env::set_var(ISSUE2827_LEGACY_ENV, "1");
+        let pane = powershell_run_pane_script("x", "__TAKO_EXIT=", None, Lang::En);
+        assert!(!pane.starts_with(POWERSHELL_UNFINISHED_HEAD), "{pane}");
+        assert!(
+            pane.contains(POWERSHELL_51_FORGET_INVOCATION),
+            "#2822 の片まで戻った: {pane}"
+        );
+        assert_eq!(powershell_output_script("cargo test"), gate);
+        std::env::remove_var(ISSUE2827_LEGACY_ENV);
+
+        std::env::set_var(ISSUE2822_LEGACY_ENV, "1");
+        let pane = powershell_run_pane_script("x", "__TAKO_EXIT=", None, Lang::En);
+        assert!(
+            pane.starts_with(POWERSHELL_UNFINISHED_HEAD),
+            "TAKO_2822_LEGACY が #2827 の口を外した: {pane}"
+        );
+        assert!(!pane.contains("$MyInvocation"), "{pane}");
+        std::env::remove_var(ISSUE2822_LEGACY_ENV);
+    }
+}
+
+#[cfg(test)]
+mod tests_2828 {
+    use super::*;
+    use std::borrow::Cow;
+
+    /// CRLF も単独の CR も LF に揃え、CR 以外の文字は 1 つも落とさない（受け入れ条件: 本文は消えない）
+    #[test]
+    fn issue2828_改行はcrlfも単独のcrもlfへ揃え本文を落とさない() {
+        for (raw, want) in [
+            ("a\r\nb\r\n", "a\nb\n"),
+            // 進捗の上書き（単独の CR）と本文の途中の CRLF
+            (
+                "50%\r100%\r\ninstall failed: x\r\ndone",
+                "50%\n100%\ninstall failed: x\ndone",
+            ),
+            ("x\r\r\ny", "x\n\ny"),
+            ("end\r", "end\n"),
+            ("\r", "\n"),
+        ] {
+            let got = newlines_to_lf(raw);
+            assert_eq!(got, want, "{raw:?}");
+            assert!(!got.contains('\r'), "{raw:?}");
+            assert_eq!(
+                got.replace('\n', ""),
+                raw.replace(['\r', '\n'], ""),
+                "改行以外の文字が消えた: {raw:?}"
+            );
+        }
+        let plain = "no cr\nhere";
+        assert!(matches!(newlines_to_lf(plain), Cow::Borrowed(r) if r == plain));
+    }
+
+    /// 揃えるのはインタプリタが PowerShell（5.1 / pwsh 7）のときだけ。bash / sh のインストーラ（macOS ほか）は
+    /// 借用のまま = 修正前とバイト一致（受け入れ条件: macOS の経路）
+    #[test]
+    fn issue2828_揃えるのはpowershellのインタプリタだけ() {
+        for program in [
+            "powershell",
+            "powershell.exe",
+            "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+            "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+            "pwsh",
+        ] {
+            assert_eq!(
+                powershell_captured_text(program, "a\r\nb\rc"),
+                "a\nb\nc",
+                "{program}"
+            );
+        }
+        let raw = "a\r\nb\rc";
+        for program in ["bash", "/bin/bash", "sh", "/bin/sh"] {
+            assert!(
+                matches!(powershell_captured_text(program, raw), Cow::Borrowed(r) if r == raw),
+                "{program}"
+            );
+        }
+    }
+
+    /// 製品のレシピの表（`agent_install::recipe`）で: macOS の 3 系統のインタプリタ（bash / sh）は借用のまま、
+    /// Windows の 3 系統（PowerShell）は揃える。表が変わってもここが追う
+    #[test]
+    fn issue2828_レシピの表でmacosは借用のままwindowsは揃える() {
+        use crate::platform::agent_install::{recipe, AgentKind};
+        use crate::platform::support::Platform;
+        let raw = "progress 10%\rprogress 100%\r\ninstall failed";
+        for agent in AgentKind::ALL {
+            let mac = recipe(Platform::MacOs, agent).runner;
+            for program in mac.candidates.iter().copied().chain([mac.fallback]) {
+                assert!(
+                    matches!(powershell_captured_text(program, raw), Cow::Borrowed(r) if r == raw),
+                    "{agent:?} {program}"
+                );
+            }
+            let win = recipe(Platform::Windows, agent).runner;
+            for program in win.candidates.iter().copied().chain([win.fallback]) {
+                assert_eq!(
+                    powershell_captured_text(program, raw),
+                    "progress 10%\nprogress 100%\ninstall failed",
+                    "{agent:?} {program}"
+                );
+            }
+        }
+    }
+
+    /// 受け入れゲートの evidence が通る平文化（`powershell_stderr_text`）は #2828 で変えない
+    /// （CLIXML でない入力は借用のまま = #2800）
+    #[test]
+    fn issue2828_ゲートの平文化は変えない() {
+        let raw = "line 1\r\nline 2\r";
+        assert!(matches!(powershell_stderr_text(raw), Cow::Borrowed(r) if r == raw));
+    }
+
+    /// 既定の入口は修正後の形。`TAKO_2828_LEGACY=1` で走らせるとここが名指しで落ちる
+    #[test]
+    fn issue2828_既定の入口は修正後の形() {
+        assert_eq!(
+            powershell_captured_text("pwsh.exe", "a\r\nb"),
+            "a\nb",
+            "導入代行の出力の CR が残る（{ISSUE2828_LEGACY_ENV} が立っている？）"
+        );
+    }
+
+    /// `TAKO_2828_LEGACY=1` は CR を残す形（#2828 前）に戻す。#2827 の門は #2828 に効かない（独立した A/B）
+    #[test]
+    fn issue2828_旧形の門は2827と独立() {
+        if crate::run_alone!(issue2828_旧形の門は2827と独立) {
+            return;
+        }
+        let raw = "a\r\nb";
+        std::env::set_var(ISSUE2828_LEGACY_ENV, "1");
+        assert!(matches!(powershell_captured_text("pwsh.exe", raw), Cow::Borrowed(r) if r == raw));
+        std::env::remove_var(ISSUE2828_LEGACY_ENV);
+        std::env::set_var(ISSUE2827_LEGACY_ENV, "1");
+        assert_eq!(powershell_captured_text("pwsh.exe", raw), "a\nb");
+        std::env::remove_var(ISSUE2827_LEGACY_ENV);
     }
 }
