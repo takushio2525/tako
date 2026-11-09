@@ -539,10 +539,11 @@ pub mod notes {
         "codex does have an (experimental) remote-control, but it is a self-hosted app-server daemon that a TUI connects to over websocket with a bearer token: it does not surface the conversation in a vendor mobile app. tako has no plumbing for it either",
     );
 
-    /// #1068 の実測（agy 1.1.23）。フラグ・サブコマンドの全件にリモート操作が無い
-    pub const AGY_NO_REMOTE_CONTROL: Note = Note::new(
-        "agy の `--help` 全件（フラグ 24 / サブコマンド 11）にリモート操作の口が無い（`mic-serve` はマイクを別ホストへ配るだけ）ので、会話を外の端末から操作する手段がそもそも無い",
-        "The full agy `--help` surface (24 flags, 11 subcommands) has no remote-control entry point at all (`mic-serve` only shares a microphone with another host), so there is no way to drive the conversation from another device",
+    /// #2831 の確認（agy 1.5.3）。上流には公式の手段がある（#1068 の時点の 1.1.23 には無かった）。
+    /// tako のプロファイルの opt-in（FR-2.34）を agy へ広げるかの判断ごと #2835 で配線する
+    pub const AGY_REMOTE_CONTROL_NOT_WIRED: Note = Note::new(
+        "agy にも公式のリモート操作がある（1.2.6 からの `--remote-control`。同じ Google アカウントで antigravity.google.com から会話を操作する）が、tako の起動コマンドへの配線がまだ無い（プロファイルの `remote_control` は claude の起動にだけ効く。agy のペインの中で `/remote-control` を打てば手で繋げる）",
+        "agy has an official remote control too (`--remote-control` since 1.2.6: the conversation is driven from antigravity.google.com with the same Google account), but tako does not wire it into the launch command yet (the profile's `remote_control` only affects claude launches; typing `/remote-control` inside the agy pane connects it by hand)",
     );
 
     /// ローカルで動かすモデルにベンダーの権利（座席 / クレジット / 組織ポリシー）が無い
@@ -557,10 +558,10 @@ pub mod notes {
         "The model runs on your own machine, so there is no vendor login to expire in the first place",
     );
 
-    /// #2412: agy は起動ごとに MCP を絞る手段が CLI に無い
+    /// #2412: agy は起動ごとに MCP を絞る手段が CLI に無い（#2831 で agy 1.5.3 の `--settings` を確かめた）
     pub const AGY_NO_PER_LAUNCH_MCP: Note = Note::new(
-        "起動ごとに MCP を絞る手段が CLI に無い（agy 1.4.7 の `--help` に `-c` / `--mcp-config` / `--settings` が無い。`agy mcp disable` は利用者自身の agy の設定を書き換えるので使わない）",
-        "The CLI has no per-launch way to narrow MCP servers (agy 1.4.7 `--help` lists no `-c` / `--mcp-config` / `--settings`; `agy mcp disable` would rewrite the user's own agy config, so it is not used)",
+        "起動ごとに MCP を絞る手段が CLI に無い（agy 1.5.3 の `--settings` はその回だけの settings.json のキーを受けるが、MCP の定義は別ファイルの `mcp_config.json` で、`--settings` に `mcpServers` を渡すと未知の設定として断られる。`agy mcp disable` は利用者自身の agy の設定を書き換えるので使わない）",
+        "The CLI has no per-launch way to narrow MCP servers (agy 1.5.3's `--settings` takes settings.json keys for that session only, but MCP servers are defined in the separate `mcp_config.json`, and `mcpServers` passed to `--settings` is rejected as an unknown setting; `agy mcp disable` would rewrite the user's own agy config, so it is not used)",
     );
 
     /// #757: 失効の文言を実物で採っていない（無いと確定したわけではない）
@@ -1185,7 +1186,7 @@ pub const MATRIX: &[AgentFeature] = &[
         ),
         claude: S::Supported,
         codex: pending(notes::CODEX_SELF_HOSTED_REMOTE, 1059),
-        agy: unsupported(notes::AGY_NO_REMOTE_CONTROL),
+        agy: pending(notes::AGY_REMOTE_CONTROL_NOT_WIRED, 2835),
         local: local_pending_first_class(),
         evidence: AgentEvidence::Measured(
             "#1068 の実測（2026-09-02）: claude 2.1.232 の `--help` に \
@@ -1193,7 +1194,14 @@ pub const MATRIX: &[AgentFeature] = &[
              tako は build_master_cmd_in / build_worker_cmd_in の claude 分岐でこれを渡す。\
              codex 0.150.1 の `--help` には `remote-control  [experimental] Manage the app-server daemon \
              with remote control enabled` と `--remote <ADDR>` があるが自前ホストの app-server 経路で別物。\
-             agy 1.1.23 の `--help` 全件にはリモート操作の口が無い",
+             agy は 1.1.23 の `--help` 全件にリモート操作の口が無かったが、#2831 の確認（2026-11-09 / \
+             agy 1.5.3 の `--help`・同梱の CHANGELOG・公式 docs の remote-control.md。外部サービスへは繋いでいない）で、\
+             1.2.6 から `--remote-control`（`Create a remote connection for the CLI session on start up`。\
+             その会話だけを同じ Google アカウントのブラウザ = antigravity.google.com から操作し、会話の終了で\
+             トンネルも閉じる）が在ると分かった。`agy remote-control start|status|stop`（1.2.0）は機械全体を\
+             OS のサービスとして常時公開するデーモンで会話単位ではない。ADC（`AGY_ADC_AUTH`）のログインでは \
+             1.3.3 からフラグが起動時にエラーで終わる。tako は build_worker_cmd_in の claude 分岐でしか渡さず、\
+             claude_remote::eligibility が claude 以外を AgentUnsupported で断る（配線と opt-in の範囲は #2835）",
         ),
     },
     AgentFeature {
@@ -1830,7 +1838,14 @@ pub const MATRIX: &[AgentFeature] = &[
              `codex resume <id>` / `claude --resume <id>` だけで組まれ、spawn の断片（codex 9〜13 個・claude の `--settings`）が \
              0 個になり、止めたはずの user 設定の MCP が立っていた。いまは復元とカタログの再開も spawn と同じ \
              worker_mcp::prepare_for_resume（判断）と orchestrator::agent::worker_mcp_args（断片）を通る \
-             （`codex resume` は `-c` を受ける = 0.154.0 の --help）。agy 1.4.7 は起動ごとの手段が無い",
+             （`codex resume` は `-c` を受ける = 0.154.0 の --help）。agy は #2831 の実測（2026-11-09 / agy 1.5.3・\
+             一時の HOME で `agy --settings <JSON> mcp list` = セッションを起こさない）: `--settings` は未知のキーを \
+             `Error: --settings: unknown setting \"<キー>\"` で断るので、バイナリに在る JSON のキー名の候補を 1 本ずつ渡して \
+             受けるキーを数えると 37 個（公式 docs の reference.md の settings.json の表の 32 個を全部含む）で、MCP のキーは \
+             無い（`mcpServers` も unknown）。MCP の定義は `~/.gemini/config/mcp_config.json`・`<workspace>/.agents/mcp_config.json`・\
+             プラグインの `mcp_config.json` だけで、公式 docs（settings.md）は同名ならすでに起きている方が勝つと書く = \
+             ワークスペース側の定義で利用者の server を止められない。`permissions` は道具の呼び出しの許可規則で、\
+             server を起こすかどうかの設定ではない（同 docs）",
         ),
     },
     AgentFeature {
@@ -2437,6 +2452,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #2831: agy の起動ごとの MCP は、1.5.3 の `--settings` を確かめたうえで unsupported。
+    /// 理由文は「`--settings` は在るが MCP のキーが無い（MCP は別ファイルの `mcp_config.json`）」を
+    /// 日英で言う。旧版の `--help` に `--settings` が無いことを根拠に戻すと、1.5.3 で `--help` を
+    /// 読んだ人には嘘になる
+    #[test]
+    fn issue2831_agyの起動ごとのmcpは_settingsにmcpのキーが無いことを言う() {
+        let s = support_for(Agent::Agy, keys::WORKER_MCP_SCOPE).expect("キーが在る");
+        assert_eq!(
+            s.status(),
+            "unsupported",
+            "worker_mcp_scope の agy が unsupported ではない。起動ごとに MCP を絞る口が agy に \
+             見つかったなら、worker_mcp::prepare の agy 分岐と起動コマンドの配線を足してから上げること（#2831）"
+        );
+        let note = s.note().expect("unsupported なら理由文を持つ");
+        for text in [note.ja(), note.en()] {
+            for needle in ["1.5.3", "--settings", "mcp_config.json", "mcpServers"] {
+                assert!(
+                    text.contains(needle),
+                    "worker_mcp_scope の agy の理由が `{needle}` を言っていない。agy 1.5.3 の `--settings` は \
+                     settings.json のキーだけを受け、MCP は別ファイルの mcp_config.json なので `mcpServers` を \
+                     渡せない、が #2831 の実測（#2831）: {text}"
+                );
+            }
+            assert!(
+                !text.contains("1.4.7"),
+                "worker_mcp_scope の agy の理由が旧版（1.4.7）の `--help` を根拠にしている（#2831）: {text}"
+            );
+        }
+        assert!(
+            MATRIX
+                .iter()
+                .find(|f| f.key == keys::WORKER_MCP_SCOPE)
+                .and_then(|f| f.evidence.citation())
+                .is_some_and(|c| c.contains("#2831") && c.contains("agy 1.5.3")),
+            "worker_mcp_scope の根拠に #2831 の agy 1.5.3 の実測が無い"
+        );
+    }
+
+    /// #2831: agy には 1.2.6 から公式の `--remote-control` がある（同じ Google アカウントの
+    /// ブラウザから会話を操作する）。「上流に手段が無い」（Unsupported）へ戻さない。
+    /// tako の起動コマンドへの配線が無い間は Pending で、理由文はそのフラグを名指す
+    #[test]
+    fn issue2831_agyのリモート操作は上流に手段があるのでunsupportedにしない() {
+        let s = support_for(Agent::Agy, keys::REMOTE_CONTROL).expect("キーが在る");
+        assert_ne!(
+            s.status(),
+            "unsupported",
+            "remote_control の agy が unsupported になっている。agy 1.2.6 以降には公式の \
+             `--remote-control` がある（#2831）。tako が配線していないだけなら pending（#2835）"
+        );
+        if let AgentSupport::Pending { note, issue } = s {
+            assert_ne!(
+                issue, 0,
+                "remote_control の agy が pending なのに追跡 Issue が無い"
+            );
+            for text in [note.ja(), note.en()] {
+                for needle in ["--remote-control", "1.2.6"] {
+                    assert!(
+                        text.contains(needle),
+                        "remote_control の agy の理由が `{needle}` を言っていない。上流の手段と \
+                         入った版を名指して、足りないのが tako の配線だと分かるように書く（#2831）: {text}"
+                    );
+                }
+            }
+        }
+        assert!(
+            MATRIX
+                .iter()
+                .find(|f| f.key == keys::REMOTE_CONTROL)
+                .and_then(|f| f.evidence.citation())
+                .is_some_and(|c| c.contains("#2831") && c.contains("agy 1.5.3")),
+            "remote_control の根拠に #2831 の agy 1.5.3 の確認が無い"
+        );
     }
 
     /// claude は tako の実装基準。**基準系が縮退している行を黙って作らない**

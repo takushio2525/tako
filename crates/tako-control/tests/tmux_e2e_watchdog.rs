@@ -118,6 +118,13 @@ const RETIRE_ALLOWLIST: &[(&str, &str)] = &[
          器は tmux / psmux 共用の CLI（`tako_core::backend::binary()`）を直接叩くので tmux_e2e を通せない",
     ),
     (
+        "issue2826_fresh_pane_send.rs",
+        "畳むのは Windows の psmux の器だけ（tmux の器は `tmux_e2e::release_session` で返す）。psmux の器は\
+         組み合わせごとに `run_alone!` の子プロセスで、名前に pid とタグを入れて立てる = 隣のテストと器を\
+         共有しない。tmux 専用の tmux_e2e では畳めないので、tako-core の psmux の 1 実装\
+         （`psmux_ctl::kill_server` = 期限つき・pid 指定）で畳む（#2826）",
+    ),
+    (
         "issue2399_tmux_socket_kill.rs",
         "器はテストごとに別の一時 `TMUX_TMPDIR` の中に立てる（置き場ごと別 = 隣のテストと器を共有しない）。\
          検証スクリプトの後片付けの 1 実装（`scripts/lib/tmux-socket.sh`）そのものを測るので tmux_e2e を通せない。\

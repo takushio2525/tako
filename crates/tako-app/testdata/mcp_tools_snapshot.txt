@@ -14,6 +14,7 @@ tako_confirm_close
 tako_context_budget
 tako_create_tab
 tako_equalize_layout
+tako_events
 tako_fda
 tako_file_op
 tako_focus_pane

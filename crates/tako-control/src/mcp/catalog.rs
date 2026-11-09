@@ -85,6 +85,22 @@ pub fn tools() -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
         }),
         json!({
+            "name": "tako_events",
+            "description": "ペインの増減・role・タブ名・ターン状態の変化を since より後から返す（ポーリングの代わり）。\
+                該当が無ければ wait_ms（上限 30000）まで待つ。cursor を次の since に渡し、epoch が変わるか \
+                dropped なら tako_list_panes で読み直す。種類は kinds_known。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "since": { "type": "integer", "minimum": 0 },
+                    "kinds": { "type": "array", "items": { "type": "string" } },
+                    "panes": { "type": "array", "items": { "type": "integer" } },
+                    "wait_ms": { "type": "integer", "minimum": 0 },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_split_pane",
             "description": "ペインを分割して新しいターミナルペインを作り、新ペイン ID を返す。\
                 command を指定するとシェルの代わりにそれを実行する（dev サーバー・`git diff`・\
@@ -134,6 +150,7 @@ pub fn tools() -> Vec<Value> {
                 改行つき送信は送達確認ループで配送され（マルチライン可）、応答は queued: true で即座に返る。\
                 顛末は tako_read_pane の delivery で追う（読み方もそちら）。応答の delivery には積む前に\
                 **未決着**（queued / waiting）だったフローだけが出る = この送達はその後ろに並ぶ（決着済みは出ない）。\
+                作りたてのシェルへの改行つき 1 行は準備を待って送る（応答に shell_wait）。\
                 text を空にして newline: true で Enter 単独送信（入力欄が空へ戻るまで再送）。\
                 **選択肢ダイアログ表示中は送信を拒否してエラーを返す**（数字なら選択が確定してしまう）。\
                 エラー本文の選択肢を見て tako_orchestrator_respond で応答する。\

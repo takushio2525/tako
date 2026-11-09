@@ -802,6 +802,22 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         priority: Option<String>,
     },
+    /// 変化の出来事の購読（FR-2.45 / #2731。長ポーリング）。`since` より後の出来事を返し、
+    /// 該当が無ければ `wait_ms`（既定 0・上限 `tako_core::events::MAX_WAIT_MS`）まで待ってから
+    /// 空で返す。`kinds` / `panes` は絞り込み（空 = すべて。知らない種類は断る）。
+    ///
+    /// **dispatch ではなく受け口（`ipc::submit`）が答える**（待つのは接続のスレッド。UI スレッドを
+    /// 通らない = `events::answer`）。UI スレッドの dispatch へ来たら待たずに返す
+    Events {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<u64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        kinds: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        panes: Vec<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait_ms: Option<u64>,
+    },
     /// ジャンプ履歴（戻る / 進む。FR-3.29 / #1677 / #1007 S0-d）。`action`:
     /// - "list"（既定）: 履歴の全項目と現在位置
     /// - "back": 1 つ戻る（行を指定した `OpenFile` が積んだ位置へ）
@@ -3034,6 +3050,8 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::CheckHealth
         // 受け口が答えるので UI の loop へは来ないが、意味としては読み取り（#1993）
         | Request::Queue { .. }
+        // 受け口が答える（#2731。長ポーリングの待ちも接続のスレッド）
+        | Request::Events { .. }
         | Request::WindowList
         | Request::MenuList
         | Request::BackgroundList

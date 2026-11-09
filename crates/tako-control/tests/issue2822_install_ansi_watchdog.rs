@@ -166,16 +166,18 @@ fn issue2822_導入代行の起動片は関数をドットソースし捕捉中�
 #[test]
 fn issue2822_実行ペインの包みは51の片を1行目に置きゲートの包みは変えない() {
     let src = read(SHELL);
+    // 入口が本体へ渡す引数の 1 つとして `legacy_2822()` を読む（#2827 で引数が増え、rustfmt が呼び出しを折り返すので
+    // 閉じ括弧の位置までは見ない）
     for (entry_name, body_name, arg) in [
         (
             "powershell_run_pane_script",
             "powershell_run_pane_script_in",
-            "legacy_2822())",
+            "legacy_2822()",
         ),
         (
             "powershell_run_script",
             "powershell_run_script_in",
-            "legacy_2822())",
+            "legacy_2822()",
         ),
     ] {
         let (entry, entry_line) = fn_body(&src, SHELL, entry_name);

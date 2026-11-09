@@ -601,6 +601,15 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
   同じ run が見える。#1745 まではこの処理が HTTP のハンドラにだけあり、stdio ブリッジからの
   非同期 run は `sync=true` を付けないと JSON-RPC エラーで返っていた。
   実経路の検証は `scripts/test-orchestrator-run-stdio-1745.sh`（3 経路 × 境界値）
+- **変化の出来事の購読（`Request::Events`。FR-2.45 / #2731）も受け口で答える**: 外の購読者が
+  長ポーリング（最大 30 秒）で待つので、`ipc::submit` が UI の受け口へ渡す前に
+  `tako_control::events::answer` で答え、待ちは接続のスレッド（IPC は接続ごと・HTTP MCP は要求ごと・
+  named pipe も同じ `submit`）の `Condvar` で行う（`Request::Queue` = #1994 と同じ形）。UI スレッドの
+  dispatch へ来た要求は決して待たない。バッファは tako-core の `events::log()`（プロセスに 1 つ・
+  1000 件のリング・同時の待ちは 8 本まで）で、書き手はドメインの書き換えの 1 か所（`Pane` の生成と
+  `Drop`・`Pane::set_role`・`Tab` のタイトル・`ModHub::accept`）が前後の値を比べて積むだけ
+  （UI スレッドに読み取りを足さない）。IPC / HTTP MCP にサーバー発信は足さない（#1884 の S6 も
+  この `EventLog` と `Request::Events` に載せられる）
 
 #### Claude Code「設定ゼロ接続」の検証結果（2.1.172、2026-06-11）
 
@@ -664,7 +673,7 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
   （ペインと子の PowerShell の Process スコープまで緩むため。グループポリシーで強制された AllSigned /
   Restricted にも負ける）。エージェント CLI の導入代行が取得した `install.ps1` を起こす形も同じ手
   （`platform::shell::powershell_script_text_args`。#2790・FR-2.33.1。#2791 から scriptblock はドットソースで
-  走らせる = `irm | iex` / `-File` と同じスコープ。agy の `install.ps1` の取得物の片付けが `$script:` に依る。#2822 から本文は関数 `install.ps1` として定義してその名前をドットソースし、捕捉中だけ pwsh 7 の色を止める = 失敗の文にインストーラ本文と色の符号を載せない。FR-2.33.1）。既知の制限: ペインの中で手で起こした
+  走らせる = `irm | iex` / `-File` と同じスコープ。agy の `install.ps1` の取得物の片付けが `$script:` に依る。#2822 から本文は関数 `install.ps1` として定義してその名前をドットソースし、捕捉中だけ pwsh 7 の色を止める = 失敗の文にインストーラ本文と色の符号を載せない。#2828 から捕捉した出力の改行は `powershell_captured_text` で LF へ揃える = 失敗の文に CR を載せない。FR-2.33.1）。既知の制限: ペインの中で手で起こした
   入れ子の PowerShell には統合が入らない。残った `$PROFILE` のブロックは移行
   （`SchemaId::PowerShellProfile`）が取り除く。
   **読み込みは共有違反のときだけ読み直す**（#2659）: `ReadAllText` は他の書き手を許さない開き方なので、

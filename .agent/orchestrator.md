@@ -119,7 +119,8 @@ tako が起こす **claude の worker**（spawn / run / git resolve / 会話を�
   で呼ばれた `mcp__<server>__*` のうち user scope のものを、そのプロジェクトの `mcp_servers` へ写す。
   写すのは名前だけで本文は残さない。元のファイルは `projects.yaml.pre-v1.bak`
 - **対象外**: master / solo のセッション・人が手で開く claude。agy の worker は
-  能力マトリクス `worker_mcp_scope`（agy = unsupported。起動ごとの手段が CLI に無い）
+  能力マトリクス `worker_mcp_scope`（agy = unsupported。起動ごとの手段が CLI に無い = 1.5.3 の
+  `--settings` は settings.json のキーだけを受け、MCP は別ファイルの `mcp_config.json`。#2831）
 - A/B は `TAKO_2412_LEGACY=1`（user scope を全部持ち込む #2412 前の起動。codex も戻る）
 
 #### 再開（resume）の worker（Issue #2447）
@@ -533,6 +534,13 @@ master は結果を確認してユーザーに報告する。
 アプリ再起動やシェルの再利用で `TAKO_PANE_ID` が古くなっていても起動は止まらない
 （読み替え・フォールバックが起きたときは案内と `unset TAKO_PANE_ID` を表示する）。
 `tako solo` も同じ解決順。
+
+**新しいタブの起動行はシェルの準備を待って届く**（#2826）。`--tab`・呼び出し元不明のときは TabNew の
+直後に起動行を `Request::Send` で送る。作りたてのシェル（まだ最初のプロンプトを出していない）への
+改行つきの 1 行は dispatch が worker の spawn と同じ送達フロー（シェル準備待ち → エコー確認 → 分離 Enter）
+へ寄せる（判断は `tako_core::shell_send::shell_wait`。Windows の器 = psmux では即時に書くと全損した）。
+CLI 側は何も変えていない = 出力は従来と同じ。インライン起動（自分のペイン = プロンプトを出した
+シェル）は従来どおり即時に書く。詳細は `.agent/requirements.md` の FR-2.2.2 追補 5
 
 **default.yaml を読めなくても立てるが、黙らない**（#2227）。プロファイルの読み込みは
 `master_launch::load_profile` の 1 実装で、CLI・スマホの「+ master」・返答の配送（#1450）が

@@ -1697,6 +1697,17 @@ impl ModHub {
         }
         self.dormant.remove(&pane);
         let prev = self.reports.get(&pane);
+        // #2731: ターンの状態が変わったら外の購読者へ（前の報告と比べるだけ = 読み取りを足さない）。
+        // 前の報告が無い（最初の報告・ended / dormant の後）ときは `from` 無しで積む
+        let prev_turn = prev.map(|s| s.report.turn);
+        if prev_turn != Some(report.turn) {
+            crate::events::emit(crate::events::Detail::TurnChanged {
+                pane,
+                from: prev_turn.map(ModTurn::as_str),
+                to: report.turn.as_str(),
+                source: "mod",
+            });
+        }
         if let Some(pending) = crate::usage::pending_from_report(prev.map(|s| &s.report), &report) {
             if self.pending_usage.len() >= crate::usage::MAX_PENDING {
                 self.pending_usage.remove(0);
@@ -3317,6 +3328,40 @@ mod tests {
         assert_eq!(
             hub.pending_usage.last().unwrap().limits[0].percent_used,
             (crate::usage::MAX_PENDING + 9) as f64
+        );
+    }
+
+    /// #2731: ターンの状態が変わった報告だけを外の購読者へ積む（heartbeat・ペインの外の報告は積まない）
+    #[test]
+    fn issue2731_ターンの変化だけを出来事へ積む() {
+        use crate::events::Detail;
+        let t0 = Instant::now();
+        let mut hub = ModHub::new(true);
+        let turn = |t: ModTurn| {
+            let mut r = parse_report(report_json()).unwrap();
+            r.turn = t;
+            r
+        };
+        let captured = crate::events::capture_on_this_thread();
+        hub.accept(5, turn(ModTurn::Idle), t0);
+        hub.accept(5, turn(ModTurn::Idle), t0);
+        hub.accept(5, turn(ModTurn::Busy), t0);
+        hub.accept(5, turn(ModTurn::Permission), t0);
+        hub.reject_foreign(5, t0);
+        hub.accept(5, turn(ModTurn::Permission), t0);
+        let changed = |from: Option<&'static str>, to: &'static str| Detail::TurnChanged {
+            pane: 5,
+            from,
+            to,
+            source: "mod",
+        };
+        assert_eq!(
+            captured.take(),
+            [
+                changed(None, "idle"),
+                changed(Some("idle"), "busy"),
+                changed(Some("busy"), "permission"),
+            ]
         );
     }
 

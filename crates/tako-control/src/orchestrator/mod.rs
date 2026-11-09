@@ -1278,8 +1278,8 @@ pub struct Profile {
     /// （tako の機器ペアリングと role 4 段はその会話には効かない）。
     /// tako の現行モデルは「会話はローカルに閉じている」なので、明示 opt-in にする。
     ///
-    /// claude 以外の系統（codex / agy）には相当する仕組みが無いため何も付かない
-    /// （`agent_support::keys::REMOTE_CONTROL` の宣言が正）。
+    /// claude 以外の系統（codex / agy）には何も付かない（codex は上流の形が別物・agy の公式の
+    /// `--remote-control` へ広げるかは #2835。`agent_support::keys::REMOTE_CONTROL` の宣言が正）。
     ///
     /// `skip_serializing_if` を付けている（= 未設定なら書き出さない）ので、
     /// **既存の profiles/*.yaml はバイト単位で不変**。旧ファイルは serde の default で
