@@ -3802,14 +3802,13 @@ impl TakoApp {
                                 .text_color(hsla(theme.text_muted))
                                 .text_ellipsis()
                                 .child(SharedString::from(
-                                    // #1203: 確定は platform 修飾（Windows は Win+Enter =
-                                    // 押せない）なので、打鍵の案内は macOS のときだけ出す
+                                    // #1601: 確定の判定（`keybindings::platform_modifier_active`）
+                                    // と同じ表（macOS = Cmd+Enter / Windows = Ctrl+Enter）
                                     crate::ui_text::panel::git_commit_placeholder(
                                         &branch_name,
-                                        tako_core::platform::keys::modifier_enter(
+                                        &tako_core::platform::keys::modifier_enter(
                                             tako_core::platform::support::Platform::current(),
-                                        )
-                                        .as_deref(),
+                                        ),
                                     ),
                                 )),
                         )
@@ -4874,10 +4873,11 @@ impl TakoApp {
         keystroke: &gpui::Keystroke,
         cx: &mut Context<Self>,
     ) -> bool {
-        // この画面だけの割り当てを先に見る（⌘Enter = 確定 / Esc = フォーカスを外す）。
+        // この画面だけの割り当てを先に見る（⌘Enter / Windows は Ctrl+Enter = 確定 /
+        // Esc = フォーカスを外す。#1601）。
         // 編集操作は下の `TextField` へ渡すので、ここには置かない（#1459）
         match keystroke.key.as_str() {
-            "enter" if keystroke.modifiers.platform => {
+            "enter" if crate::keybindings::platform_modifier_active(&keystroke.modifiers) => {
                 if let Some(data) = &self.git_data {
                     let repo = data.repo_root.clone();
                     self.git_do_commit(repo, cx);

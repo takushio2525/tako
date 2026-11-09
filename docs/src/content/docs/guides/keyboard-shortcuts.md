@@ -188,5 +188,6 @@ Markdown のリストの行（`- `・`* `・`+ `・`1. `・`- [ ] `）で <kbd>E
 | <kbd>Cmd</kbd>+クリック（Windows は <kbd>Ctrl</kbd>+クリック） | URL・ファイルパスを開く（同じ修飾キーを押しながらのホバーで下線が出ます） |
 | ファイルツリーからペインへドラッグ | パス入力 / プレビュー表示 |
 | ファイルツリーの行を <kbd>Cmd</kbd>+クリック（Windows は <kbd>Ctrl</kbd>+クリック）/ <kbd>Shift</kbd>+クリック | 行を足す・外す / 範囲を選ぶ（まとめてコピー・切り取り・ゴミ箱・ドラッグ） |
+| ペイン・タブの × を <kbd>Cmd</kbd>+クリック（Windows は <kbd>Ctrl</kbd>+クリック） | 確認ダイアログを出さずに閉じる |
 
-Windows は Win キーを OS が使うため、リンクを開く修飾キーだけ <kbd>Ctrl</kbd> になります（ほかのマウス操作は両 OS 共通です）。クリックを使わずに開きたいときは `tako file open-in-tako <path>`、リンクとして認識されている範囲を確認したいときは `tako links` が使えます。
+Windows は Win キーを OS が使うため、修飾キー + クリックの操作（リンクを開く・行を足す・確認なしで閉じる）は <kbd>Ctrl</kbd> になります（ほかのマウス操作は両 OS 共通です）。入力欄で <kbd>Cmd</kbd>+<kbd>Enter</kbd> で確定する操作（git のコミット・ユーザー向けタスクの返答・設定の settings.json 直接編集）も、Windows は <kbd>Ctrl</kbd>+<kbd>Enter</kbd> です。クリックを使わずに開きたいときは `tako file open-in-tako <path>`、リンクとして認識されている範囲を確認したいときは `tako links` が使えます。

@@ -853,8 +853,8 @@ impl SettingsWindow {
         }
         match ks.key.as_str() {
             "enter" => {
-                // 複数行フィールドは Enter で改行、⌘+Enter で確定
-                if multiline && !ks.modifiers.platform {
+                // 複数行フィールドは Enter で改行、⌘+Enter（Windows は Ctrl+Enter。#1601）で確定
+                if multiline && !crate::keybindings::platform_modifier_active(&ks.modifiers) {
                     self.insert_text("\n", cx);
                 } else {
                     self.commit_edit(cx);
@@ -1294,6 +1294,23 @@ impl SettingsWindow {
             .into_iter()
             .map(|(key, bounds)| (key, to_rect(bounds)))
             .collect()
+    }
+
+    /// visual-test 用（#1601）: settings.json 直接編集を始める（本文のクリックと同じ入口・
+    /// 同じ初期本文）。続く打鍵は窓の `on_key_down` = 実の打鍵経路で受ける
+    #[cfg(feature = "visual-test")]
+    pub(crate) fn vt_start_advanced_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text =
+            serde_json::to_string_pretty(&self.settings).unwrap_or_else(|_| "{}".to_string());
+        self.start_edit(EditField::AdvancedJson, text, window, cx);
+    }
+
+    /// visual-test 用（#1601）: settings.json 直接編集の最中なら本文の改行の数
+    /// （編集していなければ `None` = 確定か取消で閉じた）
+    #[cfg(feature = "visual-test")]
+    pub(crate) fn vt_advanced_edit_newlines(&self) -> Option<usize> {
+        self.editing(&EditField::AdvancedJson)
+            .map(|e| e.text.matches('\n').count())
     }
 
     /// visual-test の実測マーカー（#738）。絶対配置なのでレイアウトには一切効かない。
@@ -3749,7 +3766,8 @@ impl SettingsWindow {
                     .pt_1()
                     .text_color(to_hsla(theme.text_faint))
                     .text_size(px(11.))
-                    // #1203: 確定は platform 修飾（Windows は Win+Enter = 押せない）
+                    // #1601: 確定の判定（`keybindings::platform_modifier_active`）と同じ表
+                    // （macOS = ⌘+Enter / Windows = Ctrl+Enter）
                     .child(txt::advanced_edit_help(
                         tako_core::platform::keys::platform_modifier(
                             tako_core::platform::support::Platform::current(),

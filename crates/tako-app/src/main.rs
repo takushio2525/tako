@@ -25886,7 +25886,9 @@ impl TakoApp {
                                         cx.stop_propagation();
                                         this.close_pane_with_confirm(
                                             pane_id,
-                                            event.modifiers().platform,
+                                            crate::keybindings::platform_modifier_active(
+                                                &event.modifiers(),
+                                            ),
                                             CloseOrigin::PaneButton,
                                             cx,
                                         );
@@ -32235,18 +32237,18 @@ impl TakoApp {
                                         .child(crate::ui_text::dialog::close_enter()),
                                 ),
                         )
-                        // #1203: スキップ判定は GPUI の platform 修飾を直接見ているので、
-                        // Windows（= Win キー・実質押せない）では案内ごと出さない
-                        .children(
-                            tako_core::platform::keys::platform_modifier(
-                                tako_core::platform::support::Platform::current(),
-                            )
-                            .map(|m| {
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(hsla(theme.text_overlay))
-                                    .child(crate::ui_text::dialog::close_skip_hint(m.symbol))
-                            }),
+                        // #1601: スキップの判定（`keybindings::platform_modifier_active`）と
+                        // 同じ表から引く（macOS = ⌘ / Windows = Ctrl）。両 OS とも押せるので
+                        // 案内を落とす分岐は無い
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(hsla(theme.text_overlay))
+                                .child(crate::ui_text::dialog::close_skip_hint(
+                                    &tako_core::platform::keys::modifier_click_prefix(
+                                        tako_core::platform::support::Platform::current(),
+                                    ),
+                                )),
                         ),
                 ),
         )
@@ -50598,6 +50600,12 @@ mod self_test {
                     no_emoji_visual(any, window, cx).await;
                     visual_exit(0);
                 }
+                // #1601: 「修飾 + クリック / Enter」の案内（確認スキップ・コミット欄・設定の
+                // 直接編集）の実画面と、設定の複数行欄の「修飾 + Enter」の実の打鍵経路
+                "modifier-hints-1601" => {
+                    modifier_hints_1601_visual(any, window, cx).await;
+                    visual_exit(0);
+                }
                 // #1657: 実行ペインのタイトルバーに実行中 / 完了 / 失敗のバッジが
                 // 実ピクセルで描かれているか（実 `Run` → GUI の終了確定経路まで通す）
                 "run-badge" => {
@@ -66337,6 +66345,269 @@ mod self_test {
         // 後始末: 既定を戻す（隔離 data dir の settings.json）
         check(click(cx), "1945 ⑧: ボタンの実矩形が無い");
         wait(cx, 100).await;
+    }
+
+    /// 「修飾 + クリック / Enter」の案内と判定（#1601）。
+    ///
+    /// 案内の 3 画面（確認ダイアログのスキップ・git のコミット欄・設定の settings.json
+    /// 直接編集）を実フレームで撮り（`TAKO_VISUAL_DUMP_DIR` へ `1601-*.png`）、設定の
+    /// 複数行欄で素の Enter / control + Enter / 主修飾 + Enter を**窓の実の打鍵経路**
+    /// （`dispatch_keystroke` → 窓の `on_key_down`）で押して、改行 / 改行 / 確定に分かれるかを見る。
+    /// 案内と判定は実行 OS の表で組むので、macOS で走らせれば macOS の見た目と判定
+    /// （#1601 の前から変わらないこと）を見ることになる。単独実行は
+    /// `TAKO_VISUAL_ONLY=modifier-hints-1601`
+    #[cfg(feature = "visual-test")]
+    async fn modifier_hints_1601_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        use tako_core::platform::keys;
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+        let save = |frame: &image::RgbaImage, name: &str| {
+            if let Ok(dump) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
+                let _ = std::fs::create_dir_all(&dump);
+                let _ = frame.save(std::path::Path::new(&dump).join(name));
+            }
+        };
+        let platform = tako_core::platform::support::Platform::current();
+        // 画面に出る文言（render と同じ関数・同じ表）。PNG と突き合わせる控え
+        println!(
+            "TAKO_VISUAL_1601: platform={platform:?} confirm={:?} commit={:?} settings={:?}",
+            crate::ui_text::dialog::close_skip_hint(&keys::modifier_click_prefix(platform)),
+            crate::ui_text::panel::git_commit_placeholder("main", &keys::modifier_enter(platform)),
+            crate::ui_text::settings::advanced_edit_help(keys::platform_modifier(platform)),
+        );
+
+        // --- 1. 確認ダイアログ（× の素のクリックと同じ入口 = 修飾なし） ---
+        let set_role = |app: &mut TakoApp, pane: PaneId, role: Option<String>| {
+            if let Some(p) = app.workspace.active_tab_mut().tree_mut().get_mut(pane) {
+                p.set_role(role);
+            }
+        };
+        let target = window
+            .update(cx, |app, _, cx| {
+                let target = app.focused_pane();
+                // role 付き = 確認が入るペイン（セルフテスト 73 と同じ作り方）
+                set_role(app, target, Some("orchestrator-master:vt1601".into()));
+                app.confirm_close = true;
+                app.close_pane_with_confirm(target, false, CloseOrigin::PaneButton, cx);
+                cx.notify();
+                target
+            })
+            .unwrap_or_else(|_| fail("visual-test #1601: 窓を更新できない"));
+        wait(cx, 400).await;
+        let shown = window
+            .update(cx, |app, _, _| {
+                app.pending_close_confirm
+                    == Some(CloseConfirmTarget::Pane(target, CloseOrigin::PaneButton))
+            })
+            .unwrap_or(false);
+        check(
+            shown,
+            "visual-test #1601: 修飾なしの × で確認ダイアログが出る",
+        );
+        match capture_frame(any, cx) {
+            Some((frame, _)) => save(&frame, "1601-confirm-close.png"),
+            None => fail("visual-test #1601: 確認ダイアログのフレームを読み戻せない"),
+        }
+        // 主修飾ではないほう（macOS = control = 右クリック相当 / Windows = Win キー）は
+        // スキップにならない = ダイアログが出る。主修飾ならダイアログなしで閉じる。
+        // どちらも × の on_click が渡すのと同じ判定（keybindings::platform_modifier_active）を通す
+        let other = crate::keybindings::non_link_modifiers();
+        let primary = crate::keybindings::link_modifiers(true);
+        let (other_dialog, primary_closed) = window
+            .update(cx, |app, _, cx| {
+                app.close_confirm_cancelled(cx);
+                let before = app.workspace.active_tab().tree().len();
+                app.close_pane_with_confirm(
+                    target,
+                    crate::keybindings::platform_modifier_active(&other),
+                    CloseOrigin::PaneButton,
+                    cx,
+                );
+                let other_dialog = app.pending_close_confirm.is_some()
+                    && app.workspace.active_tab().tree().len() == before;
+                app.close_confirm_cancelled(cx);
+                // 閉じてよい 1 枚を足してから主修飾で閉じる（最後の 1 枚を閉じない）
+                let extra = Pane::new(PaneOrigin::User);
+                let extra_id = extra.id();
+                let split = app
+                    .workspace
+                    .active_tab_mut()
+                    .tree_mut()
+                    .split_with_ratio(target, SplitDirection::Right, 0.5, extra)
+                    .is_ok();
+                set_role(app, extra_id, Some("orchestrator-master:vt1601".into()));
+                let with_extra = app.workspace.active_tab().tree().len();
+                app.close_pane_with_confirm(
+                    extra_id,
+                    crate::keybindings::platform_modifier_active(&primary),
+                    CloseOrigin::PaneButton,
+                    cx,
+                );
+                let primary_closed = split
+                    && app.pending_close_confirm.is_none()
+                    && app.workspace.active_tab().tree().len() == with_extra - 1;
+                set_role(app, target, None);
+                app.confirm_close = false;
+                cx.notify();
+                (other_dialog, primary_closed)
+            })
+            .unwrap_or((false, false));
+        check(
+            other_dialog,
+            "visual-test #1601: 主修飾ではない修飾の × は確認を飛ばさない",
+        );
+        check(
+            primary_closed,
+            "visual-test #1601: 主修飾の × は確認なしで閉じる",
+        );
+
+        // --- 2. git のコミット欄（空・フォーカスなし = プレースホルダが出る） ---
+        let repo = std::env::temp_dir().join(format!("tako-vt1601-{}", std::process::id()));
+        remove_on_fail(&repo);
+        let _ = std::fs::remove_dir_all(&repo);
+        let git = |args: &[&str]| -> bool {
+            let mut cmd = std::process::Command::new("git");
+            tako_core::platform::process::no_console_window(&mut cmd)
+                .args(["-c", "user.name=tako-self-test"])
+                .args(["-c", "user.email=self-test@example.invalid"])
+                .args(args)
+                .current_dir(&repo)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        let repo_ready = std::fs::create_dir_all(&repo).is_ok()
+            && git(&["init", "-q", "-b", "main"])
+            && std::fs::write(repo.join("a.txt"), "a\n").is_ok()
+            && git(&["add", "-A"])
+            && git(&["commit", "-qm", "base"]);
+        check(repo_ready, "visual-test #1601: 使い捨ての git リポを作れる");
+        let pin = repo.display().to_string();
+        let tree_folder = |action: &str| tako_control::protocol::Request::TreeFolder {
+            action: action.into(),
+            path: Some(pin.clone()),
+            tab: None,
+            pane: None,
+            limit: None,
+        };
+        let _ = window.update(cx, |app, _, cx| {
+            let _ = tako_control::dispatch(app, tree_folder("add"), PaneOrigin::User);
+            app.panel_visible = true;
+            app.panel_view = PanelView::Git;
+            app.git_commit_input_focused = false;
+            app.git_commit.clear();
+            app.refresh_git(cx);
+        });
+        // 状態で待つ（#1902。回数の窓は混んだ機で使い切る）
+        let has_data = wait_for_app_state(
+            window,
+            cx,
+            "vt1601-git",
+            state_wait_budget(Duration::from_secs(8), machine_busy()),
+            |app| app.git_data.is_some(),
+        )
+        .await;
+        check(has_data, "visual-test #1601: git パネルにリポの状態が出る");
+        wait(cx, 300).await;
+        match capture_frame(any, cx) {
+            Some((frame, _)) => save(&frame, "1601-git-commit.png"),
+            None => fail("visual-test #1601: git パネルのフレームを読み戻せない"),
+        }
+        let _ = window.update(cx, |app, _, cx| {
+            let _ = tako_control::dispatch(app, tree_folder("remove"), PaneOrigin::User);
+            app.panel_visible = false;
+            cx.notify();
+        });
+        let _ = std::fs::remove_dir_all(&repo);
+
+        // --- 3. 設定の settings.json 直接編集（説明文 + 実の打鍵経路の Enter） ---
+        let _ = window.update(cx, |app, _, cx| {
+            app.open_settings_window_impl(Some(crate::settings_window::SettingsTab::Advanced), cx);
+        });
+        let opened = wait_for_app_state(
+            window,
+            cx,
+            "vt1601-settings",
+            state_wait_budget(Duration::from_secs(4), machine_busy()),
+            |app| app.settings_window_handle.is_some(),
+        )
+        .await;
+        let settings = window
+            .update(cx, |app, _, _| app.settings_window_handle)
+            .ok()
+            .flatten();
+        let (true, Some(settings)) = (opened, settings) else {
+            fail("visual-test #1601: 設定ウィンドウが開かない");
+        };
+        let settings_any: AnyWindowHandle = settings.into();
+        let _ = settings.update(cx, |view, window, cx| {
+            view.set_tab(crate::settings_window::SettingsTab::Advanced, cx);
+            window.resize(size(px(760.), px(600.)));
+            cx.notify();
+        });
+        wait(cx, 300).await;
+        match capture_frame(settings_any, cx) {
+            Some((frame, _)) => save(&frame, "1601-settings-advanced.png"),
+            None => fail("visual-test #1601: 設定ウィンドウのフレームを読み戻せない"),
+        }
+        let _ = settings.update(cx, |view, window, cx| {
+            view.vt_start_advanced_edit(window, cx);
+        });
+        wait(cx, 100).await;
+        let newlines = |cx: &mut AsyncApp| {
+            settings
+                .update(cx, |view, _, _| view.vt_advanced_edit_newlines())
+                .ok()
+                .flatten()
+        };
+        let press = |cx: &mut AsyncApp, spec: &str| {
+            let ks = Keystroke::parse(spec).unwrap_or_else(|_| fail("打鍵を組めない"));
+            // 窓の根のエンティティを借りずに流す（借りたままだと on_key_down が同じ
+            // エンティティを更新できずに panic する）
+            let _ = settings_any.update(cx, |_, window, cx| {
+                window.dispatch_keystroke(ks, cx);
+            });
+        };
+        // 主修飾ではないほう（macOS = ctrl / Windows = cmd = Win キー）の Enter
+        let other_spec = match platform {
+            tako_core::platform::support::Platform::MacOs => "ctrl-enter",
+            tako_core::platform::support::Platform::Windows => "cmd-enter",
+        };
+        let primary_spec = match platform {
+            tako_core::platform::support::Platform::MacOs => "cmd-enter",
+            tako_core::platform::support::Platform::Windows => "ctrl-enter",
+        };
+        let n0 = newlines(cx);
+        press(cx, "enter");
+        wait(cx, 100).await;
+        let n1 = newlines(cx);
+        press(cx, other_spec);
+        wait(cx, 100).await;
+        let n2 = newlines(cx);
+        press(cx, primary_spec);
+        wait(cx, 200).await;
+        let n3 = newlines(cx);
+        println!("TAKO_VISUAL_1601: newlines={n0:?} -> enter {n1:?} -> {other_spec} {n2:?} -> {primary_spec} {n3:?}");
+        check(
+            n0.is_some() && n1 == n0.map(|n| n + 1),
+            "visual-test #1601: 設定の複数行欄で素の Enter は改行",
+        );
+        check(
+            n2 == n1.map(|n| n + 1),
+            "visual-test #1601: 主修飾ではない修飾の Enter は確定せず改行",
+        );
+        check(
+            n3.is_none(),
+            "visual-test #1601: 主修飾の Enter で確定する（編集が閉じる）",
+        );
+        let _ = settings.update(cx, |_, window, _| window.remove_window());
+        let _ = window.update(cx, |app, _, _| app.settings_window_handle = None);
     }
 
     /// UI の絵文字を置き換えた 4 箇所が**実ピクセルで描かれている**か（#1536）。

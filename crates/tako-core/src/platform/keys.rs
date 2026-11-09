@@ -105,42 +105,19 @@ pub fn quit(platform: Platform) -> &'static str {
     }
 }
 
-/// GPUI の platform 修飾（macOS = command / Windows = Win キー）の表記。
+/// 「修飾 + クリック / Enter」の主修飾キーの表記（macOS = command / Windows = Ctrl）。
 ///
-/// **非 macOS では `None`**。キーバインド表に載っていない「修飾 + クリック」
-/// 「修飾 + Enter」のような操作は `Modifiers::platform` を直接見ているので、
-/// Windows では Win キーになる。Win+クリック / Win+Enter は OS 側が持っていて
-/// 実質押せないため、**案内に出さない**のが正しい振る舞いになる
-/// （`keybindings::shortcut_hint_for` が非 macOS の platform 修飾バインドを
-/// 落とすのと同じ規則）。呼び出し側は `None` のとき打鍵に触れない文へ落とす。
+/// キーバインド表に載っていない「修飾 + クリック」「修飾 + Enter」の操作
+/// （確認スキップ・コミット確定・設定の確定・タスクの返答・リンクを開く）は、
+/// **両 OS ともこの表**を見る。判定側の正本は [`platform_modifier_active`] で、
+/// **表記と判定は必ず同じ表**を見る。
 ///
-/// **リンクを開く操作はここではなく [`link_modifier`] を引く**。あちらは #763 で
-/// Windows 側を Ctrl へ移したので、両 OS とも押せる打鍵を返す。ここが `None` を
-/// 返し続けるのは、確認スキップ・コミット確定のように **まだ platform 修飾を
-/// 直接見ている**操作のぶん（それらを Ctrl へ移すのは別の仕事）。
-pub fn platform_modifier(platform: Platform) -> Option<ModifierLabel> {
-    match platform {
-        Platform::MacOs => Some(ModifierLabel {
-            symbol: "\u{2318}",
-            word: "Cmd",
-        }),
-        Platform::Windows => None,
-    }
-}
-
-/// 「修飾 + Enter」で確定する操作の打鍵表記（語形。macOS = `Cmd+Enter`）。
-///
-/// [`platform_modifier`] と同じ理由で **非 macOS は `None`**
-pub fn modifier_enter(platform: Platform) -> Option<String> {
-    platform_modifier(platform).map(|m| format!("{}+Enter", m.word))
-}
-
-/// リンクを開く「修飾 + クリック」の修飾キー表記（Issue #763）。
-///
-/// [`platform_modifier`] と違って **両 OS とも `Some` 相当**（`Option` を返さない）。
-/// リンクだけは打鍵そのものを Windows で Ctrl へ移したので、案内を落とす必要が無い。
-/// 判定側の正本は [`link_modifier_active`] で、**表記と判定は必ず同じ表**を見る。
-pub fn link_modifier(platform: Platform) -> ModifierLabel {
+/// GPUI の `Modifiers::platform` は Windows では Win キーへ解決される。Win+クリック /
+/// Win+Enter は OS 側が持っていて実質押せないので、Windows は Ctrl へ移した
+/// （#763 でリンクだけ先に移し、#1601 で残りの操作を揃えた。それまでは Windows で
+/// `None` を返し、案内ごと落としていた）。`Option` を返さないので、呼び出し側に
+/// 「Windows では案内を出さない」経路は作れない
+pub fn platform_modifier(platform: Platform) -> ModifierLabel {
     match platform {
         Platform::MacOs => ModifierLabel {
             symbol: "\u{2318}",
@@ -154,6 +131,55 @@ pub fn link_modifier(platform: Platform) -> ModifierLabel {
     }
 }
 
+/// 「修飾 + Enter」で確定する操作の打鍵表記（語形。macOS = `Cmd+Enter` /
+/// Windows = `Ctrl+Enter`）。修飾は [`platform_modifier`] の表から引く
+pub fn modifier_enter(platform: Platform) -> String {
+    format!("{}+Enter", platform_modifier(platform).word)
+}
+
+/// 「修飾 + クリック」を 1 語で書くときの頭（macOS = `⌘` / Windows = `Ctrl+`。Issue #1601）。
+///
+/// 後ろへ「クリック」「click」を続けて使う（確認ダイアログのスキップ案内
+/// `⌘クリックで…` / `Ctrl+クリックで…`）。macOS は記号を詰めて書く慣習（`⌘K` と同じ）
+/// なので `+` を挟まず、Windows は `Ctrl+Shift+P` と同じく `+` で繋ぐ。
+/// macOS の表記は #1203 から変えていない
+pub fn modifier_click_prefix(platform: Platform) -> String {
+    let m = platform_modifier(platform);
+    match platform {
+        Platform::MacOs => m.symbol.to_string(),
+        Platform::Windows => format!("{}+", m.symbol),
+    }
+}
+
+/// 「修飾 + クリック / Enter」の主修飾キーが押されているか（Issue #1601）。
+///
+/// `platform_key` / `control` には GPUI の `Modifiers::platform` /
+/// `Modifiers::control` をそのまま渡す。**GPUI に依存しない形で受ける**ので、
+/// macOS 上から Windows 側の分岐を単体で検証できる（#515 と同じ方針）。
+///
+/// なぜ `platform || control` を素で書かないか:
+///
+/// - **macOS で control を混ぜてはいけない**。macOS の Ctrl+クリックは右クリック
+///   相当なので、混ぜるとコンテキストメニューと本来の操作が同時に走る
+/// - **Windows で platform（Win キー）を混ぜてはいけない**。Win+クリック / Win+Enter は
+///   OS のシェルが持っていて tako まで届かないことがあり、「効くときと効かないときが
+///   ある」という一番たちの悪い挙動になる。案内できない打鍵は受理もしない
+pub fn platform_modifier_active(platform: Platform, platform_key: bool, control: bool) -> bool {
+    match platform {
+        Platform::MacOs => platform_key,
+        Platform::Windows => control,
+    }
+}
+
+/// リンクを開く「修飾 + クリック」の修飾キー表記（Issue #763）。
+///
+/// 中身は [`platform_modifier`] と同じ表（#1601 で 1 つに寄せた）。リンク経路の
+/// 呼び出し側（番犬 `issue763_link_modifier_watchdog` が見る名前）を変えないために
+/// 名前だけ残してある
+pub fn link_modifier(platform: Platform) -> ModifierLabel {
+    platform_modifier(platform)
+}
+
 /// リンクを開く「修飾 + クリック」の案内表記（macOS = `⌘+クリック` /
 /// Windows = `Ctrl+クリック`）。
 ///
@@ -165,22 +191,10 @@ pub fn link_click(platform: Platform) -> String {
 
 /// リンクを開く修飾キーが押されているか（Issue #763）。
 ///
-/// `platform_key` / `control` には GPUI の `Modifiers::platform` /
-/// `Modifiers::control` をそのまま渡す。**GPUI に依存しない形で受ける**ので、
-/// macOS 上から Windows 側の分岐を単体で検証できる（#515 と同じ方針）。
-///
-/// なぜ `platform || control` を素で書かないか:
-///
-/// - **macOS で control を混ぜてはいけない**。macOS の Ctrl+クリックは右クリック
-///   相当なので、混ぜるとコンテキストメニューとリンク開きが同時に走る
-/// - **Windows で platform（Win キー）を混ぜてはいけない**。Win+クリックは OS の
-///   シェルが持っていて tako まで届かないことがあり、「効くときと効かないときが
-///   ある」という一番たちの悪い挙動になる。案内できない打鍵は受理もしない
+/// 判定は [`platform_modifier_active`] と同じ表（#1601 で 1 つに寄せた）。
+/// `platform || control` を素で書かない理由もあちらに書いてある
 pub fn link_modifier_active(platform: Platform, platform_key: bool, control: bool) -> bool {
-    match platform {
-        Platform::MacOs => platform_key,
-        Platform::Windows => control,
-    }
+    platform_modifier_active(platform, platform_key, control)
 }
 
 /// ファイルツリーのコピー / 切り取り / 貼り付けの操作（FR-3.34 / Issue #1860）
@@ -513,20 +527,68 @@ mod tests {
             assert!(!s.contains("Cmd"), "{s:?} に Cmd が残っている");
             assert!(!s.contains("Win"), "{s:?} に Win が残っている");
         }
-        assert_eq!(
-            platform_modifier(Platform::Windows),
-            None,
-            "Windows の platform 修飾（Win キー）は押せないので案内してはいけない"
-        );
+        // #1601: 「修飾 + クリック / Enter」の修飾も Windows は Ctrl（Win キーは押せない）
+        let m = platform_modifier(Platform::Windows);
+        for s in [
+            m.symbol,
+            m.word,
+            &modifier_enter(Platform::Windows),
+            &modifier_click_prefix(Platform::Windows),
+        ] {
+            assert!(!s.contains('\u{2318}'), "{s:?} に ⌘ が残っている");
+            assert!(!s.contains("Cmd"), "{s:?} に Cmd が残っている");
+            assert!(!s.contains("Win"), "{s:?} に Win が残っている");
+        }
     }
 
+    /// #1601: 「修飾 + Enter」の表記は **両 OS で押せる打鍵**を出す（Windows で `None` に
+    /// して案内ごと落としていたのが #1601 の症状）
     #[test]
-    fn 修飾_enterの表記はmacosだけ出る() {
-        assert_eq!(
-            modifier_enter(Platform::MacOs).as_deref(),
-            Some("Cmd+Enter")
-        );
-        assert_eq!(modifier_enter(Platform::Windows), None);
+    fn 修飾_enterの表記は両osで出る() {
+        assert_eq!(modifier_enter(Platform::MacOs), "Cmd+Enter");
+        assert_eq!(modifier_enter(Platform::Windows), "Ctrl+Enter");
+    }
+
+    /// #1601: 「修飾 + クリック」の 1 語の頭。macOS は #1203 からの `⌘` のまま（`+` を
+    /// 挟まない）、Windows は `Ctrl+`
+    #[test]
+    fn 修飾クリックの頭はosごとの書き方になる() {
+        assert_eq!(modifier_click_prefix(Platform::MacOs), "\u{2318}");
+        assert_eq!(modifier_click_prefix(Platform::Windows), "Ctrl+");
+    }
+
+    /// #1601: 「修飾 + クリック / Enter」の主修飾は **macOS = command のみ /
+    /// Windows = Ctrl のみ**（リンクの #763 と同じ規則）。両方向から固定する
+    #[test]
+    fn 主修飾キーはosごとに1つだけ受理する() {
+        // macOS: command で効く / control では効かない（Ctrl+クリックは右クリック相当）
+        assert!(platform_modifier_active(Platform::MacOs, true, false));
+        assert!(!platform_modifier_active(Platform::MacOs, false, true));
+        // Windows: control で効く / platform（Win キー）では効かない
+        assert!(platform_modifier_active(Platform::Windows, false, true));
+        assert!(!platform_modifier_active(Platform::Windows, true, false));
+        // 修飾なし（素のクリック / Enter）はどちらも効かない
+        assert!(!platform_modifier_active(Platform::MacOs, false, false));
+        assert!(!platform_modifier_active(Platform::Windows, false, false));
+        // 両方押されていれば、その OS が見るほうが立っているので効く
+        assert!(platform_modifier_active(Platform::MacOs, true, true));
+        assert!(platform_modifier_active(Platform::Windows, true, true));
+    }
+
+    /// #1601: リンク（#763）と「修飾 + クリック / Enter」の残りが**同じ表**を見ること。
+    /// 片方だけ直すと、同じ画面でリンクは Ctrl・× は Win キー、のように割れる
+    #[test]
+    fn リンクと修飾操作は同じ表を見る() {
+        for platform in [Platform::MacOs, Platform::Windows] {
+            assert_eq!(link_modifier(platform), platform_modifier(platform));
+            for (p, c) in [(false, false), (true, false), (false, true), (true, true)] {
+                assert_eq!(
+                    link_modifier_active(platform, p, c),
+                    platform_modifier_active(platform, p, c),
+                    "{platform:?} platform={p} control={c}"
+                );
+            }
+        }
     }
 
     /// #763: リンクを開く修飾キーは **macOS = command のみ / Windows = Ctrl のみ**。
@@ -566,10 +628,18 @@ mod tests {
         }
     }
 
+    /// macOS の表記は #1601 の前と 1 文字も変わらない
     #[test]
     fn macosのplatform修飾は記号と語を持つ() {
-        let m = platform_modifier(Platform::MacOs).expect("macOS には ⌘ がある");
+        let m = platform_modifier(Platform::MacOs);
         assert_eq!(m.symbol, "\u{2318}");
         assert_eq!(m.word, "Cmd");
+    }
+
+    #[test]
+    fn windowsのplatform修飾はctrl() {
+        let m = platform_modifier(Platform::Windows);
+        assert_eq!(m.symbol, "Ctrl");
+        assert_eq!(m.word, "Ctrl");
     }
 }

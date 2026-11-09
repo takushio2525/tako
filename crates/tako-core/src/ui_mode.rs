@@ -843,7 +843,7 @@ mod tests {
                 t.contains(keys::command_palette(Platform::Windows)),
                 "{t:?}"
             );
-            let mac = keys::platform_modifier(Platform::MacOs).expect("macOS の修飾");
+            let mac = keys::platform_modifier(Platform::MacOs);
             assert!(
                 !t.contains(mac.symbol),
                 "Windows の案内に macOS の修飾記号が出ている: {t:?}"
