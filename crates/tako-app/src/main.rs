@@ -66470,7 +66470,8 @@ mod self_test {
         remove_on_fail(&repo);
         let _ = std::fs::remove_dir_all(&repo);
         let git = |args: &[&str]| -> bool {
-            std::process::Command::new("git")
+            let mut cmd = std::process::Command::new("git");
+            tako_core::platform::process::no_console_window(&mut cmd)
                 .args(["-c", "user.name=tako-self-test"])
                 .args(["-c", "user.email=self-test@example.invalid"])
                 .args(args)
@@ -66503,16 +66504,15 @@ mod self_test {
             app.git_commit.clear();
             app.refresh_git(cx);
         });
-        let mut has_data = false;
-        for _ in 0..40 {
-            wait(cx, 200).await;
-            has_data = window
-                .update(cx, |app, _, _| app.git_data.is_some())
-                .unwrap_or(false);
-            if has_data {
-                break;
-            }
-        }
+        // 状態で待つ（#1902。回数の窓は混んだ機で使い切る）
+        let has_data = wait_for_app_state(
+            window,
+            cx,
+            "vt1601-git",
+            state_wait_budget(Duration::from_secs(8), machine_busy()),
+            |app| app.git_data.is_some(),
+        )
+        .await;
         check(has_data, "visual-test #1601: git パネルにリポの状態が出る");
         wait(cx, 300).await;
         match capture_frame(any, cx) {
@@ -66530,18 +66530,19 @@ mod self_test {
         let _ = window.update(cx, |app, _, cx| {
             app.open_settings_window_impl(Some(crate::settings_window::SettingsTab::Advanced), cx);
         });
-        let mut settings = None;
-        for _ in 0..40 {
-            settings = window
-                .update(cx, |app, _, _| app.settings_window_handle)
-                .ok()
-                .flatten();
-            if settings.is_some() {
-                break;
-            }
-            wait(cx, 100).await;
-        }
-        let Some(settings) = settings else {
+        let opened = wait_for_app_state(
+            window,
+            cx,
+            "vt1601-settings",
+            state_wait_budget(Duration::from_secs(4), machine_busy()),
+            |app| app.settings_window_handle.is_some(),
+        )
+        .await;
+        let settings = window
+            .update(cx, |app, _, _| app.settings_window_handle)
+            .ok()
+            .flatten();
+        let (true, Some(settings)) = (opened, settings) else {
             fail("visual-test #1601: 設定ウィンドウが開かない");
         };
         let settings_any: AnyWindowHandle = settings.into();
