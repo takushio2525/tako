@@ -6,10 +6,12 @@
 //! OS へ問い合わせる部分。呼び出し側（`ports` / UI）は単一のコードパスを持ち、
 //! `cfg(target_os)` はこのモジュールの内側だけに置く。
 //!
-//! macOS 側の実装（libproc）は歴史的に `ports.rs` にあり、そちらが正のまま。
-//! ここには **Windows 実装と、両プラットフォームで共有できる純粋関数**を置く
-//! （macOS 実装を移設すると挙動差ゼロの検証を Windows 機からは行えないため。
-//! 移設は macOS 実機で検証できるタイミングに回す）。
+//! macOS の実装（libproc / sysctl）は `procinfo/macos.rs` にある（#2856 で `ports.rs` から
+//! 移設。それまでは `ports.rs` が正で、境界の側が境界の外を呼ぶ逆向きの依存があった）。
+//! このファイルには公開の口・**Windows 実装**・両プラットフォームで共有できる純粋関数を置く。
+//! `crate::ports` は公開の名前を re-export するだけの層で、境界からは呼ばない
+//! （`ports.rs` に OS の `cfg` を戻す形と、境界から `crate::ports` を呼ぶ形は
+//! 番犬 `crates/tako-control/tests/platform_parity.rs` が落とす）。
 //!
 //! ## Windows で「ペイン配下」をどう決めるか
 //!
@@ -86,7 +88,8 @@ pub fn snapshot() -> Vec<ProcEntry> {
 /// **空の `Vec` では返さない**。呼び出したプロセス自身が必ず載るので
 /// 「成功したが 0 件」という在籍表は在り得ず、0 件は失敗の別の顔でしかない。
 ///
-/// 非 Windows は常に `None`（macOS の検査は `ports.rs` の libproc 実装が正）。
+/// 非 Windows は常に `None`（macOS の検査は `procinfo/macos.rs` の libproc 実装が
+/// 個別の口で答え、在籍表としては返さない）。
 /// OS に列挙の手段があるかは [`snapshot_supported`] で分かる
 pub fn snapshot_checked() -> Option<Vec<ProcEntry>> {
     imp::snapshot_checked()
@@ -745,6 +748,262 @@ pub fn agent_process_count(procs: &[ProcEntry]) -> usize {
         .count()
 }
 
+// ---------------------------------------------------------------------------
+// listen ポート検知とプロセス検査（FR-2.4.2。#2856 で `ports.rs` から移設）
+//
+// ペイン配下のプロセスが LISTEN している TCP ポートを列挙する。「ペイン配下」の決め方は
+// OS で違う: macOS は**制御端末（tty）の一致**（`macos.rs` の libproc）、Windows（#524）は
+// tty の概念が無いため **PTY 直下の子プロセスの子孫**（ポートの列挙は `GetExtendedTcpTable`、
+// 親子関係と名前は Toolhelp32 スナップショット = 下の `imp` の Windows の腕）。Linux は未対応で空を返す。
+//
+// **ペインを指すキーはプラットフォームで実体が違う**（macOS = 制御端末の rdev、
+// Windows = 子 pid）。呼び出し側に `cfg` を書かせないため、キーの作成は
+// `pane_key()` に閉じ込め、以後は不透明な `u64` として扱う。
+//
+// 公開の名前は `crate::ports` が re-export している（呼び出し側の綴り `ports::scan` 等はそのまま）。
+
+#[cfg(target_os = "macos")]
+mod macos;
+
+// 実装の選択: macOS の腕は `macos.rs`、Windows / その他の腕はこの下に並ぶ
+#[cfg(target_os = "macos")]
+pub use macos::{
+    is_live_tako_app, listening_ports_of_pid, other_tako_pids, process_env_vars, process_table,
+    scan,
+};
+// 境界の内側（`platform::resources` の走査）と tako-core のテストが使う libproc の口（#1993）
+#[cfg(target_os = "macos")]
+pub(crate) use macos::{argv_and_env, list_pids, procargs_buffer_len, short_info};
+
+/// 検知した listen ポート（提案チップ FR-2.4.3 と list 公開 FR-2.5.1 の素材）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenPort {
+    pub port: u16,
+    pub pid: i32,
+    /// プロセス名（`proc_name`。取得できなければ空文字）
+    pub process: String,
+}
+
+/// tty デバイス名（`/dev/ttysNNN`）→ rdev。tty とプロセスの突き合わせキーに使う
+#[cfg(unix)]
+pub fn tty_rdev(tty_name: &str) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(tty_name).ok().map(|m| m.rdev())
+}
+
+/// Windows に tty の概念は無い（ペインの特定は `pane_key` が子 pid で行う）
+#[cfg(not(unix))]
+pub fn tty_rdev(_tty_name: &str) -> Option<u64> {
+    None
+}
+
+/// ペイン配下を指すスキャンキーを作る（#524）。
+///
+/// 中身の意味はプラットフォームで違い、**呼び出し側は解釈してはいけない**:
+/// macOS は制御端末の rdev、Windows は PTY 直下の子プロセスの pid。
+/// `scan()` へ渡すキーはここでしか作らない。
+///
+/// どちらの材料も取れなければ `None`（そのペインはスキャン対象から外れるだけ）
+pub fn pane_key(tty_name: Option<&str>, child_pid: Option<u32>) -> Option<u64> {
+    // 実装選択は `let` への cfg で行う。`return` で書くと、有効な分岐が末尾に
+    // 来ないぶん clippy の `needless_return` に当たる（macOS の `-D warnings` が落ちる）
+    #[cfg(target_os = "macos")]
+    let key = {
+        let _ = child_pid;
+        tty_name.and_then(tty_rdev)
+    };
+    #[cfg(windows)]
+    let key = {
+        let _ = tty_name;
+        // pid 0 は System Idle Process。ペインの子として返ることは無いが、
+        // 万一 0 が来たら全プロセスを配下と誤認しかねないので弾く
+        child_pid.filter(|&pid| pid != 0).map(u64::from)
+    };
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let key = {
+        let _ = (tty_name, child_pid);
+        None
+    };
+    key
+}
+
+/// Windows 版（#524）。キーは PTY 直下の子 pid で、その**子孫**が LISTEN している
+/// TCP ポートを集める。プロセス一覧と TCP テーブルはキーの数によらず 1 回ずつしか
+/// 取らない（3 秒毎に走るため、ペイン数に比例して重くしない）
+#[cfg(windows)]
+pub fn scan(keys: &[u64]) -> HashMap<u64, Vec<ListenPort>> {
+    if keys.is_empty() {
+        return HashMap::new();
+    }
+    let procs = crate::platform::procinfo::snapshot();
+    let listeners = crate::platform::procinfo::tcp_listeners();
+    group_by_root(&procs, &listeners, keys)
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+pub fn scan(_keys: &[u64]) -> HashMap<u64, Vec<ListenPort>> {
+    HashMap::new()
+}
+
+/// スキャン結果の組み立て（純粋関数）。プロセス一覧・LISTEN 一覧・キー群から
+/// キー → ポート一覧を作る。**Windows 実機が無くてもテストできる**ように
+/// `cfg` の外に出してある（`platform::locale` の parse 関数と同じ方針）
+///
+/// ## 器（psmux）自身の LISTEN を落とす（#724）
+///
+/// psmux はクライアント↔サーバー間の IPC に **TCP ループバック**を使い、
+/// サーバーを**クライアントの子プロセス**として 1 セッションに 1 個起動する。
+/// クライアント = ペインの PTY 直下の子（`pane_key` の材料）なので、
+/// 器つきのペインは**例外なく** 1 個の偽 listen ポートを持つことになる。
+///
+/// そこで所有プロセスが器そのものなら結果から落とす。**子孫の走査自体は止めない**
+/// （器の下で動いている本物の dev サーバーは引き続き拾いたいため）
+#[cfg_attr(not(windows), allow(dead_code))]
+fn group_by_root(
+    procs: &[crate::platform::procinfo::ProcEntry],
+    listeners: &[crate::platform::procinfo::TcpListenEntry],
+    roots: &[u64],
+) -> HashMap<u64, Vec<ListenPort>> {
+    let names: HashMap<u32, &str> = procs.iter().map(|p| (p.pid, p.name.as_str())).collect();
+    let mut result: HashMap<u64, Vec<ListenPort>> = HashMap::new();
+    for &root in roots {
+        let Ok(root_pid) = u32::try_from(root) else {
+            continue;
+        };
+        let family = crate::platform::procinfo::descendants_of(procs, root_pid);
+        let mut ports: Vec<ListenPort> = listeners
+            .iter()
+            .filter(|e| family.contains(&e.pid))
+            // 名前が取れないものは器と断定できないので落とさない（従来どおり報告する）
+            .filter(|e| {
+                !names
+                    .get(&e.pid)
+                    .is_some_and(|name| crate::backend::is_plumbing_process(name))
+            })
+            .map(|e| ListenPort {
+                port: e.port,
+                // 実在の Windows pid は i32 に収まる（4 の倍数で 2^31 未満）
+                pid: e.pid as i32,
+                process: names.get(&e.pid).copied().unwrap_or_default().to_string(),
+            })
+            .collect();
+        if ports.is_empty() {
+            continue;
+        }
+        // macOS 実装と同じ整形: ポート昇順・同一ポートは 1 件（IPv4 / IPv6 の重複を畳む）
+        ports.sort_by_key(|p| p.port);
+        ports.dedup_by_key(|p| p.port);
+        result.insert(root, ports);
+    }
+    result
+}
+
+/// Windows 版（#524）。`pid` **自身**が LISTEN している TCP ポートを列挙する
+/// （子孫は含めない。macOS 版と同じ粒度）
+#[cfg(windows)]
+pub fn listening_ports_of_pid(pid: i32) -> Vec<ListenPort> {
+    let Ok(pid) = u32::try_from(pid) else {
+        return Vec::new();
+    };
+    let listeners = crate::platform::procinfo::tcp_listeners();
+    let mut ports: Vec<u16> = listeners
+        .iter()
+        .filter(|e| e.pid == pid)
+        .map(|e| e.port)
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    if ports.is_empty() {
+        return Vec::new();
+    }
+    let name = crate::platform::procinfo::snapshot()
+        .into_iter()
+        .find(|p| p.pid == pid)
+        .map(|p| p.name)
+        .unwrap_or_default();
+    ports
+        .into_iter()
+        .map(|port| ListenPort {
+            port,
+            pid: pid as i32,
+            process: name.clone(),
+        })
+        .collect()
+}
+
+/// 検査手段を持たないプラットフォーム（Linux）
+#[cfg(not(any(target_os = "macos", windows)))]
+pub fn listening_ports_of_pid(_pid: i32) -> Vec<ListenPort> {
+    Vec::new()
+}
+
+/// 非 macOS はプロセス名の取得手段が未整備のため空（多重起動ガードは効かない = 従来挙動）
+#[cfg(not(target_os = "macos"))]
+pub fn other_tako_pids() -> Vec<u32> {
+    Vec::new()
+}
+
+/// 自分以外の `tako-app` プロセスが生きているか（二重起動ガード用）
+pub fn other_tako_running() -> bool {
+    !other_tako_pids().is_empty()
+}
+
+/// プロセスが生きているか（#1192 の所有者判定）。`kill(pid, 0)` はシグナルを送らず
+/// 存在と権限だけを見る（EPERM = 別ユーザーの生存プロセス = 生きている）。
+///
+/// **「生きていない」と言い切れるときだけ false**（回収の可否を分ける材料なので、
+/// 迷ったら生きている側に倒す）
+#[cfg(unix)]
+pub fn process_alive(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        // 0 はプロセスグループ指定になるため所有者判定には使わない（= 触らない）
+        return true;
+    }
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Windows には tmux のソケットレイアウトが無く、回収の対象も存在しない。
+/// 「生きている」を返して**何も回収しない**側へ倒す
+#[cfg(not(unix))]
+pub fn process_alive(_pid: u32) -> bool {
+    true
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn process_env_vars(_pid: u32, _names: &[&str]) -> Option<HashMap<String, String>> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn process_table() -> Option<(HashMap<u32, u32>, HashMap<u32, String>)> {
+    None
+}
+
+/// 非 macOS はプロセス名の取得手段が未整備のため常に false
+/// （多重起動ガードは効かない = 従来挙動。Phase 6 の Windows 対応で実装する）
+#[cfg(not(target_os = "macos"))]
+pub fn is_live_tako_app(_pid: u32) -> bool {
+    false
+}
+
+/// 接続情報ファイル（control.json）に載った GUI の pid が、生きた tako GUI か
+/// （`tako check-health` の手元の診断 `ipc.gui.alive`。#2002）。
+///
+/// macOS は [`is_live_tako_app`]（プロセス名まで見るので pid の再利用を外せる）。
+/// それ以外の OS は名前を引く口が無く [`is_live_tako_app`] が常に `false` なので、
+/// 生死だけを見る（[`crate::platform::process::pid_alive`]）。
+/// #2856 で cli の `cfg!` の出し分けをここへ移した（式はそのまま = 挙動は変えていない）
+pub fn tako_app_alive(pid: u32) -> bool {
+    if cfg!(target_os = "macos") {
+        is_live_tako_app(pid)
+    } else {
+        crate::platform::process::pid_alive(pid)
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use super::{LoopbackPeer, ProcEntry, TcpListenEntry};
@@ -1216,7 +1475,7 @@ mod imp {
 mod imp {
     use super::{LoopbackPeer, ProcEntry, TcpListenEntry};
 
-    /// macOS の検査は `ports.rs` の libproc 実装が正（このモジュールは使わない）。
+    /// macOS の検査は `procinfo/macos.rs` の libproc 実装が個別の口で答える（在籍表は返さない）。
     /// **`None` = 列挙の手段が無い**（「0 件が居る」ではない。#1597）
     pub(super) fn snapshot_checked() -> Option<Vec<ProcEntry>> {
         None
@@ -1234,7 +1493,7 @@ mod imp {
         None
     }
 
-    /// macOS は libproc の `proc_bsdinfo`（`ports.rs` の `bsd_info` と同じ呼び出しだが、
+    /// macOS は libproc の `proc_bsdinfo`（`procinfo/macos.rs` の `bsd_info` と同じ呼び出しだが、
     /// あちらは制御端末の取得用に private なので、ここでは起動時刻だけを取る）。
     /// pid 再利用の判別（#1296）に使う
     #[cfg(target_os = "macos")]
@@ -1292,7 +1551,7 @@ mod imp {
     /// 親 pid（#2533）。macOS は libproc の `PROC_PIDT_SHORTBSDINFO`（別ユーザーでも取れる）
     #[cfg(target_os = "macos")]
     pub(super) fn parent_pid(pid: u32) -> Option<u32> {
-        crate::ports::short_info(i32::try_from(pid).ok()?).map(|(ppid, _, _)| ppid)
+        super::macos::short_info(i32::try_from(pid).ok()?).map(|(ppid, _, _)| ppid)
     }
 
     /// macOS 以外の unix は procfs の stat の 4 欄目。2 欄目（comm）は空白や括弧を
@@ -1309,8 +1568,8 @@ mod imp {
     /// プロセス（launchd 等）は comm へ落とす
     #[cfg(target_os = "macos")]
     pub(super) fn short_name(pid: u32) -> Option<String> {
-        crate::ports::argv0_name(pid)
-            .or_else(|| crate::ports::short_info(i32::try_from(pid).ok()?).map(|(_, _, comm)| comm))
+        super::macos::argv0_name(pid)
+            .or_else(|| super::macos::short_info(i32::try_from(pid).ok()?).map(|(_, _, comm)| comm))
     }
 
     /// macOS 以外の unix は procfs の comm
@@ -1338,7 +1597,7 @@ mod imp {
     ///
     /// ## なぜ libproc の fd 走査ではないのか
     ///
-    /// `ports.rs` が使っている libproc の fd 走査は**自分と同じユーザーのプロセスしか
+    /// listen ポート検知（`procinfo/macos.rs`）が使っている libproc の fd 走査は**自分と同じユーザーのプロセスしか
     /// 見えない**（実測 2026-09-12: 非 root から root 所有の tailscaled は
     /// `lsof -p <pid>` も `PROC_PIDLISTFDS` も 0 件）。tailscaled は root で動くので、
     /// fd 走査では**正規の接続元すら特定できない**。`net.inet.tcp.pcblist_n` は
@@ -2349,5 +2608,226 @@ mod tests {
     /// テスト側のヘルパ（`stem_of` は非公開なのでパスからも同じ語を作る）
     fn stem_of_path(path: &std::path::Path) -> String {
         stem_of(&path.to_string_lossy())
+    }
+}
+
+/// プラットフォームを問わず走るテスト（純粋関数 + 実機の検知 e2e）
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+
+    fn proc(pid: u32, ppid: u32, name: &str) -> ProcEntry {
+        ProcEntry {
+            pid,
+            ppid,
+            name: name.to_string(),
+        }
+    }
+
+    fn listener(pid: u32, port: u16) -> TcpListenEntry {
+        TcpListenEntry { port, pid }
+    }
+
+    #[test]
+    fn 子孫のlistenだけがそのペインのポートになる() {
+        let procs = vec![
+            proc(100, 1, "pwsh.exe"),
+            proc(200, 100, "node.exe"),
+            proc(300, 1, "other.exe"),
+        ];
+        let listeners = vec![listener(200, 5173), listener(300, 8080)];
+        let grouped = group_by_root(&procs, &listeners, &[100]);
+        let ports = grouped.get(&100).expect("ペイン 100 のポートが無い");
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].port, 5173);
+        assert_eq!(ports[0].pid, 200);
+        assert_eq!(ports[0].process, "node.exe");
+        assert!(
+            !grouped.contains_key(&300),
+            "キーに渡していないプロセスは結果に出ない"
+        );
+    }
+
+    #[test]
+    fn 同一ポートのipv4とipv6は1件に畳まれポート昇順に並ぶ() {
+        let procs = vec![proc(100, 1, "pwsh.exe"), proc(200, 100, "node.exe")];
+        // IPv4 / IPv6 の両待ち受け（同じポートが 2 行で返る）+ 別ポート
+        let listeners = vec![
+            listener(200, 8080),
+            listener(200, 3000),
+            listener(200, 8080),
+        ];
+        let ports = group_by_root(&procs, &listeners, &[100]);
+        let ports = &ports[&100];
+        assert_eq!(
+            ports.iter().map(|p| p.port).collect::<Vec<_>>(),
+            vec![3000, 8080]
+        );
+    }
+
+    #[test]
+    fn 器そのもののlistenは落とすが器の下のdevサーバーは拾う() {
+        // psmux は「クライアントの子」としてサーバーを起こし、その IPC に
+        // TCP ループバックを使う（#724）。ペインの PTY 直下の子 = クライアントなので、
+        // 器つきの全ペインが必ず 1 個の偽 listen を持つ形になる
+        let procs = vec![
+            proc(100, 1, "psmux.exe"),   // ペイン直下の子（= キー）
+            proc(200, 100, "psmux.exe"), // 器のサーバー。落としたい
+            proc(300, 200, "node.exe"),  // 器の下で動く本物の dev サーバー
+        ];
+        let listeners = vec![listener(200, 63836), listener(300, 5173)];
+        let ports = group_by_root(&procs, &listeners, &[100]);
+        let ports = &ports[&100];
+        assert_eq!(
+            ports.iter().map(|p| p.port).collect::<Vec<_>>(),
+            vec![5173],
+            "器の内部ポートだけが落ち、子孫の走査は止まっていない"
+        );
+    }
+
+    #[test]
+    fn 器しかlistenしていないペインは結果に現れない() {
+        // 症状①（全ペインにチップが出る）の直接の再現。落とした結果が空なら
+        // そのペインはキーごと結果から消える（= チップが立たない）
+        let procs = vec![proc(100, 1, "pwsh.exe"), proc(200, 100, "tmux.exe")];
+        let listeners = vec![listener(200, 59000)];
+        assert!(group_by_root(&procs, &listeners, &[100]).is_empty());
+    }
+
+    #[test]
+    fn 名前が取れないlistenは器と断定できないので落とさない() {
+        // 権限・レースで名前だけ取れないことがある。そこで落とすと本物を見落とす
+        let procs = vec![proc(100, 1, "pwsh.exe")];
+        let listeners = vec![listener(200, 5173)]; // pid 200 は procs に居ない
+        let ports = group_by_root(&procs, &listeners, &[100]);
+        assert!(ports.is_empty(), "そもそも子孫として見えないので対象外");
+        let procs = vec![proc(100, 1, "pwsh.exe"), proc(200, 100, "")];
+        let ports = group_by_root(&procs, &listeners, &[100]);
+        assert_eq!(ports[&100].len(), 1, "名前が空でも報告する");
+    }
+
+    #[test]
+    fn listenが無いペインは結果に現れない() {
+        let procs = vec![proc(100, 1, "pwsh.exe")];
+        assert!(group_by_root(&procs, &[], &[100]).is_empty());
+    }
+
+    #[test]
+    fn 既に終了したpidをキーにしても壊れない() {
+        // スキャンとペイン終了のレース。空の結果になるだけで panic しない
+        let procs = vec![proc(100, 1, "pwsh.exe")];
+        let listeners = vec![listener(100, 5173)];
+        assert!(group_by_root(&procs, &listeners, &[999_999]).is_empty());
+    }
+
+    #[test]
+    fn u32に収まらないキーは無視する() {
+        // macOS の rdev をそのまま渡されても panic しない（キーは不透明 u64）
+        let procs = vec![proc(100, 1, "pwsh.exe")];
+        let listeners = vec![listener(100, 5173)];
+        assert!(group_by_root(&procs, &listeners, &[u64::MAX]).is_empty());
+    }
+
+    #[test]
+    fn プロセス名が取れなくてもポートは返す() {
+        // 権限不足などで名前だけ取れない場合（macOS 実装も空文字にする）
+        let listeners = vec![listener(200, 5173)];
+        let procs = vec![proc(100, 1, "pwsh.exe"), proc(200, 100, "")];
+        let ports = group_by_root(&procs, &listeners, &[100]);
+        assert_eq!(ports[&100][0].process, "");
+    }
+
+    #[test]
+    fn キーが空ならスキャンしない() {
+        assert!(scan(&[]).is_empty());
+    }
+
+    #[test]
+    fn pane_keyは材料が無ければnone() {
+        assert!(pane_key(None, None).is_none());
+        // 子 pid 0（System Idle Process）は配下判定の材料にしない
+        assert!(pane_key(None, Some(0)).is_none());
+    }
+
+    /// 実機の検知 e2e。**自分で listen して自分で検知する**ので、
+    /// 構造体レイアウトの転記ミス・バイトオーダーの誤りはここで露見する
+    #[cfg(windows)]
+    #[test]
+    fn 自プロセスのlistenポートを検知できる() {
+        let l4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p4 = l4.local_addr().unwrap().port();
+        let l6 = std::net::TcpListener::bind("[::1]:0").unwrap();
+        let p6 = l6.local_addr().unwrap().port();
+        let me = std::process::id() as i32;
+
+        let found = listening_ports_of_pid(me);
+        assert!(
+            found.iter().any(|p| p.port == p4),
+            "IPv4 の listen ポート {p4} が検知されない（検知結果: {found:?}）"
+        );
+        assert!(
+            found.iter().any(|p| p.port == p6),
+            "IPv6 の listen ポート {p6} が検知されない（検知結果: {found:?}）"
+        );
+        assert!(found
+            .iter()
+            .all(|p| p.process.to_ascii_lowercase().ends_with(".exe")));
+
+        drop(l4);
+        drop(l6);
+        let found = listening_ports_of_pid(me);
+        assert!(
+            !found.iter().any(|p| p.port == p4 || p.port == p6),
+            "閉じたポートが残っている: {found:?}"
+        );
+    }
+
+    /// 接続済み（ESTABLISHED）は LISTEN ではないので出てこない
+    #[cfg(windows)]
+    #[test]
+    fn 接続済みソケットはlistenとして検知しない() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (_server, _) = l.accept().unwrap();
+        let client_port = client.local_addr().unwrap().port();
+        let me = std::process::id() as i32;
+        let found: Vec<u16> = listening_ports_of_pid(me).iter().map(|p| p.port).collect();
+        assert!(found.contains(&port), "listen 側は検知される");
+        assert!(
+            !found.contains(&client_port),
+            "接続済みクライアント側は検知されない"
+        );
+    }
+
+    /// `scan` の実機経路（子孫の判定 + テーブル取得）を自プロセスで通す
+    #[cfg(windows)]
+    #[test]
+    fn scanは自プロセスをrootにすると自分のlistenを拾う() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let key = pane_key(None, Some(std::process::id())).expect("自 pid がキーになる");
+        let scanned = scan(&[key]);
+        let ports = scanned.get(&key).expect("自プロセスのポートが取れない");
+        let mine = ports
+            .iter()
+            .find(|p| p.port == port)
+            .unwrap_or_else(|| panic!("listen 中の {port} が scan で拾えない: {ports:?}"));
+        // キーの持ち主に正しく紐付いていること（別プロセスのポートを混ぜていない）。
+        // 同じテストバイナリの子プロセスが listen していれば結果に混ざりうるので、
+        // 「全件が自分」ではなく「自分のポートが自分の pid で返る」を検査する
+        assert_eq!(mine.pid, std::process::id() as i32);
+    }
+
+    /// 存在しない pid・権限の無いシステムプロセスを対象にしても panic しない
+    #[cfg(windows)]
+    #[test]
+    fn 存在しないpidやシステムプロセスでも壊れない() {
+        assert!(listening_ports_of_pid(0x7fff_fff0).is_empty());
+        assert!(listening_ports_of_pid(-1).is_empty());
+        // pid 4 = System。LSASS 等の LISTEN はこの pid の配下ではないので空、
+        // かつ OpenProcess を使わないので権限エラーにもならない
+        let _ = listening_ports_of_pid(4);
+        assert!(scan(&[0x7fff_fff0]).is_empty());
     }
 }

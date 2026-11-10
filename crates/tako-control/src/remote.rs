@@ -11733,20 +11733,29 @@ esac
     /// 「pid の再利用」と判定して止められなかった。記録より**後**に起動した相手（再利用）は
     /// 従来どおり弾く。unix の ps 経路を実プロセスで動かす（境界の腕の規則は
     /// procinfo の単体テストが持つ）
+    ///
+    /// 使い捨ての子は **spawn が返った時点で args が読めるもの**にする（#2874）。macOS の
+    /// `/bin/sh` は選んだシェル（`/private/var/select/sh` = bash）へ exec し直す shim で、
+    /// その execve の最中（spawn から約 1 ms 後の約 0.2 ms）は args を読めず、`ps -o args=` が
+    /// `(sh)` だけを返す。判定はそれを「確かめられない」= false と正しく答えるので、判定の `ps` が
+    /// その窓に重なった回だけこのテストが落ちていた（混んだ CI で 1 回・静かな機械でも 3000 回に 3 回）。
+    /// `/bin/sleep` は exec し直さないので、`arg0` で `tako remote serve` に見せて使う
+    /// （`daemon_stop_implはゾンビpidを終了済みとして扱う` と同じ形）
     #[cfg(unix)]
     #[test]
     fn verify_pid_identityは記録より前に起動した本物を通す() {
-        // コマンドラインが `tako remote serve` に見える使い捨てのプロセス。
-        // `read` は組み込みなので子を作らず、kill すれば後に何も残らない
-        let mut cmd = std::process::Command::new("/bin/sh");
-        cmd.args(["-c", "read line", "tako", "remote", "serve"])
-            .stdin(Stdio::piped())
+        use std::os::unix::process::CommandExt as _;
+        // コマンドラインが `tako remote serve` に見える使い捨てのプロセス（kill すれば後に何も残らない）
+        let mut cmd = std::process::Command::new("/bin/sleep");
+        cmd.arg0("tako remote serve")
+            .arg("60")
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         // 起動の形は spawn_disposable_sleep と揃える（#628 の番犬が数える）
         let mut child = tako_core::platform::process::no_console_window(&mut cmd)
             .spawn()
-            .expect("使い捨ての sh");
+            .expect("使い捨ての sleep");
         let pid = child.id();
         let now = now_epoch_secs();
         let late = verify_pid_identity(&PidInfo {
@@ -11761,16 +11770,44 @@ esac
             start_time: Some(now.saturating_sub(3600)),
             stamp: None,
         });
+        // 落ちたときは判定が読んだ材料を読み直して添える（#2874。CI の 1 回は材料が残らなかった）
+        let seen = if late && !reused {
+            String::new()
+        } else {
+            ps_identity_materials(pid)
+        };
         let _ = child.kill();
         let _ = child.wait();
         assert!(
             late,
-            "記録の 30 秒前に起動した本物（起動 → 記録が遅い daemon）を通す"
+            "記録の 30 秒前に起動した本物（起動 → 記録が遅い daemon）を通す。{seen}"
         );
         assert!(
             !reused,
-            "記録の 1 時間後に起動した相手 = pid の再利用は弾く"
+            "記録の 1 時間後に起動した相手 = pid の再利用は弾く。{seen}"
         );
+    }
+
+    /// `verify_pid_identity` の unix の腕が読む材料（`ps` の args と etime）を同じ口で読み直す。
+    /// 失敗の説明に添えるだけで判定には使わない（#2874）。args が `(名前)` だけなら読み直した
+    /// 時点でも args を読めていない（exec の途中など）、`<defunct>` なら子はもう終わっている
+    #[cfg(unix)]
+    fn ps_identity_materials(pid: u32) -> String {
+        let read = |field: &str| {
+            let mut cmd = Command::new("/bin/ps");
+            cmd.args(["-p", &pid.to_string(), "-o", field])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            tako_core::platform::process::no_console_window(&mut cmd)
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_else(|e| format!("ps を起動できない: {e}"))
+        };
+        format!(
+            "判定の直後に読み直した材料: args=[{}] etime=[{}]",
+            read("args="),
+            read("etime=")
+        )
     }
 
     /// 偽の待ち受けの答え方（#2455）

@@ -2153,6 +2153,15 @@ pid が生きていることを確かめても、**相手が誰かはまだ分�
   停止の Windows 実装（#1599）が先に入れば、pid を再利用した無関係なプロセスを撃つ
 - 番犬: `crates/tako-control/tests/issue1616_windows_pid_identity_watchdog.rs`
   （素通り・`#[cfg]` の腕・自前判定へ戻した形・`Unknown` の反転を `file:line` で名指す）
+- **正体の照合を実プロセスで測るテストの子は、spawn が返った後に exec し直さないものにする**
+  （#2874）。macOS の `/bin/sh` は選んだシェル（`/private/var/select/sh` = bash）へ exec し直す
+  shim で、その execve の最中（spawn から約 1 ms 後の約 0.2 ms）は args を読めない
+  （KERN_PROCARGS2 が EIO / EINVAL。`ps -o args=` は終了コード 0 のまま `(sh)` だけを返す）。
+  照合は「読めない = 確かめられない = false」と正しく答えるので、判定の `ps` がその窓に重なった回
+  だけテストが落ちる（実測: 静かな機械で 3000 回に 3 回）。`tako remote serve` に見せたい子は
+  `/bin/sleep` を `CommandExt::arg0` で起こす（`/bin/sleep`・`/bin/bash` は spawn の直後から
+  読める = 300 回とも窓 0）。本物の daemon は exec し直しを `main` の最初で済ませ、PID ファイルは
+  その後に書くので、停止の照合がこの窓に当たることはない（テストだけの問題）
 
 ### 材料が採れなかった回は「不在」ではない（Issue #1597）
 

@@ -1,4 +1,4 @@
-/* 入れ方・使い方動画（#2866）の場面だけの置き方。
+/* 入れ方・使い方動画（#2866。v2 = #2886）の場面だけの置き方。
    色・書体・チップ・実画面の窓・字幕・題字は #2864 の comp.css のものをそのまま使う（変数も同じ）。
    動きは comp.js / howto.js が毎フレーム値を書く（CSS の transition / animation は使わない）。 */
 
@@ -393,6 +393,20 @@
 	border-left: 12px solid var(--accent);
 }
 
+/* 手順が 2 つあるとき（Windows）は、その下へ置く */
+.hw-box.low {
+	top: 672px;
+}
+
+.hw-box small code {
+	font-family: var(--mono);
+	font-size: 0.9em;
+	padding: 2px 10px 3px;
+	border-radius: 8px;
+	background: rgba(21, 23, 28, 0.08);
+	color: var(--ink);
+}
+
 .hw-box p {
 	font-size: 50px;
 	font-weight: 700;
@@ -469,4 +483,9 @@
 	font-size: 36px;
 	white-space: nowrap;
 	box-shadow: 0 14px 34px rgba(21, 23, 28, 0.22);
+}
+
+/* 4 行の並び（行の高さを詰めて、下の 1 行と重ならないようにする） */
+.ways.tips.four .row {
+	min-height: 166px;
 }
