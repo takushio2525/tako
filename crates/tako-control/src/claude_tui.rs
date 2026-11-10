@@ -917,7 +917,7 @@ pub const TRUST_KEY_LEGACY_ENV: &str = "TAKO_1886_LEGACY";
 /// `\` 区切りの鍵は信頼済みと読まれず、信頼の確認が出て、確認が通るまで hooks module（tako mod）も読まれない。
 /// unix はそのまま。判定は [`claude_project_key_in`]（OS と A/B を引数で受ける = macOS でも Windows の形を検査できる）。
 ///
-/// #2843: 作業 dir が 8.3 の短い形（`C:\Users\WINUSE~1\…`）のときは、先に長い形へ戻す
+/// #2843: 作業 dir が 8.3 の短い形（`C:\Users\<利用者名の頭>~1\…`）のときは、先に長い形へ戻す
 /// （境界 B34 `long_path::long_form`。claude は短い形の cwd から起こしても長い形の鍵で引く = Windows CI の実測）。
 /// 戻せないパス（存在しない・8.3 の名前が無いボリューム）は従来の答えのまま。A/B は `TAKO_2843_LEGACY=1`
 pub fn claude_project_key(cwd: &str) -> String {
@@ -1698,7 +1698,7 @@ mod tests {
             );
         }
         if !cfg!(windows) {
-            for cwd in ["/home/testuser/a~1/work", "/work/WINUSE~1"] {
+            for cwd in ["/home/testuser/a~1/work", "/work/LONGFO~1"] {
                 assert_eq!(claude_project_key(cwd), cwd);
             }
         }

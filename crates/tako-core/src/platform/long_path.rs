@@ -1,9 +1,9 @@
-//! 8.3 の短い形（`C:\Users\WINUSE~1\…`）の成分を長い形へ戻す（抽象境界 B34。#2843）
+//! 8.3 の短い形（`C:\Users\<利用者名の頭>~1\…`）の成分を長い形へ戻す（抽象境界 B34。#2843）
 //!
 //! ## なぜ境界が要るか
 //!
 //! Windows は同じフォルダに長い名前と 8.3 の短い名前を持たせる（ボリュームで無効にもできる）。
-//! 利用者名に空白・日本語・9 文字以上を含む PC では `TEMP` が `C:\Users\WINUSE~1\AppData\Local\Temp`
+//! 利用者名に空白・日本語・9 文字以上を含む PC では `TEMP` が `C:\Users\<利用者名の頭>~1\AppData\Local\Temp`
 //! のような短い形になり、そこから作ったパスや、利用者が短い形で書いたパスが作業 dir として tako に届く。
 //!
 //! claude は `.claude.json` の `projects` の鍵を**長い形**の作業 dir で引く（#2843 の Windows CI の実測。
@@ -122,9 +122,9 @@ mod tests {
     #[test]
     fn チルダを含まないパスはosへ問い合わせずそのまま() {
         for p in [
-            r"C:\Users\winuser\work",
+            r"C:\work\long folder\proj",
             "C:/Users/winuser/work",
-            r"\\?\C:\Users\winuser\work",
+            r"\\?\C:\work\long folder\proj",
             "/home/testuser/work",
             "",
         ] {
@@ -135,23 +135,23 @@ mod tests {
 
     #[test]
     fn 長い形が返れば置き換える() {
-        let short = r"C:\Users\WINUSE~1\work";
+        let short = r"C:\work\LONGFO~1\proj";
         assert_eq!(
-            choose_long_form(short, short, Some(r"C:\Users\winuser\work")),
-            r"C:\Users\winuser\work"
+            choose_long_form(short, short, Some(r"C:\work\long folder\proj")),
+            r"C:\work\long folder\proj"
         );
         // `/` 区切りの入力は `\` にそろえて問い合わせ、戻した形は OS の形（`\`）
-        let slash = "C:/Users/WINUSE~1/work";
+        let slash = "C:/work/LONGFO~1/proj";
         assert_eq!(os_input(slash), short);
         assert_eq!(
-            choose_long_form(slash, &os_input(slash), Some(r"C:\Users\winuser\work")),
-            r"C:\Users\winuser\work"
+            choose_long_form(slash, &os_input(slash), Some(r"C:\work\long folder\proj")),
+            r"C:\work\long folder\proj"
         );
     }
 
     #[test]
     fn 答えが無い空か同じなら入力のまま() {
-        let short = r"C:\Users\WINUSE~1\work";
+        let short = r"C:\work\LONGFO~1\proj";
         // 存在しない・読めない（GetLongPathNameW が 0）
         assert!(matches!(choose_long_form(short, short, None), Cow::Borrowed(p) if p == short));
         assert!(matches!(choose_long_form(short, short, Some("")), Cow::Borrowed(p) if p == short));
@@ -170,12 +170,9 @@ mod tests {
     #[test]
     fn verbatimの中のスラッシュは区切りにしない() {
         // verbatim では `/` は普通の文字。そろえると別の名前を問い合わせてしまう
-        let p = r"\\?\C:\Users\WINUSE~1\a/b";
+        let p = r"\\?\C:\work\LONGFO~1\a/b";
         assert_eq!(os_input(p), p);
-        assert_eq!(
-            os_input(r"C:\Users\WINUSE~1\work"),
-            r"C:\Users\WINUSE~1\work"
-        );
+        assert_eq!(os_input(r"C:\work\LONGFO~1\proj"), r"C:\work\LONGFO~1\proj");
     }
 
     #[cfg(not(windows))]
