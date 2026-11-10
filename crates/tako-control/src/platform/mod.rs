@@ -8,6 +8,9 @@
 //! ここに境界を追加する。
 
 pub mod facts;
+/// プライバシー許可の案内（境界 B15 `PermissionGuide`。macOS = TCC のフルディスクアクセス、
+/// それ以外 = 対象外。#2859）
+pub mod fda;
 /// OS のファイルのクリップボード（境界 B28。#1860）
 pub mod file_clipboard;
 #[cfg(target_os = "macos")]

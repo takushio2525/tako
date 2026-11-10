@@ -73,7 +73,7 @@ P0 完了以降、`cargo check --target x86_64-pc-windows-msvc` は **macOS 上�
 | B12 | ドキュメントレンダラ | `trait PdfRenderer` / `trait VideoPlayer` | `tako-app/src/preview.rs:745,821,1039`、`video_player.rs:11-24`、`tako-core/src/pdf_links.rs`、`preview_outline.rs` | PDFKit / CoreGraphics / AVFoundation | pdfium 等 or `Unsupported` 明示 |
 | B13 | シェル統合 | `shell_integration::script_for(shell)` + 注入先解決 | `tako-core/shell-integration/{zshenv.zsh,tako.bash,tako.fish}` | 既存 3 種 | PowerShell profile |
 | B14 | 配布・自動更新 | `trait UpdateChannel`（detect / download / apply / restart） | `tako-app/src/update_checker.rs:261-286,707-733` | .app / Caskroom | **［#2434 で適用を実装］** Inno Setup のインストーラーを検査して無言で起こす（`tako-app/src/platform/installer_update.rs` + `tako.iss` の `InitializeSetup` / `DeinitializeSetup`）。winget / scoop は未着手 |
-| B15 | プライバシー許可ガイド | `trait PermissionGuide` | `tako-control/src/fda.rs` | TCC / FDA | `Unsupported`（Windows に TCC 相当なし） |
+| B15 | プライバシー許可ガイド | `tako_control::platform::fda`（対象か `supported`・付与の判定 `is_granted`・設定画面 `open_settings_typed`） | `tako-control/src/fda.rs`（**#2859 で集約済み**: OS の腕は `platform/fda.rs`。`fda.rs` は境界の口の re-export と OS を意識しない層 = 日本語の口 `open_settings`・CLI / MCP の `status_info` / `FdaStatus` だけで OS の `cfg` を持たない。診断の `fda` 項目と `tako setup` の FDA の段は `supported` の答えを見る 1 本の経路で、対象外なら項目を出さない = 番犬 `platform_parity.rs`） | TCC / FDA（保護下のパスへの `read_dir` で判定・システム設定の URL スキーム） | 対象外（`supported` が false。判定は常に付与済み・設定画面は `OsRefusal::FdaMacOnly`。Windows に TCC 相当なし） |
 
 ### 2.1 モジュール配置の規約
 
