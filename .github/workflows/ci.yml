@@ -521,9 +521,11 @@ jobs:
         shell: bash
         working-directory: web/tako-remote
         run: npm ci --no-audit --no-fund && npm run build
+      # clippy は下の「clippy の指摘 0 件のゲート（#2850）」が使う（dtolnay の既定は minimal で入らない）
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.95.0
+          components: clippy
       # macOS ジョブと同じ理由（#1915）
       - name: ルートの Cargo.toml の指紋（rust-cache のキー。#1915）
         id: cargo-root
@@ -776,6 +778,22 @@ jobs:
           rc=0
           bash scripts/warning-gate.sh cargo build --workspace || rc=$?
           bash scripts/warning-gate.sh cargo test --workspace --no-run || rc=$?
+          exit "$rc"
+      # #2850: Windows の cfg の内側を clippy の指摘 0 件に保つ。macOS は 3 つの feature 宇宙で clippy の -D warnings を
+      # 通しているが、Windows でだけコンパイルされる行は一度も clippy を受けておらず、着手時に 13 件あった（うち 1 件は
+      # visual-test の宇宙にしか出ない）。宇宙は macOS ジョブの clippy と同じ 3 つ（AGENTS.md の lint 行）。
+      # 数えるのは上と同じ scripts/warning-gate.sh（-D warnings を付けると最初に指摘の出たクレートで止まり、依存する
+      # クレートが検査されない。件数と位置はゲートが名指し、チェックの注釈にも出る）。所要と成果物の使い回しの実測は
+      # .agent/commands.md の Windows のクロス検査の行。上の警告ゲートと同じく、テストのコンパイルが通っていればテストが赤でも走る。
+      # **Windows でだけ出る clippy の指摘を足すとここで落ちる**（番犬 crates/tako-control/tests/ci_windows_test_compile.rs）
+      - name: Windows の clippy の指摘 0 件のゲート（#2850。macOS と同じ 3 つの feature 宇宙）
+        if: ${{ !cancelled() && steps.test-build.outcome == 'success' }}
+        shell: bash
+        run: |
+          rc=0
+          bash scripts/warning-gate.sh cargo clippy --workspace --all-targets || rc=$?
+          bash scripts/warning-gate.sh cargo clippy -p tako-app --features visual-test --all-targets || rc=$?
+          bash scripts/warning-gate.sh cargo clippy -p tako-core -p tako-control -p tako-cli --all-targets || rc=$?
           exit "$rc"
       # #2433: 任意依存の導入代行を本物の winget で回す（製品の口 `tako setup deps install`）。psmux を利用者の権限で
       # 入れて導入の前後の status を記録し、Git は一度外してから「同意なし = 起こさない → --yes = 入る」を確かめて元の

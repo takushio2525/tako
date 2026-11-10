@@ -349,7 +349,7 @@ fn resolve_named_dest(
     let names_dict = resolve_dict(doc, names_ref)?;
     let dests_ref = names_dict.get(b"Dests").ok()?;
     let dests_dict = resolve_dict(doc, dests_ref)?;
-    lookup_name_tree(doc, &dests_dict, name, pages)
+    lookup_name_tree(doc, dests_dict, name, pages)
 }
 
 /// PDF の Name Tree をたどる
@@ -381,7 +381,7 @@ fn lookup_name_tree(
         let kids = resolve_array(doc, kids_arr)?;
         for kid in kids {
             let kid_dict = resolve_dict(doc, kid)?;
-            if let Some(result) = lookup_name_tree(doc, &kid_dict, name, pages) {
+            if let Some(result) = lookup_name_tree(doc, kid_dict, name, pages) {
                 return Some(result);
             }
         }
@@ -391,11 +391,13 @@ fn lookup_name_tree(
 
 // --- lopdf によるアウトライン（しおり）抽出 ---
 
+/// 目次に積む項目の上限
+const OUTLINE_MAX_ITEMS: usize = 5_000;
+/// 目次をたどる深さの上限
+const OUTLINE_MAX_DEPTH: u8 = 32;
+
 /// `/Outlines` ツリーを走査して平坦な目次を組み立てる
 fn lopdf_extract_outline(doc: &LopdfDocument, total_pages: usize) -> PreviewOutline {
-    const MAX_ITEMS: usize = 5_000;
-    const MAX_DEPTH: u8 = 32;
-
     let pages = doc.get_pages();
     let catalog = match doc.catalog() {
         Ok(c) => c,
@@ -415,16 +417,7 @@ fn lopdf_extract_outline(doc: &LopdfDocument, total_pages: usize) -> PreviewOutl
     };
 
     let mut items = Vec::new();
-    collect_outline_items(
-        doc,
-        first,
-        1,
-        total_pages,
-        &pages,
-        &mut items,
-        MAX_DEPTH,
-        MAX_ITEMS,
-    );
+    collect_outline_items(doc, first, 1, total_pages, &pages, &mut items);
     PreviewOutline::new(items)
 }
 
@@ -435,10 +428,8 @@ fn collect_outline_items(
     total_pages: usize,
     pages: &std::collections::BTreeMap<u32, lopdf::ObjectId>,
     items: &mut Vec<PreviewOutlineItem>,
-    max_depth: u8,
-    max_items: usize,
 ) {
-    if level > max_depth || items.len() >= max_items {
+    if level > OUTLINE_MAX_DEPTH || items.len() >= OUTLINE_MAX_ITEMS {
         return;
     }
     let dict = match resolve_dict(doc, item_ref) {
@@ -454,7 +445,7 @@ fn collect_outline_items(
         .to_string();
 
     if !title.is_empty() {
-        let page_target = resolve_outline_dest(doc, &dict, pages);
+        let page_target = resolve_outline_dest(doc, dict, pages);
         if let Some(page) = page_target {
             if page <= total_pages {
                 items.push(PreviewOutlineItem {
@@ -474,22 +465,11 @@ fn collect_outline_items(
             total_pages,
             pages,
             items,
-            max_depth,
-            max_items,
         );
     }
 
     if let Ok(next) = dict.get(b"Next") {
-        collect_outline_items(
-            doc,
-            next,
-            level,
-            total_pages,
-            pages,
-            items,
-            max_depth,
-            max_items,
-        );
+        collect_outline_items(doc, next, level, total_pages, pages, items);
     }
 }
 

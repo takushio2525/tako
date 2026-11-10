@@ -64355,6 +64355,8 @@ mod self_test {
                 format!("tako-vt1860-{}", std::process::id()),
             );
         }
+        // 使うのは macOS の ⑤⑥（別プロセスの AppKit との往復）だけ
+        #[cfg(target_os = "macos")]
         let pasteboard = std::env::var("TAKO_FILE_PASTEBOARD").unwrap_or_default();
         let p0 = ensure_fresh_scene(window, cx, "tree-clipboard").await;
         let mac = cfg!(target_os = "macos");

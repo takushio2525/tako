@@ -4997,6 +4997,14 @@ CI 完了前に merge され（merge 04:24:10 / Windows 完了 04:48:24）、過
   手元は `scripts/check-windows.sh` が同じ 1 実装を通す。直し方の順（消す / 使う側の cfg へ寄せる /
   理由つきの `#[cfg_attr(windows, allow(dead_code))]`）は `.agent/commands.md` の同名の行。
   番犬 `ci_windows_test_compile.rs` の `windowsジョブがコンパイラの警告を0件に保つ`
+- **clippy の指摘も 0 件に保つ**（#2850）。Windows でだけコンパイルされる行は macOS の clippy から見えず、
+  Windows の clippy は一度も回っていなかった（着手時 13 件。うち 1 件は visual-test の宇宙にしか出ない）。
+  段「Windows の clippy の指摘 0 件のゲート」が macOS ジョブの clippy と**同じ 3 つの feature 宇宙**を
+  同じ `scripts/warning-gate.sh` に通す（`-- -D warnings` は付けない = 最初に指摘の出たクレートで止まり
+  依存先が検査されない）。clippy は check の単位でビルドの成果物を使い回せないので約 13 分かかる
+  （実測と直し方の順は `.agent/commands.md` の Windows のクロス検査の行）。警告ゲートの後ろ・#2433 の実走の手前で、
+  テストのコンパイルが通っていればテストが赤でも走る。手元は `scripts/check-windows.sh` が xwin の clippy で
+  同じ 3 つを回す。番犬 `ci_windows_test_compile.rs` の `windowsジョブがclippyの指摘を0件に保つ`
 
 ### CI ランナーと実機は別物として扱う
 
