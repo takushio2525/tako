@@ -728,6 +728,9 @@ mod tests {
         assert_eq!(b.free(), Some(2), "足すと 2 + 4 = 6 > N");
         // cargo が返して終わる
         cargo.put(2).unwrap();
+        // 誤検知: Windows の Fifo は中身の無い型（#2000）なので drop は何もしないが、unix ではここで
+        // fifo を閉じるのが検査の要点。Windows ではこの検査は冒頭の SUPPORTED で戻る。#2850
+        #[cfg_attr(not(unix), allow(clippy::drop_non_drop))]
         drop(cargo);
         b.tick(|| Some(0));
         assert_eq!(b.free(), Some(4));

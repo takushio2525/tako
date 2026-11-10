@@ -3614,6 +3614,9 @@ mod tests {
         #[cfg(not(unix))]
         {
             let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            // 誤検知: この lint が案じるのは「unix で全員に書き込み可になる」こと。unix は上の分岐で
+            // mode を戻しており、ここは unix 以外（Windows の読み取り専用の属性を外すだけ）。#2850
+            #[allow(clippy::permissions_set_readonly_false)]
             permissions.set_readonly(false);
             std::fs::set_permissions(&path, permissions).unwrap();
         }

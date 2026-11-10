@@ -18,9 +18,15 @@
 # 配布物が VC++ の DLL を要求する形に変わる（#587）。キャッシュの鍵も変わる。
 # cargo の build.warnings = "deny" は 1.95 の安定版では効かない（黙って無視される）。
 #
+# clippy も同じ 1 実装で数える（#2850）: clippy の指摘も cargo の `generated N warnings` に数えられ、
+# 済んだ単位は同じように再生される。`-- -D warnings` を付けないのは、最初に指摘の出たクレートで
+# 止まり、それに依存するクレート（tako-core → tako-control → tako-app）が 1 件も検査されないため。
+# コマンドに `clippy` があれば、見出し・直し方・注釈を clippy の指摘として言う。
+#
 # 使い方:
 #   scripts/warning-gate.sh cargo build --workspace
 #   scripts/warning-gate.sh cargo test --workspace --no-run
+#   scripts/warning-gate.sh cargo clippy --workspace --all-targets
 # 終了コード: 0 = 警告 0 件 / 3 = 警告がある（コマンドは成功）/ 2 = 使い方の誤り /
 #             それ以外 = コマンド自身の終了コード（コンパイルエラーなど）
 set -u
@@ -34,6 +40,18 @@ case " $* " in
     # 数えるのは人向けの出力。JSON などでは summary の行が出ない
     echo "warning-gate.sh: --message-format を付けると警告を数えられません（人向けの出力を読みます）" >&2
     exit 2
+    ;;
+esac
+
+# 見出しと直し方の言い分け（数え方は同じ）。clippy の段はコンパイラの警告も含めて数える
+GATE_NAME="警告ゲート（#1537）"
+NOUN="警告"
+TAG="#1537 警告ゲート"
+case " $* " in
+  *" clippy "*)
+    GATE_NAME="clippy ゲート（#2850）"
+    NOUN="指摘"
+    TAG="#2850 clippy ゲート"
     ;;
 esac
 
@@ -85,7 +103,11 @@ if [ -n "$located" ]; then
 fi
 
 if [ "$total" -eq 0 ] && [ "$listed" -eq 0 ]; then
-  echo "警告ゲート（#1537）: 自分のクレートの警告は 0 件"
+  if [ "$NOUN" = "指摘" ]; then
+    echo "${GATE_NAME}: 自分のクレートの clippy の指摘は 0 件"
+  else
+    echo "${GATE_NAME}: 自分のクレートの警告は 0 件"
+  fi
   exit 0
 fi
 
@@ -95,19 +117,28 @@ if [ "$listed" -gt "$count" ]; then
 fi
 {
   echo
-  echo "警告ゲート（#1537）: 自分のクレートにコンパイラの警告が ${count} 件あります。0 件に保ってください"
+  if [ "$NOUN" = "指摘" ]; then
+    echo "${GATE_NAME}: 自分のクレートに clippy の指摘（コンパイラの警告を含む）が ${count} 件あります。0 件に保ってください"
+  else
+    echo "${GATE_NAME}: 自分のクレートにコンパイラの警告が ${count} 件あります。0 件に保ってください"
+  fi
   if [ -n "$located" ]; then
     printf '%s\n' "$located" | awk -F '\t' '{ print "  " $1 ": " $2 }'
   fi
   if [ "$total" -gt "$listed" ]; then
-    echo "  （位置の分からない警告が $((total - listed)) 件。上の cargo の出力を見てください）"
+    echo "  （位置の分からない${NOUN}が $((total - listed)) 件。上の cargo の出力を見てください）"
   fi
-  echo "  直し方: 本当に使っていないものは消し、片方の OS でだけ使うものは使う側の cfg へ寄せる"
-  echo "  （逃がすなら #[cfg_attr(windows, allow(dead_code))] に理由のコメントを添える）"
+  if [ "$NOUN" = "指摘" ]; then
+    echo "  直し方: clippy の help の行に従って直す。cfg の片側でだけ出る誤検知と、直すと挙動が変わるものだけ"
+    echo "  #[allow(clippy::…)]（片側なら #[cfg_attr(windows, allow(clippy::…))]）に理由のコメントを添えて逃がす"
+  else
+    echo "  直し方: 本当に使っていないものは消し、片方の OS でだけ使うものは使う側の cfg へ寄せる"
+    echo "  （逃がすなら #[cfg_attr(windows, allow(dead_code))] に理由のコメントを添える）"
+  fi
 } >&2
 # GitHub Actions ではチェックの注釈に位置を名指しで出す
 if [ "${GITHUB_ACTIONS:-}" = "true" ] && [ -n "$located" ]; then
-  printf '%s\n' "$located" | awk -F '\t' '{
+  printf '%s\n' "$located" | awk -F '\t' -v tag="$TAG" '{
     loc = $1; msg = $2
     file = loc; ln = ""; col = ""
     if (match(loc, /:[0-9]+:[0-9]+$/)) {
@@ -116,7 +147,7 @@ if [ "${GITHUB_ACTIONS:-}" = "true" ] && [ -n "$located" ]; then
       ln = p[1]; col = p[2]
     }
     gsub(/%/, "%25", msg)
-    printf "::error file=%s,line=%s,col=%s::[#1537 警告ゲート] %s\n", file, ln, col, msg
+    printf "::error file=%s,line=%s,col=%s::[%s] %s\n", file, ln, col, tag, msg
   }'
 fi
 exit 3

@@ -12,6 +12,8 @@
 #      位置の分からない警告も数える / GitHub Actions では注釈を出す / --message-format は断る
 #   B. 本物の cargo: 本体の警告・テストの cfg の内側だけの警告（`cargo test --no-run`）を拾う・
 #      済んだビルドに当てても再コンパイル無しで数える（色つきで作った後でも）・警告の無いクレートは 0
+#   A2 / B2. clippy の段（#2850）: 偽の cargo で見出し・直し方・注釈を clippy の指摘として言う / 本物の
+#      clippy で本体とテストの cfg の内側の指摘を拾い、済んだ単位は検査し直さずに数える
 # 配線（CI の Windows ジョブと scripts/check-windows.sh がこのゲートを通すこと）は
 # Rust の番犬 crates/tako-control/tests/ci_windows_test_compile.rs が見る
 # 検出力: 色を切らない写しのゲートは、色つきの CI と同じ条件で警告を見落とすことを確かめる
@@ -141,6 +143,40 @@ assert_eq "--message-format は断る" "$?" "2"
 out="$(bash "$GATE" 2>&1)"
 assert_eq "コマンドが無ければ使い方の誤り" "$?" "2"
 
+echo "A2. clippy の段（#2850。偽の cargo）"
+run_fake_clippy() { # run_fake と同じ。cargo の副コマンドだけ clippy
+  local file="$1" rc="$2"
+  shift 2
+  out="$(env "$@" FAKE_OUT="$file" FAKE_RC="$rc" bash "$GATE" "$FAKE" clippy --workspace --all-targets 2>&1)"
+  code=$?
+}
+printf '%s\r\n' \
+  '    Checking tako-control v0.8.40 (C:\a\tako\tako\crates\tako-control)' \
+  'warning: unneeded `return` statement' \
+  '  --> crates\tako-control\src\fda.rs:20:9' \
+  '   |' \
+  '20 |         return true;' \
+  '   |' \
+  '   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#needless_return' \
+  '   = note: `#[warn(clippy::needless_return)]` on by default' \
+  '' \
+  'warning: `tako-control` (lib) generated 1 warning (run `cargo clippy --fix --lib -p tako-control` to apply 1 suggestion)' \
+  'warning: `tako-control` (lib test) generated 1 warning (1 duplicate)' \
+  '    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.00s' >"${TMP}/clippy.txt"
+run_fake_clippy "${TMP}/clippy.txt" 0
+assert_eq "clippy の指摘があれば終了コード 3" "$code" "3"
+assert_has "clippy の指摘として件数を言う（重複は引く）" "clippy ゲート（#2850）: 自分のクレートに clippy の指摘（コンパイラの警告を含む）が 1 件あります" "$out"
+assert_has "clippy の指摘を名指す" "crates/tako-control/src/fda.rs:20:9: unneeded \`return\` statement" "$out"
+assert_has "clippy の直し方を言う" "#[allow(clippy::…)]" "$out"
+assert_lacks "コンパイラの警告の直し方を言わない" "allow(dead_code)" "$out"
+run_fake_clippy "${TMP}/clippy.txt" 0 GITHUB_ACTIONS=true
+assert_has "clippy の注釈は clippy ゲートの名で出す" "::error file=crates/tako-control/src/fda.rs,line=20,col=9::[#2850 clippy ゲート] unneeded \`return\` statement" "$out"
+run_fake_clippy "${TMP}/clean.txt" 0
+assert_eq "clippy の指摘 0 件は 0" "$code" "0"
+assert_has "clippy の指摘は 0 件と言う" "clippy ゲート（#2850）: 自分のクレートの clippy の指摘は 0 件" "$out"
+run_fake "${TMP}/clippy.txt" 0
+assert_has "build の段は従来どおり警告ゲートの名で言う" "警告ゲート（#1537）: 自分のクレートにコンパイラの警告が 1 件あります" "$out"
+
 echo "B. 本物の cargo（一時ディレクトリの小さなクレート）"
 if ! command -v cargo >/dev/null 2>&1; then
   ng "cargo がある" "PATH に cargo が無い"
@@ -187,6 +223,53 @@ EOF
   printf 'pub fn used() {}\n' >"${CRATE}/src/lib.rs"
   out="$(cd "$CRATE" && bash "$GATE" cargo build --offline 2>&1)"
   assert_eq "警告の無いクレートは 0" "$?" "0"
+  unset CARGO_TARGET_DIR
+
+  echo "B2. clippy の段（#2850。本物の clippy）"
+  # リポジトリと同じ版の clippy で見る（一時ディレクトリにはリポジトリの rust-toolchain.toml が効かない）
+  CL="${TMP}/probe-clippy"
+  mkdir -p "${CL}/src"
+  command cp -f "${REPO_ROOT}/rust-toolchain.toml" "${CL}/rust-toolchain.toml"
+  printf '[package]\nname = "probe2850"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\n' >"${CL}/Cargo.toml"
+  cat >"${CL}/src/lib.rs" <<'EOF'
+pub fn used(x: u32) -> u32 {
+    return x + 1;
+}
+
+#[cfg(test)]
+mod tests {
+    fn twice_2850(x: u32) -> u32 {
+        return x * 2;
+    }
+
+    #[test]
+    fn t() {
+        assert_eq!(super::used(twice_2850(1)), 3);
+    }
+}
+EOF
+  export CARGO_TARGET_DIR="${CL}/target"
+  if ! (cd "$CL" && cargo clippy --version >/dev/null 2>&1); then
+    ng "clippy がある" "rust-toolchain.toml の版に clippy が無い"
+  else
+    out="$(cd "$CL" && bash "$GATE" cargo clippy --offline 2>&1)"
+    code=$?
+    assert_eq "clippy: 本体の指摘で 3" "$code" "3"
+    assert_has "clippy: 本体の指摘を名指す" "src/lib.rs:2:5: unneeded \`return\` statement" "$out"
+    assert_lacks "clippy: --all-targets なしではテストの cfg の内側を見ない" "src/lib.rs:8:9" "$out"
+    out="$(cd "$CL" && bash "$GATE" cargo clippy --offline --all-targets 2>&1)"
+    code=$?
+    assert_eq "clippy --all-targets: 3" "$code" "3"
+    assert_has "clippy --all-targets: テストの cfg の内側だけの指摘を名指す" "src/lib.rs:8:9: unneeded \`return\` statement" "$out"
+    out="$(cd "$CL" && CARGO_TERM_COLOR=always bash "$GATE" cargo clippy --offline --all-targets 2>&1)"
+    code=$?
+    assert_eq "clippy: 済んだ単位に当てても 3" "$code" "3"
+    assert_lacks "clippy: 済んだ単位は検査し直さない" "Checking probe2850" "$out"
+    assert_has "clippy: 再生でも本体の指摘を名指す" "src/lib.rs:2:5: unneeded \`return\` statement" "$out"
+    printf 'pub fn used(x: u32) -> u32 {\n    x + 1\n}\n' >"${CL}/src/lib.rs"
+    out="$(cd "$CL" && bash "$GATE" cargo clippy --offline --all-targets 2>&1)"
+    assert_eq "clippy: 指摘の無いクレートは 0" "$?" "0"
+  fi
   unset CARGO_TARGET_DIR
 fi
 

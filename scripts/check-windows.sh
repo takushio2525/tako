@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# macOS から Windows ターゲットのコンパイル検査を行う（Issue #467 / P0）。
+# macOS から Windows ターゲットのコンパイル検査と clippy を行う（Issue #467 / P0・#2850）。
 #
 # 目的: mac で先行開発している間に Windows ビルドを腐らせないこと。
 # 「一括反映」の差分が純粋な機能実装だけになり、ビルド修復作業が混ざらないようにする。
 #
 # 設計の正: .agent/plans/2026-07-windows-port-architecture.md
-# 実機での build / 実行は別途必要（本スクリプトはリンクを行わない型検査まで）。
+# 実機での build / 実行は別途必要（本スクリプトはリンクを行わない型検査と clippy まで）。
 #
 # 使い方:
-#   scripts/check-windows.sh            # 全クレートを検査
-#   scripts/check-windows.sh -p tako-core   # cargo の追加引数はそのまま渡る
+#   scripts/check-windows.sh            # CI の Windows ジョブと同じ 3 つの feature 宇宙を clippy で検査
+#   scripts/check-windows.sh -p tako-core   # cargo の追加引数はそのまま渡る（1 本だけ回す）
 #
-# 終了コード: 0 = エラーも警告も無い / 3 = 警告がある（エラーは無い。#1537）/
-#             2 = 前提ツールが足りない / それ以外 = cargo のエラー
+# 終了コード: 0 = エラーも警告も clippy の指摘も無い / 3 = 警告か clippy の指摘がある
+#             （エラーは無い。#1537 / #2850）/ 2 = 前提ツールが足りない / それ以外 = cargo のエラー
 set -euo pipefail
 
 TARGET="x86_64-pc-windows-msvc"
@@ -75,6 +75,13 @@ echo "target: $TARGET"
 echo "gpui:   $GPUI_DIR"
 echo
 
+# **clippy で見る**（#2850）。clippy はコンパイラのエラーと警告も含めて見る（check の上位）ので、
+# 1 回で #1537 の警告と clippy の指摘の両方を拾う。Windows の cfg の内側は macOS の clippy から
+# 見えず、Windows の clippy はそれまで誰も回していなかった（2026-11-10 の着手時 13 件）。引数なしでは
+# AGENTS.md の lint 行・CI の Windows ジョブと同じ 3 つの feature 宇宙を回す（visual-test の宇宙に
+# しか出ない指摘が着手時にあった）。clippy の `-- -D warnings` は付けない（ゲートが数える。理由は
+# scripts/warning-gate.sh）
+#
 # **警告も 0 件に保つ**（#1537 / #1827）。以前はエラーだけを見ていて、Windows の cfg の内側
 # だけで出る警告（unix 向けの補助が Windows で未使用 など）が 9 月に 31 件・11 月に 36 件まで
 # 積み上がり、新しい警告が埋もれていた。数え方は CI の Windows ジョブと同じ 1 実装
@@ -101,5 +108,25 @@ for arg in "$@"; do
     --message-format*) GATE=() ;;
   esac
 done
-PATH="${LLVM_BIN}:$PATH" INCLUDE="$GPUI_DIR" \
-  ${GATE[@]+"${GATE[@]}"} cargo xwin check --workspace --target "$TARGET" ${ALL_TARGETS[@]+"${ALL_TARGETS[@]}"} "$@"
+xwin_clippy() {
+  PATH="${LLVM_BIN}:$PATH" INCLUDE="$GPUI_DIR" \
+    ${GATE[@]+"${GATE[@]}"} cargo xwin clippy --target "$TARGET" "$@"
+}
+
+if [ "$#" -eq 0 ]; then
+  # 3 つの宇宙を全部回してから返す。エラー（3 以外）を警告（3）より優先して返す
+  rc=0
+  for universe in workspace visual-test no-gpui; do
+    r=0
+    case "$universe" in
+      workspace) xwin_clippy --workspace --all-targets || r=$? ;;
+      visual-test) xwin_clippy -p tako-app --features visual-test --all-targets || r=$? ;;
+      no-gpui) xwin_clippy -p tako-core -p tako-control -p tako-cli --all-targets || r=$? ;;
+    esac
+    if [ "$r" -ne 0 ] && { [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]; }; then
+      rc="$r"
+    fi
+  done
+  exit "$rc"
+fi
+xwin_clippy --workspace ${ALL_TARGETS[@]+"${ALL_TARGETS[@]}"} "$@"
