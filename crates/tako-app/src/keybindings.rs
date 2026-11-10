@@ -2424,7 +2424,7 @@ mod tests {
                     key: "v".into(),
                     key_char: None,
                 };
-                let (bound, _) = keymap.bindings_for_input(&[ks.clone()], &[]);
+                let (bound, _) = keymap.bindings_for_input(std::slice::from_ref(&ks), &[]);
                 let action = bound.first().map(|b| b.action().name().to_string());
                 let arm = keys::paste_key_active(
                     platform,
@@ -2449,7 +2449,7 @@ mod tests {
                 Platform::Windows => "ctrl-v",
             };
             let want = Keystroke::parse(primary).expect("貼り付けの打鍵");
-            let (bound, _) = keymap.bindings_for_input(&[want.clone()], &[]);
+            let (bound, _) = keymap.bindings_for_input(std::slice::from_ref(&want), &[]);
             assert_eq!(
                 bound.first().map(|b| b.action().name()),
                 Some("tako::PasteClipboard"),
