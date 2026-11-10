@@ -6139,22 +6139,43 @@ fn orchestrator_watch(
                     } else {
                         String::new()
                     };
-                    println!("  {number}. {label}{cut}{mark}");
+                    // #2841: キーの案内で答えるダイアログはその選択肢を確定するキー（キー名は印なので訳さない）
+                    let key = match opt.get("key") {
+                        Some(Value::String(k)) => format!(" [{k}]"),
+                        Some(Value::Null) => " [?]".to_string(),
+                        _ => String::new(),
+                    };
+                    println!("  {number}. {label}{key}{cut}{mark}");
                 }
             }
-            if choice_dialog.get("numbered").and_then(|v| v.as_bool()) == Some(false) {
+            // #2841: 選択肢がキーを持つ = 番号もカーソルも無くキーの案内で答えるダイアログ
+            let key_dialog = choice_dialog
+                .get("options")
+                .and_then(|v| v.as_array())
+                .is_some_and(|opts| opts.iter().any(|o| o.get("key").is_some()));
+            if key_dialog {
+                println!("  note: {}", ReplyNote::WatchNoteKeyDialog.text_in(lang));
+            } else if choice_dialog.get("numbered").and_then(|v| v.as_bool()) == Some(false) {
                 println!("  note: {}", ReplyNote::WatchNoteUnnumbered.text_in(lang));
             }
             // #1143: 狭いペインではカーソルもラベルの全文も画面に残らない
+            // （#2841: キーの案内で答えるダイアログでは案内の行が画面外 = 選択肢は実測の並び）
             if choice_dialog
                 .get("cursor_visible")
                 .and_then(|v| v.as_bool())
                 == Some(false)
             {
-                println!(
-                    "  note: {}",
-                    ReplyNote::WatchNoteCursorOffscreen.text_in(lang)
-                );
+                let note = match key_dialog {
+                    true => ReplyNote::WatchNoteKeyHintOffscreen,
+                    false => ReplyNote::WatchNoteCursorOffscreen,
+                };
+                println!("  note: {}", note.text_in(lang));
+            }
+            // #2841: 種別ごとの案内（原因と答え方）。応答の `note` と同じ文を CLI の表示言語で引き直す
+            if let Some(note) = tako_control::claude_tui::DialogKind::from_slug(kind)
+                .and_then(tako_control::claude_tui::DialogKind::note)
+            {
+                println!("  note: {}", note.text_in(lang));
             }
             if choice_dialog
                 .get("labels_truncated")

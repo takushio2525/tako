@@ -1946,6 +1946,94 @@ pub fn is_key_hint(line: &str) -> bool {
         || t.contains("to cancel")
 }
 
+/// キーの案内で答えるダイアログの選択肢 1 つ（#2841）。
+///
+/// 選択カーソルも番号も無く、**確定キーの案内の行そのものが選択肢**になっているダイアログがある。
+/// 実採取（claude 2.1.319 / 2.1.322）の auto mode の確認「Auto mode can't check actions in this
+/// session」は下端に `Enter to stay in auto mode · shift+Tab to leave for accept edits mode and stop ·
+/// Esc to cancel` だけを描き、押したキーで答えが決まる。`<キー> to <動詞>` の 1 区切りがこれ 1 つ
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyHintChoice {
+    /// 画面の綴りのキー（`Enter` / `shift+Tab` / `Esc`）
+    pub key_text: String,
+    /// 送るキー名（[`crate::backend::key_name_bytes`] の語彙）。綴りを語彙へ落とせなければ None
+    /// （**推測しない**。違うキーを送るとダイアログを誤操作する）
+    pub key: Option<String>,
+    /// `to` の後ろの動詞（`stay in auto mode`）。選択肢のラベルになる
+    pub action: String,
+}
+
+/// 案内のキーの語の数の上限（`shift+Tab` / `ctrl+e` は 1 語・codex の `Press enter` は 2 語）
+const KEY_HINT_CHOICE_KEY_WORDS: usize = 2;
+
+/// `<キー> to <動詞>` を ` · ` で並べた案内の文を区切りごとに読む（#2841）。
+///
+/// [`hint_shape`]（選択肢の並びの下の案内を見分ける）と違い、**動詞の長さを縛らない**
+/// （auto mode の確認の動詞は `leave for accept edits mode and stop` = 7 語）。代わりに区切りが
+/// 1 つでも形でなければ `None` を返す（会話の本文を案内と読まない）。形:
+///
+/// - キーは 1〜2 語の ASCII と矢印だけ（[`hint_segment`] と同じ字種）
+/// - 動詞は 1 語以上の英単語（ASCII の英字・数字と `'` `-` `,` `.` `(` `)` `/`）
+///
+/// 狭いペインで案内が折り返されていたら、呼び手が行を空白でつないでから渡す
+/// （`·` の前後の空白は区切りに含めて読む）
+pub fn parse_key_hint_choices(text: &str) -> Option<Vec<KeyHintChoice>> {
+    let mut out = Vec::new();
+    for seg in text.split('\u{b7}').map(str::trim) {
+        let words: Vec<&str> = seg.split_whitespace().collect();
+        let to = words.iter().position(|w| *w == "to")?;
+        let (key_words, verb) = (&words[..to], &words[to + 1..]);
+        let key_char = |c: char| c.is_ascii_graphic() || "↑↓←→".contains(c);
+        if key_words.is_empty()
+            || key_words.len() > KEY_HINT_CHOICE_KEY_WORDS
+            || !key_words.iter().all(|w| w.chars().all(key_char))
+        {
+            return None;
+        }
+        let verb_char = |c: char| c.is_ascii_alphanumeric() || "'-,.()/".contains(c);
+        if verb.is_empty() || !verb.iter().all(|w| w.chars().all(verb_char)) {
+            return None;
+        }
+        let key_text = key_words.join(" ");
+        out.push(KeyHintChoice {
+            key: hint_key_name(&key_text),
+            key_text,
+            action: verb.join(" "),
+        });
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// 案内の綴りのキーを [`crate::backend::key_name_bytes`] の語彙へ直す（#2841）。
+///
+/// claude の案内の綴り（実採取: `Enter` / `Esc` / `Tab` / `shift+Tab` / `ctrl+e` / `n`）を受ける。
+/// 1 文字のキー以外は大小を問わない。語彙に無い綴り（`↑/↓`・`Press enter` ほか）は `None`（推測しない）
+pub fn hint_key_name(key_text: &str) -> Option<String> {
+    let trimmed = key_text.trim();
+    // 1 文字の印字可能 ASCII（`n to add notes`）はそのまま（大小を変えない）
+    let mut chars = trimmed.chars();
+    if let (Some(c), None) = (chars.next(), chars.next()) {
+        return c.is_ascii_graphic().then(|| c.to_string());
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let name = match lower.as_str() {
+        "enter" | "return" => "Enter",
+        "esc" | "escape" => "Escape",
+        "tab" => "Tab",
+        "shift+tab" | "shift-tab" | "s-tab" | "btab" => "BTab",
+        "space" => "Space",
+        other => {
+            // ctrl+<英字>（`ctrl+e to explain`）は制御文字 1 バイトの `C-<英字>`
+            let letter = other
+                .strip_prefix("ctrl+")
+                .or_else(|| other.strip_prefix("ctrl-"))
+                .filter(|l| l.len() == 1 && l.as_bytes()[0].is_ascii_alphabetic())?;
+            return Some(format!("C-{letter}"));
+        }
+    };
+    Some(name.to_string())
+}
+
 /// 兄弟 2 行だけの並びを「選択肢」と言い切れる追加の根拠（#1223）。
 ///
 /// claude 2.x の信頼ダイアログは**選択肢 2 つ・番号なし**で、確定キーの案内が
@@ -3912,6 +4000,80 @@ Antigravity CLI requires permission to read, edit, and execute files here.
             assert!(
                 detect_choice_list(&rows(&screen)).is_none(),
                 "{name}: 案内の続きでない行を案内と読んだ"
+            );
+        }
+    }
+
+    // --- #2841: キーの案内で答えるダイアログ（auto mode の確認）の案内を選択肢へ読む ---
+
+    #[test]
+    fn issue2841_キーの案内を区切りごとに選択肢へ読む() {
+        // claude 2.1.322 の実採取（110 桁の 1 行。60 桁で折れた 2 行は呼び手が空白でつなぐ）
+        let auto = "Enter to stay in auto mode \u{b7} shift+Tab to leave for accept edits mode and stop \u{b7} Esc to cancel";
+        let got = parse_key_hint_choices(auto).expect("案内の形");
+        let read: Vec<(&str, Option<&str>, &str)> = got
+            .iter()
+            .map(|c| (c.key_text.as_str(), c.key.as_deref(), c.action.as_str()))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("Enter", Some("Enter"), "stay in auto mode"),
+                (
+                    "shift+Tab",
+                    Some("BTab"),
+                    "leave for accept edits mode and stop"
+                ),
+                ("Esc", Some("Escape"), "cancel"),
+            ]
+        );
+        let wrapped = "Enter to stay in auto mode \u{b7} shift+Tab to leave for accept edits mode and stop \u{b7} Esc to cancel"
+            .replace("leave for ", "leave for  ");
+        assert_eq!(parse_key_hint_choices(&wrapped), Some(got));
+        // permission の案内（実採取 v2.1.220）: ctrl+e は C-e
+        let perm =
+            parse_key_hint_choices("Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain")
+                .expect("案内の形");
+        assert_eq!(
+            perm.iter().map(|c| c.key.as_deref()).collect::<Vec<_>>(),
+            [Some("Escape"), Some("Tab"), Some("C-e")]
+        );
+    }
+
+    #[test]
+    fn issue2841_案内でない文と読めないキーの境界() {
+        // 区切りが 1 つでも形でなければ案内と読まない（本文の文・日本語・キーの語が長すぎる）
+        for text in [
+            "",
+            "Auto mode can't check actions in this session",
+            "Or you can leave for accept edits mode, which has no safety check",
+            "Enter to stay in auto mode \u{b7} 了解です",
+            "Press the big red button to stay in auto mode",
+            "Enter to",
+            "Enter to stay \u{b7} ",
+        ] {
+            assert_eq!(parse_key_hint_choices(text), None, "{text:?}");
+        }
+        // 形は保っているがキーを語彙へ落とせない区切りは key=None（推測しない）
+        let odd = parse_key_hint_choices(
+            "F9 to leave \u{b7} \u{2191}/\u{2193} to navigate \u{b7} n to add notes",
+        )
+        .expect("形は案内");
+        assert_eq!(
+            odd.iter().map(|c| c.key.as_deref()).collect::<Vec<_>>(),
+            [None, None, Some("n")]
+        );
+        assert_eq!(hint_key_name("ESC").as_deref(), Some("Escape"));
+        assert_eq!(hint_key_name("Shift+Tab").as_deref(), Some("BTab"));
+        assert_eq!(hint_key_name("N").as_deref(), Some("N"));
+        assert_eq!(hint_key_name("ctrl+1"), None);
+        assert_eq!(hint_key_name("ctrl+ee"), None);
+        // 落とした名前はどれも送り口の語彙にある（shift+Tab は器で形が変わるので器を知る口で引く）
+        for key in ["Enter", "Esc", "Tab", "shift+Tab", "Space", "ctrl+e", "n"] {
+            let name = hint_key_name(key).expect(key);
+            assert!(
+                crate::backend::key_name_bytes_in(&name, true).is_some(),
+                "{key} -> {name} が key_name_bytes の語彙に無い"
             );
         }
     }

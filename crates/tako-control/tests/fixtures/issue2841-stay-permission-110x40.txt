@@ -1,0 +1,40 @@
+
+⏺ Auto mode lets Claude handle permission prompts automatically — Claude checks each tool call for
+  risky actions and prompt injection before executing. Actions Claude identifies as safe are executed,
+  while actions Claude identifies as risky are blocked and Claude may try a different approach. Ideal
+  for long-running tasks. Sessions are slightly more expensive. Claude can make mistakes that allow
+  harmful commands to run, it's recommended to only use in isolated environments. Shift+Tab to change
+  mode.
+
+❯ Run this command: echo hello2841 > out.txt
+
+  Ran 1 shell command
+
+⏺ RUN-DONE
+
+✻ Cooked for 0s · done 6:10 PM
+
+❯ Run this command: python3 -c "print(2841)"
+
+  Running the check command
+  ⎿  $ python3 -c "print(2841)"
+
+⏺ Auto mode can't check actions in this session. Its safety check runs on the server, and your
+  requests go through 127.0.0.1:51034, which doesn't pass it through. Actions that need the check now
+  ask for your approval. To work without these prompts, switch permission mode with Shift+Tab. To use
+  auto mode, ask whoever runs 127.0.0.1:51034 to pass Claude Code's server-side safety check through:
+  https://code.claude.com/docs/en/permission-modes#server-side-classifier-review
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Run the check command
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ python3 -c "print(2841)"
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Auto mode can't check actions in this session, so this one needs your approval
+
+ Do you want to proceed?
+ ❯ No
+   Yes
+
+ Esc to cancel · Tab to amend

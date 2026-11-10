@@ -51,6 +51,11 @@ pub enum DialogKind {
     UsageLimit,
     /// plan モードの実行確認（`Would you like to proceed?`）
     PlanConfirm,
+    /// auto mode の安全確認がこのセッションで使えないときの確認（#2841。
+    /// `Auto mode can't check actions in this session`）。選択カーソルも番号も無く、
+    /// 確定キーの案内（`Enter to stay in auto mode · shift+Tab to leave … · Esc to cancel`）の
+    /// キーで答える。`ChoiceDialog::answer_keys` が選択肢ごとのキーを持つ
+    AutoModeUnchecked,
     /// それ以外の選択（`/model` のモデル選択・`/mcp` の一覧・AskUserQuestion 等）
     Select,
 }
@@ -64,8 +69,24 @@ impl DialogKind {
             Self::Bypass => "bypass",
             Self::UsageLimit => "usage_limit",
             Self::PlanConfirm => "plan_confirm",
+            Self::AutoModeUnchecked => "auto_mode_unchecked",
             Self::Select => "select",
         }
+    }
+
+    /// [`Self::as_str`] の逆（watch が応答の JSON の `kind` から種別へ戻す。知らない slug は None）
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        [
+            Self::Permission,
+            Self::Trust,
+            Self::Bypass,
+            Self::UsageLimit,
+            Self::PlanConfirm,
+            Self::AutoModeUnchecked,
+            Self::Select,
+        ]
+        .into_iter()
+        .find(|k| k.as_str() == slug)
     }
 
     /// master 向けの推奨アクション（worker_status / watch の JSON にそのまま載せる）
@@ -82,6 +103,15 @@ impl DialogKind {
     /// tako が自動で承諾する種別か（master が触ってはいけないもの）
     pub fn auto_accepted(self) -> bool {
         matches!(self, Self::Trust | Self::Bypass)
+    }
+
+    /// master へ添える案内（原因と答え方。#2841）。案内の無い種別は None。
+    /// `choice_dialog.note`（worker_status / read / respond の下見）と watch の `note:` の行が同じ文を使う
+    pub fn note(self) -> Option<crate::ReplyNote> {
+        match self {
+            Self::AutoModeUnchecked => Some(crate::ReplyNote::DialogAutoModeUnchecked),
+            _ => None,
+        }
     }
 }
 
@@ -100,8 +130,14 @@ pub struct ChoiceDialog {
     pub numbered: bool,
     /// 選択カーソルが画面に描かれているか（#1143）。
     /// **false = ダイアログがペインより高くてカーソル行が画面外**（`highlighted` も None）。
-    /// 番号キーでは確定できるので respond は動く
+    /// 番号キーでは確定できるので respond は動く。
+    /// キーの案内で答えるダイアログ（`answer_keys` が Some）では**案内の行が描かれているか**
+    /// （false = ペインより高くて案内が画面外。選択肢は実測の既定の並び = #2841）
     pub cursor_visible: bool,
+    /// 選択肢ごとの確定キー（#2841。`options` と同じ長さ・同じ順。キー名は
+    /// `tako_core::backend::key_name_bytes` の語彙で、案内の綴りを落とせない選択肢は None）。
+    /// **None = 番号キーか矢印 + Enter で答える従来の形**。Some のとき respond はそのキーを 1 つ送る
+    pub answer_keys: Option<Vec<Option<String>>>,
 }
 
 impl ChoiceDialog {
@@ -119,13 +155,22 @@ impl ChoiceDialog {
             // #1143 / #2302: 1 つでもラベルが `…` で切り詰められているか、説明との境目が
             // 読めないか（true なら master は**番号で** respond する）
             "labels_truncated": self.labels_truncated(),
-            "options": self.options.iter().map(|o| json!({
-                "number": o.number,
-                "label": o.label,
-                "highlighted": o.highlighted,
-                // #1143 / #2302: 元のラベルを画面から確定できない（ラベル一致で選ばない）
-                "label_truncated": o.label_truncated,
-            })).collect::<Vec<_>>(),
+            "options": self.options.iter().enumerate().map(|(i, o)| {
+                let mut option = json!({
+                    "number": o.number,
+                    "label": o.label,
+                    "highlighted": o.highlighted,
+                    // #1143 / #2302: 元のラベルを画面から確定できない（ラベル一致で選ばない）
+                    "label_truncated": o.label_truncated,
+                });
+                // #2841: キーの案内で答えるダイアログだけ、その選択肢を確定するキー（null = 送れない綴り）
+                if let Some(keys) = &self.answer_keys {
+                    option["key"] = json!(keys.get(i).cloned().flatten());
+                }
+                option
+            }).collect::<Vec<_>>(),
+            // #2841: 種別ごとの案内（原因と答え方。null = 案内の無い種別）。表示言語は組んだその場
+            "note": self.kind.note().map(String::from),
         })
     }
 
@@ -147,6 +192,11 @@ impl ChoiceDialog {
 /// usage limit の対処選択・`/model`・`/mcp`・plan 確認・AskUserQuestion を
 /// **同じ形**で拾えるようにする（実採取画面は `tako_core::dialog` のテスト参照）
 pub fn detect_choice_dialog(lines: &[String]) -> Option<ChoiceDialog> {
+    // #2841: 選択肢の並びを持たない（キーの案内で答える）auto mode の確認を先に見る。
+    // 錨は文言（見出しの行・案内の動詞）なので、並びの構造検知より先に見ても他の画面を奪わない
+    if let Some(dialog) = auto_mode_unchecked_dialog(lines) {
+        return Some(dialog);
+    }
     let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
     let list = tako_core::dialog::detect_choice_list(&refs)?;
     let kind = classify_dialog(lines, &list);
@@ -157,7 +207,167 @@ pub fn detect_choice_dialog(lines: &[String]) -> Option<ChoiceDialog> {
         highlighted: list.highlighted,
         numbered: list.numbered,
         cursor_visible: list.cursor_row.is_some(),
+        answer_keys: None,
     })
+}
+
+/// auto mode の確認の見出しの行（#2841。claude 2.1.319 / 2.1.322 の実採取。trim して**完全一致**）。
+///
+/// 同じ文で始まる行がほかに 2 つある: 答えた後に会話へ残る `⏺ Auto mode can't check actions in this
+/// session. Its safety check …`（記号つき・句点で続く）と、auto mode に留まった後の操作ごとの承認
+/// ダイアログの `Auto mode can't check actions in this session, so this one needs your approval`
+/// （kind=permission で並びの検知が拾う）。どちらも完全一致しないので、見出しだけを錨にできる
+pub const AUTO_MODE_UNCHECKED_TITLE: &str = "Auto mode can't check actions in this session";
+
+/// auto mode の確認の確定キーの案内に必ず入る動詞（`Enter to stay in auto mode · …`）
+const AUTO_MODE_UNCHECKED_STAY: &str = "stay in auto mode";
+
+/// 案内の行にだけ現れる字面（本文の `You can stay in auto mode …` には `to` が付かない）
+const AUTO_MODE_UNCHECKED_HINT_MARK: &str = "to stay in auto mode";
+
+/// 案内の行が画面外のとき（ダイアログがペインより高い = 80 桁 × 16 行で実測）に使う選択肢の並び。
+/// claude 2.1.322 の実測（案内 `Enter to stay in auto mode · shift+Tab to leave for accept edits mode
+/// and stop · Esc to cancel`。偽の Messages API で 110 / 80 / 60 桁を採った）。案内が見えていれば
+/// **画面の案内が正**で、こちらは使わない
+const AUTO_MODE_UNCHECKED_MEASURED: [(&str, &str); 3] = [
+    ("Enter", "stay in auto mode"),
+    ("shift+Tab", "leave for accept edits mode and stop"),
+    ("Esc", "cancel"),
+];
+
+/// `TAKO_2841_LEGACY=1` で #2841 前（auto mode の確認を検知しない）へ戻す（A/B 用）
+fn legacy_2841() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_2841_LEGACY").is_ok_and(|v| v == "1"))
+}
+
+/// auto mode の安全確認が使えないときの確認を検知する（#2841）。
+///
+/// claude 2.1.319 / 2.1.322 は auto mode の安全確認（サーバー側の分類器）がこのセッションで
+/// 届かないと、確認が要る最初の操作で次の画面を出して入力欄を奪う（偽の Messages API =
+/// `ANTHROPIC_BASE_URL` のゲートウェイ経由で再現。実採取は tests/fixtures/issue2841-*）:
+///
+/// ```text
+/// ──────────────────────────────────────────────
+///   Auto mode can't check actions in this session
+///
+///   Auto mode's safety check runs on the server. Your requests go through
+///   127.0.0.1:51034, and the check isn't getting through.
+///   …（auto mode に留まる / accept edits へ移る の説明）…
+///
+///   Enter to stay in auto mode · shift+Tab to leave for accept edits mode and stop · Esc to cancel
+/// ```
+///
+/// 選択カーソルも番号も無いので並びの構造検知（`tako_core::dialog`）には載らない（入力欄も
+/// 無いので、修正前は状態照会が waiting へ上がらず watch も `WORKER_DIALOG` を出せなかった）。
+/// 錨は 2 つで、どちらか 1 つあればよい:
+///
+/// - 見出しの行（[`AUTO_MODE_UNCHECKED_TITLE`] と完全一致）の**真上が罫線**（ダイアログの箱の上端）
+/// - 下端の段落（最後の空行より下）が `stay in auto mode` を含む確定キーの案内
+///
+/// 錨より下に入力欄（プロンプト行）が描かれていれば採らない（答えた後・会話の本文）。
+/// 選択肢は案内の行から読む（[`tako_core::dialog::parse_key_hint_choices`]）。ペインより高くて
+/// 案内が画面外なら（見出しだけ見える）実測の並び [`AUTO_MODE_UNCHECKED_MEASURED`] を使い、
+/// `cursor_visible: false` で申告する。既定の答え（Enter で確定するもの）を `highlighted` にする
+fn auto_mode_unchecked_dialog(lines: &[String]) -> Option<ChoiceDialog> {
+    if legacy_2841() {
+        return None;
+    }
+    let end = lines.iter().rposition(|l| !l.trim().is_empty())? + 1;
+    let title_row = lines[..end]
+        .iter()
+        .rposition(|l| l.trim() == AUTO_MODE_UNCHECKED_TITLE)
+        .filter(|&row| row > 0 && tako_core::dialog::is_rule_line(&lines[row - 1]));
+    // 下端の段落 = 最後の空行より下（狭いペインで折り返された案内は空白でつないで読む）
+    let hint_start = lines[..end]
+        .iter()
+        .rposition(|l| l.trim().is_empty())
+        .map_or(0, |row| row + 1);
+    let hint_text = lines[hint_start..end]
+        .iter()
+        .map(|l| l.trim())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let hint = tako_core::dialog::parse_key_hint_choices(&hint_text)
+        .filter(|choices| choices.iter().any(|c| c.action == AUTO_MODE_UNCHECKED_STAY));
+    let anchor = match (title_row, hint.is_some()) {
+        (Some(row), _) => row,
+        (None, true) => hint_start,
+        (None, false) => return None,
+    };
+    // 見出しだけで採るのは**案内が画面の下へ切れている**ときだけ。案内の文が見出しより下に描かれて
+    // いるのに下端の段落が案内でなければ、ダイアログの後ろに何かが続いている（確認の表示中に claude が
+    // 終わってシェルへ戻った画面の残り等。シェルのプロンプトは入力欄の記号ではないので下の検査を抜ける）
+    if hint.is_none()
+        && lines[anchor..end]
+            .iter()
+            .any(|l| l.contains(AUTO_MODE_UNCHECKED_HINT_MARK))
+    {
+        return None;
+    }
+    // 錨より下に入力欄があれば、それは答えた後の会話（ダイアログは入力欄を奪う）
+    if lines[anchor..end]
+        .iter()
+        .any(|l| prompt_content(l).is_some())
+    {
+        return None;
+    }
+    let cursor_visible = hint.is_some();
+    let choices: Vec<(String, Option<String>)> = match hint {
+        Some(choices) => choices.into_iter().map(|c| (c.action, c.key)).collect(),
+        None => AUTO_MODE_UNCHECKED_MEASURED
+            .iter()
+            .map(|(key, action)| (action.to_string(), tako_core::dialog::hint_key_name(key)))
+            .collect(),
+    };
+    // 既定の答え = Enter で確定する選択肢
+    let highlighted = choices
+        .iter()
+        .position(|(_, key)| key.as_deref() == Some("Enter"));
+    let options = choices
+        .iter()
+        .enumerate()
+        .map(|(i, (label, _))| tako_core::dialog::ChoiceOption {
+            number: None,
+            label: label.clone(),
+            highlighted: Some(i) == highlighted,
+            label_truncated: false,
+        })
+        .collect();
+    Some(ChoiceDialog {
+        kind: DialogKind::AutoModeUnchecked,
+        title: auto_mode_unchecked_title(lines, title_row, hint_start),
+        options,
+        highlighted,
+        numbered: false,
+        cursor_visible,
+        answer_keys: Some(choices.into_iter().map(|(_, key)| key).collect()),
+    })
+}
+
+/// auto mode の確認の本文のうち master に要る部分 = 見出しと、その次の段落（原因。#2841）。
+///
+/// 原因の段落は理由ごとに変わる（ゲートウェイ経由 / 実験的 beta の無効化 / 組織の方針 /
+/// サーバー側の停止 など。2.1.322 のバイナリ内の文）ので画面から写す。続く「留まる / 移る」の
+/// 説明は `note`（[`DialogKind::note`]）が答え方として持つので載せない。見出しが画面外なら見出しの文だけ
+fn auto_mode_unchecked_title(
+    lines: &[String],
+    title_row: Option<usize>,
+    hint_start: usize,
+) -> String {
+    let Some(row) = title_row else {
+        return AUTO_MODE_UNCHECKED_TITLE.to_string();
+    };
+    let cause: Vec<&str> = lines[row + 1..hint_start.max(row + 1)]
+        .iter()
+        .map(|l| l.trim())
+        .skip_while(|l| l.is_empty())
+        .take_while(|l| !l.is_empty())
+        .collect();
+    match cause.is_empty() {
+        true => AUTO_MODE_UNCHECKED_TITLE.to_string(),
+        false => format!("{AUTO_MODE_UNCHECKED_TITLE} {}", cause.join(" ")),
+    }
 }
 
 /// ダイアログの種別を文言で分類する。判定順は「復帰手段が特殊なものから」
@@ -273,6 +483,10 @@ pub fn detect_permission_dialog(lines: &[String]) -> Option<PermissionDialog> {
 /// **入力欄判定・送達フロー・worker 状態がすべて同じ関数を通る**のが要点で、
 /// 片方だけ古い判定を使っていると `/mcp` の一覧行が入力欄に見える（#748 の観測 1）
 pub fn is_choice_dialog(lines: &[String]) -> bool {
+    // #2841: 並びを持たない auto mode の確認も入力欄を奪うダイアログ（`detect_choice_dialog` と同値に保つ）
+    if auto_mode_unchecked_dialog(lines).is_some() {
+        return true;
+    }
     let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
     tako_core::dialog::is_choice_dialog(&refs)
 }

@@ -215,25 +215,40 @@ pub trait DialogAccess {
 ///
 /// 画面はメモリ上のグリッド、キーは PTY へ直接書く。器へ問い合わせないので、
 /// 器が入力送出を持たない環境（psmux = Windows）でも届く
-pub struct LiveDialogAccess(tako_core::PaneAccess);
+pub struct LiveDialogAccess {
+    access: tako_core::PaneAccess,
+    /// このペインへ CSI u が届くか（#2841。shift+Tab = `BTab` の形を選ぶ。修飾付き Enter と同じ判定 =
+    /// `ControlHost::pane_extended_keys`）。既定は届く（器なし・tmux の器。届かないのは psmux の器だけ）
+    extended_keys: bool,
+}
 
 impl LiveDialogAccess {
     pub fn new(access: tako_core::PaneAccess) -> Self {
-        Self(access)
+        Self {
+            access,
+            extended_keys: true,
+        }
+    }
+
+    /// ペインの「CSI u が届くか」を渡す（#2841。[`dialog_access`] がペインの器から引いて渡す）
+    pub fn with_extended_keys(mut self, extended_keys: bool) -> Self {
+        self.extended_keys = extended_keys;
+        self
     }
 }
 
 impl DialogAccess for LiveDialogAccess {
     fn capture(&self) -> Result<Vec<String>, String> {
-        Ok(self.0.visible_lines())
+        Ok(self.access.visible_lines())
     }
 
     fn send_key(&self, key: &str) -> Result<(), String> {
         // キー名の語彙は器側（`send-keys`）と共通。落とせない名前は**推測しない**
-        // （適当なバイト列を送るとダイアログを誤操作する）
-        let bytes = tako_core::backend::key_name_bytes(key)
+        // （適当なバイト列を送るとダイアログを誤操作する）。器で形が変わるキー（shift+Tab = #2841）は
+        // ペインの判定で選ぶ
+        let bytes = tako_core::backend::key_name_bytes_in(key, self.extended_keys)
             .ok_or_else(|| format!("キー名 {key} をバイト列へ落とせない"))?;
-        self.0.write(bytes);
+        self.access.write(bytes);
         Ok(())
     }
 
@@ -285,7 +300,11 @@ pub fn dialog_access(
     session_hint: Option<&str>,
 ) -> Result<Box<dyn DialogAccess + Send>, UnreachableReason> {
     if let Some(session) = host.session(PaneId::from_raw(pane)) {
-        return Ok(Box::new(LiveDialogAccess::new(session.access())));
+        // #2841: shift+Tab の形はペインの器で選ぶ（GUI の打鍵・`SendKeys` と同じ判定）
+        let extended_keys = host.pane_extended_keys(PaneId::from_raw(pane));
+        return Ok(Box::new(
+            LiveDialogAccess::new(session.access()).with_extended_keys(extended_keys),
+        ));
     }
     let Some(hint) = session_hint.filter(|s| !s.is_empty()) else {
         return Err(UnreachableReason::NoSession(pane));

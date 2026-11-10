@@ -1,0 +1,40 @@
+
+
+  Ran 1 shell command
+
+⏺ RUN-DONE
+
+✻ Cooked for 0s · done 6:10 PM
+
+❯ Run this command: python3 -c "print(2841)"
+
+  Ran 1 shell command
+
+⏺ Auto mode can't check actions in this session. Its safety check runs on the server, and your
+  requests go through 127.0.0.1:51034, which doesn't pass it through. Actions that need the check now
+  ask for your approval. To work without these prompts, switch permission mode with Shift+Tab. To use
+  auto mode, ask whoever runs 127.0.0.1:51034 to pass Claude Code's server-side safety check through:
+  https://code.claude.com/docs/en/permission-modes#server-side-classifier-review
+
+⏺ RUN-DONE
+
+✻ Churned for 0s · done 6:11 PM
+
+❯ Run this command: python3 -c "print(2842)"
+
+  Running the check command
+  ⎿  $ python3 -c "print(2842)"
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Run the check command
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ python3 -c "print(2842)"
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Auto mode can't check actions in this session, so this one needs your approval
+
+ Do you want to proceed?
+ ❯ No
+   Yes
+
+ Esc to cancel · Tab to amend

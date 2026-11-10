@@ -428,3 +428,16 @@ included) is in `tako_orchestrator_workers` (`resident.memory_mb` / `agent_mb` /
   (or the repo's own entry points that already do) so they wait their turn for
   memory. A queued command can wait a long time: run it with background execution
   instead of a blocking shell call that times out.
+
+<!-- #2841: auto mode の確認（auto_mode_unchecked）の対処。monitoring の種別ごとの対処へ追加 -->
+- `auto_mode_unchecked` (action: respond) — Claude Code's auto mode cannot run
+  its server-side safety check in this session (e.g. requests go through a
+  gateway via `ANTHROPIC_BASE_URL`; `title:` says why). It has no numbers and
+  no cursor: each option is confirmed by one key, which tako sends for you
+  (shown as `[Enter]` / `[BTab]` / `[Escape]` after the label). To keep the
+  worker going, pick "stay in auto mode" (Enter): from then on each action that
+  needs the check stops at an ordinary permission dialog (WORKER_PERMISSION,
+  default "No") that you answer like any other. "leave for accept edits mode
+  and stop" (shift+Tab) changes the worker's permission mode — ask the user
+  first. "cancel" (Esc) stops the turn, and the same dialog comes back at the
+  next action that needs the check.

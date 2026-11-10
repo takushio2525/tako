@@ -927,9 +927,11 @@ fn reason_index(r: &Reason) -> usize {
         Reason::QueueArbiterOffline => 362,
         // #2743: `tako_send_input` の attachments の写す先（ペインの作業ディレクトリ）が分からない
         Reason::AttachCwdUnknown => 363,
+        // #2841: キーの案内で答えるダイアログで、案内の綴りを送れるキー名へ読めない選択肢
+        Reason::ChoiceKeyUnreadable(_) => 364,
     }
 }
-const REASON_VARIANTS: usize = 364;
+const REASON_VARIANTS: usize = 365;
 
 /// 全バリアントの見本（値は ASCII。英語側の検査で値の日本語を拾わないため）
 fn reason_samples() -> Vec<Reason> {
@@ -1589,6 +1591,7 @@ fn reason_samples() -> Vec<Reason> {
         Reason::RecoverCopyFailed("Permission denied (os error 13)".into()),
         Reason::QueueArbiterOffline,
         Reason::AttachCwdUnknown,
+        Reason::ChoiceKeyUnreadable("stay in auto mode".into()),
     ]
 }
 
@@ -2032,6 +2035,9 @@ const REASON_OLD_JA: [&str; REASON_VARIANTS] = [
     "順番待ちは無効（tako が起動していない）",
     // #2743: 新しい理由（#2365 より前の文は無いので今の日本語）
     "添付を写す先（ペインの作業ディレクトリ）が分からない",
+    // #2841: 新しい理由（#2365 より前の文は無いので今の日本語）
+    "選択肢「stay in auto mode」の確定キーを画面の案内から送れるキー名へ読めないため応答を中止した\
+     （キーは送っていません。手動で応答してください）",
 ];
 
 /// [`REASON_OLD_JA`] の旧文。引き継ぎの材料が無い断りは、dispatch の固定文の後ろに tako-core の雛形
@@ -18725,9 +18731,13 @@ fn reply_note_index(n: &ReplyNote) -> usize {
         ReplyNote::RemoteStopped => 333,
         ReplyNote::RemoteAutostartFailed { .. } => 334,
         ReplyNote::RemoteAutostartNextStep => 335,
+        // #2841: watch のキーの案内で答えるダイアログの注記と、auto mode の確認の案内
+        ReplyNote::WatchNoteKeyDialog => 336,
+        ReplyNote::WatchNoteKeyHintOffscreen => 337,
+        ReplyNote::DialogAutoModeUnchecked => 338,
     }
 }
-const REPLY_NOTE_VARIANTS: usize = 336;
+const REPLY_NOTE_VARIANTS: usize = 339;
 
 /// 見本の Remote Control の理由・次の一手（中身は `claude_remote` の日英の `Note`）
 const RC_REASON: tako_core::platform::support::Note =
@@ -21101,6 +21111,29 @@ fn reply_note_table() -> Vec<(ReplyNote, String)> {
         (
             ReplyNote::RemoteAutostartNextStep,
             "次の一手: `tako remote start` で手動起動できます".into(),
+        ),
+        // #2841: 新しい注記（#2365 より前の文は無いので今の日本語）
+        (
+            ReplyNote::WatchNoteKeyDialog,
+            "番号もカーソルも無くキーの案内で答えるダイアログ（tako が選んだ選択肢のキーを 1 つ送る）"
+                .into(),
+        ),
+        (
+            ReplyNote::WatchNoteKeyHintOffscreen,
+            "ダイアログがペインより高くキーの案内が画面外（選択肢は実測の既定の並び。番号で応答する）"
+                .into(),
+        ),
+        (
+            ReplyNote::DialogAutoModeUnchecked,
+            "worker の claude は auto mode だが、その安全確認（サーバー側）がこのセッションでは使えない\
+             （原因は title。ANTHROPIC_BASE_URL のゲートウェイ経由・実験的 beta の無効化・組織の方針など）。\
+             「stay in auto mode」（Enter）= auto mode のまま進める。以後は確認が要る操作ごとに承認\
+             ダイアログ（WORKER_PERMISSION。既定は No）が出るので 1 件ずつ respond する。\
+             「leave for accept edits mode and stop」（shift+Tab）= accept edits mode へ移ってこの\
+             ターンを止める（安全確認なしで編集や作業フォルダ内の rm / mv が通る。許可モードが変わるので\
+             利用者に確かめる）。「cancel」（Esc）= このターンを止める（auto mode のまま。次に確認が要る\
+             操作でまた同じ確認が出る）。worker を止めずに進めるなら stay in auto mode"
+                .into(),
         ),
     ]
 }
