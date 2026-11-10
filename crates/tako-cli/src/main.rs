@@ -5281,38 +5281,56 @@ fn setup_mcp_local(args: &SetupMcpArgs) -> Result<(), String> {
 
 /// `setup-mcp` の人間向けサマリを stderr へ出す（機械可読な JSON は stdout）
 fn print_setup_mcp_report(resp: &serde_json::Value) {
+    let home = tako_core::paths::home_dir();
+    for line in setup_mcp_report_lines(resp, home.as_deref()) {
+        eprintln!("{line}");
+    }
+}
+
+/// [`print_setup_mcp_report`] の行。パスは `tako setup` のほかの行と同じくホームを `~` に
+/// 縮める（#2892。書き先・登録したコマンドの絶対パスで実ユーザー名が画面に出ていた）。
+/// 縮めるのは表示だけで、stdout の JSON の `target_path` / `command` は絶対パスのまま。
+/// ホームを引数で受けるのは、env を書き換えずにテストで行の字面を確かめるため
+fn setup_mcp_report_lines(resp: &serde_json::Value, home: Option<&std::path::Path>) -> Vec<String> {
     let Some(agents) = resp.get("agents").and_then(|a| a.as_array()) else {
-        return;
+        return Vec::new();
     };
+    let short = |path: &str| tako_core::paths::shorten_home_with(path, home);
+    let mut lines = Vec::new();
     for entry in agents {
         let name = entry.get("agent").and_then(|a| a.as_str()).unwrap_or("?");
         if entry.get("skipped").and_then(|s| s.as_bool()) == Some(true) {
             let msg = entry.get("message").and_then(|m| m.as_str()).unwrap_or("");
-            eprintln!("  [skip] {name}: {msg}");
+            lines.push(format!("  [skip] {name}: {msg}"));
             continue;
         }
         let target = entry
             .get("target_path")
             .and_then(|t| t.as_str())
-            .unwrap_or("(不明)");
+            .map_or("(不明)".to_string(), short);
         if entry.get("repaired").and_then(|r| r.as_bool()) == Some(true) {
             let old = entry
                 .get("old_command")
                 .and_then(|o| o.as_str())
-                .unwrap_or("(不明)");
-            let new = entry.get("command").and_then(|c| c.as_str()).unwrap_or("");
-            eprintln!("  [修復] {name}: 登録パスが消失していたため付け替えました（{target}）");
-            eprintln!("         旧: {old}");
-            eprintln!("         新: {new}");
+                .map_or("(不明)".to_string(), short);
+            let new = short(entry.get("command").and_then(|c| c.as_str()).unwrap_or(""));
+            lines.push(format!(
+                "  [修復] {name}: 登録パスが消失していたため付け替えました（{target}）"
+            ));
+            lines.push(format!("         旧: {old}"));
+            lines.push(format!("         新: {new}"));
         } else if entry.get("configured").and_then(|c| c.as_bool()) == Some(true) {
-            eprintln!("  [設定] {name}: 追加しました（{target}）");
+            lines.push(format!("  [設定] {name}: 追加しました（{target}）"));
         } else {
-            eprintln!("  [OK] {name}: 既に設定されています（{target}）");
+            lines.push(format!("  [OK] {name}: 既に設定されています（{target}）"));
         }
         if entry.get("legacy_cleaned").and_then(|l| l.as_bool()) == Some(true) {
-            eprintln!("         旧 ~/.claude/settings.json の無効な MCP 設定を除去しました");
+            lines.push(
+                "         旧 ~/.claude/settings.json の無効な MCP 設定を除去しました".to_string(),
+            );
         }
     }
+    lines
 }
 
 /// MCP 登録パスの存在を確認し、不在なら警告を出す（master/solo 起動前のガード）
