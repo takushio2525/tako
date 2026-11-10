@@ -1,0 +1,189 @@
+{
+  "fps": 30,
+  "duration": 170,
+  "bar": 2.5,
+  "sfx": [
+    { "t": 2, "kind": "pop", "note": 76, "vel": 0.8 },
+    { "t": 3, "kind": "pop", "note": 78, "vel": 0.8 },
+    { "t": 4, "kind": "pop", "note": 81, "vel": 0.8 },
+    { "t": 7.5, "kind": "whoosh" },
+    { "t": 14, "kind": "pop", "note": 76, "vel": 0.6 },
+    { "t": 16.1, "kind": "pop", "note": 83, "vel": 0.8 },
+    { "t": 19, "kind": "pop", "note": 86, "vel": 0.7 },
+    { "t": 22.5, "kind": "whoosh", "vel": 0.7 },
+    { "t": 23.4, "kind": "pop", "note": 76, "vel": 0.7 },
+    { "t": 25.4, "kind": "pop", "note": 78, "vel": 0.7 },
+    { "t": 27.4, "kind": "pop", "note": 81, "vel": 0.7 },
+    { "t": 32.5, "kind": "whoosh", "vel": 0.7 },
+    { "t": 33.3, "kind": "pop", "note": 76, "vel": 0.7 },
+    { "t": 34.9, "kind": "pop", "note": 81, "vel": 0.7 },
+    { "t": 40, "kind": "whoosh" },
+    { "t": 57.5, "kind": "whoosh", "vel": 0.7 },
+    { "t": 58.3, "kind": "pop", "note": 76, "vel": 0.7 },
+    { "t": 60.1, "kind": "pop", "note": 78, "vel": 0.7 },
+    { "t": 65, "kind": "whoosh", "vel": 0.7 },
+    { "t": 80, "kind": "whoosh", "vel": 0.7 },
+    { "t": 80.9, "kind": "pop", "note": 76, "vel": 0.7 },
+    { "t": 83.4, "kind": "pop", "note": 78, "vel": 0.7 },
+    { "t": 85.6, "kind": "pop", "note": 81, "vel": 0.7 },
+    { "t": 92.5, "kind": "whoosh", "vel": 0.7 },
+    { "t": 100, "kind": "whoosh" },
+    { "t": 147.5, "kind": "whoosh", "vel": 0.7 },
+    { "t": 148.4, "kind": "pop", "note": 76, "vel": 0.7 },
+    { "t": 150.4, "kind": "pop", "note": 78, "vel": 0.7 },
+    { "t": 152.4, "kind": "pop", "note": 81, "vel": 0.7 },
+    { "t": 157.5, "kind": "whoosh" },
+    { "t": 159.2, "kind": "pop", "note": 76, "vel": 0.7 },
+    { "t": 160.1, "kind": "pop", "note": 78, "vel": 0.7 },
+    { "t": 161, "kind": "pop", "note": 86, "vel": 0.8 }
+  ],
+  "scenes": [
+    { "id": "intro", "start": 0, "end": 7.5 },
+    { "id": "ch1", "start": 7.5, "end": 10 },
+    { "id": "brew", "start": 10, "end": 22.5 },
+    { "id": "zip", "start": 22.5, "end": 32.5 },
+    { "id": "win", "start": 32.5, "end": 40 },
+    { "id": "ch2", "start": 40, "end": 42.5 },
+    {
+      "id": "firstrun",
+      "start": 42.5,
+      "end": 57.5,
+      "footage": "firstrun",
+      "note": "画面は実際の tako です（デモ用の環境で収録）",
+      "chip": "2 整える",
+      "head": "初回は、初期設定が自動で。",
+      "subs": [
+        { "t0": 0.3, "t1": 3.9, "html": "初めて起動すると、タブバーの下に案内が出ます" },
+        { "t0": 4.1, "t1": 9.3, "html": "PATH・AI 連携の登録・指示ファイルまで自動です" },
+        { "t0": 9.5, "t1": 14.6, "html": "準備ができたら「master を起動」ボタンが出ます" }
+      ],
+      "clips": [
+        { "at": [0, 4], "src": ["rec:window+0.26", "rec:window+0.27"] },
+        { "at": [4, 15], "src": ["rec:auto_done-0.2", "rec:auto_done+1.5"] }
+      ],
+      "cam": [
+        { "t": 0, "z": 1, "x": 0.29, "y": 0.12 },
+        { "t": 1, "z": 1, "x": 0.29, "y": 0.12 },
+        { "t": 2.4, "z": 1.7, "x": 0.29, "y": 0.12 },
+        { "t": 9.3, "z": 1.7, "x": 0.29, "y": 0.12 },
+        { "t": 10.6, "z": 1.7, "x": 0.75, "y": 0.12 },
+        { "t": 13.6, "z": 1.7, "x": 0.75, "y": 0.12 },
+        { "t": 14.8, "z": 1, "x": 0.75, "y": 0.12 }
+      ],
+      "callouts": [
+        { "kind": "box", "t0": 0.7, "t1": 3.8, "x": 0.003, "y": 0.06, "w": 0.994, "h": 0.15 },
+        { "kind": "box", "t0": 10.9, "t1": 13.6, "x": 0.897, "y": 0.146, "w": 0.097, "h": 0.054 }
+      ],
+      "sfx": [
+        { "beat": "rec:auto_done-0.19", "kind": "pop", "note": 83 }
+      ]
+    },
+    { "id": "agent", "start": 57.5, "end": 65 },
+    {
+      "id": "setup",
+      "start": 65,
+      "end": 80,
+      "footage": "setup",
+      "chip": "2 整える",
+      "head": "tako setup で確かめ直す。",
+      "subs": [
+        { "t0": 0.3, "t1": 4.2, "html": "案内を閉じても、<code>tako setup</code> でいつでもやり直せます" },
+        { "t0": 4.4, "t1": 8.2, "html": "エージェントの検出から、AI 連携（MCP）の登録まで" },
+        { "t0": 8.4, "t1": 11, "html": "2 回目からは、変わった所だけ。ここでは「変更なし」" },
+        { "t0": 11.2, "t1": 14.6, "html": "最後に対話アシスタント。設定の変更を日本語で頼めます" }
+      ],
+      "clips": [
+        { "at": [0, 1.6], "footage": "firstrun", "src": ["rec:auto_done+1.3", "rec:auto_done+1.4"] },
+        { "at": [1.6, 4.4], "src": ["rec:hide+0.3", "rec:enter+0.1"] },
+        { "at": [4.4, 8.4], "src": ["rec:enter+0.5", "rec:enter+0.51"] },
+        { "at": [8.4, 11.2], "src": ["rec:enter+1.6", "rec:enter+1.61"] },
+        { "at": [11.2, 15], "src": ["solo:ready+0.5", "solo:ready+4.3"] }
+      ],
+      "cam": [
+        { "t": 0, "z": 1, "x": 0.29, "y": 0.12 },
+        { "t": 1.8, "z": 1, "x": 0.29, "y": 0.12 },
+        { "t": 2.9, "z": 1.7, "x": 0.29, "y": 0.12 },
+        { "t": 4.2, "z": 1.7, "x": 0.29, "y": 0.12 },
+        { "t": 5, "z": 1.45, "x": 0.33, "y": 0.4 },
+        { "t": 8.2, "z": 1.45, "x": 0.33, "y": 0.4 },
+        { "t": 9, "z": 1.45, "x": 0.33, "y": 0.66 },
+        { "t": 11, "z": 1.45, "x": 0.33, "y": 0.66 },
+        { "t": 12, "z": 1.3, "x": 0.3, "y": 0.2 },
+        { "t": 15, "z": 1.3, "x": 0.3, "y": 0.2 }
+      ],
+      "callouts": [],
+      "sfx": [
+        { "beat": "solo:ready+0.51", "kind": "pop", "note": 86, "vel": 0.8 }
+      ]
+    },
+    { "id": "updateways", "start": 80, "end": 92.5 },
+    {
+      "id": "update",
+      "start": 92.5,
+      "end": 100,
+      "footage": "update",
+      "note": "画面は実際の tako です（デモ用の環境で収録）",
+      "chip": "2 整える",
+      "head": "更新の確認は、1 コマンド。",
+      "subs": [
+        { "t0": 0.3, "t1": 3.3, "html": "<code>tako update check</code> は確認だけ。何も入れません" },
+        { "t0": 3.5, "t1": 7.1, "html": "<code>available: false</code> なら最新。あれば <code>tako update apply</code>" }
+      ],
+      "clips": [
+        { "at": [0, 7.5], "src": ["rec:type-0.6", "rec:enter+4.0"] }
+      ],
+      "cam": [
+        { "t": 0, "z": 1.9, "x": 0.25, "y": 0.15 },
+        { "t": 7.5, "z": 1.9, "x": 0.25, "y": 0.15 }
+      ],
+      "callouts": []
+    },
+    { "id": "ch3", "start": 100, "end": 102.5 },
+    {
+      "id": "master",
+      "start": 102.5,
+      "end": 147.5,
+      "footage": "master",
+      "chip": "3 任せる",
+      "head": "tako master で頼む。",
+      "subs": [
+        { "t0": 0.3, "t1": 4.8, "html": "<code>tako master</code> と打つと、今いるペインが司令塔（master）に" },
+        { "t0": 5, "t1": 12.8, "html": "まず、作業するフォルダを日本語で登録します" },
+        { "t0": 13, "t1": 21.8, "html": "あとは、やってほしいことをそのまま書くだけ" },
+        { "t0": 22, "t1": 32.8, "html": "担当（worker）が同じタブに並びます。全体は右パネルで" },
+        { "t0": 33, "t1": 44.6, "html": "終わると master が確かめて、結果をまとめて報告します" }
+      ],
+      "clips": [
+        { "at": [0, 5], "src": ["rec:type_master-0.5", "master:ready+1.2"] },
+        { "at": [5, 13], "src": ["rec:ask_project-0.4", "master:project_done+2.2"] },
+        { "at": [13, 22], "src": ["rec:ask_work-0.3", "docs:prompt1+0.4"] },
+        { "at": [22, 33], "src": ["docs:prompt1+0.4", "master:done_api+0.4"] },
+        { "at": [33, 45], "src": ["master:done_api+0.4", "master:report+4.5"] }
+      ],
+      "cam": [
+        { "t": 0, "z": 1.7, "x": 0.29, "y": 0.12 },
+        { "t": 13.4, "z": 1.7, "x": 0.29, "y": 0.12 },
+        { "t": 15, "z": 1, "x": 0.29, "y": 0.12 },
+        { "t": 33, "z": 1, "x": 0.3, "y": 0.62 },
+        { "t": 34.6, "z": 1.5, "x": 0.3, "y": 0.62 },
+        { "t": 45, "z": 1.5, "x": 0.3, "y": 0.62 }
+      ],
+      "callouts": [
+        { "t0": 23, "t1": 31.5, "x": 0.05, "y": 0.86, "text": "司令塔（master）" },
+        { "t0": 23.5, "t1": 31.5, "x": 0.52, "y": 0.46, "text": "担当（worker）× 2" },
+        { "t0": 24, "t1": 31.5, "x": 0.79, "y": 0.55, "text": "全体の見取り図" }
+      ],
+      "sfx": [
+        { "beat": "master:project_done", "kind": "pop", "note": 81, "vel": 0.8 },
+        { "beat": "master:spawn_api", "kind": "pop", "note": 76 },
+        { "beat": "master:spawn_docs", "kind": "pop", "note": 78 },
+        { "beat": "master:panel", "kind": "pop", "note": 86, "vel": 0.8 },
+        { "beat": "master:done_docs", "kind": "pop", "note": 81, "vel": 0.7 },
+        { "beat": "master:done_api", "kind": "pop", "note": 83, "vel": 0.7 },
+        { "beat": "master:report", "kind": "pop", "note": 88, "vel": 0.8 }
+      ]
+    },
+    { "id": "tips", "start": 147.5, "end": 157.5 },
+    { "id": "outro", "start": 157.5, "end": 170 }
+  ]
+}

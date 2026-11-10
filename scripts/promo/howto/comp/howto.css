@@ -1,0 +1,472 @@
+/* 入れ方・使い方動画（#2866）の場面だけの置き方。
+   色・書体・チップ・実画面の窓・字幕・題字は #2864 の comp.css のものをそのまま使う（変数も同じ）。
+   動きは comp.js / howto.js が毎フレーム値を書く（CSS の transition / animation は使わない）。 */
+
+/* ---- 図解の場面の見出し（実画面の場面の .cap と同じ位置・同じ色） ---- */
+
+.hw-chip {
+	position: absolute;
+	left: 120px;
+	top: 52px;
+	background: var(--accent);
+	color: #fff;
+}
+
+.hw-title {
+	position: absolute;
+	left: 120px;
+	top: 108px;
+	font-size: 58px;
+	font-weight: 700;
+	line-height: 1.2;
+	white-space: nowrap;
+}
+
+.hw-side {
+	position: absolute;
+	right: 120px;
+	top: 134px;
+	font-size: 30px;
+	font-weight: 600;
+	color: var(--ink-2);
+	white-space: nowrap;
+}
+
+.hw-foot {
+	position: absolute;
+	left: 120px;
+	right: 120px;
+	top: 950px;
+	text-align: center;
+	white-space: nowrap;
+	font-size: 34px;
+	font-weight: 600;
+	color: var(--ink-2);
+}
+
+/* 再現のカットの断り（実画面の場面の .demo-note と同じ位置） */
+.hw-repro {
+	position: absolute;
+	right: 120px;
+	top: 20px;
+	font-size: 19px;
+	color: var(--ink-3);
+}
+
+.hw-foot code,
+.steps code,
+.ways p code,
+.recap .plain code {
+	font-family: var(--mono);
+	font-size: 0.9em;
+	padding: 2px 10px 3px;
+	border-radius: 8px;
+	background: rgba(21, 23, 28, 0.08);
+	color: var(--ink);
+}
+
+/* ---- 題字・まとめ（中央ぞろえ） ---- */
+
+.hw-center {
+	text-align: center;
+}
+
+.hw-center .brand.big {
+	position: absolute;
+	left: 0;
+	right: 0;
+	top: 150px;
+	justify-content: center;
+}
+
+.hw-lead {
+	position: absolute;
+	left: 0;
+	right: 0;
+	top: 322px;
+	font-size: 80px;
+	font-weight: 700;
+	line-height: 1.3;
+}
+
+.flow3 {
+	position: absolute;
+	left: 0;
+	right: 0;
+	top: 560px;
+	display: flex;
+	justify-content: center;
+	align-items: center;
+	gap: 34px;
+}
+
+.flow-item {
+	width: 400px;
+	padding: 34px 0 38px;
+	border-radius: 28px;
+	background: #fff;
+	box-shadow: 0 18px 44px rgba(21, 23, 28, 0.14);
+}
+
+.flow-item b,
+.recap .row > b {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 64px;
+	height: 64px;
+	border-radius: 50%;
+	background: var(--accent);
+	color: #fff;
+	font-size: 36px;
+	font-weight: 800;
+}
+
+.flow-item span {
+	display: block;
+	margin-top: 14px;
+	font-size: 64px;
+	font-weight: 800;
+	line-height: 1.25;
+}
+
+.flow-item small {
+	display: block;
+	margin-top: 8px;
+	font-size: 28px;
+	font-weight: 600;
+	color: var(--ink-2);
+}
+
+.flow-arrow {
+	position: relative;
+	width: 58px;
+	height: 3px;
+	background: var(--accent);
+}
+
+.flow-arrow::after {
+	content: '';
+	position: absolute;
+	right: -1px;
+	top: -8px;
+	width: 16px;
+	height: 16px;
+	border-top: 3px solid var(--accent);
+	border-right: 3px solid var(--accent);
+	transform: rotate(45deg);
+}
+
+#outro .brand.big {
+	top: 76px;
+}
+
+.hw-lead.small {
+	top: 222px;
+	font-size: 56px;
+}
+
+.recap {
+	position: absolute;
+	left: 340px;
+	top: 338px;
+	width: 1240px;
+	text-align: left;
+}
+
+.recap .row {
+	display: flex;
+	align-items: center;
+	gap: 28px;
+	margin-bottom: 20px;
+}
+
+.recap .row > b {
+	flex: none;
+}
+
+.recap .box {
+	flex: 1;
+	padding: 18px 36px 20px;
+	border-radius: 18px;
+	background: var(--win);
+	color: #f1f3f8;
+	font-family: var(--mono);
+	font-size: 36px;
+	white-space: nowrap;
+	box-shadow: 0 16px 40px rgba(21, 23, 28, 0.24);
+}
+
+.recap .box span {
+	color: var(--accent);
+	margin-right: 18px;
+}
+
+.recap .box.plain {
+	background: #fff;
+	color: var(--ink);
+	font-family: var(--sans);
+	font-weight: 700;
+	box-shadow: 0 12px 30px rgba(21, 23, 28, 0.12);
+}
+
+#outro .links {
+	top: 688px;
+	font-size: 36px;
+}
+
+#outro .note {
+	top: 800px;
+}
+
+/* ---- 章の見出し ---- */
+
+.chapter .chap-num {
+	position: absolute;
+	left: 330px;
+	top: 280px;
+	width: 300px;
+	text-align: center;
+	font-size: 430px;
+	font-weight: 800;
+	line-height: 1;
+	letter-spacing: -0.04em;
+	color: var(--accent);
+}
+
+.chapter .chap-text {
+	position: absolute;
+	left: 700px;
+	top: 372px;
+}
+
+.chap-title {
+	font-size: 156px;
+	font-weight: 800;
+	line-height: 1.1;
+}
+
+.chap-sub {
+	margin-top: 30px;
+	font-size: 44px;
+	font-weight: 600;
+	color: var(--ink-2);
+	white-space: nowrap;
+}
+
+/* ---- ターミナル（再現のカット。実画面ではないので、窓の形を実画面と変えてある） ---- */
+
+.term {
+	position: absolute;
+	left: 210px;
+	top: 236px;
+	width: 1500px;
+	border-radius: 16px;
+	overflow: hidden;
+	background: #10131b;
+	box-shadow: 0 46px 100px rgba(21, 23, 28, 0.34), 0 10px 26px rgba(21, 23, 28, 0.22), 0 0 0 1px rgba(21, 23, 28, 0.5);
+}
+
+.term-bar {
+	height: 54px;
+	display: flex;
+	align-items: center;
+	gap: 9px;
+	padding-left: 20px;
+	background: var(--win-2);
+}
+
+.term-bar i {
+	width: 14px;
+	height: 14px;
+	border-radius: 50%;
+	background: #4a5063;
+}
+
+.term-bar span {
+	margin-left: 16px;
+	color: #c9cedb;
+	font-size: 21px;
+	font-weight: 600;
+}
+
+.term-body {
+	height: 590px;
+	padding: 40px 48px;
+	font-family: var(--mono);
+	font-size: 37px;
+	line-height: 1.86;
+	color: #e6e9f2;
+	text-align: left;
+}
+
+.term-body .tl {
+	white-space: pre;
+}
+
+.term-body .tp {
+	color: #f0a8c0;
+	font-weight: 400;
+}
+
+.term-body .dim {
+	color: #8f96a8;
+}
+
+.term-body .ok {
+	color: #6fd6a3;
+}
+
+.term-body .caret {
+	display: inline-block;
+	width: 19px;
+	height: 43px;
+	margin-left: 3px;
+	vertical-align: -9px;
+	background: #f1d9d2;
+}
+
+/* ---- 手順の並び ---- */
+
+.steps {
+	position: absolute;
+	left: 150px;
+	right: 150px;
+	top: 244px;
+	list-style: none;
+}
+
+.steps li {
+	display: flex;
+	align-items: flex-start;
+	gap: 38px;
+	padding: 34px 0 36px;
+	border-bottom: 2px solid var(--line);
+}
+
+.steps li > b {
+	flex: none;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 76px;
+	height: 76px;
+	border-radius: 50%;
+	background: var(--ink);
+	color: var(--paper);
+	font-size: 40px;
+	font-weight: 800;
+}
+
+/* 順番の無い並び（番号の代わりに点） */
+.steps li > b.dot {
+	width: 24px;
+	height: 24px;
+	margin: 21px 26px 0;
+	background: var(--accent);
+}
+
+.steps li p {
+	font-size: 44px;
+	font-weight: 700;
+	line-height: 1.5;
+}
+
+.steps li small {
+	display: block;
+	margin-top: 8px;
+	font-size: 29px;
+	line-height: 1.6;
+	color: var(--ink-2);
+}
+
+/* 断りの箱（Windows の対応状況） */
+.hw-box {
+	position: absolute;
+	left: 150px;
+	right: 150px;
+	top: 560px;
+	padding: 40px 52px 44px;
+	border-radius: 24px;
+	background: #fff;
+	box-shadow: 0 18px 44px rgba(21, 23, 28, 0.12);
+	border-left: 12px solid var(--accent);
+}
+
+.hw-box p {
+	font-size: 50px;
+	font-weight: 700;
+}
+
+.hw-box small {
+	display: block;
+	margin-top: 16px;
+	font-size: 31px;
+	color: var(--ink-2);
+}
+
+.hw-box small i {
+	display: inline-block;
+	width: 9px;
+	height: 9px;
+	margin: 0 22px 7px;
+	border-radius: 50%;
+	background: var(--accent);
+}
+
+/* ---- 方法の表（左に呼び名かコマンド、右に説明） ---- */
+
+.ways {
+	position: absolute;
+	left: 150px;
+	right: 150px;
+	top: 236px;
+}
+
+.ways .row {
+	display: grid;
+	grid-template-columns: 330px 1fr;
+	align-items: center;
+	min-height: 196px;
+	border-bottom: 2px solid var(--line);
+}
+
+.ways .row > span {
+	justify-self: start;
+	padding: 10px 28px 12px;
+	border-radius: 999px;
+	border: 2px solid var(--ink);
+	font-size: 30px;
+	font-weight: 700;
+	white-space: nowrap;
+}
+
+.ways .row p {
+	font-size: 42px;
+	font-weight: 700;
+	line-height: 1.45;
+	white-space: nowrap;
+}
+
+.ways .row small {
+	display: block;
+	margin-top: 8px;
+	font-size: 29px;
+	color: var(--ink-2);
+}
+
+.ways.tips .row {
+	grid-template-columns: 600px 1fr;
+}
+
+.ways.tips .row > code {
+	justify-self: start;
+	padding: 14px 30px 16px;
+	border-radius: 16px;
+	background: var(--win);
+	color: #f1f3f8;
+	font-family: var(--mono);
+	font-size: 36px;
+	white-space: nowrap;
+	box-shadow: 0 14px 34px rgba(21, 23, 28, 0.22);
+}

@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>tako howto</title>
+<!-- 色・書体・チップ・実画面の窓・字幕は #2864 の comp.css のまま。howto.css はこの動画の場面の置き方だけ -->
+<link rel="stylesheet" href="comp.css">
+<link rel="stylesheet" href="howto.css">
+</head>
+<body>
+<div id="stage">
+
+  <!-- comp.js（#2864）は起動時に #tiles へ図解の部品を組む。この動画では使わないので、空の入れ物だけ置く -->
+  <div id="tiles" hidden></div>
+
+  <!-- 0–7.5 秒: 題字と 3 つの段 -->
+  <section class="scene hw-center" id="intro">
+    <div class="brand big" data-a="in:0.25,0.7,up">
+      <img class="brand-icon" data-asset="icon" alt="">
+      <span class="brand-name">tako</span>
+    </div>
+    <p class="hw-lead" data-a="in:0.8,0.7,up">入れ方と、<em>使い方。</em></p>
+    <div class="flow3">
+      <div class="flow-item" data-a="in:2.0,0.45,pop"><b>1</b><span>入れる</span><small>ダウンロード</small></div>
+      <i class="flow-arrow" data-a="in:2.6,0.4,fade"></i>
+      <div class="flow-item" data-a="in:3.0,0.45,pop"><b>2</b><span>整える</span><small>セットアップと更新</small></div>
+      <i class="flow-arrow" data-a="in:3.6,0.4,fade"></i>
+      <div class="flow-item" data-a="in:4.0,0.45,pop"><b>3</b><span>任せる</span><small>master に頼む</small></div>
+    </div>
+  </section>
+
+  <!-- 章 1: 入れる -->
+  <section class="scene chapter" id="ch1">
+    <p class="chap-num" data-a="in:0.1,0.45,pop">1</p>
+    <div class="chap-text">
+      <p class="chap-title" data-a="in:0.25,0.5,up">入れる</p>
+      <p class="chap-sub" data-a="in:0.45,0.5,up">ダウンロードとインストール</p>
+    </div>
+  </section>
+
+  <!-- Homebrew（ターミナルの出力は再現。元は docs の導入の場面と cask の定義） -->
+  <section class="scene" id="brew">
+    <p class="hw-repro" data-a="in:1.0,0.5,fade">ターミナルの出力は再現です（抜粋）</p>
+    <span class="chip hw-chip" data-a="in:0.15,0.4,up">1 入れる</span>
+    <p class="hw-title" data-a="in:0.3,0.5,up">Mac は、Homebrew で 1 行。</p>
+    <p class="hw-side" data-a="in:0.6,0.5,fade">Apple Silicon の Mac（macOS 11 以降）</p>
+    <div class="term" data-a="in:0.5,0.6,up">
+      <div class="term-bar"><i></i><i></i><i></i><span>ターミナル</span></div>
+      <div class="term-body">
+        <p class="tl"><b class="tp">~ %</b> <span data-type="1.2,2.2">brew install --cask takushio2525/tako/tako</span></p>
+        <p class="tl dim" data-a="in:4.0,0.3,fade">==&gt; Downloading tako-v0.8.40-macos-arm64.zip</p>
+        <p class="tl" data-a="in:4.7,0.3,fade">==&gt; Moving App 'tako.app' to '/Applications/tako.app'</p>
+        <p class="tl" data-a="in:5.4,0.3,fade">==&gt; Linking Binary 'tako' to '/opt/homebrew/bin/tako'</p>
+        <p class="tl ok" data-a="in:6.1,0.3,fade">tako was successfully installed!</p>
+        <p class="tl" data-a="in:7.6,0.2,fade"><b class="tp">~ %</b> <span data-type="7.8,0.8">tako --version</span></p>
+        <p class="tl" data-a="in:9.0,0.3,fade">tako 0.8.40</p>
+      </div>
+    </div>
+    <p class="hw-foot" data-a="in:6.6,0.5,up">アプリは「アプリケーション」に入り、<code>tako</code> コマンドも一緒に使えるようになります</p>
+  </section>
+
+  <!-- zip で入れる -->
+  <section class="scene" id="zip">
+    <span class="chip hw-chip" data-a="in:0.15,0.4,up">1 入れる</span>
+    <p class="hw-title" data-a="in:0.3,0.5,up">Homebrew を使わないなら、zip で。</p>
+    <ol class="steps">
+      <li data-a="in:0.9,0.5,up"><b>1</b><div><p>GitHub Releases から <code>tako-vX.X.X-macos-arm64.zip</code> をダウンロード</p><small>github.com/takushio2525/tako/releases</small></div></li>
+      <li data-a="in:2.9,0.5,up"><b>2</b><div><p>展開して、<code>tako.app</code> を「アプリケーション」へ</p></div></li>
+      <li data-a="in:4.9,0.5,up"><b>3</b><div><p>初回に警告が出たら「このまま開く」</p><small>システム設定 → プライバシーとセキュリティ にあります。署名していない配布物のためで、一度許可すれば次からはそのまま開けます</small></div></li>
+    </ol>
+  </section>
+
+  <!-- Windows -->
+  <section class="scene" id="win">
+    <span class="chip hw-chip" data-a="in:0.15,0.4,up">1 入れる</span>
+    <p class="hw-title" data-a="in:0.3,0.5,up">Windows は、インストーラーを実行。</p>
+    <ol class="steps">
+      <li data-a="in:0.8,0.5,up"><b>1</b><div><p>GitHub Releases の <code>tako-vX.X.X-windows-x86_64.exe</code> を実行</p><small>Windows 10（1809 以降）/ 11・x64。管理者権限は要りません</small></div></li>
+    </ol>
+    <div class="hw-box" data-a="in:2.4,0.5,up">
+      <p>Windows 版は、移植の途中です。</p>
+      <small>使える機能と、まだのものは「Windows 対応状況」にまとめています<i></i>tako.takushio2525.com/windows-support</small>
+    </div>
+  </section>
+
+  <!-- 章 2: 整える -->
+  <section class="scene chapter" id="ch2">
+    <p class="chap-num" data-a="in:0.1,0.45,pop">2</p>
+    <div class="chap-text">
+      <p class="chap-title" data-a="in:0.25,0.5,up">整える</p>
+      <p class="chap-sub" data-a="in:0.45,0.5,up">起動したあとのセットアップとアップデート</p>
+    </div>
+  </section>
+
+  <!-- 実画面: 初回起動（中身は timeline.json から comp.js が組む） -->
+  <section class="scene footage" id="firstrun"></section>
+
+  <!-- エージェントがまだ無いとき -->
+  <section class="scene" id="agent">
+    <span class="chip hw-chip" data-a="in:0.15,0.4,up">2 整える</span>
+    <p class="hw-title" data-a="in:0.3,0.5,up">Claude Code が、まだ無いときは。</p>
+    <ol class="steps">
+      <li data-a="in:0.8,0.5,up"><b class="dot"></b><div><p>案内に「Claude Code を入れる」ボタンが出ます</p><small>押すと、表示されたコマンドを新しいタブで実行します（管理者権限は使いません）</small></div></li>
+      <li data-a="in:2.6,0.5,up"><b class="dot"></b><div><p>ログインがまだなら「ログイン」ボタン</p><small>ブラウザが開きます。済むと、案内は自動で次へ進みます</small></div></li>
+    </ol>
+    <p class="hw-foot" data-a="in:4.2,0.5,up">Codex CLI / Antigravity CLI でも使えます（一部の機能は Claude Code だけ）</p>
+  </section>
+
+  <!-- 実画面: tako setup -->
+  <section class="scene footage" id="setup"></section>
+
+  <!-- アップデートの 3 つの方法 -->
+  <section class="scene" id="updateways">
+    <span class="chip hw-chip" data-a="in:0.15,0.4,up">2 整える</span>
+    <p class="hw-title" data-a="in:0.3,0.5,up">アップデートは、3 つの方法で。</p>
+    <div class="ways">
+      <div class="row" data-a="in:0.9,0.5,up"><span>アプリの中で</span><div><p>新しい版が出ると、画面の上に「アップデートがあります」</p><small>「詳細を見る」→「今すぐ更新」。終わると自動で再起動します</small></div></div>
+      <div class="row" data-a="in:3.4,0.5,up"><span>コマンドで</span><div><p><code>tako update check</code> → <code>tako update apply</code></p></div></div>
+      <div class="row" data-a="in:5.6,0.5,up"><span>Homebrew で</span><div><p><code>brew upgrade --cask takushio2525/tako/tako</code></p></div></div>
+    </div>
+    <p class="hw-foot" data-a="in:7.8,0.5,up">更新のあとは <code>tako setup</code> をもう一度。新しい設定項目に追従します</p>
+  </section>
+
+  <!-- 実画面: tako update check -->
+  <section class="scene footage" id="update"></section>
+
+  <!-- 章 3: 任せる -->
+  <section class="scene chapter" id="ch3">
+    <p class="chap-num" data-a="in:0.1,0.45,pop">3</p>
+    <div class="chap-text">
+      <p class="chap-title" data-a="in:0.25,0.5,up">任せる</p>
+      <p class="chap-sub" data-a="in:0.45,0.5,up">master を起動して、仕事を頼む</p>
+    </div>
+  </section>
+
+  <!-- 実画面: tako master -->
+  <section class="scene footage" id="master"></section>
+
+  <!-- 覚えておくと便利なこと -->
+  <section class="scene" id="tips">
+    <span class="chip hw-chip" data-a="in:0.15,0.4,up">3 任せる</span>
+    <p class="hw-title" data-a="in:0.3,0.5,up">覚えておくと、便利なこと。</p>
+    <div class="ways tips">
+      <div class="row" data-a="in:0.9,0.5,up"><code>tako master --tab</code><div><p>専用のタブで、司令塔を起動</p></div></div>
+      <div class="row" data-a="in:2.9,0.5,up"><code>tako solo</code><div><p>担当を立てずに、1 対 1 で相談</p></div></div>
+      <div class="row" data-a="in:4.9,0.5,up"><code>brew install tmux</code><div><p>tmux があると、tako を閉じても作業が続きます</p><small>開き直すと、実行中の画面ごと元に戻ります</small></div></div>
+    </div>
+    <p class="hw-foot" data-a="in:6.9,0.5,up">プロジェクトの追加や設定の変更も、master に日本語で頼めます</p>
+  </section>
+
+  <!-- まとめ -->
+  <section class="scene hw-center" id="outro">
+    <div class="brand big" data-a="in:0.25,0.7,up">
+      <img class="brand-icon" data-asset="icon" alt="">
+      <span class="brand-name">tako</span>
+    </div>
+    <p class="hw-lead small" data-a="in:0.8,0.6,up">この 3 つで、<em>始められます。</em></p>
+    <div class="recap">
+      <div class="row" data-a="in:1.7,0.5,up"><b>1</b><p class="box"><span>$</span>brew install --cask takushio2525/tako/tako</p></div>
+      <div class="row" data-a="in:2.6,0.5,up"><b>2</b><p class="box plain">起動する（初期設定は自動。あとからは <code>tako setup</code>）</p></div>
+      <div class="row" data-a="in:3.5,0.5,up"><b>3</b><p class="box"><span>$</span>tako master</p></div>
+    </div>
+    <p class="links" data-a="in:4.5,0.6,up">tako.takushio2525.com/getting-started<i></i>github.com/takushio2525/tako</p>
+    <p class="note" data-a="in:5.3,0.6,up">macOS（Apple Silicon）で使えます。Windows 版は対応を進めています。</p>
+    <p class="fine" data-a="in:6.0,0.6,fade">この動画の画面は実際の tako です（デモ用の環境で収録）。エージェントの出力はデモ用の台本、brew の出力は再現です。</p>
+  </section>
+
+</div>
+<script src="comp.js"></script>
+<script src="howto.js"></script>
+</body>
+</html>
