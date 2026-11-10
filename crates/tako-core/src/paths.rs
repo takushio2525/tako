@@ -82,6 +82,173 @@ pub(crate) fn is_path_separator(c: char) -> bool {
     c == '/' || c == '\\'
 }
 
+/// 文に埋まったパスを、画面の通知に収まる長さへ縮める（#2760）。
+///
+/// ファイルツリーの断りの通知は dispatch のエラー文（CLI / MCP の応答と同じ文面 = 絶対パス入り）を
+/// 包んで出すので、一時 dir のような長いパスが 1 つの通知に 3 回入り、幅 240px のサイドバーで
+/// 約 10 行に折り返してツリーの行を窓の外へ押し出していた。**文面の正本（CLI / MCP の応答）は
+/// 変えず**、画面へ出す直前にここを通す:
+///
+/// - ツリーのルートの配下 → ルートからの相対パス（`folder/inner`）。ルートが 2 つ以上なら頭に
+///   ルートの名前（見出しの行と同じ名前）を付ける（`ws/folder/inner`）。ルートそのものは名前だけ
+/// - ルートの外でホームの配下 → `~` 表記（[`shorten_home_with`] と同じ規則）
+/// - どちらでもない → そのまま
+/// - 縮めた後、括弧の中で同じものを矢印でつないだ `（A → A）` は `（A）` にまとめる
+///   （自分自身へ移す断りは移す元と移動先が同じパス = 同じ字面が 2 回並ぶだけで、読む情報が増えない）
+///
+/// パスとみなすのは「ルート / ホームの文字列が、パスの始まりに置ける位置（文頭・括弧や空白の後）から
+/// 現れ、その直後が区切りか文の区切り（閉じ括弧・読点・コロン・矢印の前の空白・文末）」のところだけ。
+/// 途中一致（ルート `/a/b` に対する `/a/bc`）は別のパスなので縮めない。照合は字面どおり
+/// （ツリーと dispatch は同じ綴りのパスを使う）。ルートは長い順に当てる（入れ子のルートは深い方）。
+/// 名前の無いルート（`/` やドライブの根）と、同じ名前のルートが 2 つ以上あるときのそれらは名前で
+/// 見分けられないので相対にせず、ホームの規則へ回す
+pub fn shorten_paths_in_text(text: &str, roots: &[PathBuf], home: Option<&Path>) -> String {
+    /// 縮める先の 1 つ。`label` が None ならホーム（`~`）
+    struct Prefix {
+        text: String,
+        label: Option<String>,
+    }
+    /// 末尾の区切りを落としたパスの字面と、最後の成分（名前）
+    fn split(path: &Path) -> Option<(String, Option<String>)> {
+        let text = path.to_string_lossy();
+        let text = text.trim_end_matches(is_path_separator);
+        if text.is_empty() {
+            return None;
+        }
+        let name = text
+            .rsplit(is_path_separator)
+            .next()
+            .filter(|name| name.len() < text.len() && !name.is_empty() && !name.ends_with(':'))
+            .map(str::to_string);
+        Some((text.to_string(), name))
+    }
+    let multi = roots.len() > 1;
+    let split_roots: Vec<(String, Option<String>)> =
+        roots.iter().filter_map(|r| split(r)).collect();
+    let mut prefixes: Vec<Prefix> = split_roots
+        .iter()
+        .filter_map(|(text, name)| {
+            let name = name.as_ref()?;
+            let same = split_roots
+                .iter()
+                .filter(|(_, other)| other.as_ref() == Some(name))
+                .count();
+            (same == 1).then(|| Prefix {
+                text: text.clone(),
+                label: Some(name.clone()),
+            })
+        })
+        .collect();
+    prefixes.sort_by_key(|p| std::cmp::Reverse(p.text.len()));
+    if let Some((text, _)) = home.and_then(split) {
+        prefixes.push(Prefix { text, label: None });
+    }
+    if prefixes.is_empty() {
+        return collapse_same_arrow(text);
+    }
+
+    /// パスの始まりに置ける位置か（直前がパスの続きの字ではない）
+    fn starts_path(prev: Option<char>) -> bool {
+        match prev {
+            None => true,
+            Some(c) => {
+                !(c.is_ascii_alphanumeric()
+                    || is_path_separator(c)
+                    || matches!(c, '.' | '_' | '-' | '~' | ':'))
+            }
+        }
+    }
+    /// パスがそこで終わるか（文末・閉じ括弧・読点・コロン・矢印の前の空白）
+    fn ends_path(rest: &str) -> bool {
+        // 空白の後は矢印（`→` / `->`）が続くときだけ = 名前の中の空白（`/a/b c`）と取り違えない
+        if let Some(after) = rest.strip_prefix(' ') {
+            return after.trim_start().starts_with(['→', '-']);
+        }
+        matches!(
+            rest.chars().next(),
+            None | Some(
+                '）' | ')' | '」' | '』' | '、' | '，' | ',' | '：' | ':' | '\n' | '"' | '\''
+            )
+        )
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    'scan: while i < text.len() {
+        if starts_path(text[..i].chars().next_back()) {
+            for prefix in &prefixes {
+                let Some(rest) = text[i..].strip_prefix(prefix.text.as_str()) else {
+                    continue;
+                };
+                let mut chars = rest.chars();
+                let sep = chars.next().filter(|c| is_path_separator(*c));
+                let itself = match sep {
+                    // 区切りの後がすぐ終わる（`/r/）`）のもルートそのもの
+                    Some(sep) => ends_path(&rest[sep.len_utf8()..]),
+                    None if ends_path(rest) => true,
+                    // 途中一致（`/a/b` に対する `/a/bc`）は別のパス
+                    None => continue,
+                };
+                match (&prefix.label, itself) {
+                    (Some(name), true) => {
+                        out.push_str(name);
+                        i += prefix.text.len() + sep.map_or(0, char::len_utf8);
+                    }
+                    (None, true) => {
+                        out.push('~');
+                        i += prefix.text.len() + sep.map_or(0, char::len_utf8);
+                    }
+                    // ルートが 2 つ以上: 名前 + 元の区切り（区切りは次の周で写す）
+                    (Some(name), false) if multi => {
+                        out.push_str(name);
+                        i += prefix.text.len();
+                    }
+                    // ルートが 1 つ: 区切りごと落とす = ルートからの相対
+                    (Some(_), false) => {
+                        i += prefix.text.len() + sep.map_or(0, char::len_utf8);
+                    }
+                    // ホーム配下: `~` + 元の区切り
+                    (None, false) => {
+                        out.push('~');
+                        i += prefix.text.len();
+                    }
+                }
+                continue 'scan;
+            }
+        }
+        let c = text[i..].chars().next().unwrap_or_default();
+        out.push(c);
+        i += c.len_utf8().max(1);
+    }
+    collapse_same_arrow(&out)
+}
+
+/// 括弧（`（…）` / `(…)`）の中が `A → A`（矢印の両側が同じ字面）なら `A` にまとめる（#2760）。
+/// 両側が違う・矢印が 2 つ以上・片側が空なら触らない
+fn collapse_same_arrow(text: &str) -> String {
+    const ARROW: &str = " → ";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find(['（', '(']) {
+        let open_ch = rest[open..].chars().next().unwrap_or('(');
+        let close_ch = if open_ch == '（' { '）' } else { ')' };
+        let inner_start = open + open_ch.len_utf8();
+        let Some(len) = rest[inner_start..].find(close_ch) else {
+            break;
+        };
+        let inner = &rest[inner_start..inner_start + len];
+        out.push_str(&rest[..inner_start]);
+        match inner.split_once(ARROW) {
+            Some((a, b)) if a == b && !a.is_empty() => out.push_str(a),
+            _ => out.push_str(inner),
+        }
+        out.push(close_ch);
+        rest = &rest[inner_start + len + close_ch.len_utf8()..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// tako のデータディレクトリ。
 /// macOS: `~/Library/Application Support/tako`、その他 unix: `$XDG_DATA_HOME/tako`
 /// （無ければ `~/.local/share/tako`）、Windows: `%APPDATA%\tako`
@@ -765,6 +932,168 @@ mod tests {
         // 空パス・ホームだけが空
         assert_eq!(shorten_home_with("", Some(&mac)), "");
         assert_eq!(shorten_home_with("/opt", Some(&PathBuf::from(""))), "/opt");
+    }
+
+    /// #2760: ツリーの断りの通知の文（dispatch の文面 = 絶対パス 3 つ）を、ルートが 1 つなら
+    /// ルートからの相対へ縮める。日英どちらの包みでもパスの境目を取り違えない
+    #[test]
+    fn 通知の文のパスはルートが1つなら相対へ縮める() {
+        let root = PathBuf::from("/var/folders/xy/T/tako-vt2760-123/long-segment-aaaa/ws");
+        let home = PathBuf::from("/Users/testuser");
+        let ja = "項目をここに移動 に失敗しました（/var/folders/xy/T/tako-vt2760-123/long-segment-aaaa/ws/folder/inner/x.txt）: \
+                  移動できない: フォルダを自分自身へは移せない（/var/folders/xy/T/tako-vt2760-123/long-segment-aaaa/ws/folder/inner → \
+                  /var/folders/xy/T/tako-vt2760-123/long-segment-aaaa/ws/folder/inner）";
+        assert_eq!(
+            shorten_paths_in_text(ja, std::slice::from_ref(&root), Some(&home)),
+            "項目をここに移動 に失敗しました（folder/inner/x.txt）: \
+             移動できない: フォルダを自分自身へは移せない（folder/inner）"
+        );
+        let en = "Move Items Here failed (/var/folders/xy/T/tako-vt2760-123/long-segment-aaaa/ws/folder/inner/x.txt): \
+                  cannot move: cannot move a folder into itself (/var/folders/xy/T/tako-vt2760-123/long-segment-aaaa/ws/folder/inner → \
+                  /var/folders/xy/T/tako-vt2760-123/long-segment-aaaa/ws/folder/inner)";
+        assert_eq!(
+            shorten_paths_in_text(en, std::slice::from_ref(&root), Some(&home)),
+            "Move Items Here failed (folder/inner/x.txt): \
+             cannot move: cannot move a folder into itself (folder/inner)"
+        );
+        // ルートそのものは名前（見出しの行と同じ）
+        assert_eq!(
+            shorten_paths_in_text(
+                "貼り付け に失敗しました（/var/folders/xy/T/tako-vt2760-123/long-segment-aaaa/ws）: 理由",
+                std::slice::from_ref(&root),
+                Some(&home)
+            ),
+            "貼り付け に失敗しました（ws）: 理由"
+        );
+        // 末尾に区切りが付いたルートの指定・文末のパスも同じ
+        assert_eq!(
+            shorten_paths_in_text("x /r/ws/a.txt", &[PathBuf::from("/r/ws/")], None),
+            "x a.txt"
+        );
+    }
+
+    /// #2760: ルートが 2 つ以上なら頭にルートの名前を付ける（入れ子のルートは深い方）。
+    /// ルートの外はホームを `~` に畳み、ホームの外はそのまま
+    #[test]
+    fn 通知の文のパスは複数ルートなら名前を付けルートの外はホームを畳む() {
+        let home = PathBuf::from("/Users/testuser");
+        let roots = [
+            PathBuf::from("/Users/testuser/dev/tako"),
+            PathBuf::from("/Users/testuser/dev/tako/crates/tako-core"),
+            PathBuf::from("/tmp/ws"),
+        ];
+        assert_eq!(
+            shorten_paths_in_text(
+                "（/Users/testuser/dev/tako/src/a.rs → /Users/testuser/dev/tako/crates/tako-core/src/b.rs）",
+                &roots,
+                Some(&home)
+            ),
+            "（tako/src/a.rs → tako-core/src/b.rs）"
+        );
+        // ルートの外でホームの配下 / ホームそのもの / ホームの外
+        assert_eq!(
+            shorten_paths_in_text(
+                "（/Users/testuser/Downloads/日本語の名前.txt）: （/Users/testuser）: （/opt/x/y.txt）",
+                &roots,
+                Some(&home)
+            ),
+            "（~/Downloads/日本語の名前.txt）: （~）: （/opt/x/y.txt）"
+        );
+        // ホームが解決できなければルートの外は素のまま
+        assert_eq!(
+            shorten_paths_in_text("（/Users/testuser/Downloads/a）", &roots, None),
+            "（/Users/testuser/Downloads/a）"
+        );
+    }
+
+    /// #2760: 途中一致・パスの途中・名前で見分けられないルートは縮めない
+    #[test]
+    fn 通知の文のパスは途中一致と見分けられないルートを縮めない() {
+        let home = PathBuf::from("/Users/testuser");
+        let root = [PathBuf::from("/tmp/ws")];
+        // `/tmp/ws` に対する `/tmp/ws2` は別のパス。名前に空白があっても境目を取り違えない
+        assert_eq!(
+            shorten_paths_in_text(
+                "（/tmp/ws2/a）（/tmp/ws b/c）（/tmp/ws/b c/d）",
+                &root,
+                Some(&home)
+            ),
+            "（/tmp/ws2/a）（/tmp/ws b/c）（b c/d）"
+        );
+        // パスの途中（`/x/tmp/ws/a` の `/tmp/ws`）は始まりではない
+        assert_eq!(
+            shorten_paths_in_text("（/x/tmp/ws/a）", &root, Some(&home)),
+            "（/x/tmp/ws/a）"
+        );
+        // ホームの途中一致（ホーム `/Users/alice` に対する `/Users/alice2`）も縮めない
+        assert_eq!(
+            shorten_paths_in_text(
+                "（/Users/alice2/a）",
+                &root,
+                Some(&PathBuf::from("/Users/alice"))
+            ),
+            "（/Users/alice2/a）"
+        );
+        // 同じ名前のルートが 2 つ = 名前で見分けられないので、その 2 つはホームの規則へ
+        let same = [
+            PathBuf::from("/Users/testuser/a/src"),
+            PathBuf::from("/Users/testuser/b/src"),
+        ];
+        assert_eq!(
+            shorten_paths_in_text("（/Users/testuser/a/src/x.rs）", &same, Some(&home)),
+            "（~/a/src/x.rs）"
+        );
+        // 名前の無いルート（`/`）は相対にしない
+        assert_eq!(
+            shorten_paths_in_text("（/opt/x）", &[PathBuf::from("/")], Some(&home)),
+            "（/opt/x）"
+        );
+        // ルートもホームも無ければそのまま・空の文も壊れない
+        assert_eq!(shorten_paths_in_text("（/opt/x）", &[], None), "（/opt/x）");
+        assert_eq!(shorten_paths_in_text("", &root, Some(&home)), "");
+    }
+
+    /// #2760: Windows の区切り（`\`）とドライブの根も同じ規則（macOS から検査する）
+    #[test]
+    fn 通知の文のパスはwindowsの区切りも扱う() {
+        let home = PathBuf::from("C:\\Users\\winuser");
+        let root = [PathBuf::from("C:\\Users\\winuser\\dev\\ws")];
+        assert_eq!(
+            shorten_paths_in_text(
+                "（C:\\Users\\winuser\\dev\\ws\\folder\\x.txt → C:\\Users\\winuser\\Desktop\\y）",
+                &root,
+                Some(&home)
+            ),
+            "（folder\\x.txt → ~\\Desktop\\y）"
+        );
+        // ドライブの根は名前が無いので相対にしない
+        assert_eq!(
+            shorten_paths_in_text("（D:\\data\\x）", &[PathBuf::from("D:\\")], Some(&home)),
+            "（D:\\data\\x）"
+        );
+    }
+
+    /// #2760: 縮めた後の `（A → A）` だけをまとめ、両側が違う・矢印が 2 つ・片側が空・
+    /// 括弧の外の矢印は触らない（ルートもホームも無いときも同じ）
+    #[test]
+    fn 通知の文の同じパスの矢印はまとめる() {
+        let root = [PathBuf::from("/tmp/ws")];
+        assert_eq!(
+            shorten_paths_in_text(
+                "（/tmp/ws/a → /tmp/ws/b）（/tmp/ws/a → /tmp/ws/a）",
+                &root,
+                None
+            ),
+            "（a → b）（a）"
+        );
+        assert_eq!(
+            shorten_paths_in_text("(x → x → x) ( → ) x → x (y → y", &[], None),
+            "(x → x → x) ( → ) x → x (y → y"
+        );
+        assert_eq!(
+            shorten_paths_in_text("（日本 語 → 日本 語）", &[], None),
+            "（日本 語）"
+        );
     }
 
     /// `HOME` と `USERPROFILE` の**両方が無い**環境ではホームを名乗らない。

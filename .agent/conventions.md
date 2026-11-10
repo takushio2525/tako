@@ -1516,6 +1516,13 @@ Windows の `ShellExecuteW`）で、これは「URL を開く API」ではなく
   プレビューの目次 / ページ移動を同じ口へ寄せた）。番犬は `issue1399_tree_notice_watchdog`
   （UI モジュールの dispatch 呼び出しを走査し、捨てている箇所を file:line で名指す。
   `KNOWN_DISCARDED` は #1417 で**空**になった = 新しい画面で捨てたら必ず落ちる）
+- **通知欄は高さで止め、ツリーの通知はパスを縮める**（#2760）。dispatch の文面は CLI / MCP と同じ
+  （絶対パス入り）なので、ツリーの通知は `notify_ui_failure` の中で `tree_notice_text`（正本
+  `tako_core::paths::shorten_paths_in_text` = ルートからの相対・ルートの外はホームを `~`・括弧の中の
+  `A → A` は `A`）を通してから出す。**dispatch の文面のほうを縮めない**（CLI / MCP の応答の値が
+  変わる）。通知欄は `NOTICE_MAX_H`（本文 `NOTICE_MAX_LINES` 行）で止まり、超えた分は中でスクロール
+  （`notice_scroll`）。新しい種類の長い通知を足しても、ツリーの行を窓の外へ押し出さない。
+  番犬 `issue2760_tree_notice_height_watchdog`
 - **クリックの中身は `render` のクロージャから切り出す**（#1417）。合成マウスイベントは
   GPUI へ届かないことがあるので、`on_click` の中に直接書くと**押した経路をセルフテストから
   叩けない**（前後比較が取れない = #1399 で「その間の 1 行」が未検証として残った形）。
