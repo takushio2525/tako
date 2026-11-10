@@ -107,7 +107,7 @@ fn validate_run_configs(text: &str) -> Result<(), OutcomeReason> {
     json_ok::<crate::run_configs::RunConfigsFile>(text)
 }
 
-/// 蓋閉じ継続の残留記録（#697 / #1373）。中身は Windows 専用だが、
+/// 蓋閉じ継続を倒した記録（#697 / #1373 / #2904）。Windows は元値つき、macOS は持ち主だけ（`method: pmset`）。
 /// **読めない記録を「記録なし」へ丸めない**のは両 OS 共通の要件なので検査も共通
 fn validate_lid_guard(text: &str) -> Result<(), OutcomeReason> {
     json_ok::<crate::platform::lid::SavedLidState>(text)

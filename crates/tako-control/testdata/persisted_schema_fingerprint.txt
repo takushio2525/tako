@@ -37,6 +37,7 @@ LastMessage: id, t, session, model, fast, tokens
 LayoutFile: version, active_tab, tabs, window, backgrounded, collapsed, webview_dock, windows, shelved_tabs
 Ledger: entries
 LedgerEntry: id, ts, project, label, issue, task_type, model, model_actual, effort, agent, duration_seconds, ctx_percent, had_error, outcome, rounds, note, post_issue, amend_note
+LidMethod: PowerPlan, Pmset
 LimitObservation: login, key_from, kind, percent, resets_at, observed_at, recorded_at, source
 LimitSeenLayout: notice, detected_at
 LimitSettings: max_jobs, reserve_gb, swap_guard_gb, max_wait_min, jobserver
@@ -61,7 +62,7 @@ RunConfig: profile, runtime, args, env, cwd, before, target, updated_at
 RunConfigsFile: version, projects, files
 RunTarget: Reuse, New
 RuntimeRef: manager, key
-SavedLidState: scheme, ac, dc, owner
+SavedLidState: method, scheme, ac, dc, owner
 SessionCatalog: entries, pending
 SessionEntry: kind, label, project, profile, agent, model, effort, issues, prompt_head, cwd, tab, pane, tmux_session, log_file, started_at, last_seen_at
 SessionKeys: session_id, login, key_from, agent, account, role, project, project_from, issue, task_type, ledger_id, label, first_at, recorded_at

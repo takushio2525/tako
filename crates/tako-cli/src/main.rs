@@ -9720,6 +9720,10 @@ fn sleep_guard_local(sub: &SleepGuardCommand) -> Result<(), String> {
                 line(ReplyNote::SleepGuardLidUnsupported);
             }
             line(ReplyNote::SleepGuardLidApplied(state.lid_sleep_disabled));
+            // #2904: 効いているなら誰の上書きか（GUI から見た立場。旧い GUI の応答には無い = 出さない）
+            if let Some(holder) = state.lid_override_holder {
+                line(ReplyNote::SleepGuardLidHolder(holder));
+            }
             // #1473: 蓋閉じ継続の電源条件と、効いていないなら**その理由**
             if sg::lid_control_supported() {
                 line(ReplyNote::SleepGuardLidPower(

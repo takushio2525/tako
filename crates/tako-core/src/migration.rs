@@ -68,7 +68,7 @@ pub enum SchemaId {
     Recent,
     /// `<data_dir>/config-share.json`（設定共有の配線。#513）
     ConfigShare,
-    /// `<data_dir>/lid-guard.json`（蓋閉じ継続の残留状態。Windows）
+    /// `<data_dir>/lid-guard.json`（蓋閉じ継続を倒した記録。Windows = 元値つき・macOS = 持ち主だけ = #2904）
     LidGuard,
     /// `<data_dir>/orchestrator/config.yaml`（setup 状態・オーケストレーター設定）
     OrchestratorConfig,

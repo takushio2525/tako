@@ -431,6 +431,11 @@ pub struct SleepGuardState {
     /// なる。作るのは [`update`] / [`status`] と [`SleepGuardState::from_json`] だけで、
     /// どれも [`lid_decision`] の結果をそのまま入れる
     pub lid_skip_reason: Option<LidSkipReason>,
+    /// いま効いている蓋閉じ継続の上書きの持ち主（#2904）。効いていない・制御できない OS は `None`。
+    ///
+    /// **判断したプロセスから見た立場**（`self` = その GUI が倒した）なので、[`update`] / [`status`] を
+    /// 走らせたプロセスが載せ、CLI は IPC で受け取ったものを出す（`lid_skip_reason` と同じ理屈）
+    pub lid_override_holder: Option<lid::LidHolder>,
 }
 
 impl SleepGuardState {
@@ -455,6 +460,8 @@ impl SleepGuardState {
             // 読めない環境は null（0% と区別する）
             "battery_percent": self.battery_percent,
             "lid_skip_reason": self.lid_skip_reason.map(|r| r.to_json()),
+            // 効いていない・制御できない OS は null（#2904）
+            "lid_override_holder": self.lid_override_holder.map(lid::LidHolder::as_str),
             "description": self.description(),
         })
     }
@@ -494,6 +501,13 @@ impl SleepGuardState {
             lid_skip_reason: match v.get("lid_skip_reason")? {
                 Value::Null => None,
                 other => Some(LidSkipReason::from_json(other)?),
+            },
+            // #2904 で足した診断の欄。**キーが無い（#2904 より前の GUI の応答）も読む**（持ち主が
+            // 分からない = `None`）。判定には使わない表示だけの欄なので、無いことで「嘘」にはならず、
+            // ここで `None` を返すと CLI が手元で計算し直して busy 0 の嘘（#372）へ倒れる方が害が大きい
+            lid_override_holder: match v.get("lid_override_holder") {
+                None | Some(Value::Null) => None,
+                Some(other) => Some(lid::LidHolder::from_str_opt(other.as_str()?)?),
             },
         })
     }
@@ -1235,8 +1249,9 @@ pub fn update(config: SleepGuardConfig, busy_agents: usize) -> SleepGuardState {
 
     // --- 蓋閉じ継続（#218 / #697。判定は #1473 で安全弁つきの 1 実装） ---
     let lid_supported = lid_control_supported();
-    // 設定が off の間も戻しに行くかは手段による（Windows は自分の記録だけを戻す・macOS は
-    // off の間は `pmset` に触らない = #218 からの挙動。`lid::restores_while_mode_off`）
+    // 設定が off の間も戻しに行く: どちらの腕も倒した主の記録を持ち、off なら自分の上書きだけを
+    // 戻す（Windows = #1373・macOS = #2904。A/B の旧い macOS の腕だけ off の間は触らない =
+    // `lid::restores_while_mode_off`）
     if lid_supported
         && setup_done
         && (lid_sleep_mode == LidSleepMode::WhileAgentsRunning || lid::restores_while_mode_off())
@@ -1297,6 +1312,7 @@ pub fn update(config: SleepGuardConfig, busy_agents: usize) -> SleepGuardState {
         lid_battery_floor,
         battery_percent: battery,
         lid_skip_reason: None,
+        lid_override_holder: lid::override_holder(lid_sleep_disabled),
     }
     .with_decision()
 }
@@ -1316,6 +1332,7 @@ pub fn status(config: SleepGuardConfig) -> SleepGuardState {
     // 副作用なし: 取得・解放は行わず、いまの保持状態と電源・蓋だけを読む（OS の差は境界の内側）
     let lid_supported = lid_control_supported();
     let sudoers = lid_requires_privileged_setup() && is_sudoers_installed();
+    let lid_sleep_disabled = lid::override_active();
     SleepGuardState {
         assertion_held: power::is_held(),
         mode,
@@ -1324,7 +1341,7 @@ pub fn status(config: SleepGuardConfig) -> SleepGuardState {
         busy_agents,
         platform_supported: power::supported(),
         lid_closed: lid::is_closed(),
-        lid_sleep_disabled: lid::override_active(),
+        lid_sleep_disabled,
         lid_sleep_mode: if lid_supported {
             lid_sleep_mode
         } else {
@@ -1338,6 +1355,7 @@ pub fn status(config: SleepGuardConfig) -> SleepGuardState {
         lid_battery_floor,
         battery_percent: battery,
         lid_skip_reason: None,
+        lid_override_holder: lid::override_holder(lid_sleep_disabled),
     }
     .with_decision()
 }
@@ -1355,11 +1373,29 @@ pub fn cleanup_on_exit() {
     power::release_on_exit();
     // **蓋の設定は OS が回収してくれない**（電源プランに書かれた永続設定なので、
     // 倒したまま終了すると次に tako を起動するまで蓋を閉じてもスリープしない）。
-    // 起動時の残留復元（#697）は最後の砦であって、正常終了ではここで必ず戻す
-    // （macOS の腕は失敗を黙って捨てる = #2857 より前のまま）
-    if let Err(e) = lid::restore_on_exit() {
-        eprintln!("[sleep-guard] 終了時の蓋設定の復元に失敗: {e}");
-        crate::diag::persist_log(&format!("lid-sleep cleanup on exit failed: {e}"));
+    // 起動時の残留復元（#697）は最後の砦であって、正常終了ではここで戻す。
+    // 戻すのは**自分が倒した上書きだけ**（#2904。検証起動の終了が本番の上書きを外さない）
+    match lid::restore_on_exit() {
+        Ok(outcome) => log_exit_restore(outcome),
+        Err(e) => {
+            eprintln!("[sleep-guard] 終了時の蓋設定の復元に失敗: {e}");
+            crate::diag::persist_log(&format!("lid-sleep cleanup on exit failed: {e}"));
+        }
+    }
+}
+
+/// 終了時の戻しの結果を persist.log へ 1 行残す（#2904。`lid-sleep:` で grep すると周期の
+/// 有効化・解除と同じ形で並ぶ）。戻すものが無かった終了は残さない（検証起動の終了のたびに行を増やさない）
+fn log_exit_restore(outcome: lid::ExitRestore) {
+    match outcome {
+        lid::ExitRestore::Restored => {
+            crate::diag::persist_log("lid-sleep: 蓋閉じ継続を解除 reason=exit");
+        }
+        lid::ExitRestore::Kept(holder) => crate::diag::persist_log(&format!(
+            "lid-sleep: 終了時は戻さない holder={}",
+            holder.as_str()
+        )),
+        lid::ExitRestore::Nothing => {}
     }
 }
 
@@ -1492,6 +1528,7 @@ mod tests {
             lid_battery_floor: DEFAULT_LID_BATTERY_FLOOR,
             battery_percent: Some(100),
             lid_skip_reason: None,
+            lid_override_holder: None,
         };
         let json = state.to_json();
         assert!(json.get("assertion_held").is_some());
@@ -1535,6 +1572,7 @@ mod tests {
             lid_battery_floor: 35,
             battery_percent: Some(42),
             lid_skip_reason: None,
+            lid_override_holder: None,
         };
         let back = SleepGuardState::from_json(&state.to_json()).expect("往復できるはず");
         assert_eq!(back.assertion_held, state.assertion_held);
@@ -1568,6 +1606,33 @@ mod tests {
         broken["busy_agents"] = Value::Null;
         assert!(SleepGuardState::from_json(&broken).is_none());
         assert!(SleepGuardState::from_json(&json!({})).is_none());
+
+        // #2904: 上書きの持ち主は 4 つとも往復する
+        for holder in [
+            lid::LidHolder::Mine,
+            lid::LidHolder::OtherTako,
+            lid::LidHolder::Stale,
+            lid::LidHolder::NoRecord,
+        ] {
+            let held = SleepGuardState {
+                lid_override_holder: Some(holder),
+                ..state.clone()
+            };
+            let back = SleepGuardState::from_json(&held.to_json()).expect("往復できる");
+            assert_eq!(back.lid_override_holder, Some(holder));
+        }
+        // 診断だけの欄なので、キーの無い #2904 より前の GUI の応答も読む（持ち主は分からない）。
+        // 読めない値は他の欄と同じく弾く
+        let mut before_2904 = state.to_json();
+        before_2904
+            .as_object_mut()
+            .unwrap()
+            .remove("lid_override_holder");
+        let back = SleepGuardState::from_json(&before_2904).expect("旧い GUI の応答も読める");
+        assert_eq!(back.lid_override_holder, None);
+        let mut garbage = state.to_json();
+        garbage["lid_override_holder"] = json!("someone");
+        assert!(SleepGuardState::from_json(&garbage).is_none());
     }
 
     #[test]
@@ -1622,6 +1687,7 @@ mod tests {
             lid_battery_floor: DEFAULT_LID_BATTERY_FLOOR,
             battery_percent: Some(100),
             lid_skip_reason: None,
+            lid_override_holder: None,
         };
         assert!(state.description().contains("無効"));
     }
@@ -1646,6 +1712,7 @@ mod tests {
             lid_battery_floor: DEFAULT_LID_BATTERY_FLOOR,
             battery_percent: Some(100),
             lid_skip_reason: None,
+            lid_override_holder: None,
         };
         assert!(state.description().contains("蓋閉じ継続: 有効"));
     }
@@ -1670,6 +1737,7 @@ mod tests {
             lid_battery_floor: DEFAULT_LID_BATTERY_FLOOR,
             battery_percent: Some(100),
             lid_skip_reason: None,
+            lid_override_holder: None,
         };
         assert!(state.description().contains("高温警告中"));
     }
@@ -1694,6 +1762,7 @@ mod tests {
             lid_battery_floor: DEFAULT_LID_BATTERY_FLOOR,
             battery_percent: Some(100),
             lid_skip_reason: None,
+            lid_override_holder: None,
         }
         // 理由は材料から埋める（`update` / `status` と同じ締め）
         .with_decision();
@@ -1720,6 +1789,7 @@ mod tests {
             lid_battery_floor: DEFAULT_LID_BATTERY_FLOOR,
             battery_percent: Some(100),
             lid_skip_reason: None,
+            lid_override_holder: None,
         };
         assert!(state.description().contains("AC 未接続"));
     }
@@ -1744,6 +1814,7 @@ mod tests {
             lid_battery_floor: DEFAULT_LID_BATTERY_FLOOR,
             battery_percent: Some(100),
             lid_skip_reason: None,
+            lid_override_holder: None,
         };
         assert!(state.description().contains("この OS では"));
     }
@@ -1872,6 +1943,7 @@ mod tests {
             lid_battery_floor: DEFAULT_LID_BATTERY_FLOOR,
             battery_percent: Some(100),
             lid_skip_reason: None,
+            lid_override_holder: None,
         }
         .with_decision();
         assert!(state.description().contains("sudoers 未登録"));
@@ -2000,6 +2072,7 @@ mod tests {
             lid_battery_floor: DEFAULT_LID_BATTERY_FLOOR,
             battery_percent: Some(100),
             lid_skip_reason: None,
+            lid_override_holder: None,
         };
         assert!(state.description().contains("蓋閉じ継続: 有効"));
         assert!(state.description().contains("ディスプレイ消灯済み"));
@@ -2175,6 +2248,7 @@ mod tests {
             lid_battery_floor: 20,
             battery_percent: Some(10),
             lid_skip_reason: None,
+            lid_override_holder: None,
         };
         state = state.with_decision();
         assert_eq!(
@@ -2222,6 +2296,7 @@ mod tests {
             lid_battery_floor: 20,
             battery_percent: percent,
             lid_skip_reason: None,
+            lid_override_holder: None,
         }
         .with_decision()
     }

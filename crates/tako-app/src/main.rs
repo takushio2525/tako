@@ -93500,6 +93500,7 @@ mod self_test {
                     lid_battery_floor: tako_control::sleep_guard::DEFAULT_LID_BATTERY_FLOOR,
                     battery_percent: Some(80),
                     lid_skip_reason: None,
+                    lid_override_holder: None,
                 };
                 let device = Device::detect();
                 // チップのクリックハンドラが立てるのと同じ 2 つの状態を立てて開く
@@ -98194,6 +98195,7 @@ mod self_test {
                             lid_battery_floor: 20,
                             battery_percent: Some(80),
                             lid_skip_reason: None,
+                            lid_override_holder: None,
                         };
                         // 落ちた側は**判断した理由まで**持つ（読む側は再計算しない）
                         let dropped = sg::SleepGuardState {
