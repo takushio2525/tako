@@ -504,8 +504,9 @@ fn sandbox(given: &Given) -> Sandbox {
         .unwrap_or_else(|| panic!("claude --version の版を読めない: {version_text}"));
     let claude_version = format!("{major}.{minor}.{patch}");
     let masker = Masker::new(&[scratch.path(), root.as_path()], &given.home);
-    // GUI の版の控え（`quick_claude_version`）は置き場の symlink の先のパスから版を読み、
-    // 読めなければ背景で PE の版情報 → `claude --version` へ落ちる。Windows の置き場の形を記録する
+    // GUI の版の控え（`quick_claude_version`）は置き場の symlink の先のパス → PE の版情報（#2842）から版を読み、
+    // 読めなければ背景で `claude --version` へ落ちる。Windows の置き場の形を記録する（版の控えそのものの実測は
+    // issue2842_claude_version_windows.rs）
     let canonical = tako_core::platform::path::canonicalize(&given.claude).ok();
     println!(
         "TAKO1886_CLAUDE version={claude_version} raw=[{}] file_version={:?} canonical_has_versions_segment={}",
