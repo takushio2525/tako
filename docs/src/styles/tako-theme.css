@@ -129,13 +129,18 @@
   --sl-color-accent: var(--tako-accent);
   --sl-color-accent-high: var(--tako-accent-strong);
 
-  --sl-color-gray-1: #f6f2ef;
-  --sl-color-gray-2: #ece5df;
-  --sl-color-gray-3: #dcd2ca;
+  /* 灰色の段の向きは Starlight の約束に合わせる（#2877）: gray-1 が文字の側（--sl-color-white
+   * 寄り）、gray-7 が背景の側（--sl-color-black 寄り）。ライトでもダークでも同じ向き。
+   * Starlight の部品はこの向きを前提に塗る（説明文・フッター = gray-3、検索の抜粋・テーマ切替 =
+   * gray-2、検索の枠の地 = gray-6、区切り線 = gray-5 / 6）。逆に並べると、どれも背景に溶ける。
+   * 向きと説明文の読みやすさは scripts/verify-contrast.mjs がビルドの後に検査する */
+  --sl-color-gray-1: #1a1520;
+  --sl-color-gray-2: #2e2933;
+  --sl-color-gray-3: #6b6472;
   --sl-color-gray-4: #a79fac;
-  --sl-color-gray-5: #6b6472;
-  --sl-color-gray-6: #2e2933;
-  --sl-color-gray-7: #1a1520;
+  --sl-color-gray-5: #dcd2ca;
+  --sl-color-gray-6: #ece5df;
+  --sl-color-gray-7: #f6f2ef;
 
   --sl-color-hairline: var(--tako-border);
   --sl-color-hairline-light: var(--tako-border-soft);
@@ -196,13 +201,14 @@
   --sl-color-accent: var(--tako-accent);
   --sl-color-accent-high: var(--tako-accent-strong);
 
-  --sl-color-gray-1: #1e1926;
-  --sl-color-gray-2: #302939;
-  --sl-color-gray-3: #423a4d;
+  /* ライトと同じ向き（gray-1 = 文字の側 → gray-7 = 背景の側。#2877） */
+  --sl-color-gray-1: #faf6f2;
+  --sl-color-gray-2: #ede7f0;
+  --sl-color-gray-3: #a79fac;
   --sl-color-gray-4: #7b7388;
-  --sl-color-gray-5: #a79fac;
-  --sl-color-gray-6: #ede7f0;
-  --sl-color-gray-7: #faf6f2;
+  --sl-color-gray-5: #423a4d;
+  --sl-color-gray-6: #302939;
+  --sl-color-gray-7: #1e1926;
 
   --sl-color-hairline: var(--tako-border);
   --sl-color-hairline-light: var(--tako-border-soft);
