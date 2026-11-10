@@ -18739,9 +18739,12 @@ fn reply_note_index(n: &ReplyNote) -> usize {
         ReplyNote::WorkerSettingUnused { .. } => 339,
         // #2904: 蓋閉じ継続の上書きの持ち主
         ReplyNote::SleepGuardLidHolder(_) => 340,
+        // #2907: worker ポリシーの行を spawn の値から組む（上の段が決める / 解決できない）
+        ReplyNote::WorkerPolicyResolved { .. } => 341,
+        ReplyNote::WorkerPolicyUnresolved { .. } => 342,
     }
 }
-const REPLY_NOTE_VARIANTS: usize = 341;
+const REPLY_NOTE_VARIANTS: usize = 343;
 
 /// 見本の Remote Control の理由・次の一手（中身は `claude_remote` の日英の `Note`）
 const RC_REASON: tako_core::platform::support::Note =
@@ -21178,6 +21181,32 @@ fn reply_note_table() -> Vec<(ReplyNote, String)> {
             "worker_effort（medium）は worker_model_policy が inherit のあいだ使われません（使うのは fixed のときだけ）。\
              既定の worker（claude）の effort は high（worker_agents.claude.effort）です。\n  \
              変えるなら `tako orchestrator profiles set default --agent claude --agent-effort medium`"
+                .into(),
+        ),
+        // #2907: 新しい注記（#2365 より前の文は無いので今の日本語。見本は Issue の再現 = setup の既定 +
+        // `--agent claude --agent-effort medium` と、未登録のアカウント）
+        (
+            ReplyNote::WorkerPolicyResolved {
+                policy: tako_control::orchestrator::WorkerModelPolicy::Inherit,
+                worker: tako_control::orchestrator::DefaultWorkerLaunch {
+                    agent: tako_control::orchestrator::WorkerAgent::Claude,
+                    model: "(claude CLI default)".into(),
+                    effort: "medium".into(),
+                    model_origin: None,
+                    effort_origin: Some(tako_control::orchestrator::WorkerValueOrigin::AgentConfig(
+                        tako_control::orchestrator::WorkerAgent::Claude,
+                    )),
+                },
+            },
+            "worker モデルポリシー: inherit（worker の既定: (claude CLI default) / medium。effort は worker_agents.claude）"
+                .into(),
+        ),
+        (
+            ReplyNote::WorkerPolicyUnresolved {
+                policy: tako_control::orchestrator::WorkerModelPolicy::Fixed,
+                why: tako_control::orchestrator::ConfigError::AccountNotFound("acct".into()),
+            },
+            "worker モデルポリシー: fixed（worker の既定を決められない: アカウント 'acct' が accounts.yaml に見つからない）"
                 .into(),
         ),
     ]

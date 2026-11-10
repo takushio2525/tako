@@ -1252,6 +1252,95 @@ impl UnusedWorkerSetting {
     }
 }
 
+/// ポリシーの段より上で worker の起動値を決めた段（#2907。prompt と `tako master` の起動の行の出どころ）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerValueOrigin {
+    /// アカウントの `default_model` / `default_effort`（名前）
+    Account(String),
+    /// `worker_agents.<agent>.<欄>`
+    AgentConfig(WorkerAgent),
+}
+
+/// 既定の worker（spawn が agent / model / effort / account を省いて立てたとき）の起動値（#2907）。
+///
+/// master の system prompt の「Worker Model Policy」節・Session Identity の行と、`tako master` の
+/// 起動の行（`ReplyNote::WorkerPolicy*`）がこれ 1 つから組む。値は spawn と同じ 1 実装
+/// [`Profile::plan_worker_launch_typed`] の答え。ポリシーの段だけの `resolve_worker_*` を直に出すと、
+/// `worker_agents.<agent>` / アカウントの既定が先に効いていても古い値を名乗る（#2907 の実発生:
+/// inherit + `worker_agents.claude.effort: medium` で prompt が「Effort: high」と書いた）
+#[derive(Debug, Clone, PartialEq)]
+pub struct DefaultWorkerLaunch {
+    pub agent: WorkerAgent,
+    /// 表示ラベル（値が無い = その系統の CLI の既定 = `(<agent> CLI default)`）
+    pub model: String,
+    pub effort: String,
+    /// model をポリシーの段より上が決めたとき、その段
+    pub model_origin: Option<WorkerValueOrigin>,
+    /// effort をポリシーの段より上が決めたとき、その段
+    pub effort_origin: Option<WorkerValueOrigin>,
+}
+
+impl DefaultWorkerLaunch {
+    fn from_plan(plan: &WorkerLaunchPlan) -> Self {
+        let launch = &plan.launch;
+        let origin = |source: LaunchValueSource| match source {
+            LaunchValueSource::Account => Some(WorkerValueOrigin::Account(
+                plan.account_name.clone().unwrap_or_default(),
+            )),
+            LaunchValueSource::AgentConfig => Some(WorkerValueOrigin::AgentConfig(launch.agent)),
+            // spawn の指定は既定の worker（引数なし）には来ない。残りはポリシーの段と CLI の既定
+            LaunchValueSource::Explicit
+            | LaunchValueSource::ProfilePolicy
+            | LaunchValueSource::CliDefault => None,
+        };
+        let label = |value: Option<&str>| match value {
+            Some(v) => v.to_string(),
+            None => format!("({} CLI default)", launch.agent.as_str()),
+        };
+        Self {
+            agent: launch.agent,
+            model: label(launch.model.as_deref()),
+            effort: label(launch.effort.as_deref()),
+            model_origin: origin(launch.model_source),
+            effort_origin: origin(launch.effort_source),
+        }
+    }
+
+    /// 値がポリシーの段（と claude CLI の既定）から来ている = ポリシーの文（「master と同じ」「fixed」）が
+    /// そのまま spawn の値を言える。上の段が決めた・既定の worker が claude の語彙を継がない系統なら false
+    pub fn follows_policy(&self) -> bool {
+        inherits_claude_vocabulary_defaults(self.agent)
+            && self.model_origin.is_none()
+            && self.effort_origin.is_none()
+    }
+}
+
+/// system prompt の「Worker Model Policy」節の値の 2 行（`- **{prefix}Model**: …` / `- **{prefix}Effort**: …`。#2907）。
+/// 上の段が決めた欄は同じ行の括弧で出どころを言う。spawn が断る状態は値の代わりに断りの理由を 1 行で
+/// （prompt は英語なので理由も英語。組み立ては止めない）
+fn worker_value_lines(worker: &Result<DefaultWorkerLaunch, ConfigError>, prefix: &str) -> String {
+    let from = |origin: &Option<WorkerValueOrigin>| match origin {
+        None => String::new(),
+        Some(WorkerValueOrigin::Account(name)) => format!(" (from account `{name}`)"),
+        Some(WorkerValueOrigin::AgentConfig(agent)) => {
+            format!(" (from `worker_agents.{}`)", agent.as_str())
+        }
+    };
+    match worker {
+        Ok(w) => format!(
+            "- **{prefix}Model**: {}{}\n- **{prefix}Effort**: {}{}",
+            w.model,
+            from(&w.model_origin),
+            w.effort,
+            from(&w.effort_origin)
+        ),
+        Err(why) => format!(
+            "- **{prefix}Model / Effort**: unresolved — spawn refuses: {}",
+            why.text_in(tako_core::i18n::Lang::En)
+        ),
+    }
+}
+
 impl WorkerModelPolicy {
     /// YAML / 応答の表記（`inherit` / `fixed` / `delegate`）
     pub fn as_str(self) -> &'static str {
@@ -1919,6 +2008,15 @@ impl Profile {
         })
     }
 
+    /// 既定の worker（spawn が agent / model / effort / account を省いたとき）の起動値（#2907）。
+    /// [`Self::plan_worker_launch_typed`] の答えをそのまま見せる形にしたもの。spawn が断る状態
+    /// （未登録のアカウント・不正な系統名）は Err = spawn と同じ断り（prompt と起動の行は止めずに理由を出す）
+    pub fn default_worker_launch(&self) -> Result<DefaultWorkerLaunch, ConfigError> {
+        self.plan_worker_launch_typed(None, None, None, None)
+            .map(|plan| DefaultWorkerLaunch::from_plan(&plan))
+            .map_err(|e| e.config_error().clone())
+    }
+
     /// `worker_model` / `worker_effort` のうち、`plan`（既定の worker の spawn の値）に使われていないもの（#2891）。
     ///
     /// 使われるのは「ポリシーが fixed・系統が claude の語彙を受け取る・上の段（spawn の指定 /
@@ -2294,18 +2392,26 @@ impl Profile {
         for agent in WorkerAgent::ALL {
             let name = agent.as_str();
             let cfg = self.worker_agents.get(name);
-            let model = cfg
-                .and_then(|c| c.model.as_deref())
-                .map(|m| format!("model `{m}`"))
-                .unwrap_or_else(|| {
-                    if agent == WorkerAgent::Claude {
-                        format!("model {}", self.worker_model_label())
-                    } else {
-                        "model (CLI default)".to_string()
-                    }
-                });
+            // #2907: 値は `spawn --agent <系統>` と同じ 1 実装の答え（アカウントの既定は worker_agents より
+            // 先に効く）。spawn が断る状態（未登録のアカウント）はアカウントを混ぜない解決で並べる
+            // （断りの理由は上の Worker Model Policy の値の行が言う）
+            let launch = self
+                .plan_worker_launch_typed(Some(name), None, None, None)
+                .map(|plan| plan.launch)
+                .unwrap_or_else(|_| self.resolve_agent_launch(agent, None, None));
+            let model = match (launch.model.as_deref(), launch.model_source) {
+                (Some(m), LaunchValueSource::ProfilePolicy) => format!("model {m}"),
+                (Some(m), _) => format!("model `{m}`"),
+                (None, _) if agent == WorkerAgent::Claude => {
+                    format!("model {CLAUDE_DEFAULT_LABEL}")
+                }
+                (None, _) => "model (CLI default)".to_string(),
+            };
             let mut extras = Vec::new();
-            if let Some(e) = cfg.and_then(|c| c.effort.as_deref()) {
+            // ポリシーの段の effort は上の節が言うので、ここは上の段（worker_agents / アカウント）が決めたときだけ
+            if let (Some(e), LaunchValueSource::AgentConfig | LaunchValueSource::Account) =
+                (launch.effort.as_deref(), launch.effort_source)
+            {
                 extras.push(format!("effort {e}"));
             }
             let effective_skip = cfg
@@ -2384,31 +2490,45 @@ impl Profile {
             .map(|t| resolve_text_or_file(t))
     }
 
+    /// #2907: 値は spawn と同じ 1 実装（[`Self::default_worker_launch`]）の答え。ポリシーの文
+    /// （「master と同じ」「fixed」）が値を言えないとき（上の段が決める・master が claude 以外・既定の
+    /// worker が claude 以外）は頭の 1 行を「省いた spawn が使う値」へ替え、上の段が決めた欄は同じ行の
+    /// 括弧で出どころを言う（行は増やさない）。言えるときは #2907 より前の文とバイト一致
     fn generate_model_policy_base(&self) -> String {
+        const SPAWN_DEFAULTS_LEAD: &str =
+            "Workers spawned without `model` / `effort` use these values:";
+        let worker = self.default_worker_launch();
+        let follows = matches!(&worker, Ok(w) if w.follows_policy());
         match self.worker_model_policy {
             WorkerModelPolicy::Inherit => {
+                let lead = if follows && self.master_agent_is_claude() {
+                    "All workers use the same model and effort as this master session:"
+                } else {
+                    SPAWN_DEFAULTS_LEAD
+                };
                 format!(
                     "## Worker Model Policy\n\n\
-                     All workers use the same model and effort as this master session:\n\
-                     - **Model**: {}\n\
-                     - **Effort**: {}\n\n\
+                     {lead}\n\
+                     {}\n\n\
                      When calling `tako_orchestrator_spawn` or `tako_orchestrator_run`, do NOT specify\n\
                      `model` or `effort` — the defaults already match this session's configuration.",
-                    self.model_label(),
-                    self.effort
+                    worker_value_lines(&worker, "")
                 )
             }
             WorkerModelPolicy::Fixed => {
+                let lead = if follows {
+                    "All workers use a fixed model/effort configuration:"
+                } else {
+                    SPAWN_DEFAULTS_LEAD
+                };
                 format!(
                     "## Worker Model Policy\n\n\
-                     All workers use a fixed model/effort configuration:\n\
-                     - **Model**: {}\n\
-                     - **Effort**: {}\n\n\
+                     {lead}\n\
+                     {}\n\n\
                      When calling `tako_orchestrator_spawn` or `tako_orchestrator_run`, do NOT specify\n\
                      `model` or `effort` unless the user explicitly requests a different model for a\n\
                      specific task.",
-                    self.worker_model_label(),
-                    self.resolve_worker_effort()
+                    worker_value_lines(&worker, "")
                 )
             }
             // #1477: プロファイルの `delegate_guidance`（実測で 1.8〜2.0 KB）は
@@ -2425,10 +2545,8 @@ impl Profile {
                      **Always** specify `model` and `effort` explicitly in `tako_orchestrator_spawn`\n\
                      and `tako_orchestrator_run` calls.\n\n\
                      If you cannot determine the appropriate model, use the default:\n\
-                     - **Default Model**: {}\n\
-                     - **Default Effort**: {}{legacy}",
-                    self.model_label(),
-                    self.effort
+                     {}{legacy}",
+                    worker_value_lines(&worker, "Default ")
                 )
             }
         }
@@ -2441,28 +2559,16 @@ impl Profile {
         blocks: &[(String, String)],
         pb: Option<&PromptBlocks>,
     ) -> String {
-        let policy_str = match self.worker_model_policy {
-            WorkerModelPolicy::Inherit if self.master_agent_is_claude() => {
-                format!(
-                    "inherit（master と同じ {} / {}）",
-                    self.model_label(),
-                    self.effort
-                )
+        // #2907: `tako master` の起動の行と同じ 1 実装（spawn の起動値）の本文。master が claude 以外の
+        // ときの非継承（#127）・上の段が決めた欄の出どころ・解決できない理由もそこが言う
+        let policy_str = match crate::ReplyNote::worker_policy(self) {
+            // delegate は値を持たない。言い方は prompt のほうが長い（#2907 より前のまま）
+            crate::ReplyNote::WorkerPolicyDelegate => {
+                "delegate（master がタスクごとに判断）".into()
             }
-            // master が claude 以外のとき master の model / effort は claude worker へ
-            // 継承されない（Issue #127）。実際に解決される値を明示する
-            WorkerModelPolicy::Inherit => format!(
-                "inherit（master は {} のため claude worker へは非継承: {} / {}）",
-                self.master_agent.as_deref().unwrap_or("claude"),
-                self.worker_model_label(),
-                self.resolve_worker_effort()
-            ),
-            WorkerModelPolicy::Fixed => format!(
-                "fixed（{} / {}）",
-                self.worker_model_label(),
-                self.resolve_worker_effort()
-            ),
-            WorkerModelPolicy::Delegate => "delegate（master がタスクごとに判断）".into(),
+            note => note
+                .worker_policy_body_in(tako_core::i18n::Lang::Ja)
+                .unwrap_or_default(),
         };
 
         let profile_path = profile_path(profile_name)
