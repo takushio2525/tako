@@ -187,6 +187,64 @@ pub fn unknown_step(reason: &str) -> String {
     )
 }
 
+// --- ボタン → setup → 対話（#2879）-----------------------------------------------
+
+/// 最初の段（まだ setup が一度も最後まで走っていない）
+pub fn setup_step() -> &'static str {
+    tr!(
+        "初期設定をします。ボタンを押すと、新しいタブで tako setup を実行します",
+        "Set up tako. The button runs tako setup in a new tab"
+    )
+}
+
+/// setup の最後に開く対話で何を決めるか（最初の段と「続ける」の段の下の 1 行）
+pub fn setup_detail() -> &'static str {
+    tr!(
+        "最後に対話のアシスタントが開き、master / worker の設定や GitHub との連携などを相談しながら決めます",
+        "An assistant then opens to decide master / worker settings, GitHub sync and more with you"
+    )
+}
+
+/// 使える系統はあるが、対話のセットアップがまだ
+pub fn continue_step() -> &'static str {
+    tr!(
+        "続けて、対話でセットアップします。ボタンを押すと、setup のタブで tako setup をもう一度実行します",
+        "Continue with the guided setup. The button runs tako setup again in the setup tab"
+    )
+}
+
+pub fn continue_button() -> &'static str {
+    tr!("セットアップを続ける", "Continue setup")
+}
+
+/// setup・対話が走っているあいだの本文
+pub fn running_step(phase: tako_control::setup::RunningPhase) -> &'static str {
+    use tako_control::setup::RunningPhase;
+    match phase {
+        RunningPhase::Setup => tr!(
+            "setup のタブでセットアップを進めています。終わると次にやることが出ます",
+            "Setup is running in the setup tab. The next step appears when it finishes"
+        ),
+        RunningPhase::Dialogue => tr!(
+            "setup のタブで対話のセットアップ中です。終わると「master を起動」が出ます",
+            "The guided setup is open in the setup tab. Start master appears when it finishes"
+        ),
+    }
+}
+
+/// 走っているあいだのボタン（タブを見せるだけ）
+pub fn show_tab_button() -> &'static str {
+    tr!("タブを開く", "Show tab")
+}
+
+/// PATH の段（ボタン起点の形 = 自動の段が無い。ボタンが `tako setup bootstrap path` を打つ）
+pub fn path_step_by_button(agent: &str) -> String {
+    tr!(
+        format!("{agent} コマンドをどのターミナルからも使えるようにする（ボタンを押すと、タブで設定します）"),
+        format!("Make the {agent} command available in every terminal (the button sets it up in the tab)")
+    )
+}
+
 /// ボタンで開いたペインの終わりを見張っているあいだの 1 行
 pub fn watching() -> &'static str {
     tr!(
@@ -259,6 +317,15 @@ mod tests {
                 ready_step().to_string(),
                 unknown_step("x"),
                 watching().to_string(),
+                // #2879
+                setup_step().to_string(),
+                setup_detail().to_string(),
+                continue_step().to_string(),
+                continue_button().to_string(),
+                running_step(tako_control::setup::RunningPhase::Setup).to_string(),
+                running_step(tako_control::setup::RunningPhase::Dialogue).to_string(),
+                show_tab_button().to_string(),
+                path_step_by_button("claude"),
             ];
             for agent in AgentKind::ALL {
                 out.push(login_step(&account(agent)));

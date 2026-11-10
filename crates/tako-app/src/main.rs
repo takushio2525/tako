@@ -2409,6 +2409,11 @@ pub(crate) struct LspGotoMenu {
     landing: tako_control::LspGotoLanding,
 }
 
+/// 「セットアップを実行 / 続ける」を押した直後の二度押しを打ち直さない長さ（#2879）。押してから setup が
+/// 起きて走っている印を立てるまで（ログインシェルの起動 + 移行の段）のあいだに、2 本目の `tako setup` を
+/// 1 本目の入力（導入の `[Y/n]`）へ打ち込まないため
+const WELCOME_REPRESS_GUARD: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// dispatch の内側（`tako welcome next|auto`・確かめの着地）で頼まれた初回起動の導線の続き（#1510）。
 /// ペインを開く・background を起こすには Context が要るので、`after_dispatch` が消化する
 #[derive(Default)]
@@ -3281,6 +3286,8 @@ struct TakoApp {
     welcome_onboarding: tako_control::welcome::Onboarding,
     /// 導線のボタンで開いたペインと、そのとき押した段（同じ段をもう一度押したら打ち直さずに見せる）
     welcome_pane: Option<(PaneId, &'static str)>,
+    /// 導線のボタンでタブへ打った時刻（#2879。押した直後の二度押しで setup を 2 本打たない）
+    welcome_pressed_at: Option<std::time::Instant>,
     /// dispatch の内側で頼まれた導線の続き（Context が要るので `after_dispatch` で消化する）
     welcome_pending: WelcomePending,
     /// 見張りのループが走っているか / 確かめが飛んでいるか（重ねて撃たない）
@@ -5668,8 +5675,11 @@ impl TakoApp {
             // 「このプロセスが最初の 1 回目か」を正しく反映する
             welcome_banner: tako_control::welcome::should_show_on_launch(),
             welcome_live: tako_control::welcome::onboarding_enabled(),
-            welcome_onboarding: tako_control::welcome::Onboarding::default(),
+            welcome_onboarding: tako_control::welcome::Onboarding::new(
+                tako_control::welcome::flow(),
+            ),
             welcome_pane: None,
+            welcome_pressed_at: None,
             welcome_pending: WelcomePending::default(),
             welcome_watch_running: false,
             welcome_probe_inflight: false,
@@ -14423,14 +14433,22 @@ impl TakoApp {
     // --- 初回起動の導線（Issue #1510）--------------------------------------
 
     /// 起動時の入口。バナーを出す起動（初回 / 導線の途中）でだけ動く。
-    /// setup が一度も最後まで走っていなければ自動の段から、走っていれば確かめるだけ
-    /// （= 2 回目の起動で自動の段を繰り返さない。失敗していれば残りから再開する）
+    /// #2879 のボタン起点の形（既定）は**確かめるだけ**で、何も走らせず何も書かない（11/10 の指示）。
+    /// #1510 の形（A/B `TAKO_2879_LEGACY=1`）だけ、setup が一度も最後まで走っていなければ自動の段から
+    /// （= 2 回目の起動で自動の段を繰り返さない。失敗していれば残りから再開する）。判断は
+    /// `welcome::startup_action`（番犬 `issue2879_no_setup_on_launch_watchdog`）
     fn start_welcome_onboarding(&mut self, cx: &mut Context<Self>) {
+        use tako_control::welcome::{Flow, Startup};
         if !self.welcome_banner || !self.welcome_live {
             return;
         }
-        // 初回起動（settings.json がまだ無い）なら導線を始めた印を残す（以後の起動でも出し続ける）
-        if !tako_control::settings::load().welcome_onboarding {
+        let flow = self.welcome_onboarding.flow;
+        if flow == Flow::Guided {
+            // #2879: 起動しただけでは何も書かない（印は最初のボタンで書く）。初回のこのプロセスでは、
+            // ほかの設定の保存にも印を載せる（先に別の設定を変えた人の次の起動でバナーを消さない）
+            tako_control::welcome::carry_guided_on_first_launch();
+        } else if !tako_control::settings::load().welcome_onboarding {
+            // #1510 の形（A/B）: 初回起動なら導線を始めた印を残す（以後の起動でも出し続ける）
             if let Err(e) = tako_control::welcome::begin_onboarding() {
                 eprintln!("warning: 初回起動の導線の状態を保存できない: {e}");
             }
@@ -14438,10 +14456,10 @@ impl TakoApp {
         let completed = tako_control::setup::load_config()
             .map(|config| config.setup.completed)
             .unwrap_or(false);
-        if completed {
-            self.probe_welcome(cx);
-        } else {
-            self.start_welcome_auto(cx);
+        // 判断は welcome の純関数（#2879: ボタン起点の形では起動時に setup を走らせない）
+        match tako_control::welcome::startup_action(flow, completed) {
+            Startup::Probe => self.probe_welcome(cx),
+            Startup::Auto => self.start_welcome_auto(cx),
         }
     }
 
@@ -14585,22 +14603,51 @@ impl TakoApp {
         launch: tako_control::welcome::Launch,
         cx: &mut Context<Self>,
     ) {
-        use tako_control::welcome::Launch;
+        use tako_control::welcome::{Flow, Launch};
+        // #2879: 最初のボタンで導線の印を書く（起動しただけでは書かない。以後の起動でも出し続ける）
+        if self.welcome_onboarding.flow == Flow::Guided
+            && !matches!(launch, Launch::Master)
+            && std::env::var_os("TAKO_SELF_TEST").is_none()
+        {
+            if let Err(e) = tako_control::welcome::mark_guided() {
+                eprintln!("warning: 初回起動の導線の状態を保存できない: {e}");
+            }
+        }
         match launch {
             Launch::Master => self.run_master_command(cx),
             Launch::Auto => self.start_welcome_auto(cx),
+            // #2879: setup・対話が走っている = そのタブを見せるだけ（走っている setup の入力へ打たない）
+            Launch::Focus => {
+                if let Some((pane, _)) = self
+                    .welcome_pane
+                    .filter(|(pane, _)| self.terminals.contains_key(pane))
+                {
+                    self.jump_to_pane(pane, cx);
+                }
+            }
+            // #2879: 自分で PATH を足し終えた = 確かめ直す
+            Launch::Recheck => self.probe_welcome(cx),
             Launch::Pane { title, line } => {
-                let kind = self
-                    .welcome_onboarding
-                    .step
+                let step = self.welcome_onboarding.step.clone();
+                let kind = step
                     .as_ref()
                     .map_or("unknown", tako_control::welcome::NextStep::kind);
+                // #2879: 「セットアップを実行 / 続ける」は、走っているあいだ別の段（running）になるので、
+                // 同じ段が出ている = 前の setup は終わっている = 打ち直してよい。ただし押した直後
+                // （setup がまだ起きて印を立てる前）の二度押しは打たない
+                let retype = self.welcome_onboarding.flow == Flow::Guided
+                    && step
+                        .as_ref()
+                        .is_some_and(tako_control::welcome::retypes_on_repress)
+                    && self
+                        .welcome_pressed_at
+                        .is_none_or(|at| at.elapsed() >= WELCOME_REPRESS_GUARD);
                 let alive = self
                     .welcome_pane
                     .filter(|(pane, _)| self.terminals.contains_key(pane));
                 let pane = match alive {
                     // 同じ段をもう一度押した = まだそのタブで進めている。打ち直さずにそのタブを見せる
-                    Some((pane, pressed)) if pressed == kind => {
+                    Some((pane, pressed)) if pressed == kind && !retype => {
                         self.jump_to_pane(pane, cx);
                         return;
                     }
@@ -14616,6 +14663,7 @@ impl TakoApp {
                     },
                 };
                 self.welcome_pane = Some((pane, kind));
+                self.welcome_pressed_at = Some(std::time::Instant::now());
                 self.welcome_onboarding
                     .start_watch(std::time::Instant::now());
                 self.ensure_welcome_watch(cx);

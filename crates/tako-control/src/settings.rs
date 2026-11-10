@@ -178,6 +178,13 @@ pub struct Settings {
     /// ファイルには無い = serde の default で false** なので、#1510 より前から使っている人には出ない
     #[serde(default)]
     pub welcome_onboarding: bool,
+    /// 初回起動から始まった導線（#2879: ボタン → setup → 対話）が続いているか（既定 false）。
+    /// 初回起動の「セットアップを実行」を押したときに立ち（**起動しただけでは書かない**。それまでは
+    /// settings.json が無いこと自体が初回の印）、master を起動したら倒れる。立っているあいだは
+    /// バナーが毎回出る。**既存の利用者のファイルには無い = serde の default で false** なので、
+    /// 初回起動を済ませた人（#1510 の `welcome_onboarding` が立ったままの人を含む）には出ない
+    #[serde(default)]
+    pub welcome_guided: bool,
     /// 更新通知カードを閉じたときの対象バージョン（Issue #616。None = 閉じていない）。
     /// 値は「どのバージョンを案内していたか」を表すキー（例 `"stable:0.6.1 test:0.7.0-test.1"`）。
     /// 新しいバージョンを検知するとキーが変わり、カードは再び出る（= バージョン単位の抑止）
@@ -319,6 +326,7 @@ impl Default for Settings {
             telemetry: false,
             welcome_dismissed: false,
             welcome_onboarding: false,
+            welcome_guided: false,
             update_card_dismissed: None,
             limit_service: default_limit_service(),
             language: default_language(),
@@ -678,8 +686,28 @@ impl ThemeWarningLog {
 /// 設定を書き出す。tmp へ書いて rename する（読み手と競合しない。discovery と同方式）
 pub fn save(settings: &Settings) -> io::Result<PathBuf> {
     let path = settings_path().ok_or_else(|| crate::config_io::DataDirUnresolved.io_error())?;
-    save_to(&path, settings)?;
+    if CARRY_WELCOME_GUIDED.load(std::sync::atomic::Ordering::SeqCst) && !settings.welcome_guided {
+        let mut carried = settings.clone();
+        carried.welcome_guided = true;
+        save_to(&path, &carried)?;
+    } else {
+        save_to(&path, settings)?;
+    }
     Ok(path)
+}
+
+/// 初回起動のこのプロセスで、ほかの設定の保存にも導線の印（`welcome_guided`）を載せるか（#2879）。
+///
+/// 導線の印は「セットアップを実行」を押したときに書く（起動しただけではファイルを増やさない）。
+/// その前に利用者が別の設定を変えて settings.json ができると、次の起動は「初回ではない・印も無い」と
+/// 読んでバナーが消える。それを防ぐため、初回起動の GUI がこれを立てているあいだは、どの保存にも印を載せる。
+/// 立てるのは GUI だけ（`welcome::carry_guided_on_first_launch`）。導線を終える・閉じると倒す
+static CARRY_WELCOME_GUIDED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// [`CARRY_WELCOME_GUIDED`] を立てる / 倒す
+pub fn set_carry_welcome_guided(on: bool) {
+    CARRY_WELCOME_GUIDED.store(on, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// 指定パスへ設定を書き出す（`save` の本体。隔離した検証で使えるよう公開）
@@ -930,6 +958,7 @@ mod tests {
             telemetry: true,
             welcome_dismissed: true,
             welcome_onboarding: true,
+            welcome_guided: true,
             update_card_dismissed: Some("stable:9.9.9".into()),
             limit_service: "codex".into(),
             language: "en".into(),

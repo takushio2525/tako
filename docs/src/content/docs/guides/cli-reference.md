@@ -1499,12 +1499,12 @@ tako limit-resume --all         # 全ペインの状態を一覧
 
 ### tako welcome
 
-初回起動時にタブバー直下へ出る案内バナーと、初回起動の導線（自動の初期設定 → 次にやること）の操作です。
+初回起動時にタブバー直下へ出る案内バナーと、初回起動の導線（セットアップを実行 → 対話のセットアップ → master を起動）の操作です。起動しただけでは何も走りません。
 
 ```bash
 tako welcome           # 表示状態と次にやること（onboarding.step.command が打つべき 1 行）
-tako welcome next      # 次にやることを進める（バナーのボタンと同じ。入れる・ログインは新しいタブで実行）
-tako welcome auto      # 自動の初期設定をもう一度（インターネットからの導入はしない）
+tako welcome next      # 次にやることを進める（バナーのボタンと同じ。setup・ログインは setup のタブで実行）
+tako welcome auto      # 対話なしの setup を走らせる（インターネットからの導入はしない）
 tako welcome show      # もう一度出す
 tako welcome hide      # その回だけ閉じる
 tako welcome dismiss   # 以後出さない

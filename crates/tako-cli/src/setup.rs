@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use tako_control::config_share::env::ShareEnvironment;
 use tako_control::setup::{
     compare_instruction_coverage, load_config, pending_changes, resolve_setup_value, ChangeKind,
-    InstructionCoverage, ResolvedSetupValue, SetupAnswers, SetupChange, SetupPlan,
+    InstructionCoverage, ResolvedSetupValue, RunningPhase, SetupAnswers, SetupChange, SetupPlan,
     SetupValueSource, CHANGES_YAML, INSTRUCTIONS_DEFAULT, RECOMMENDED_SECTIONS,
 };
 use tako_control::setup_bootstrap::{self, InstallOptions, Step};
@@ -3279,6 +3279,11 @@ fn mark_setup_complete(
         return Ok(revision);
     }
     tako_control::setup::mutate_config(|config| {
+        // #2879: 初めて最後まで走った = 対話はまだ（このあと開ければ済んだ印へ書き直す）。
+        // 記録の無い既存の利用者（`None` のまま完了済み）には立てない = 扱いを変えない
+        if !config.setup.completed && config.setup.dialogue_done.is_none() {
+            config.setup.dialogue_done = Some(false);
+        }
         config.setup.completed = true;
         config.setup.completed_at = Some(now_iso8601());
         config.setup.applied_revision = revision;
@@ -3427,11 +3432,20 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
     // 前回値をすべての質問より先に読む。破損時は既定値で上書きせず中断する。
     let config = load_config()?;
     let is_first_run = !config.setup.completed;
+    // #2879: この端末で対話をまだ済ませていない（初めての setup、またはログイン待ちで 1 回目に開けなかった）
+    let first_dialogue = is_first_run || config.setup.dialogue_done == Some(false);
     let reuse_previous = should_reuse_previous(&config, review);
     let review_mode = review;
     if assume_yes {
         eprintln!("  [default] 非対話モードで既定値を適用します");
     }
+    // #2879: 端末の setup が走っている印。初回起動のバナーは、これが生きているあいだ
+    // 「セットアップを実行 / 続ける」を出さない（走っている setup の入力へコマンド行を打たない）。
+    // 戻り・エラー・panic のどれでも落ちたときに消える（Drop）。タブを閉じて殺されたら残るが、
+    // 読み手は書いたプロセスの生死で無視する
+    let running = (!assume_yes && std::io::IsTerminal::is_terminal(&std::io::stdin()))
+        .then(|| tako_control::setup::RunningMarker::begin(RunningPhase::Setup))
+        .flatten();
     if reuse_previous {
         eprintln!("  [previous] 前回の設定を引き継ぎます");
         eprintln!();
@@ -3928,21 +3942,27 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
         eprintln!();
         eprintln!("対話アシスタントを起動します。設定の変更・解説・次の一歩の相談ができます。");
         eprintln!("─────────────────────────────────────────────────────");
-        let greeting = if review_mode {
-            if pending.is_empty() {
-                "最初に setup-instructions.md を読んでください。前回設定の個別見直しを始めます。変更したい項目だけ確認してください。"
-            } else {
-                "最初に setup-instructions.md と pending-changes.md を読んでください。アップデート変更と前回設定の個別見直しを始めます。"
-            }
-        } else if is_first_run {
-            "最初に setup-instructions.md を読んでください。セットアップが完了しました。設定の確認・変更、コマンドの使い方、次に何をすればよいかなど、何でも聞いてください。"
-        } else if !pending.is_empty() {
-            "最初に setup-instructions.md と pending-changes.md を読んでください。アップデート変更があります。確認と設定の調整ができます。何でも聞いてください。"
-        } else {
-            "最初に setup-instructions.md を読んでください。設定の確認・変更、コマンドの使い方、次に何をすればよいかなど、何でも聞いてください。"
-        };
+        // 文の正本は tako-control（フロー判定の合図との突き合わせはそちらのテスト。#2879）
+        let greeting = tako_control::setup::assistant_greeting(
+            review_mode,
+            !pending.is_empty(),
+            first_dialogue,
+        );
         let agent = usable_agent.expect("skip_agent が false = 使える系統が在る");
+        if let Some(running) = &running {
+            running.set_phase(RunningPhase::Dialogue);
+        }
+        let started = std::time::Instant::now();
         let status = launch_setup_agent(agent, &dir, greeting)?;
+        // #2879: 対話が済んだ印。初回起動のバナーはこれで「master を起動」へ進む。
+        // 起動してすぐ 0 以外で落ちたときは書かない（`dialogue_finished`）
+        if tako_control::setup::dialogue_finished(status.success(), started.elapsed()) {
+            if let Err(e) = tako_control::setup::mutate_config(|config| {
+                config.setup.dialogue_done = Some(true);
+            }) {
+                eprintln!("  [警告] 対話が済んだ記録を書けません: {e}");
+            }
+        }
         if !status.success() {
             eprintln!(
                 "{} が終了しました（exit code: {}）",

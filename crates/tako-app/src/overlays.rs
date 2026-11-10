@@ -195,6 +195,8 @@ impl TakoApp {
         let theme = self.theme.clone();
         let now = std::time::Instant::now();
         let onboarding = self.welcome_onboarding.clone();
+        // #2879: ボタン起点の形（自動の段が無い）
+        let guided = onboarding.flow == tako_control::welcome::Flow::Guided;
 
         // 見出し行の文字だけのボタン
         let link = |id: &'static str, label: String| {
@@ -279,6 +281,13 @@ impl TakoApp {
                 Some(txt::install_manual_button().to_string()),
                 false,
             ),
+            // #2879: ボタン起点の形には自動の段が無いので、PATH を通すコマンドをタブで打つと言う
+            Some(NextStep::Path { agent }) if guided => (
+                next(txt::path_step_by_button(agent.as_str())),
+                None,
+                Some(txt::path_button().to_string()),
+                false,
+            ),
             Some(NextStep::Path { agent }) => (
                 next(txt::path_step(agent.as_str())),
                 None,
@@ -310,8 +319,29 @@ impl TakoApp {
                 Some(txt::run_setup_button().to_string()),
                 false,
             ),
+            // #2879: ボタン → setup → 対話 → master
+            Some(NextStep::Setup) => (
+                next(txt::setup_step().to_string()),
+                Some(txt::setup_detail().to_string()),
+                Some(txt::run_setup_button().to_string()),
+                false,
+            ),
+            Some(NextStep::Continue { .. }) => (
+                next(txt::continue_step().to_string()),
+                Some(txt::setup_detail().to_string()),
+                Some(txt::continue_button().to_string()),
+                false,
+            ),
+            Some(NextStep::Running { phase }) => (
+                txt::running_step(*phase).to_string(),
+                None,
+                Some(txt::show_tab_button().to_string()),
+                false,
+            ),
         };
-        let watching = onboarding.watching(now);
+        // 走っている段は本文がそのまま「タブで進めています」を言うので、見張りの 1 行を重ねない
+        let watching =
+            onboarding.watching(now) && !matches!(onboarding.step, Some(NextStep::Running { .. }));
 
         let step_column =
             div()

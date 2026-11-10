@@ -4066,10 +4066,10 @@ struct MigrateArgs {
     schema: Option<String>,
 }
 
-/// ウェルカムバナーと初回起動の導線の引数（Issue #549 / #1510）
+/// ウェルカムバナーと初回起動の導線の引数（Issue #549 / #1510 / #2879）
 #[derive(Args)]
 struct WelcomeArgs {
-    /// next（次にやることを進める）/ auto（自動の初期設定をもう一度）/ show（再表示）/
+    /// next（次にやることを進める）/ auto（対話なしの setup を走らせる）/ show（再表示）/
     /// hide（いまだけ閉じる）/ dismiss（閉じて以後出さない）。省略時は状態表示
     action: Option<String>,
 }
