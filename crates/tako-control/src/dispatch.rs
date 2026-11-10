@@ -17207,6 +17207,17 @@ pub struct ProfilesParams {
     pub remote_control: Option<bool>,
 }
 
+/// worker の起動値（model / effort とその出どころ）。`profiles` の `resolved_workers.<系統>` の形で、
+/// 欄の名前と出どころの語は spawn の応答（`model` / `model_source` / `effort` / `effort_source`）と同じ（#2891）
+fn resolved_launch_json(launch: &crate::orchestrator::ResolvedWorkerLaunch) -> Value {
+    json!({
+        "model": launch.model,
+        "model_source": launch.model_source.as_str(),
+        "effort": launch.effort,
+        "effort_source": launch.effort_source.as_str(),
+    })
+}
+
 /// プロファイルを JSON 化する（list / show / set の共通形）。
 /// model が null のときは claude CLI の既定モデルで起動することを表す。
 /// `kind` は保存先ディレクトリ（master = profiles/ / solo = solo-profiles/。#721）
@@ -17216,6 +17227,20 @@ fn profile_to_json(
     profile: &crate::orchestrator::Profile,
 ) -> Value {
     use crate::orchestrator;
+    // #2891: worker の「resolved」は spawn が agent / model / effort / account を省いて立てたときに
+    // 実際に付く値。spawn と同じ 1 実装（`plan_worker_launch_typed`）で解決する（ポリシーの段だけの
+    // `resolve_worker_effort()` を載せていたので、`worker_agents.<agent>.effort` が効いていても
+    // 「resolved」だけ古い値を名乗っていた）。spawn が断る状態（未登録のアカウント・不正な系統名）は
+    // null と `resolved_worker_error`（spawn と同じ断りの文）
+    let default_plan = profile.plan_worker_launch_typed(None, None, None, None);
+    let (resolved_model, resolved_effort, resolved_agent) = match &default_plan {
+        Ok(plan) => (
+            json!(plan.launch.model),
+            json!(plan.launch.effort),
+            json!(plan.launch.agent.as_str()),
+        ),
+        Err(_) => (Value::Null, Value::Null, Value::Null),
+    };
     let mut v = json!({
         "name": name,
         "kind": kind.as_str(),
@@ -17224,17 +17249,55 @@ fn profile_to_json(
         "worker_model_policy": profile.worker_model_policy,
         "worker_model": profile.worker_model,
         "worker_effort": profile.worker_effort,
-        "resolved_worker_model": profile.resolve_worker_model(),
-        "resolved_worker_effort": profile.resolve_worker_effort(),
+        "resolved_worker_model": resolved_model,
+        "resolved_worker_effort": resolved_effort,
+        "resolved_worker_agent": resolved_agent,
         "path": kind.dir()
             .map(|d| d.join(format!("{name}.yaml")).display().to_string()),
     });
+    if let Err(e) = &default_plan {
+        v["resolved_worker_error"] = json!(e.config_error().to_string());
+    }
+    // 系統ごと（`spawn --agent <系統>` で立てたときの値と出どころ。#1013 の model_source / effort_source と同じ語）
+    let resolved_workers: serde_json::Map<String, Value> = orchestrator::WorkerAgent::ALL
+        .iter()
+        .filter_map(|agent| {
+            let plan = profile
+                .plan_worker_launch_typed(Some(agent.as_str()), None, None, None)
+                .ok()?;
+            Some((
+                agent.as_str().to_string(),
+                resolved_launch_json(&plan.launch),
+            ))
+        })
+        .collect();
+    if !resolved_workers.is_empty() {
+        v["resolved_workers"] = Value::Object(resolved_workers);
+    }
     // 参照整合性の警告（未登録 project / アカウント / [1m] モデル）は list / show /
     // set のすべてに載せる。GUI は保存前の確認に、CLI / MCP は起動前の気づきに使う（#721）
-    let warnings: Vec<String> = orchestrator::profile_warnings(profile)
+    let mut warnings: Vec<String> = orchestrator::profile_warnings(profile)
         .into_iter()
         .map(String::from)
         .collect();
+    // #2891: 既定の worker の起動に使われない worker_model / worker_effort を黙って抱えさせない
+    // （setup の既定のプロファイルは inherit + worker_agents.claude.effort なので、`--worker-effort` は
+    // ポリシーでも上の段でも効かない）。solo は worker を spawn しないので言わない
+    if kind == orchestrator::ProfileKind::Master {
+        if let Ok(plan) = &default_plan {
+            warnings.extend(
+                profile
+                    .unused_worker_settings(plan)
+                    .into_iter()
+                    .map(|setting| {
+                        String::from(ReplyNote::WorkerSettingUnused {
+                            profile: name.to_string(),
+                            setting,
+                        })
+                    }),
+            );
+        }
+    }
     if !warnings.is_empty() {
         v["warnings"] = json!(warnings);
     }
@@ -20703,44 +20766,29 @@ fn spawn_place(
         .validate_env_typed()
         .map_err(ConfigError::operation)?;
 
-    // #504: アカウント解決（spawn 指定 > worker_account > master_account）
-    let account_name = profile.resolve_worker_account_name(account);
-    let resolved_account = if let Some(acct_name) = account_name {
-        let accounts =
-            orchestrator::AccountsConfig::load_typed().map_err(ConfigError::operation)?;
-        Some(
-            accounts
-                .resolve_typed(acct_name)
-                .map_err(ConfigError::operation)?,
-        )
-    } else {
-        None
-    };
+    // アカウント（spawn 指定 > worker_account > master_account。#504）→ 系統（#120）→
+    // model / effort（明示 → アカウントの既定 → worker_agents.<agent> → ポリシー。#1013）。
+    // **`profiles show` / `set` の resolved_worker_* と同じ 1 実装**（#2891。順を書き写さない）。
+    // アカウントの断りは操作の断り、系統名の断りは引数の断り（修正前と同じ分け方）。
+    // 検証はペイン分割の**前**（不正 agent でペインだけ生える事故を防ぐ）
+    let orchestrator::WorkerLaunchPlan {
+        account_name,
+        account: resolved_account,
+        launch,
+    } = profile
+        .plan_worker_launch_typed(agent, account, model, effort)
+        .map_err(|e| match e {
+            orchestrator::WorkerLaunchPlanError::Account(e) => e.operation(),
+            orchestrator::WorkerLaunchPlanError::Agent(e) => e.invalid(),
+        })?;
     let profile_env = profile.resolved_env_plan_with_account(resolved_account.as_ref());
-
-    let worker_agent = profile
-        .resolve_worker_agent_typed(agent)
-        .map_err(ConfigError::invalid)?;
+    let worker_agent = launch.agent;
     // #983: agent CLI の実在検査。**ペイン分割・レジストリ登録より前**に落とすので、
     // 失敗しても空ペインも active エントリも残らない（不正 agent の検証と同じ位置）。
     // 無ければ「理由 + 次の一手」を返す（無言死を作らない）
     // #1984: 所在の確認（unix はログインシェル）は UI スレッドの dispatch では background が
     // 先取りした答えを読む
     let agent_cli_path = agent_preflight(worker_agent)?;
-    // アカウントの default_model / default_effort をフォールバックに使う（#504）。
-    // **claude 語彙なので明示指定と同じ段に混ぜない**（#1013: 混ぜていたため
-    // `codex --model claude-opus-5` が組み立てられていた）。継承の可否は
-    // resolve_agent_launch_with_account が能力マトリクスへ問う
-    let account_defaults = orchestrator::AccountDefaults {
-        model: resolved_account
-            .as_ref()
-            .and_then(|a| a.default_model.as_deref()),
-        effort: resolved_account
-            .as_ref()
-            .and_then(|a| a.default_effort.as_deref()),
-    };
-    let launch =
-        profile.resolve_agent_launch_with_account(worker_agent, model, effort, account_defaults);
     // Remote Control（#1068）。opt-in が無ければ何も起きない。
     // opt-in なのに不適格なら、フラグは付けずに理由を spawn 応答の warnings へ載せる
     // （無言で「繋がっているはず」にしない）
@@ -20876,7 +20924,7 @@ fn spawn_place(
         profile_env,
         launch,
         remote_control,
-        account_name: account_name.map(str::to_string),
+        account_name,
         profile_warning,
         caller_profile,
         window_title,

@@ -1794,7 +1794,8 @@ pub fn tools() -> Vec<Value> {
                 model 省略は CLI の既定モデル（推奨）。[1m] モデルは set で明示したときだけ使う\
                 （Max / API 限定。Pro は起動不能）。master の model / effort は master_agent の\
                 ネイティブ表記（codex: gpt-5.6-sol / xhigh）で、claude 以外なら worker へ継承しない。\
-                worker は worker_agent と agent + agent_* で指定する。閾値の実効値は応答の \
+                worker は worker_agent と agent + agent_* で指定する。spawn の実効値は応答の \
+                resolved_worker_* / resolved_workers（出どころつき）。閾値の実効値は応答の \
                 resolved_ctx_threshold / ctx_threshold_source / resolved_auto_handoff。\
                 remote_control_effective=false なら remote_control_blocked\
                 （kind / detail / reason / next_step）の next_step に従う。",
@@ -1828,7 +1829,7 @@ pub fn tools() -> Vec<Value> {
                     "worker_model": { "type": "string", "description": "worker_model_policy=fixed の worker モデル" },
                     "clear_worker_model": { "type": "boolean" },
                     "effort": { "type": "string", "description": "master の thinking effort" },
-                    "worker_effort": { "type": "string", "description": "worker の thinking effort" },
+                    "worker_effort": { "type": "string", "description": "worker_model_policy=fixed の worker effort" },
                     "worker_agent": {
                         "type": "string",
                         "enum": ["claude", "codex", "agy"],
