@@ -41,7 +41,7 @@
 //! 自前で描くが、**置き場所は一段上の in-window メニューバー行**（`menu_bar.rs`）。
 //! VSCode と同じく「メニュー群 … ウィンドウコントロール」を 1 行に収める形にした。
 //! この行に残る macOS 専用の要素は左端の `TRAFFIC_LIGHTS_SPACER`（native traffic
-//! lights が載る余白）だけ。
+//! lights が載る余白。値は境界 B36 `platform::window_chrome` が持つ）だけ。
 
 use std::time::Duration;
 
@@ -54,14 +54,7 @@ use tako_core::{CommandState, TitleSource};
 
 use super::*;
 use crate::file_icons::ui_icon;
-
-/// traffic lights（12px × 3 + gap 8px × 2 = 52px）+ 右余白 16px。
-/// native traffic lights を持つのは macOS だけなので、他プラットフォームでは
-/// 意味のない左端余白になる（#584）。0 にして左端からタブを並べる
-#[cfg(target_os = "macos")]
-const TRAFFIC_LIGHTS_SPACER: f32 = 68.0;
-#[cfg(not(target_os = "macos"))]
-const TRAFFIC_LIGHTS_SPACER: f32 = 0.0;
+use crate::platform::window_chrome::TRAFFIC_LIGHTS_SPACER;
 
 /// 1 タブのラベル込みの参考幅（px）。ラベル truncate 上限を決めるために使う概算値。
 /// 実測: dot(7) + gap(8) + pl(10) + label + pr(11) + gap(3)。

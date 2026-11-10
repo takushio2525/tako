@@ -1,7 +1,17 @@
 //! macOS アプリケーションメニューの項目名（キー: menu.*。Issue #485）
 //!
 //! メニューは起動時に `cx.set_menus` で OS へ渡すため、言語切替時は
-//! `TakoApp::render` の言語監視が `app_menus()` を再構築して貼り直す。
+//! `TakoApp::render` の言語監視が `app_menus()`（境界 B36 `platform::window_chrome`）を
+//! 再構築して貼り直す。
+//!
+//! **`cfg_attr(not(target_os = "macos"), allow(dead_code))` が 5 つ残る理由**（#2858 で判断）:
+//! `APP` / `services` / `hide_app` / `hide_others` / `show_all` は macOS のアプリ名メニュー
+//! （`platform::window_chrome::app_menus` の macOS の腕）だけが使う文言で、Windows の腕には
+//! アプリ名メニューが無い（`HideOthers` / `ShowAllApps` は `gpui_windows` で `unimplemented!()` =
+//! 構造的に持たないのが安全装置）。文言は i18n カタログの検査対象なのでここから動かせない。
+//! 属性は lint を黙らせるだけで、どちらの OS でも同じコードがコンパイルされる（片方の腕が
+//! 消えて黙って何もしない枝は生まれない）。増やさないことは `platform_parity.rs` の
+//! `窓の枠のos差が境界の外に戻っていない` が固定している
 //!
 //! **メニュー名・項目名に `/` を入れない**（日英とも。#1058 / #1820）: `tako menu invoke` /
 //! MCP `tako_menu` のパス区切りが `/` なので、含めるとその項目を AI から名指しできなくなる
