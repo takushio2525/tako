@@ -243,7 +243,7 @@ CI（`.github/workflows/ci.yml`）は macOS / Windows の両ランナーで buil
 - 手動確認チェックリスト（IME・.app 等、機械検証できない項目）: `.agent/manual-checks.md`
 - リリース運用の詳細（両 OS 同時 / 夜間リリース / 版数の予約）: `.agent/release.md`
 - オーケストレーター使い方ガイド: `.agent/orchestrator.md`
-- 解説動画 / X 向けショートの作り方: `.agent/plans/2026-09-youtube-explainer.md` / `.agent/plans/2026-09-x-short.md`
+- 解説動画 / X 向けショート / プロモ動画の作り方: `.agent/plans/2026-09-youtube-explainer.md` / `.agent/plans/2026-09-x-short.md` / `.agent/plans/2026-11-promo-remake.md`
 - LSP 基盤（#1007 の S1）の実装設計: `.agent/plans/2026-09-lsp-s1.md`
 
 ### 作業履歴メモ（毎ターン参照・更新）

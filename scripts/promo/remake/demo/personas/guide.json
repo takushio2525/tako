@@ -1,0 +1,74 @@
+{
+  "title": "エージェント",
+  "footer": "demo · 台本（LLM は呼んでいません）",
+  "promptLines": 2,
+  "turns": [
+    [
+      {
+        "busy": "作業中"
+      },
+      {
+        "wait": 800
+      },
+      {
+        "say": "下のペインで dev サーバーを起動します。",
+        "beat": "say_split"
+      },
+      {
+        "wait": 700,
+        "tool": "tako",
+        "arg": "split --down -- npm run dev"
+      },
+      {
+        "wait": 500,
+        "exec": "tako split --down --ratio 0.36 -- node \"$DEMO_DIR/dev-server.mjs\"",
+        "beat": "split"
+      },
+      {
+        "wait": 1500,
+        "say": "README を右のペインにプレビューで開きます。",
+        "beat": "say_open"
+      },
+      {
+        "wait": 700,
+        "tool": "tako",
+        "arg": "open README.md --right"
+      },
+      {
+        "wait": 500,
+        "exec": "tako open \"$HOME/shop-app/README.md\" --right",
+        "beat": "open"
+      },
+      {
+        "wait": 1400,
+        "say": "起動しました。README も開いてあります。",
+        "color": "ok",
+        "beat": "done1"
+      }
+    ],
+    [
+      {
+        "busy": "作業中"
+      },
+      {
+        "wait": 700
+      },
+      {
+        "tool": "tako",
+        "arg": "theme light",
+        "beat": "say_theme"
+      },
+      {
+        "wait": 600,
+        "exec": "tako theme light",
+        "beat": "theme"
+      },
+      {
+        "wait": 900,
+        "say": "ライトテーマに切り替えました。",
+        "color": "ok",
+        "beat": "done2"
+      }
+    ]
+  ]
+}
