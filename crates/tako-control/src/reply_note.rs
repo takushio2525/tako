@@ -94,6 +94,12 @@ pub enum ReplyNote {
     SoloLimitResumeScope,
     /// codex の承認スキップとサンドボックス解除が同じフラグ
     CodexBypassSandboxOff,
+    /// `worker_model` / `worker_effort` が既定の worker の起動に使われない（#2891。
+    /// `profile` は直し方のコマンドに埋めるプロファイル名）
+    WorkerSettingUnused {
+        profile: String,
+        setting: crate::orchestrator::UnusedWorkerSetting,
+    },
     /// プロファイルの remote_control が有効にできない（`detail` は env 名・設定ファイル名・系統名）
     ProfileRemoteControlBlocked {
         detail: String,
@@ -1158,6 +1164,12 @@ impl ReplyNote {
                  while bypass_sandbox is false (commands ask for approval).\n  To lift it, use \
                  `--bypass-sandbox true` (this disables both the sandbox and approvals)"
                     .into()
+            }
+            (Self::WorkerSettingUnused { profile, setting }, Ja) => {
+                worker_setting_unused_text(profile, setting, Ja)
+            }
+            (Self::WorkerSettingUnused { profile, setting }, En) => {
+                worker_setting_unused_text(profile, setting, En)
             }
             (
                 Self::ProfileRemoteControlBlocked {
@@ -4524,6 +4536,92 @@ fn jobserver_off_en(code: Option<&str>) -> String {
         }
         Some(other) => other.to_string(),
         None => "?".into(),
+    }
+}
+
+/// [`ReplyNote::WorkerSettingUnused`] の文（#2891）。「何が・なぜ使われない」→「spawn が実際に使う値と
+/// 出どころ」→「効く直し方」（`worker_agents.<agent>.<欄>` が効くときだけ）の順に言う
+fn worker_setting_unused_text(
+    profile: &str,
+    s: &crate::orchestrator::UnusedWorkerSetting,
+    lang: Lang,
+) -> String {
+    use crate::orchestrator::{LaunchValueSource as Src, UnusedWorkerReason as Why};
+    let key = s.field.profile_key();
+    let field = s.field.as_str();
+    let agent = s.agent.as_str();
+    let value = &s.value;
+    let policy = s.policy.as_str();
+    let account = s.account.as_deref().unwrap_or("?");
+    // 直し方に埋める値。claude の語彙を受け取らない系統へはプロファイルの値を写さない（#1013）
+    let fix_value = |placeholder: &str| match s.fix_value() {
+        Some(v) if v.chars().any(char::is_whitespace) => format!("'{v}'"),
+        Some(v) => v.to_string(),
+        None => placeholder.to_string(),
+    };
+    let fix_command = |placeholder: &str| {
+        format!(
+            "tako orchestrator profiles set {profile} --agent {agent} --agent-{field} {}",
+            fix_value(placeholder)
+        )
+    };
+    match lang {
+        Lang::Ja => {
+            let why = match s.reason {
+                Why::Policy => format!(
+                    " worker_model_policy が {policy} のあいだ使われません（使うのは fixed のときだけ）"
+                ),
+                Why::NotInherited => format!(
+                    " claude の表記の既定なので、既定の worker（{agent}）には渡しません（claude の worker にだけ効きます）"
+                ),
+                Why::Shadowed => "上の段が先に決めるので使われません".to_string(),
+            };
+            let effective = s.effective.as_deref().unwrap_or("CLI の既定");
+            let source = match s.source {
+                Src::Explicit => "（spawn の指定）".to_string(),
+                Src::Account => format!("（アカウント {account} の default_{field}）"),
+                Src::AgentConfig => format!("（worker_agents.{agent}.{field}）"),
+                Src::ProfilePolicy => format!("（worker_model_policy: {policy}）"),
+                Src::CliDefault => String::new(),
+            };
+            let fix = if s.agent_config_fixes() {
+                format!("\n  変えるなら `{}`", fix_command("<値>"))
+            } else {
+                String::new()
+            };
+            format!(
+                "{key}（{value}）は{why}。既定の worker（{agent}）の {field} は {effective}{source}です。{fix}"
+            )
+        }
+        Lang::En => {
+            let why = match s.reason {
+                Why::Policy => format!(
+                    "is not used while worker_model_policy is {policy} (only fixed uses it)"
+                ),
+                Why::NotInherited => format!(
+                    "is a claude-style default, so it is not passed to the default worker \
+                     ({agent}) (it only applies to claude workers)"
+                ),
+                Why::Shadowed => "is not used because a higher stage decides first".to_string(),
+            };
+            let effective = s.effective.as_deref().unwrap_or("the CLI default");
+            let source = match s.source {
+                Src::Explicit => " (the spawn argument)".to_string(),
+                Src::Account => format!(" (account {account}'s default_{field})"),
+                Src::AgentConfig => format!(" (worker_agents.{agent}.{field})"),
+                Src::ProfilePolicy => format!(" (worker_model_policy: {policy})"),
+                Src::CliDefault => String::new(),
+            };
+            let fix = if s.agent_config_fixes() {
+                format!("\n  To change it: `{}`", fix_command("<value>"))
+            } else {
+                String::new()
+            };
+            format!(
+                "{key} ({value}) {why}. The default worker ({agent}) starts with {field} \
+                 {effective}{source}.{fix}"
+            )
+        }
     }
 }
 

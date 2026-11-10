@@ -55,28 +55,47 @@ fn fn_body(src: &str, signature: &str) -> String {
 
 #[test]
 fn アカウント既定を明示指定と同じ段へ混ぜていない() {
-    let src = std::fs::read_to_string(crate_file("src/dispatch.rs")).expect("dispatch.rs を読む");
-    let body = without_comments(production_source(&src));
     // 修正前は `model.or(resolved_account…default_model)` で spawn の明示指定と
     // アカウント既定を 1 つの Option へ潰し、agent 種別を見る前に確定させていた。
-    // アカウント既定は `AccountDefaults` として**段のまま**渡す
-    let joined = body.split_whitespace().collect::<Vec<_>>().join(" ");
-    for pattern in [
-        "model .or( resolved_account",
-        "effort .or( resolved_account",
-        "model.or(resolved_account",
-        "effort.or(resolved_account",
+    // アカウント既定は `AccountDefaults` として**段のまま**渡す。
+    // #2891 からアカウントの解決と `AccountDefaults` の組み立ては spawn と `profiles show` が共有する
+    // `Profile::plan_worker_launch_typed` にあるので、dispatch.rs とその本体の両方を見る
+    let dispatch =
+        std::fs::read_to_string(crate_file("src/dispatch.rs")).expect("dispatch.rs を読む");
+    let orch = std::fs::read_to_string(crate_file("src/orchestrator/mod.rs"))
+        .expect("orchestrator/mod.rs を読む");
+    let plan = without_comments(&fn_body(
+        production_source(&orch),
+        "pub fn plan_worker_launch_typed(",
+    ));
+    let join = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let dispatch = join(&without_comments(production_source(&dispatch)));
+    let plan = join(&plan);
+    for (place, body) in [
+        ("src/dispatch.rs", &dispatch),
+        ("Profile::plan_worker_launch_typed", &plan),
     ] {
-        assert!(
-            !joined.contains(pattern),
-            "アカウント既定を明示指定と同じ段へ潰している（`{pattern}`）。\
-             AccountDefaults で段を分けて resolve_agent_launch_with_account へ渡すこと（#1013）"
-        );
+        for pattern in [
+            "model .or( resolved_account",
+            "effort .or( resolved_account",
+            "model.or(resolved_account",
+            "effort.or(resolved_account",
+        ] {
+            assert!(
+                !body.contains(pattern),
+                "{place}: アカウント既定を明示指定と同じ段へ潰している（`{pattern}`）。\
+                 AccountDefaults で段を分けて resolve_agent_launch_with_account へ渡すこと（#1013）"
+            );
+        }
     }
     // 段を分けて渡している側が実在すること（番犬が空振りしないため）
     assert!(
-        joined.contains("resolve_agent_launch_with_account"),
-        "spawn がアカウント既定つきの解決を通っていない（#1013）"
+        plan.contains("AccountDefaults") && plan.contains("resolve_agent_launch_with_account"),
+        "plan_worker_launch_typed がアカウント既定つきの解決を通っていない（#1013）:\n{plan}"
+    );
+    assert!(
+        dispatch.contains("plan_worker_launch_typed"),
+        "spawn がアカウント既定つきの解決（plan_worker_launch_typed）を通っていない（#1013 / #2891）"
     );
 }
 

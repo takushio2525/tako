@@ -18735,11 +18735,13 @@ fn reply_note_index(n: &ReplyNote) -> usize {
         ReplyNote::WatchNoteKeyDialog => 336,
         ReplyNote::WatchNoteKeyHintOffscreen => 337,
         ReplyNote::DialogAutoModeUnchecked => 338,
+        // #2891: 既定の worker の起動に使われない worker_model / worker_effort
+        ReplyNote::WorkerSettingUnused { .. } => 339,
         // #2904: 蓋閉じ継続の上書きの持ち主
-        ReplyNote::SleepGuardLidHolder(_) => 339,
+        ReplyNote::SleepGuardLidHolder(_) => 340,
     }
 }
-const REPLY_NOTE_VARIANTS: usize = 340;
+const REPLY_NOTE_VARIANTS: usize = 341;
 
 /// 見本の Remote Control の理由・次の一手（中身は `claude_remote` の日英の `Note`）
 const RC_REASON: tako_core::platform::support::Note =
@@ -21155,6 +21157,27 @@ fn reply_note_table() -> Vec<(ReplyNote, String)> {
              ターンを止める（安全確認なしで編集や作業フォルダ内の rm / mv が通る。許可モードが変わるので\
              利用者に確かめる）。「cancel」（Esc）= このターンを止める（auto mode のまま。次に確認が要る\
              操作でまた同じ確認が出る）。worker を止めずに進めるなら stay in auto mode"
+                .into(),
+        ),
+        // #2891: 新しい注記（#2365 より前の文は無いので今の日本語。見本は Issue の再現 1 = setup の既定 +
+        // `--worker-effort medium`）
+        (
+            ReplyNote::WorkerSettingUnused {
+                profile: "default".into(),
+                setting: tako_control::orchestrator::UnusedWorkerSetting {
+                    field: tako_control::orchestrator::WorkerLaunchField::Effort,
+                    value: "medium".into(),
+                    reason: tako_control::orchestrator::UnusedWorkerReason::Policy,
+                    policy: tako_control::orchestrator::WorkerModelPolicy::Inherit,
+                    agent: tako_control::orchestrator::WorkerAgent::Claude,
+                    effective: Some("high".into()),
+                    source: tako_control::orchestrator::LaunchValueSource::AgentConfig,
+                    account: None,
+                },
+            },
+            "worker_effort（medium）は worker_model_policy が inherit のあいだ使われません（使うのは fixed のときだけ）。\
+             既定の worker（claude）の effort は high（worker_agents.claude.effort）です。\n  \
+             変えるなら `tako orchestrator profiles set default --agent claude --agent-effort medium`"
                 .into(),
         ),
     ]

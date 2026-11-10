@@ -258,7 +258,8 @@ fn 依存段の表示は在るが動かないをokより先に言い分ける() 
         (
             CLI_SETUP,
             "run_dependency_check",
-            "unrunnable_text()",
+            // 見つけたパスをホームの `~` へ縮めてから言い分ける（#2892）ので、判定の `unrunnable()` が印
+            "state.unrunnable()",
             "\"  [OK] {}: {path}\"",
         ),
         (

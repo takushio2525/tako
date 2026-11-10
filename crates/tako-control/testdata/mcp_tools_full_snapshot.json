@@ -2561,7 +2561,7 @@
     "name": "tako_orchestrator_adopt"
   },
   {
-    "description": "master / solo の起動設定（profiles/<name>.yaml）を管理する。action: list / show / set（作成・更新）/ create / copy / delete（default は不可）。**書き込み系の引数は set でだけ効き、省略は現状維持**。clear_* で既定へ戻す。list / show / set は warnings（未登録 project / アカウント / [1m] モデル）を返す。model 省略は CLI の既定モデル（推奨）。[1m] モデルは set で明示したときだけ使う（Max / API 限定。Pro は起動不能）。master の model / effort は master_agent のネイティブ表記（codex: gpt-5.6-sol / xhigh）で、claude 以外なら worker へ継承しない。worker は worker_agent と agent + agent_* で指定する。閾値の実効値は応答の resolved_ctx_threshold / ctx_threshold_source / resolved_auto_handoff。remote_control_effective=false なら remote_control_blocked（kind / detail / reason / next_step）の next_step に従う。",
+    "description": "master / solo の起動設定（profiles/<name>.yaml）を管理する。action: list / show / set（作成・更新）/ create / copy / delete（default は不可）。**書き込み系の引数は set でだけ効き、省略は現状維持**。clear_* で既定へ戻す。list / show / set は warnings（未登録 project / アカウント / [1m] モデル）を返す。model 省略は CLI の既定モデル（推奨）。[1m] モデルは set で明示したときだけ使う（Max / API 限定。Pro は起動不能）。master の model / effort は master_agent のネイティブ表記（codex: gpt-5.6-sol / xhigh）で、claude 以外なら worker へ継承しない。worker は worker_agent と agent + agent_* で指定する。spawn の実効値は応答の resolved_worker_* / resolved_workers（出どころつき）。閾値の実効値は応答の resolved_ctx_threshold / ctx_threshold_source / resolved_auto_handoff。remote_control_effective=false なら remote_control_blocked（kind / detail / reason / next_step）の next_step に従う。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -2745,7 +2745,7 @@
           "type": "string"
         },
         "worker_effort": {
-          "description": "worker の thinking effort",
+          "description": "worker_model_policy=fixed の worker effort",
           "type": "string"
         },
         "worker_model": {
