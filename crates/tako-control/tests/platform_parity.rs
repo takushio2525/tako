@@ -1832,3 +1832,65 @@ fn 番犬2856は戻した形を実際に落とす() {
         "注入",
     );
 }
+
+/// **#2857 の番犬**: スリープ防止（境界 B9）の OS の腕は `tako_control::platform::power` /
+/// `platform::lid` の内側だけに置き、`sleep_guard.rs` は OS を意識しない判断と記録だけを持つ。
+///
+/// ## なぜ止めるのか
+///
+/// #2857 まで macOS の腕（IOKit の電源アサーション・`pmset disablesleep`・QoS の確認・`mod iokit`）は
+/// `sleep_guard.rs` の中に `#[cfg(target_os = "macos")]` で 29 塊並び（#1538 の集計）、関数ごとに
+/// 「macOS の塊で IOKit / pmset を直に呼ぶ・`not(macos)` の塊で `platform::…` を呼ぶ」の対になっていた。
+/// macOS の CI では Windows の腕が型検査されない（逆も同じ）ので、片方の腕を直しても他方が壊れて
+/// いることに気付けない。戻る形は `sleep_guard.rs` の本番コードに OS の `cfg`（`#[cfg]` / `cfg!` /
+/// `cfg_attr`）を足すことで、macOS / Windows のビルドとテストは緑のまま通る。
+/// OS ごとに手段が違うところは境界の能力（`lid::requires_privileged_setup` = sudoers の手段を使うか・
+/// `power::reason_accepts_non_ascii` ほか）で分け、呼び手に `cfg` を戻さない。
+///
+/// 見るのは本番コードだけ（テスト領域・コメント・文字列の中は数えない。#2856 の番犬と同じ眺め）
+const SLEEP_GUARD_RS: &str = "crates/tako-control/src/sleep_guard.rs";
+
+fn check_sleep_guard_has_no_os_cfg(src: &str, rel: &str) {
+    let sites = os_cfg_sites(&production_code_view(src));
+    assert!(
+        sites.is_empty(),
+        "{} — `sleep_guard.rs` の本番コードに OS の cfg が戻っている（#2857）。\n\
+         OS ごとの実装は境界 B9 の `tako_control::platform::power`（電源要求・電源の状態・QoS の確認。\
+         macOS の FFI は `power/iokit.rs`）/ `platform::lid`（蓋閉じ継続。macOS の手段は `lid/pmset.rs`）の\
+         内側へ置き、手段の違いは境界の能力（`lid::requires_privileged_setup` ほか）で分ける",
+        sites
+            .iter()
+            .map(|(line, head)| format!("{rel}:{line} `{head}…`"))
+            .collect::<Vec<_>>()
+            .join(" / ")
+    );
+}
+
+#[test]
+fn sleep_guard_rsの本番コードにosのcfgが戻っていない() {
+    // 検出力: 戻した形の断片は落ち、当たってはいけない形は通る（リポジトリのファイルは触らない）
+    let caught = |f: &dyn Fn()| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err();
+    for legacy in [
+        // #2857 より前の対の形（関数の中の塊）
+        "pub fn lid_control_supported() -> bool {\n    #[cfg(target_os = \"macos\")]\n    {\n        true\n    }\n    \
+         #[cfg(not(target_os = \"macos\"))]\n    {\n        crate::platform::lid::supported()\n    }\n}\n",
+        // 値の分岐・モジュールごと・属性の出し分け
+        "pub fn lid_state_detectable() -> bool {\n    cfg!(target_os = \"macos\")\n}\n",
+        "#[cfg(target_os = \"macos\")]\nmod iokit {}\n",
+        "#[cfg_attr(windows, allow(dead_code))]\nfn assertion_reason() {}\n",
+    ] {
+        assert!(
+            caught(&|| check_sleep_guard_has_no_os_cfg(legacy, "注入")),
+            "sleep_guard.rs の OS の cfg を見逃した: {legacy}"
+        );
+    }
+    check_sleep_guard_has_no_os_cfg(
+        "pub use crate::platform::power::ThermalState;\n\
+         #[cfg(feature = \"x\")]\nfn f() {}\n\
+         // #[cfg(target_os = \"macos\")] は説明\n\
+         const S: &str = \"cfg!(windows)\";\n\
+         #[cfg(test)]\nmod tests {\n    #[cfg(target_os = \"macos\")]\n    #[test]\n    fn t() {}\n}\n",
+        "注入",
+    );
+    check_sleep_guard_has_no_os_cfg(&read_rel(SLEEP_GUARD_RS), SLEEP_GUARD_RS);
+}
