@@ -2794,6 +2794,9 @@ struct TakoApp {
     /// リモート操作の通知（#919）。サイドバー上部に出す。
     /// **失敗は自動で消さない**（静かな失敗を作らないため）
     remote_notice: Option<RemoteNotice>,
+    /// 通知欄の中のスクロール（#2760）。通知欄は高さに上限があり、超えた分は中で
+    /// スクロールして読む。新しい通知を出すたびに頭へ戻す（`set_remote_notice`）
+    notice_scroll: gpui::ScrollHandle,
     /// いま SFTP で取得中のリモートファイル（#1010）。ツリーの行にスピナーを出す。
     /// GUI の「開く」は取得を背景へ出すので、**押した瞬間から終わるまで**ここに居る
     /// （CLI / MCP は同期のまま = #966 の切り分けと同じ）
@@ -5393,6 +5396,7 @@ impl TakoApp {
             preview_remote_push: HashMap::new(),
             remote_push_again: std::collections::HashSet::new(),
             remote_notice: None,
+            notice_scroll: gpui::ScrollHandle::new(),
             remote_file_loading: HashMap::new(),
             ssh_connect: HashMap::new(),
             pane_context_menu: None,
@@ -34339,6 +34343,11 @@ mod self_test {
     mod tree_keys;
     #[cfg(feature = "visual-test")]
     use tree_keys::tree_keys_visual;
+    /// #2760: ツリーの断りの通知が長いパスでも上限に収まり、行を押し出さないか（visual-test `tree-notice-2760`）
+    #[cfg(feature = "visual-test")]
+    mod tree_notice_2760;
+    #[cfg(feature = "visual-test")]
+    use tree_notice_2760::tree_notice_2760_visual;
     /// #1903: ステータスバーの 5h / 7d が mod の報告の値で描かれるか（visual-test `mod-limits`）
     #[cfg(feature = "visual-test")]
     mod mod_limits;
@@ -50909,6 +50918,11 @@ mod self_test {
                     tree_keys_visual(any, window, cx).await;
                     visual_exit(0);
                 }
+                // #2760: ツリーの断りの通知が長いパスでも上限に収まり、ツリーの行を押し出さないか
+                "tree-notice-2760" => {
+                    tree_notice_2760_visual(any, window, cx).await;
+                    visual_exit(0);
+                }
                 // #1903: ステータスバーの 5h / 7d が mod の報告の値で描かれ、古くなると戻るか
                 "mod-limits" => {
                     mod_limits_visual(any, window, cx).await;
@@ -51069,7 +51083,7 @@ mod self_test {
                          tasks-accordion / tasks-tick / tasks-offload / shelve-tab / no-emoji / editor-keys / \
                          run-command-truncate / run-dropdown-1733 / run-board-1952 / viewport-lines / jump-keys / search-case / goto-hover / \
                          large-file-edit / large-file-decor / external-change / editor-font / tree-move / \
-                         tree-clipboard / tree-multiselect / tree-keyboard-copy / tree-keys / completion / completion-real / lsp-context-menu / lsp-held-2048 / \
+                         tree-clipboard / tree-multiselect / tree-keyboard-copy / tree-keys / tree-notice-2760 / completion / completion-real / lsp-context-menu / lsp-held-2048 / \
                          lsp-context-menu-real / md-edit-resume / md-find-restore / hover / hover-real / \
                          hover-1893 / hover-loading / hover-loading-real / mod-limits / mod-bar / ino-highlight / \
                          syntax-alias / extra-syntax / net-resume / setup-deps-2433 / \
@@ -53492,6 +53506,8 @@ mod self_test {
             tree_multiselect_visual(any, window, cx).await;
             tree_keyboard_copy_visual(any, window, cx).await;
             tree_keys_visual(any, window, cx).await;
+            // #2760: ツリーの断りの通知の高さの上限と、パスの縮め
+            tree_notice_2760_visual(any, window, cx).await;
 
             // #932: ちらつきの機械検証。**最後に回す**（専用タブを作り、分割・
             // プレビュー・連続出力まで状態を動かすので、他の節の前提を壊さない）
