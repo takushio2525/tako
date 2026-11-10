@@ -9,11 +9,12 @@
 //! - `issue2843_windows_claude_trusts_short_cwd`（`#[ignore]`・**本物の claude を起こす**）:
 //!   `scripts/windows/test-claude-mod-1886.ps1` が砂場へ claude を入れ偽の Messages API を立ててから名指しで回す
 //!   （`agent_install` の門の中。#1886 / #2842 と同じ導入）。短い形の cwd の ConPTY のペインから claude を
-//!   直起動 / ペインの PowerShell 5.1 から打つ形の両方で起こし、
+//!   直起動 / ペインの PowerShell 5.1 から打つ形の両方で起こして、次の 3 つを見る:
 //!   1. 信頼の確認を通したときに claude が自分で書く鍵（= claude が引く鍵）が長い形か短い形か
 //!   2. 製品の事前信頼（短い形の cwd を渡す）を書いた設定 dir では確認が出ないこと
 //!   3. 修正前の答え（短い形をそのまま鍵にした形）だけを書いた設定 dir では確認が出ること（2 の検出力）
-//!   を見る。結果は `TAKO2843_*` の行で CI のログへ残す（パスは `<scratch>` / `<scratch~>` に置き換える）。
+//!
+//! 結果は `TAKO2843_*` の行で CI のログへ残す（パスは `<scratch>` / `<scratch~>` に置き換える）。
 
 #![cfg(windows)]
 
