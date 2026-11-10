@@ -63,6 +63,115 @@ fn close_pane_key() -> &'static str {
     tako_core::platform::keys::close_pane(tako_core::platform::support::Platform::current())
 }
 
+/// ヘルプへ埋める打鍵を組む（実行プラットフォームの表から引く。Issue #2854）。
+///
+/// 移動・削除は編集の打鍵表（`editor_keys::TABLE` = GUI の入口が引く正本）を
+/// `keys::editor_key` で、検索欄の開閉は `keys::find_preview`、shift は `keys::shift`、
+/// 修飾クリックは `keys::platform_modifier`、ツリーの移動の貼り付けは `keys::tree_clip_hint` で引く。
+/// **直書きしない**: clap の doc comment に `⌥←` / `⌘⌫` / `⌘F` と書くと、Windows では存在しない
+/// 打鍵（Win キーは OS が持つ）を案内することになる。doc comment への直書きは番犬
+/// `ui_key_notation` の規則 C が名指す。`Platform` を引数で受けるので、macOS の単体から
+/// Windows のヘルプも確かめられる
+mod help_keys {
+    use tako_core::platform::editor_keys::Action;
+    use tako_core::platform::keys;
+    use tako_core::platform::support::Platform;
+    use tako_core::text_edit::{CursorMovement, DeleteMotion};
+
+    /// 実行中の OS（clap の属性から呼ぶ短い名前）
+    pub(crate) fn here() -> Platform {
+        Platform::current()
+    }
+
+    /// 編集の打鍵を ` / ` で繋ぐ（その OS に打鍵が無い操作は落とす）
+    fn editor_keys_joined(platform: Platform, actions: &[Action]) -> String {
+        actions
+            .iter()
+            .filter_map(|action| keys::editor_key(platform, *action))
+            .collect::<Vec<_>>()
+            .join(" / ")
+    }
+
+    /// `tako edit move` の見出し（macOS = `⌥← / Home / Page Down` / Windows = `Ctrl+← / Home / Page Down`）
+    pub(crate) fn edit_move_about(platform: Platform) -> String {
+        let keys = editor_keys_joined(
+            platform,
+            &[
+                Action::Move(CursorMovement::WordLeft),
+                Action::Move(CursorMovement::SmartLineStart),
+                Action::Move(CursorMovement::PageDown),
+            ],
+        );
+        format!("カーソルを単語・行・ページ・文書端の単位で動かす（{keys} と同じ）")
+    }
+
+    /// `tako edit move --help` の本文（clap が doc comment から組む形 = 段落は空行・段落内の行は空白で繋ぐ）
+    pub(crate) fn edit_move_long_about(platform: Platform) -> String {
+        format!(
+            "{}\n\n単位: left / right / up / down / word-left / word-right / line-start / \
+             smart-home / line-end / doc-start / doc-end / page-up / page-down。 \
+             選択中の left / right は選択の端へ畳む（←→ の打鍵と同じ）。 \
+             例: `tako edit move word-left --select`",
+            edit_move_about(platform)
+        )
+    }
+
+    /// `tako edit move --select` の説明（macOS = `⇧` / Windows = `Shift`）
+    pub(crate) fn edit_select_help(platform: Platform) -> String {
+        format!("選択を伸ばす（{} 付きの打鍵と同じ）", keys::shift(platform))
+    }
+
+    /// `tako edit delete` の見出し（macOS = `⌥⌫ / ⌘⌫` / Windows = `Ctrl+Backspace`。
+    /// Windows は行頭までの削除に打鍵が無いので 1 つだけ）
+    pub(crate) fn edit_delete_about(platform: Platform) -> String {
+        let keys = editor_keys_joined(
+            platform,
+            &[
+                Action::Delete(DeleteMotion::WordBackward),
+                Action::Delete(DeleteMotion::ToLineStart),
+            ],
+        );
+        format!("単語・行単位で消す（{keys} と同じ。選択があれば選択を消す）")
+    }
+
+    /// `tako edit delete --help` の本文
+    pub(crate) fn edit_delete_long_about(platform: Platform) -> String {
+        format!(
+            "{}\n\n単位: char-backward / char-forward / word-backward / word-forward / \
+             to-line-start / to-line-end。例: `tako edit delete word-backward`",
+            edit_delete_about(platform)
+        )
+    }
+
+    /// `tako edit search` の見出し（macOS = `⌘F` / Windows = `Ctrl+Shift+F`）
+    pub(crate) fn edit_search_about(platform: Platform) -> String {
+        format!(
+            "テキスト検索（query 省略時は現在の検索状態を返す）。 \
+             既定は大文字小文字を区別する。query を省略したときは今の検索の条件を引き継ぐ。 \
+             `--open` / `--close` は画面の検索欄を開く / 閉じる（GUI の {}・Escape と同じ）",
+            keys::find_preview(platform)
+        )
+    }
+
+    /// `tako lsp definition` の見出し（修飾クリックの修飾 = macOS は `⌘` / Windows は `Ctrl`）
+    pub(crate) fn lsp_definition_about(platform: Platform) -> String {
+        format!(
+            "識別子の定義へ飛ぶ（GUI の修飾クリック = {} と同じ。#1680）。 \
+             同じファイルは同じペイン、同じタブで開いているファイルはそのペイン、\
+             それ以外は新しいペイン。 MCP は `tako_lsp` の action=definition",
+            keys::platform_modifier(platform).symbol
+        )
+    }
+
+    /// `tako file paste --move` の説明（macOS = `⌥⌘V` / Windows = `Ctrl+Alt+V`）
+    pub(crate) fn file_paste_move_help(platform: Platform) -> String {
+        format!(
+            "移動として貼る（コピーしたものも移す = ファイルツリーの {}）",
+            keys::tree_clip_hint(platform, keys::TreeClipKey::PasteMove)
+        )
+    }
+}
+
 /// ジャンプ履歴の戻る / 進むの打鍵（#1677。実行中の OS の表記）
 fn jump_keys() -> (&'static str, &'static str) {
     let platform = tako_core::platform::support::Platform::current();
@@ -1106,9 +1215,9 @@ enum LspCommand {
         #[arg(long)]
         json: bool,
     },
-    /// 識別子の定義へ飛ぶ（GUI の修飾クリック = macOS は ⌘・Windows は Ctrl と同じ。#1680）。
-    /// 同じファイルは同じペイン、同じタブで開いているファイルはそのペイン、それ以外は新しいペイン。
-    /// MCP は `tako_lsp` の action=definition
+    /// 識別子の定義へ飛ぶ（GUI の修飾クリックと同じ。#1680）。
+    /// ヘルプの本文は修飾キーを実行 OS の表から引く `help_keys::lsp_definition_about`（#2854）
+    #[command(about = help_keys::lsp_definition_about(help_keys::here()))]
     Definition(LspGotoArgs),
     /// 宣言へ飛ぶ（引数は definition と同じ）
     Declaration(LspGotoArgs),
@@ -2409,8 +2518,9 @@ enum FileCommand {
     Paste {
         /// 貼り付け先（フォルダならその中・ファイルならそのフォルダ。省略時はカレントディレクトリ）
         dest: Option<String>,
-        /// 移動として貼る（コピーしたものも移す = ファイルツリーの ⌥⌘V / Windows は Ctrl+Alt+V）
-        #[arg(long = "move")]
+        /// 移動として貼る（ファイルツリーの移動の貼り付けと同じ。打鍵は実行 OS の表から
+        /// `help_keys::file_paste_move_help` が引く = #2854）
+        #[arg(long = "move", help = help_keys::file_paste_move_help(help_keys::here()))]
         as_move: bool,
     },
     /// 走っているコピーの進み具合（件数・バイト）を表示する
@@ -2498,17 +2608,18 @@ enum EditCommand {
         #[arg(long)]
         pane: Option<u64>,
     },
-    /// カーソルを単語・行・ページ・文書端の単位で動かす（⌥← / Home / Page Down と同じ）
-    ///
-    /// 単位: left / right / up / down / word-left / word-right / line-start /
-    /// smart-home / line-end / doc-start / doc-end / page-up / page-down。
-    /// 選択中の left / right は選択の端へ畳む（←→ の打鍵と同じ）。
-    /// 例: `tako edit move word-left --select`
+    /// カーソルを単語・行・ページ・文書端の単位で動かす（GUI の打鍵と同じ）。
+    /// ヘルプの本文（単位の一覧と例を含む）は打鍵を実行 OS の表から引く
+    /// `help_keys::edit_move_about` / `edit_move_long_about`（#2854）
+    #[command(
+        about = help_keys::edit_move_about(help_keys::here()),
+        long_about = help_keys::edit_move_long_about(help_keys::here())
+    )]
     Move {
         /// 動かす単位
         movement: String,
-        /// 選択を伸ばす（⇧ 付きの打鍵と同じ）
-        #[arg(long)]
+        /// 選択を伸ばす（shift 付きの打鍵と同じ。表記は `help_keys::edit_select_help`）
+        #[arg(long, help = help_keys::edit_select_help(help_keys::here()))]
         select: bool,
         /// 文書の版。指定すると版が違うときは何もせず失敗する
         #[arg(long)]
@@ -2516,10 +2627,13 @@ enum EditCommand {
         #[arg(long)]
         pane: Option<u64>,
     },
-    /// 単語・行単位で消す（⌥⌫ / ⌘⌫ と同じ。選択があれば選択を消す）
-    ///
-    /// 単位: char-backward / char-forward / word-backward / word-forward /
-    /// to-line-start / to-line-end。例: `tako edit delete word-backward`
+    /// 単語・行単位で消す（GUI の打鍵と同じ。選択があれば選択を消す）。
+    /// ヘルプの本文（単位の一覧と例を含む）は打鍵を実行 OS の表から引く
+    /// `help_keys::edit_delete_about` / `edit_delete_long_about`（#2854）
+    #[command(
+        about = help_keys::edit_delete_about(help_keys::here()),
+        long_about = help_keys::edit_delete_long_about(help_keys::here())
+    )]
     Delete {
         /// 消す単位
         motion: String,
@@ -2620,9 +2734,10 @@ enum EditCommand {
         #[arg(long)]
         pane: Option<u64>,
     },
-    /// テキスト検索（query 省略時は現在の検索状態を返す）。
-    /// 既定は大文字小文字を区別する。query を省略したときは今の検索の条件を引き継ぐ。
-    /// `--open` / `--close` は画面の検索欄を開く / 閉じる（GUI の ⌘F・Escape と同じ）
+    /// テキスト検索（query 省略時は現在の検索状態を返す）。`--open` / `--close` は画面の
+    /// 検索欄を開く / 閉じる（GUI の検索の打鍵と同じ）。ヘルプの本文は打鍵を実行 OS の表から引く
+    /// `help_keys::edit_search_about`（#2854）
+    #[command(about = help_keys::edit_search_about(help_keys::here()))]
     Search {
         /// 検索文字列
         query: Option<String>,
@@ -15005,6 +15120,219 @@ mod tests {
             );
         }
         assert!(seen >= 1, "confirm-close にヘルプの見出しが無い");
+    }
+
+    /// #2854: ヘルプに出す打鍵（`help_keys`）の両 OS の文言。
+    ///
+    /// **Windows は字面で固定**する（表の Windows の列 = 語は Ctrl・行頭までの削除は打鍵が無い・
+    /// 検索は Ctrl+Shift+F。macOS の記号が混ざらないことを字面で見る）。**macOS は表の記号から組む**:
+    /// 記号の字面がこのファイルに現れると番犬 `ui_key_notation` の規則 A が名指すので、記号は
+    /// `keys` から引く。macOS の打鍵の字面が修正前のヘルプと同じこと（`⌥← / Home / Page Down`・
+    /// `⌥⌫ / ⌘⌫`）は tako-core の `編集の打鍵の案内は打鍵表の先頭の打鍵を出す` が固定する。
+    /// `lsp definition` と `file paste --move` は両 OS を並べていた文から実行 OS の側だけを残した
+    fn issue2854_expected(
+        platform: tako_core::platform::support::Platform,
+    ) -> [(&'static str, String); 8] {
+        use tako_core::platform::editor_keys::Action;
+        use tako_core::platform::keys;
+        use tako_core::platform::support::Platform;
+        use tako_core::text_edit::{CursorMovement as M, DeleteMotion as D};
+        // 打鍵の部分（移動・削除・shift・検索・修飾クリック・移動の貼り付け）
+        let [move_keys, delete_keys, shift, find, modifier, paste_move]: [String; 6] =
+            match platform {
+                Platform::Windows => [
+                    "Ctrl+\u{2190} / Home / Page Down",
+                    "Ctrl+Backspace",
+                    "Shift",
+                    "Ctrl+Shift+F",
+                    "Ctrl",
+                    "Ctrl+Alt+V",
+                ]
+                .map(String::from),
+                Platform::MacOs => {
+                    let mac = Platform::MacOs;
+                    let ek = |action| keys::editor_key(mac, action).expect("macOS の打鍵");
+                    [
+                        format!("{} / Home / Page Down", ek(Action::Move(M::WordLeft))),
+                        format!(
+                            "{} / {}",
+                            ek(Action::Delete(D::WordBackward)),
+                            ek(Action::Delete(D::ToLineStart))
+                        ),
+                        keys::shift(mac).to_string(),
+                        keys::find_preview(mac).to_string(),
+                        keys::platform_modifier(mac).symbol.to_string(),
+                        keys::tree_clip_hint(mac, keys::TreeClipKey::PasteMove),
+                    ]
+                }
+            };
+        let move_about =
+            format!("カーソルを単語・行・ページ・文書端の単位で動かす（{move_keys} と同じ）");
+        let delete_about =
+            format!("単語・行単位で消す（{delete_keys} と同じ。選択があれば選択を消す）");
+        [
+            ("edit move の見出し", move_about.clone()),
+            (
+                "edit move の本文",
+                format!(
+                    "{move_about}\n\n単位: left / right / up / down / word-left / word-right / \
+                     line-start / smart-home / line-end / doc-start / doc-end / page-up / page-down。 \
+                     選択中の left / right は選択の端へ畳む（←→ の打鍵と同じ）。 \
+                     例: `tako edit move word-left --select`"
+                ),
+            ),
+            (
+                "edit move --select",
+                format!("選択を伸ばす（{shift} 付きの打鍵と同じ）"),
+            ),
+            ("edit delete の見出し", delete_about.clone()),
+            (
+                "edit delete の本文",
+                format!(
+                    "{delete_about}\n\n単位: char-backward / char-forward / word-backward / \
+                     word-forward / to-line-start / to-line-end。例: `tako edit delete word-backward`"
+                ),
+            ),
+            (
+                "edit search の見出し",
+                format!(
+                    "テキスト検索（query 省略時は現在の検索状態を返す）。 既定は大文字小文字を区別する。\
+                     query を省略したときは今の検索の条件を引き継ぐ。 `--open` / `--close` は画面の\
+                     検索欄を開く / 閉じる（GUI の {find}・Escape と同じ）"
+                ),
+            ),
+            (
+                "lsp definition の見出し",
+                format!(
+                    "識別子の定義へ飛ぶ（GUI の修飾クリック = {modifier} と同じ。#1680）。 同じファイルは\
+                     同じペイン、同じタブで開いているファイルはそのペイン、それ以外は新しいペイン。 \
+                     MCP は `tako_lsp` の action=definition"
+                ),
+            ),
+            (
+                "file paste --move",
+                format!("移動として貼る（コピーしたものも移す = ファイルツリーの {paste_move}）"),
+            ),
+        ]
+    }
+
+    /// `help_keys` が組む 8 つの文言（[`issue2854_expected`] と同じ並び）
+    fn issue2854_built(platform: tako_core::platform::support::Platform) -> [String; 8] {
+        use super::help_keys as h;
+        [
+            h::edit_move_about(platform),
+            h::edit_move_long_about(platform),
+            h::edit_select_help(platform),
+            h::edit_delete_about(platform),
+            h::edit_delete_long_about(platform),
+            h::edit_search_about(platform),
+            h::lsp_definition_about(platform),
+            h::file_paste_move_help(platform),
+        ]
+    }
+
+    /// macOS の打鍵記号（Windows の文言に 1 つも出てはいけない。正本は `keys` の一覧）
+    const ISSUE2854_MAC_MARKS: [char; 6] = tako_core::platform::keys::MACOS_KEY_SYMBOLS;
+
+    /// #2854: 両 OS の文言を OS を問わず組んで確かめる（macOS の単体から Windows のヘルプも見る）
+    #[test]
+    fn issue2854_ヘルプの打鍵は両osの表の文言になる() {
+        use tako_core::platform::support::Platform;
+        for platform in [Platform::MacOs, Platform::Windows] {
+            for ((place, want), got) in issue2854_expected(platform)
+                .into_iter()
+                .zip(issue2854_built(platform))
+            {
+                assert_eq!(got, want, "{platform:?}: {place}");
+                if platform == Platform::Windows {
+                    for mark in ISSUE2854_MAC_MARKS {
+                        assert!(
+                            !got.contains(mark),
+                            "Windows の {place} に macOS の記号 {mark} が残っている: {got}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// #2854: 実際の clap のヘルプ（実行 OS で組まれたもの）が表の文言になっている。Windows の CI では
+    /// Windows の文言（`Ctrl+← / Home / Page Down` ほか）を、macOS では修正前とバイト一致の文言を見る。
+    /// 加えて、**実行 OS が Windows なら CLI のヘルプ全体**（全サブコマンドの見出し・本文・引数の説明）に
+    /// macOS の打鍵記号が 1 つも無いことを確かめる（doc comment の直書きを実際の出力の側から押さえる）
+    #[test]
+    fn issue2854_editのヘルプは実行osの表の打鍵を出す() {
+        use clap::CommandFactory as _;
+        use tako_core::platform::support::Platform;
+        let cli = super::Cli::command();
+        let sub = |path: &[&str]| -> clap::Command {
+            let mut c = cli.clone();
+            for name in path {
+                c = c
+                    .find_subcommand(name)
+                    .unwrap_or_else(|| panic!("サブコマンド {name} が無い"))
+                    .clone();
+            }
+            c
+        };
+        let arg_help = |c: &clap::Command, id: &str| -> String {
+            c.get_arguments()
+                .find(|a| a.get_id() == id)
+                .unwrap_or_else(|| panic!("引数 {id} が無い"))
+                .get_help()
+                .map(|h| h.to_string())
+                .unwrap_or_default()
+        };
+        let text =
+            |s: Option<&clap::builder::StyledStr>| s.map(|t| t.to_string()).unwrap_or_default();
+        let edit_move = sub(&["edit", "move"]);
+        let edit_delete = sub(&["edit", "delete"]);
+        let actual = [
+            text(edit_move.get_about()),
+            text(edit_move.get_long_about()),
+            arg_help(&edit_move, "select"),
+            text(edit_delete.get_about()),
+            text(edit_delete.get_long_about()),
+            text(sub(&["edit", "search"]).get_about()),
+            text(sub(&["lsp", "definition"]).get_about()),
+            arg_help(&sub(&["file", "paste"]), "as_move"),
+        ];
+        let platform = Platform::current();
+        for ((place, want), got) in issue2854_expected(platform).into_iter().zip(actual) {
+            assert_eq!(got, want, "{platform:?}: 実際の clap の {place}");
+        }
+
+        // CLI のヘルプ全体を辿る（件数の下限 = 辿れていない形を偽の緑にしない）
+        fn walk(c: &clap::Command, path: &str, out: &mut Vec<(String, String)>) {
+            for (what, s) in [("見出し", c.get_about()), ("本文", c.get_long_about())] {
+                if let Some(s) = s {
+                    out.push((format!("{path} の{what}"), s.to_string()));
+                }
+            }
+            for a in c.get_arguments() {
+                for s in [a.get_help(), a.get_long_help()].into_iter().flatten() {
+                    out.push((format!("{path} --{}", a.get_id()), s.to_string()));
+                }
+            }
+            for s in c.get_subcommands() {
+                walk(s, &format!("{path} {}", s.get_name()), out);
+            }
+        }
+        let mut all = Vec::new();
+        walk(&cli, "tako", &mut all);
+        assert!(all.len() > 1000, "ヘルプを辿れていない: {} 件", all.len());
+        if platform == Platform::Windows {
+            let leaked: Vec<String> = all
+                .iter()
+                .filter(|(_, s)| ISSUE2854_MAC_MARKS.iter().any(|m| s.contains(*m)))
+                .map(|(place, s)| format!("{place}: {s}"))
+                .collect();
+            assert!(
+                leaked.is_empty(),
+                "Windows の CLI のヘルプに macOS の打鍵記号が残っている:\n  {}",
+                leaked.join("\n  ")
+            );
+        }
     }
     use super::*;
 
