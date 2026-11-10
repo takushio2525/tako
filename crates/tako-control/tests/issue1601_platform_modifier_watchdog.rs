@@ -22,11 +22,22 @@
 //! 判定そのものの正しさ（macOS = command のみ / Windows = control のみ）は
 //! `tako_core::platform::keys` の単体が macOS 上から両 OS ぶん見る。
 //! ここが見るのは**配線**（全サイトがその 1 実装を通っているか）だけ。
+//!
+//! #2844 で残りの直読み 3 系統（修飾キーを押しながらのファイルのドロップ・入力欄の
+//! `"v"` の貼り付け・CLI `confirm-close` のヘルプの `cmd+W`）を表へ寄せ、規則を足した:
+//!
+//! 5. 本番コードの `Modifiers::platform` の直読みは、理由つきの凍結表（関数単位の件数）の
+//!    外で増やさない。ドロップの判定と入力欄の貼り付けの腕は判定の 1 実装を通る
+//! 6. `PasteClipboard` のアクションのハンドラは伝播を止めたまま（`propagate()` を呼ばない）。
+//!    呼ぶと入力欄の `"v"` の腕へも打鍵が落ち、同じ ⌘V / Ctrl+V で 2 回貼る
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-#[path = "common/code_view.rs"]
-mod code_view;
+#[path = "common/production_range.rs"]
+mod production_range;
+// code_view は production_range が読み込むものを使う（2 回読むと clippy::duplicate_mod）
+use production_range::code_view;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -450,5 +461,356 @@ fn 修飾操作の案内は判定と同じ表から引く() {
             ));
         }
     }
+    assert!(violations.is_empty(), "\n{}", violations.join("\n"));
+}
+
+// --------------------------------------------------------------- #2844（規則 5 / 6）
+
+/// 入力欄の貼り付けの腕が通す 1 実装（tako-app 側の薄いラッパー）
+const PASTE_HELPER: &str = "paste_key_active";
+
+/// 規則 5: 本番コードで `Modifiers::platform` の直読みを許す場所
+/// （ファイル, 関数, その関数の中の件数, 理由）。
+///
+/// **「修飾 + X」で何かをする判定（主修飾を選ぶもの）はここへ足さない**。それは
+/// `keybindings::platform_modifier_active` / `paste_key_active` を通す（Windows では
+/// platform = Win キーで、案内も受理もできない）。ここに載るのは主修飾を選ばない読み
+/// （薄い層そのもの・バインド表の読み取り・表記の整形・「どれかの修飾が立っていたら文字
+/// 入力ではない」の除外）だけ。件数が増えても減っても落ちる（直したら表から消す）
+const KNOWN_PLATFORM_READS: &[(&str, &str, usize, &str)] = &[
+    (
+        "crates/tako-app/src/keybindings.rs",
+        "link_modifier_active",
+        1,
+        "薄い層: GPUI の Modifiers を正本 keys::link_modifier_active の引数へ落とすだけ",
+    ),
+    (
+        "crates/tako-app/src/keybindings.rs",
+        "platform_modifier_active",
+        1,
+        "薄い層: GPUI の Modifiers を正本 keys::platform_modifier_active の引数へ落とすだけ",
+    ),
+    (
+        "crates/tako-app/src/keybindings.rs",
+        "paste_key_active",
+        1,
+        "薄い層: GPUI の Keystroke を正本 keys::paste_key_active の引数へ落とすだけ（#2844）",
+    ),
+    (
+        "crates/tako-app/src/keybindings.rs",
+        "shortcut_hint_for",
+        1,
+        "バインド表（張る側の定義）の読み取り: Windows で Win キーのバインドを案内に出さない",
+    ),
+    (
+        "crates/tako-app/src/menu_bar.rs",
+        "format_keystroke",
+        1,
+        "表記の整形: バインドの修飾をメニューの右端へ書く（判定ではない）",
+    ),
+    (
+        "crates/tako-app/src/menu_bar.rs",
+        "menu_bar_key",
+        1,
+        "修飾なし（plain）の判定: どの修飾も立っていない F10 / 矢印だけをメニューが受ける",
+    ),
+    (
+        "crates/tako-app/src/tasks_panel.rs",
+        "handle_task_comment_key",
+        1,
+        "platform || control の修飾つきを文字入力から外す（主修飾を選ばない）",
+    ),
+    (
+        "crates/tako-app/src/right_panel.rs",
+        "handle_git_commit_key",
+        1,
+        "platform || control の修飾つきを文字入力から外す（主修飾を選ばない）",
+    ),
+    (
+        "crates/tako-app/src/sidebar.rs",
+        "handle_inline_edit_key",
+        1,
+        "control || platform の修飾つきを文字入力から外す（主修飾を選ばない）",
+    ),
+    (
+        "crates/tako-app/src/main.rs",
+        "handle_search_bar_key",
+        1,
+        "platform || control || alt の修飾つきを検索欄の文字入力から外す（主修飾を選ばない）",
+    ),
+    (
+        "crates/tako-app/src/main.rs",
+        "handle_key",
+        1,
+        "表に無い platform 付きのキー（⌘ / Win）を PTY へ流さない関所（端末の修飾に platform は無い）",
+    ),
+    (
+        "crates/tako-app/src/preview_render.rs",
+        "render_preview_pane",
+        1,
+        "platform || control + ホイールで拡大縮小（両方を受ける・主修飾を選ばない）",
+    ),
+];
+
+/// ドロップで「修飾キーを押しながら」を読む代入（`drop_cmd_held = …` / `let cmd_held = …`）
+const DROP_FILE: &str = "crates/tako-app/src/main.rs";
+/// （rustfmt が `=` の後で折り返すので、目印は `=` で止める）
+const DROP_READS: &[&str] = &["drop_cmd_held =", "let cmd_held ="];
+
+/// 入力欄の `"v"`（貼り付け）を扱うキー処理（ファイル, 関数名, `"v"` の件数）
+const PASTE_HANDLERS: &[(&str, &str, usize)] = &[
+    (
+        "crates/tako-app/src/tasks_panel.rs",
+        "handle_task_comment_key",
+        1,
+    ),
+    (
+        "crates/tako-app/src/right_panel.rs",
+        "handle_git_branch_input_key",
+        1,
+    ),
+    // match の腕（打鍵を握るかの `handled` も同じ関数を呼ぶ。直読みへ戻すと規則 5 が名指す）
+    ("crates/tako-app/src/settings_window.rs", "handle_key", 1),
+];
+
+fn is_ident(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// `pos` を本体に含むいちばん内側の `fn 名前(…) { … }` の名前（`code` は code_view の眺め）
+fn enclosing_fn(code: &str, pos: usize) -> Option<String> {
+    let bytes = code.as_bytes();
+    for (at, _) in code[..pos].rmatch_indices("fn ") {
+        if at > 0 && is_ident(bytes[at - 1]) {
+            continue;
+        }
+        let name_start = at + "fn ".len();
+        let name_len = code[name_start..]
+            .bytes()
+            .take_while(|b| is_ident(*b))
+            .count();
+        if name_len == 0 {
+            continue;
+        }
+        let after = name_start + name_len;
+        // `fn 名前(` / `fn 名前<T>(` だけ（型の `fn(u8)` は名前が無いので上で落ちる）
+        let Some(paren) = code[after..].find('(').map(|o| after + o) else {
+            continue;
+        };
+        let between = code[after..paren].trim();
+        if !(between.is_empty() || between.starts_with('<')) {
+            continue;
+        }
+        let sig_end = balanced_end(code, paren, b'(', b')');
+        let tail = &code[sig_end..];
+        let open = match (tail.find('{'), tail.find(';')) {
+            (Some(b), Some(s)) if s < b => continue, // 本体の無い宣言（trait の中など）
+            (Some(b), _) => sig_end + b,
+            _ => continue,
+        };
+        if open > pos {
+            continue;
+        }
+        if pos < balanced_end(code, open, b'{', b'}') {
+            return Some(code[name_start..after].to_string());
+        }
+    }
+    None
+}
+
+/// 本番コードの `Modifiers::platform` の直読み（`(ファイル, 行, 関数, 行の原文)`）
+fn platform_reads() -> Vec<(String, usize, String, String)> {
+    let product = production_range::product_sources();
+    let test_only = production_range::test_only_files(&product);
+    let mut out = Vec::new();
+    for rel in product.iter().filter(|r| !test_only.contains(*r)) {
+        let src = read(rel);
+        if !has_any(&src, RAW) {
+            continue;
+        }
+        // テスト領域を潰した原文 → コメントと文字列も潰した眺め（バイト長と行は保つ）
+        let text = production_range::scan(&src).text;
+        let code = code_view::code_view(&text);
+        let mut hits: Vec<usize> = RAW
+            .iter()
+            .flat_map(|raw| code.match_indices(raw).map(|(i, _)| i))
+            .collect();
+        hits.sort_unstable();
+        hits.dedup();
+        for at in hits {
+            let line = line_of(&code, at);
+            let source_line = src.lines().nth(line - 1).unwrap_or("").trim().to_string();
+            let func = enclosing_fn(&code, at).unwrap_or_else(|| "（関数の外）".to_string());
+            out.push((rel.clone(), line, func, source_line));
+        }
+    }
+    out
+}
+
+/// 規則 5: `Modifiers::platform` の直読みは凍結表の外で増やさない（#2844）。
+///
+/// 表に無い場所の直読みは `file:line` で名指す。主修飾を選ぶ判定なら
+/// `keybindings::platform_modifier_active` / `paste_key_active` を通し、主修飾を選ばない
+/// 読み（どれかの修飾が立っていたら文字入力ではない、など）なら理由を添えて表へ足す
+#[test]
+fn platform修飾の直読みは凍結表の外で増やさない() {
+    let reads = platform_reads();
+    let mut by_fn: BTreeMap<(String, String), Vec<(usize, String)>> = BTreeMap::new();
+    for (rel, line, func, source) in &reads {
+        by_fn
+            .entry((rel.clone(), func.clone()))
+            .or_default()
+            .push((*line, source.clone()));
+    }
+    let mut violations: Vec<String> = Vec::new();
+    for ((rel, func), sites) in &by_fn {
+        let known = KNOWN_PLATFORM_READS
+            .iter()
+            .find(|(r, f, _, _)| r == rel && f == func);
+        let allowed = known.map_or(0, |(_, _, n, _)| *n);
+        if sites.len() > allowed {
+            for (line, source) in sites {
+                violations.push(format!(
+                    "{rel}:{line}: {func}() が GPUI の platform 修飾を直読みしている（凍結表は {allowed} 件・\
+                     実際は {} 件）: `{source}`\n  → Windows では platform = Win キー。「修飾 + X」の判定なら \
+                     keybindings::{HELPER} / {PASTE_HELPER} を通す。主修飾を選ばない読みなら理由を添えて \
+                     KNOWN_PLATFORM_READS へ足す（#2844）",
+                    sites.len()
+                ));
+            }
+        }
+    }
+    for (rel, func, n, _) in KNOWN_PLATFORM_READS {
+        let actual = by_fn
+            .get(&(rel.to_string(), func.to_string()))
+            .map_or(0, Vec::len);
+        if actual < *n {
+            violations.push(format!(
+                "{rel}: {func}() の platform 修飾の直読みが凍結表の {n} 件より少ない（{actual} 件）。\
+                 直したなら KNOWN_PLATFORM_READS の件数を下げるか行を消す（表を実態へ合わせる。#2844）"
+            ));
+        }
+    }
+    // 走査が空振りしていない（列挙が壊れて 0 件で緑になるのを防ぐ）
+    assert!(
+        reads.len() >= KNOWN_PLATFORM_READS.len(),
+        "直読みが {} 件しか見つからない（走査が壊れた？）",
+        reads.len()
+    );
+    assert!(violations.is_empty(), "\n{}", violations.join("\n"));
+}
+
+/// 規則 5 の続き: 修飾キーを押しながらのファイルのドロップ（cd / 下のターミナルへの
+/// パス入力。#415）と、入力欄の `"v"` の貼り付けは判定の 1 実装を通る（#2844）。
+///
+/// 規則 5 の凍結表は「直読みが増えた」を止める。こちらは「直読みを消しただけで
+/// 判定ごと無くなった / control を素で読む形へ変わった」を止める
+#[test]
+fn ドロップと貼り付けの修飾は判定の1実装を通る() {
+    let mut violations: Vec<String> = Vec::new();
+    // ドロップ: 修飾を読む代入は全部 platform_modifier_active を通る
+    let v = without_self_test(views(DROP_FILE));
+    let mut drop_reads = 0usize;
+    for needle in DROP_READS {
+        for (at, _) in v.code.match_indices(needle) {
+            let end = at
+                + v.code[at..]
+                    .find(';')
+                    .unwrap_or_else(|| panic!("{DROP_FILE}: `{needle}` の文の終わりが無い"));
+            let stmt = &v.text[at..end];
+            if !stmt.contains("modifiers") {
+                continue; // `= false` などの後片付け
+            }
+            drop_reads += 1;
+            if !stmt.contains(&format!("keybindings::{HELPER}(")) {
+                violations.push(format!(
+                    "{DROP_FILE}:{}: ドロップの修飾の判定が {HELPER} を通っていない: `{}`\
+                     （Windows では Ctrl+ドロップが効かない。#2844）",
+                    line_of(&v.code, at),
+                    stmt.trim()
+                ));
+            }
+        }
+    }
+    // ドラッグ中の 2 種（ツリー / 外部）・ドロップの 2 種・描画フレームの同期
+    if drop_reads < 5 {
+        violations.push(format!(
+            "{DROP_FILE}: 修飾を読むドロップの判定が {drop_reads} 件しか見つからない（5 件のはず。構造が変わった？）"
+        ));
+    }
+    // 貼り付け: 入力欄の `"v"` は paste_key_active を通る（control を素で読まない）
+    for (rel, name, want) in PASTE_HANDLERS {
+        let v = views(rel);
+        let (start, end) = fn_body(&v, rel, name);
+        let mut arms = 0usize;
+        for (off, _) in v.text[start..end].match_indices("\"v\"") {
+            let at = start + off;
+            arms += 1;
+            let line_end = at + v.text[at..].find('\n').unwrap_or(v.text.len() - at);
+            let line_start = v.text[..at].rfind('\n').map_or(0, |i| i + 1);
+            let line = &v.text[line_start..line_end];
+            if !line.contains(PASTE_HELPER) {
+                violations.push(format!(
+                    "{rel}:{}: {name}() の貼り付け（\"v\"）が keybindings::{PASTE_HELPER} を通っていない: `{}`\
+                     （Windows では Win+V を見て Ctrl+V を落とす。#2844）",
+                    line_of(&v.code, at),
+                    line.trim()
+                ));
+            }
+        }
+        if arms != *want {
+            violations.push(format!(
+                "{rel}: {name}() の \"v\" が {arms} 件（{want} 件のはず。構造が変わった？）"
+            ));
+        }
+    }
+    assert!(violations.is_empty(), "\n{}", violations.join("\n"));
+}
+
+/// 規則 6: `PasteClipboard` のアクションのハンドラは伝播を止めたまま（#2844）。
+///
+/// GPUI はキーバインドのアクションを `on_key_down` より先に配り、バブルのハンドラは既定で
+/// 伝播を止める。入力欄の `"v"` の腕（`paste_key_active`）が ⌘V / Ctrl+V を受けても
+/// 二重に貼らないのはこのため（tako-app の `貼り付けはバインド表の経路と二重に発火しない`
+/// の前提）。ハンドラが `propagate()` を呼ぶと、同じ打鍵が腕へも落ちて 2 回貼る
+#[test]
+fn 貼り付けのアクションは伝播を止めたまま() {
+    let product = production_range::product_sources();
+    let test_only = production_range::test_only_files(&product);
+    let mut violations: Vec<String> = Vec::new();
+    let mut handlers = 0usize;
+    for rel in product
+        .iter()
+        .filter(|r| r.starts_with("crates/tako-app/src/") && !test_only.contains(*r))
+    {
+        let src = read(rel);
+        if !src.contains("PasteClipboard") {
+            continue;
+        }
+        let text = production_range::scan(&src).text;
+        let code = code_view::code_view(&text);
+        let needle = ".on_action(";
+        for (at, _) in code.match_indices(needle) {
+            let open = at + needle.len() - 1;
+            let end = balanced_end(&code, open, b'(', b')');
+            let args = &code[open..end];
+            if !args.contains("PasteClipboard") {
+                continue;
+            }
+            handlers += 1;
+            if args.contains("propagate(") {
+                violations.push(format!(
+                    "{rel}:{}: PasteClipboard のハンドラが propagate() を呼んでいる\
+                     （同じ打鍵が入力欄の \"v\" の腕へも落ちて 2 回貼る。#2844）",
+                    line_of(&code, at)
+                ));
+            }
+        }
+    }
+    // メイン窓（paste() へ振り分け）と設定窓（編集欄へ挿入）
+    assert!(
+        handlers >= 2,
+        "PasteClipboard のハンドラが {handlers} 件しか見つからない（構造が変わった？）"
+    );
     assert!(violations.is_empty(), "\n{}", violations.join("\n"));
 }

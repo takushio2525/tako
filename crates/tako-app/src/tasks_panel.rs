@@ -1283,8 +1283,8 @@ impl TakoApp {
                 cx.notify();
                 true
             }
-            "v" if keystroke.modifiers.platform => {
-                // ⌘V はクリップボード読み出しの共通経路（`paste`）へ任せる
+            "v" if crate::keybindings::paste_key_active(keystroke) => {
+                // ⌘V（Windows は Ctrl+V。#2844）はクリップボード読み出しの共通経路（`paste`）へ任せる
                 self.paste(cx);
                 true
             }

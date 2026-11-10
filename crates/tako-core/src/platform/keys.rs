@@ -105,6 +105,18 @@ pub fn quit(platform: Platform) -> &'static str {
     }
 }
 
+/// フォーカス中のペインを閉じる打鍵（Issue #2844）。
+///
+/// Windows は Windows Terminal / ブラウザと同じ `Ctrl+Shift+W`（`Ctrl+W` は readline の
+/// 単語削除なので奪わない）。CLI `confirm-close` のヘルプが `cmd+W` と直書きしていた
+/// （Windows では Win+W = OS のウィジェットを案内していた）のを、ここから引く形へ移した
+pub fn close_pane(platform: Platform) -> &'static str {
+    match platform {
+        Platform::MacOs => "\u{2318}W",
+        Platform::Windows => "Ctrl+Shift+W",
+    }
+}
+
 /// 「修飾 + クリック / Enter」の主修飾キーの表記（macOS = command / Windows = Ctrl）。
 ///
 /// キーバインド表に載っていない「修飾 + クリック」「修飾 + Enter」の操作
@@ -169,6 +181,38 @@ pub fn platform_modifier_active(platform: Platform, platform_key: bool, control:
         Platform::MacOs => platform_key,
         Platform::Windows => control,
     }
+}
+
+/// アプリ内の入力欄（タスクの返答欄・git のブランチ名欄・設定窓の編集欄）のキー処理が
+/// 「貼り付け」として受ける打鍵か（Issue #2844）。
+///
+/// 主修飾は [`platform_modifier_active`] と同じ表（macOS = command / Windows = Ctrl）。
+/// 修正前はどの欄も `"v" if modifiers.platform` を直読みしていて、Windows では
+/// Win+V（OS のクリップボード履歴）を見ていた。
+///
+/// - **macOS は修正前の答えのまま**: ⌘ が立っていれば他の修飾は問わない（⌘⌥V も貼る）
+/// - **Windows は Ctrl+V / Ctrl+Shift+V だけ**: alt が立っていたら当たらない（AltGr は
+///   Ctrl+Alt として届くので、ハンガリー語配列の AltGr+V = `@` などの文字入力を貼り付けに
+///   奪ってしまう。[`tree_clip_key`] と同じ理由）。Win キーが混ざったものも当たらない
+///   （Win+V は OS が持つ。[`platform_modifier_active`] が Win を受けないのと同じ理由）
+///
+/// 貼り付けの主経路はキーバインド表の `PasteClipboard`（macOS `cmd-v` / Windows `ctrl-v`）で、
+/// GPUI はアクションを `on_key_down` より先に配り、ハンドラが伝播を止める。ここが入力欄で
+/// 効くのは**表に無い組み合わせ**（macOS の ⌘⌥V など）だけなので、表の経路と二重には貼らない
+/// （tako-app の `貼り付けはバインド表の経路と二重に発火しない` が両 OS の表で見る）
+pub fn paste_key_active(
+    platform: Platform,
+    key: &str,
+    platform_key: bool,
+    control: bool,
+    alt: bool,
+) -> bool {
+    let primary = platform_modifier_active(platform, platform_key, control);
+    let clean = match platform {
+        Platform::MacOs => true,
+        Platform::Windows => !alt && !platform_key,
+    };
+    key == "v" && primary && clean
 }
 
 /// リンクを開く「修飾 + クリック」の修飾キー表記（Issue #763）。
@@ -513,6 +557,8 @@ mod tests {
         assert_eq!(save_preview(Platform::Windows), "Ctrl+Shift+S");
         assert_eq!(quit(Platform::MacOs), "\u{2318}Q");
         assert_eq!(quit(Platform::Windows), "Ctrl+Shift+Q");
+        assert_eq!(close_pane(Platform::MacOs), "\u{2318}W");
+        assert_eq!(close_pane(Platform::Windows), "Ctrl+Shift+W");
     }
 
     /// Windows の案内に macOS の記号 / 語が混ざらない（#1203 の症状そのもの）
@@ -522,6 +568,7 @@ mod tests {
             command_palette(Platform::Windows),
             save_preview(Platform::Windows),
             quit(Platform::Windows),
+            close_pane(Platform::Windows),
         ] {
             assert!(!s.contains('\u{2318}'), "{s:?} に ⌘ が残っている");
             assert!(!s.contains("Cmd"), "{s:?} に Cmd が残っている");
@@ -573,6 +620,88 @@ mod tests {
         // 両方押されていれば、その OS が見るほうが立っているので効く
         assert!(platform_modifier_active(Platform::MacOs, true, true));
         assert!(platform_modifier_active(Platform::Windows, true, true));
+    }
+
+    /// 判定が見る修飾 3 つ（platform / control / alt）の全組み合わせ
+    fn modifier_lattice() -> Vec<(bool, bool, bool)> {
+        (0u8..8)
+            .map(|b| (b & 1 != 0, b & 2 != 0, b & 4 != 0))
+            .collect()
+    }
+
+    /// #2844: 修飾キーを押しながらのドロップ（cd / 下のターミナルへパス入力）は修正前
+    /// `window.modifiers().platform` を直読みしていた。**macOS の答えは全組み合わせで
+    /// 直読みと同じ**で、Windows だけが Win キー → Ctrl に変わる（直読みでは Ctrl+ドロップが
+    /// 効かず、Win+ドロップが効いていた）
+    #[test]
+    fn 修飾ドロップの判定はmacosで修正前の直読みと同じ答えを返す() {
+        for (p, c, _) in modifier_lattice() {
+            let direct = p; // 修正前: `window.modifiers().platform`
+            assert_eq!(
+                platform_modifier_active(Platform::MacOs, p, c),
+                direct,
+                "macOS platform={p} control={c}"
+            );
+        }
+        // Windows: 直読みは Ctrl+ドロップで false（効かない）・Win+ドロップで true だった
+        assert!(platform_modifier_active(Platform::Windows, false, true));
+        assert!(!platform_modifier_active(Platform::Windows, true, false));
+    }
+
+    /// #2844: 入力欄の貼り付けの判定。macOS = ⌘V（他の修飾は問わない）/ Windows = Ctrl+V
+    /// （Alt = AltGr と Win キーが混ざったら当たらない）
+    #[test]
+    fn 貼り付けの打鍵はosごとの主修飾で当たる() {
+        let mac = |p, c, a| paste_key_active(Platform::MacOs, "v", p, c, a);
+        let win = |p, c, a| paste_key_active(Platform::Windows, "v", p, c, a);
+        // macOS: ⌘V で貼る / Ctrl+V は端末の逐語入力（貼らない）/ 素の v は文字
+        assert!(mac(true, false, false));
+        assert!(!mac(false, true, false));
+        assert!(!mac(false, false, false));
+        // Windows: Ctrl+V で貼る / Win+V は OS のクリップボード履歴 / 素の v は文字
+        assert!(win(false, true, false));
+        assert!(!win(true, false, false));
+        assert!(!win(false, false, false));
+        // Windows の AltGr（Ctrl+Alt）+ V は文字入力（ハンガリー語配列の `@` など）を奪わない
+        assert!(!win(false, true, true));
+        // Win+Ctrl+V も当たらない（Win キーの組み合わせは OS が持つ）
+        assert!(!win(true, true, false));
+        // V 以外は主修飾が立っていても貼り付けではない
+        for platform in [Platform::MacOs, Platform::Windows] {
+            for key in ["c", "x", "enter", "insert"] {
+                assert!(
+                    !paste_key_active(platform, key, true, true, false),
+                    "{platform:?} {key}"
+                );
+            }
+        }
+    }
+
+    /// #2844: 入力欄の貼り付けは修正前 `"v" if modifiers.platform` を直読みしていた。
+    /// **macOS の答えは全組み合わせで直読みと同じ**（⌘⌥V・⌘⌃V も貼るまま）。
+    /// Windows は直読みだと Ctrl+V を落として Win+V を受けていた
+    #[test]
+    fn 貼り付けの判定はmacosで修正前の直読みと同じ答えを返す() {
+        for (p, c, a) in modifier_lattice() {
+            for key in ["v", "c"] {
+                let direct = key == "v" && p; // 修正前: `"v" if modifiers.platform`
+                assert_eq!(
+                    paste_key_active(Platform::MacOs, key, p, c, a),
+                    direct,
+                    "macOS key={key} platform={p} control={c} alt={a}"
+                );
+            }
+        }
+        // Windows で直読みと答えが食い違う 2 点が #2844 の症状そのもの
+        // （直読みは Ctrl+V = 貼らない・Win+V = 貼る、だった）
+        assert!(paste_key_active(Platform::Windows, "v", false, true, false));
+        assert!(!paste_key_active(
+            Platform::Windows,
+            "v",
+            true,
+            false,
+            false
+        ));
     }
 
     /// #1601: リンク（#763）と「修飾 + クリック / Enter」の残りが**同じ表**を見ること。

@@ -5909,6 +5909,26 @@ Windows では Win キーになり、Win+クリック / Win+Enter は OS が持�
   × の主修飾 / それ以外の修飾と、設定の複数行欄の素の Enter / 主修飾ではない修飾 + Enter / 主修飾 + Enter を
   窓の実の打鍵経路で押す。実行 OS の表で組むので macOS で回せば macOS の見た目と判定）
 
+#2844 で残りの直読みも同じ表へ寄せた:
+
+- **修飾キーを押しながらのファイルのドロップ**（ターミナルへ cd・プレビューの下のターミナルへパス入力。
+  #415）も `keybindings::platform_modifier_active`（Windows は Ctrl+ドロップ）。ただし Explorer からの
+  **外部ドロップ**は、GPUI が OLE の修飾（`grfKeyState`）を捨てて `window.modifiers()` を更新しないので、
+  Windows ではドロップの間の Ctrl が届かない見込み（GPUI 側の制約・実機で未確認）
+- **入力欄の `"v"` の腕**（タスクの返答欄・git のブランチ名欄・設定窓の編集欄）は
+  `keybindings::paste_key_active`（正本 `keys::paste_key_active`）。macOS は修正前の答えのまま
+  （⌘ が立っていれば貼る）、Windows は Ctrl+V / Ctrl+Shift+V だけで、**Alt（= AltGr）と Win が
+  混ざったら当たらない**（AltGr+V の文字入力を奪わない）。素の `platform_modifier_active` へ寄せない。
+  貼り付けの主経路はバインド表の `PasteClipboard` で、GPUI はアクションを `on_key_down` より先に配り
+  伝播を止めるので、腕は表に無い組み合わせの受け皿（二重に貼らないことは `keybindings::tests` の
+  `貼り付けはバインド表の経路と二重に発火しない` が `gpui::Keymap` の照合で両 OS の表を見る）
+- **CLI のヘルプに打鍵を書くなら `keys` の表から実行 OS で引く**（`#[command(about = format!(…))]`）。
+  clap の doc comment はそのままヘルプ本文になるのに、`ui_key_notation` はコメントを落として見るので
+  `cmd+W` の直書きが素通りしていた。ペインを閉じる打鍵は `keys::close_pane`（`⌘W` / `Ctrl+Shift+W`）
+- 番犬に規則 5（本番コードの `Modifiers::platform` の直読みは関数単位の凍結表 `KNOWN_PLATFORM_READS`
+  の外で増やさない。表に載るのは主修飾を選ばない読みだけで、理由を添える）と規則 6（`PasteClipboard` の
+  ハンドラは `propagate()` を呼ばない）を足した
+
 ## MCP カタログの説明文は AI が使える情報だけ載せる（Issue #1540）
 
 `tools/list` の応答は **MCP を繋いだエージェント全員が起動した瞬間に全文を受け取る**
