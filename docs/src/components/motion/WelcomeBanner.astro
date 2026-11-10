@@ -1,22 +1,86 @@
 ---
 /**
- * 初回起動のバナー「tako へようこそ」の再現（文言は crates/tako-app/src/ui_text/welcome.rs）。
- * TakoWindow の slot="banner" に置く。pressAt を渡すとその手順で「セットアップを実行」が押された姿になる。
+ * 初回起動のバナー「tako へようこそ」の再現（#2879 のボタン → setup → 対話 → master の形）。
+ * 正本: 並びは crates/tako-app/src/overlays.rs の render_welcome_onboarding、文言は ui_text/welcome.rs、
+ * 段の判定は crates/tako-control/src/welcome.rs の next_step_guided。TakoWindow の slot="banner" に置く。
+ *
+ *   <WelcomeBanner />                                  … 最初の段（セットアップを実行）
+ *   <WelcomeBanner step="master" pressAt="5" />        … 段を 1 つ。pressAt の手順でボタンが押された姿になる
+ *   <WelcomeBanner stages={[{ step: 'setup', at: '3', pressAt: '3' }, { step: 'running', at: '4' }]} />
+ *                                                      … 手順ごとに段を入れ替える（同じ場所で切り替わる）
+ *
+ * 段（step）。実物は「次にやること」を 1 つだけ出し、ボタンも 1 つ:
+ *   setup    = まだ setup が一度も最後まで走っていない →「セットアップを実行」
+ *   running  = setup のタブで tako setup が走っている →「タブを開く」（タブを見せるだけ）
+ *   login    = ログインがまだ →「ログイン」
+ *   continue = ログインの後、対話のセットアップがまだ →「セットアップを続ける」
+ *   dialogue = setup の最後の対話のアシスタントが開いている →「タブを開く」
+ *   master   = 対話が済んだ →「master を起動」
  */
+import Icon from './Icon.astro';
+
+type Step = 'setup' | 'running' | 'login' | 'continue' | 'dialogue' | 'master';
+interface Stage {
+	step: Step;
+	/** この段を出す手順（data-at の書き方）。段が 1 つなら省いてよい */
+	at?: string;
+	/** ボタンが押された印を出す手順 */
+	pressAt?: string;
+}
 interface Props {
 	at?: string;
 	fx?: string;
+	step?: Step;
 	pressAt?: string;
+	stages?: Stage[];
 }
 
-const { at, fx, pressAt } = Astro.props;
+const { at, fx, step = 'setup', pressAt, stages } = Astro.props;
+const list: Stage[] = stages ?? [{ step, pressAt }];
+
+const NEXT = '次にやること: ';
+const DIALOGUE = '最後に対話のアシスタントが開き、master / worker の設定や GitHub との連携などを相談しながら決めます';
+const TEXT: Record<Step, { desc: string; detail?: string; button: string }> = {
+	setup: {
+		desc: `${NEXT}初期設定をします。ボタンを押すと、新しいタブで tako setup を実行します`,
+		detail: DIALOGUE,
+		button: 'セットアップを実行',
+	},
+	running: { desc: 'setup のタブでセットアップを進めています。終わると次にやることが出ます', button: 'タブを開く' },
+	login: { desc: `${NEXT}Claude アカウントにログインする（ブラウザが開きます）`, button: 'ログイン' },
+	continue: {
+		desc: `${NEXT}続けて、対話でセットアップします。ボタンを押すと、setup のタブで tako setup をもう一度実行します`,
+		detail: DIALOGUE,
+		button: 'セットアップを続ける',
+	},
+	dialogue: { desc: 'setup のタブで対話のセットアップ中です。終わると「master を起動」が出ます', button: 'タブを開く' },
+	master: { desc: '準備ができました。master（AI 司令塔）を起動して、あとは日本語で頼むだけです', button: 'master を起動' },
+};
 ---
 
 <div class="tk-welcome" data-at={at} data-fx={fx}>
 	<span class="tk-welcome-title">tako へようこそ</span>
-	<span class="tk-welcome-links"><span>設定を開く</span><span>閉じる（次回から表示しない）</span></span>
-	<span class="tk-welcome-line">1. tako setup — 初期設定と AI 連携の登録を自動で済ませる</span>
-	<span class="tk-ubtn is-primary" data-at={pressAt} data-fx={pressAt ? 'mark' : undefined}>セットアップを実行</span>
-	<span class="tk-welcome-line">2. tako master — AI 司令塔を起動して、あとは日本語で頼む</span>
-	<span class="tk-ubtn is-sub">master を起動</span>
+	<span class="tk-welcome-links">
+		<span>設定を開く</span><span>今後表示しない</span><span class="tk-welcome-later">あとで<Icon name="x" /></span>
+	</span>
+	<div class="tk-welcome-steps">
+		{
+			list.map((s) => {
+				const t = TEXT[s.step];
+				return (
+					<div
+						class:list={['tk-welcome-step', { 'has-detail': t.detail }]}
+						data-at={s.at}
+						data-fx={s.at ? 'fade' : undefined}
+					>
+						<span class="tk-welcome-desc">{t.desc}</span>
+						{t.detail && <span class="tk-welcome-detail">{t.detail}</span>}
+						<span class="tk-ubtn is-primary" data-at={s.pressAt} data-fx={s.pressAt ? 'mark' : undefined}>
+							{t.button}
+						</span>
+					</div>
+				);
+			})
+		}
+	</div>
 </div>

@@ -96,7 +96,8 @@ const {
 
 const cwdParts = cwd.split(/[\\/]/);
 const cwdLast = cwdParts.pop() ?? cwd;
-const cwdHead = cwdParts.join(os === 'windows' ? '\\' : '/') + (os === 'windows' ? '\\' : '/');
+// 1 段だけ（`~`）なら区切りを付けない（実物のステータスバーは「~」だけを出す）
+const cwdHead = cwdParts.length ? cwdParts.join(os === 'windows' ? '\\' : '/') + (os === 'windows' ? '\\' : '/') : '';
 const hasSidebar = Astro.slots.has('sidebar');
 const remotes = remote === undefined ? undefined : Array.isArray(remote) ? remote : [remote];
 const remoteLabel = (r: Remote) =>
