@@ -795,10 +795,16 @@ jobs:
   #   - windows ジョブの段にせず、別ジョブで並走させる: clippy は check の単位で組むので windows ジョブのビルドの
   #     成果物を使い回せず、段にすると約 13 分がそのまま足される（PR #2862 の実測で windows ジョブが 81.5 分 =
   #     上限 90 分の手前）。別ジョブなら windows ジョブの所要は #2850 の前と同じで、こちらはその間に終わる
+  #     （実測 約 15 分。上限 40 分はその 2.5 倍強）
   #   - Spectre-mitigated libs は入れない（clippy はリンクしない。build.rs と proc-macro は素の CRT で組める）。
   #     PWA のビルドは要る（rust_embed がコンパイル時に dist/ を見る）
   #   - 判定は macOS ジョブの lint と同じ: docs だけなら skip（#2084）、定期実行でも走らない（定期実行は上流の
   #     install.ps1 の形の変化を拾うためのもので、lint とは関係しない）
+  #   - **キャッシュは持たない**（licenses ジョブと同じ）: windows ジョブより先に終わるので速くしても CI の待ちは
+  #     縮まない一方、clippy の単位の rust-cache は約 1.4 GiB あり、main に載せると Actions のキャッシュ（約 9.2 GiB /
+  #     上限 10 GiB）があふれて macOS / Windows のビルドキャッシュを追い出しうる。windows ジョブとキーを共有しないのは、
+  #     clippy は check の単位で build の成果物を使えず、同じキーだと先に保存した側だけが残るため（clippy が先なら
+  #     windows ジョブのビルドが毎回作り直しになる）
   # 所要とキャッシュの実測は .agent/commands.md の Windows のクロス検査の行。
   # **Windows でだけ出る clippy の指摘を足すとここで落ちる**（番犬 crates/tako-control/tests/ci_windows_test_compile.rs）
   windows-clippy:
@@ -806,7 +812,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true' && github.event_name != 'schedule'
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v4
@@ -824,15 +830,6 @@ jobs:
         with:
           toolchain: 1.95.0
           components: clippy
-      # macOS ジョブと同じ理由（#1915）
-      - name: ルートの Cargo.toml の指紋（rust-cache のキー。#1915）
-        id: cargo-root
-        shell: bash
-        run: key=$(bash scripts/lib/cargo-root-manifest-key.sh) && echo "key=$key" >> "$GITHUB_OUTPUT"
-      # rust-cache のキーは既定で job id を含むので、windows ジョブ（build / test の単位）とは別のキャッシュになる
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: manifest-${{ steps.cargo-root.outputs.key }}
       - name: Windows の clippy の指摘 0 件のゲート（#2850。macOS と同じ 3 つの feature 宇宙）
         shell: bash
         run: |

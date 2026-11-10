@@ -317,6 +317,7 @@ fn windowsジョブがコンパイラの警告を0件に保つ() {
 /// - Windows のランナーで回し、走らせる判定（`if:`）は macOS ジョブの lint と同じ行にする
 ///   （docs だけなら skip = #2084・定期実行では走らない）
 /// - ツールチェーンに clippy を入れ（dtolnay の既定は minimal で clippy が無い）、版は windows ジョブと揃える
+/// - キャッシュを持たない（臨界経路に乗らないのに、約 1.4 GiB で Actions のキャッシュの上限をあふれさせる）
 /// - 手元の `scripts/check-windows.sh` も `cargo xwin clippy` で同じ宇宙を回す
 #[test]
 fn windowsのclippyの指摘を並走するジョブで0件に保つ() {
@@ -397,6 +398,12 @@ fn windowsのclippyの指摘を並走するジョブで0件に保つ() {
     assert!(
         gate.contains("exit \"$rc\""),
         "Windows の clippy のゲートが途中の宇宙の結果を捨てている（#2850。全部回してから終了コードを返す）\n{gate}"
+    );
+    assert!(
+        !job.contains("Swatinem/rust-cache"),
+        "{CLIPPY_JOB} ジョブがキャッシュを持っている（#2850。windows ジョブより先に終わるので速くしても CI の待ちは\
+         縮まず、clippy の単位のキャッシュ約 1.4 GiB が Actions のキャッシュの上限 10 GiB をあふれさせて\
+         macOS / Windows のビルドキャッシュを追い出しうる。理由の全文は ci.yml のこのジョブの上のコメント）\n{job}"
     );
 
     // ツールチェーン: clippy を入れ、版は windows ジョブ（build / test）と揃える
