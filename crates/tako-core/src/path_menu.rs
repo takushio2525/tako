@@ -228,8 +228,8 @@ mod tests {
     /// `\` の形の検出は `links` の単体 = #2435 が見る）。絶対パスは別テストに分ける
     #[test]
     fn 相対_行番号つき_ディレクトリ_空白入りのどれでもメニューが出る() {
-        let dir = std::env::temp_dir().join(format!("tako_path_menu_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        // 器はスコープで消える（落ちても `$TMPDIR` 直下に独自名の dir を残さない = #2847）
+        let dir = crate::test_residue::ScratchDir::new("path-menu");
         std::fs::create_dir_all(dir.join("src")).unwrap();
         // 空白 + 日本語を含む名前（#1182 のエッジケース）。画面には引用符つきで出る
         std::fs::write(dir.join("src/読み 込み.txt"), "x").unwrap();
@@ -292,16 +292,12 @@ mod tests {
             .is_none(),
             "URL がパスメニューの対象になっている"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 絶対パス（macOS は `/` 始まり、Windows は `C:\…` = #2435 から候補になったので両 OS で走る）
     #[test]
     fn 絶対パスでもメニューが出る() {
-        let dir = std::env::temp_dir().join(format!("tako_path_menu_abs_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_residue::ScratchDir::new("path-menu-abs");
         let abs = dir.join("読み 込み.txt");
         std::fs::write(&abs, "x").unwrap();
         let line = format!("open \"{}\"", abs.display());
@@ -310,7 +306,6 @@ mod tests {
         assert_eq!(std::path::Path::new(&target), abs.as_path());
         assert!(actions.contains(&PathMenuAction::OpenInTako));
         assert!(actions.contains(&PathMenuAction::OpenDefault));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `~` 起点も同じ 1 実装で解決される（HOME を解決できない環境では skip）

@@ -1072,10 +1072,28 @@ mod tests {
         );
     }
 
+    /// 参照ファイルが決め方より優先され、消えたら決め方へ戻る。
+    ///
+    /// 置き場の深さは TMPDIR しだい（一巡の番犬の子は深い TMPDIR で回す）なので、
+    /// 「固定パスへ戻るか・短縮パスへ戻るか」を環境の深さに預けない（#2847: 浅い前提で
+    /// 固定パスを期待していたので、深い TMPDIR では短縮パスへ倒れて毎回落ちていた）。
+    /// 上限（引数）を実際の `<dir>/tako.sock` の長さの前後に置いて、両方の枝を毎回通す
     #[test]
     fn 参照ファイルは実体パスを指す() {
-        let dir = std::env::temp_dir().join(format!("tako1441-ptr-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // 器はスコープで消える（落ちても残らない）。置き場は `tako-test-scratch-<pid>` の下
+        let dir = crate::test_residue::ScratchDir::new("ipc1441-ptr");
+        let temp = Path::new("/var/tmp");
+        let well_known = dir.join(WELL_KNOWN_NAME);
+        // ちょうど収まる上限と、1 バイト足りない上限
+        let fits = path_bytes(&well_known);
+        let short_of = fits - 1;
+        let shortened = temp.join(short_name(&dir));
+        // 前提: 1 バイト足りない上限でも短縮パスは収まる（でないと Overflow へ倒れて枝を外す）
+        assert!(
+            path_bytes(&shortened) <= short_of,
+            "前提が崩れた: 短縮パス {} バイト > 上限 {short_of}",
+            path_bytes(&shortened)
+        );
         let plan = SocketPlan {
             path: PathBuf::from("/tmp/tako-abc.sock"),
             kind: SocketPathKind::Shortened,
@@ -1088,18 +1106,18 @@ mod tests {
             read_pointer(&dir),
             Some(PathBuf::from("/tmp/tako-abc.sock"))
         );
-        // 参照が正（bind した側が書いた値を、決め方より優先する）
-        assert_eq!(
-            resolve_with(&dir, Path::new("/var/tmp"), MAC),
-            PathBuf::from("/tmp/tako-abc.sock")
-        );
+        // 参照が正（bind した側が書いた値を、決め方がどちらの枝でも優先する）
+        for limit in [fits, short_of] {
+            assert_eq!(
+                resolve_with(&dir, temp, limit),
+                PathBuf::from("/tmp/tako-abc.sock"),
+                "limit={limit}"
+            );
+        }
         std::fs::remove_file(dir.join(POINTER_NAME)).unwrap();
-        // 参照が無ければ決め方で導く（浅いので固定パス）
-        assert_eq!(
-            resolve_with(&dir, Path::new("/var/tmp"), MAC),
-            dir.join(WELL_KNOWN_NAME)
-        );
-        std::fs::remove_dir_all(&dir).ok();
+        // 参照が無ければ決め方で導く: 収まれば固定パス・1 バイト足りなければ短縮パス
+        assert_eq!(resolve_with(&dir, temp, fits), well_known);
+        assert_eq!(resolve_with(&dir, temp, short_of), shortened);
     }
 
     /// 記録（[`STATUS`] / [`FIXED_PATH`]）はプロセスで 1 つなので、触るテストを直列にする

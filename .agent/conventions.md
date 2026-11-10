@@ -4567,6 +4567,11 @@ Dock のピン留めは `.app` への **file URL ブックマーク**（`com.app
   番犬は `crates/tako-control/tests/issue2561_temp_dir_helper_watchdog.rs`（作って素の `PathBuf` / `String` を
   返す補助を、消さない呼び手か `HOME` を渡すファイルのとき、`get_or_init` の初期化子が後始末なしで
   `$TMPDIR` の下へ作るときに file:line で名指す）
+- **`temp_dir()` の下が浅いことを assert の前提にしない**（#2847）。一巡の番犬（下）の子は
+  `<TMPDIR>/tako-test-scratch-<pid>/…/t<n>` の深い TMPDIR で同じテストを回す。パス長で枝が変わる
+  決め方（`ipc_socket::plan_with` の上限など）を器の下の実パスで確かめるなら、上限を引数で
+  実パスの長さの前後に置いて両方の枝を固定する（修正前は `ipc_socket` の 1 本が子で毎回落ち、
+  置き場 `tako1441-ptr-<pid>` を残していた。番犬は個々の成否で落とさないので CI は緑のまま見えない）
 - 番犬は 2 段: `tako_core::test_residue` の
   `テストを一巡してもtmpdirに残骸が残らない`（**このテストバイナリをもう一度回して実際に数える**。
   個々のテストの成否では落とさず、残骸の件数だけを見る）と、
