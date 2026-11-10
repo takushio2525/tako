@@ -54,6 +54,15 @@ fn link_click() -> String {
     tako_core::platform::keys::link_click(tako_core::platform::support::Platform::current())
 }
 
+/// ヘルプへ埋める「ペインを閉じる」打鍵（実行プラットフォーム。Issue #2844）。
+///
+/// macOS は `⌘W` / Windows は `Ctrl+Shift+W`。**直書きしない**: `cmd+W` と書くと Windows では
+/// Win+W（OS のウィジェット）を案内することになる。表記の正本は
+/// `tako_core::platform::keys::close_pane`（tako-app のテストがバインド表と突き合わせる）
+fn close_pane_key() -> &'static str {
+    tako_core::platform::keys::close_pane(tako_core::platform::support::Platform::current())
+}
+
 /// ジャンプ履歴の戻る / 進むの打鍵（#1677。実行中の OS の表記）
 fn jump_keys() -> (&'static str, &'static str) {
     let platform = tako_core::platform::support::Platform::current();
@@ -191,9 +200,16 @@ enum Command {
     /// 有効時、tako を再起動してもタブ構成と実行中プロセスが復元される。
     /// `reattach --pane N` は tmux のセッションへ再接続できなくなったペインを attach し直す
     Persist(PersistArgs),
-    /// close 確認ダイアログの ON/OFF・状態確認（× ボタン / cmd+W。
+    /// close 確認ダイアログの ON/OFF・状態確認（× ボタン / ペインを閉じるキー。
     /// 確認が入るのはエージェント・実行中プロセスがあるペインのみ）
-    #[command(name = "confirm-close")]
+    #[command(
+        name = "confirm-close",
+        about = format!(
+            "close 確認ダイアログの ON/OFF・状態確認（× ボタン / {}。 \
+             確認が入るのはエージェント・実行中プロセスがあるペインのみ）",
+            close_pane_key()
+        )
+    )]
     ConfirmClose(ToggleArgs),
     /// UI テーマの確認・切替・色設定・プリセット・フォント（Issue #217/#459）
     Theme(ThemeArgs),
@@ -14954,6 +14970,41 @@ mod tests {
         assert!(super::queue_priority_request(&v(&["abc", "high"]), None).is_err());
         assert!(super::queue_priority_request(&v(&["high"]), None).is_err());
         assert!(super::queue_priority_request(&v(&["1", "high"]), Some(5)).is_err());
+    }
+
+    /// #2844: `confirm-close` のヘルプは「ペインを閉じる」打鍵を `keys::close_pane` の表から
+    /// 実行 OS で引く（macOS = ⌘W / Windows = Ctrl+Shift+W）。修正前は doc comment に `cmd+W` を
+    /// 直書きしていて、Windows では Win+W（OS のウィジェット）を案内していた。Windows の CI では
+    /// この検査が Windows の表記（`Ctrl+Shift+W`）を見る
+    #[test]
+    fn issue2844_confirm_closeのヘルプは表の閉じるキーを出す() {
+        use clap::CommandFactory as _;
+        let cmd = super::Cli::command();
+        let sub = cmd
+            .find_subcommand("confirm-close")
+            .expect("confirm-close がある");
+        let want = tako_core::platform::keys::close_pane(
+            tako_core::platform::support::Platform::current(),
+        );
+        let mut seen = 0usize;
+        for (place, text) in [
+            ("見出し", sub.get_about()),
+            ("見出し（長）", sub.get_long_about()),
+        ] {
+            let Some(text) = text.map(|t| t.to_string()) else {
+                continue;
+            };
+            seen += 1;
+            assert!(
+                text.contains(want),
+                "confirm-close の{place}に実行 OS の閉じるキー {want:?} が無い: {text}"
+            );
+            assert!(
+                !text.to_lowercase().contains("cmd+"),
+                "confirm-close の{place}に cmd+ の直書きが残っている: {text}"
+            );
+        }
+        assert!(seen >= 1, "confirm-close にヘルプの見出しが無い");
     }
     use super::*;
 

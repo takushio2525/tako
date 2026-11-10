@@ -847,7 +847,7 @@ impl SettingsWindow {
         let handled = matches!(
             ks.key.as_str(),
             "enter" | "escape" | "backspace" | "delete" | "left" | "right" | "home" | "end"
-        ) || (ks.key == "v" && ks.modifiers.platform);
+        ) || crate::keybindings::paste_key_active(ks);
         if !handled {
             return;
         }
@@ -922,7 +922,9 @@ impl SettingsWindow {
                 }
                 cx.notify();
             }
-            "v" if ks.modifiers.platform => {
+            // ⌘V（Windows は Ctrl+V。#2844）。主経路はキーバインドの PasteClipboard（窓の on_action）で、
+            // ここは表に無い組み合わせの受け皿
+            "v" if crate::keybindings::paste_key_active(ks) => {
                 if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
                     self.insert_text(&text, cx);
                 }

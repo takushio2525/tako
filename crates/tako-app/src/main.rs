@@ -2836,7 +2836,8 @@ struct TakoApp {
     /// drop / mouse-up でクリア。gpui の active_drag は型を公開しないため自前で追跡し、
     /// ドロップ先オーバーレイの生成判定 + ラベル出し分けに使う
     drag_kind: Option<DragKind>,
-    /// ファイル D&D 中に cmd が押されているか（#415: パス入力表示の切替に使用）
+    /// ファイル D&D 中に主修飾（macOS = ⌘ / Windows = Ctrl）が押されているか（#415: パス入力表示の
+    /// 切替に使用）。判定は「修飾 + クリック」と同じ `keybindings::platform_modifier_active`（#2844）
     drop_cmd_held: bool,
     /// ドラッグ中のドロップ先（ペイン, 挿入位置）。挿入プレビュー表示の状態
     drop_target: Option<(PaneId, DropZone)>,
@@ -20630,7 +20631,8 @@ impl TakoApp {
             ))
             .on_drag_move::<FileDrag>(cx.listener(
                 move |this, e: &DragMoveEvent<FileDrag>, window, cx| {
-                    this.drop_cmd_held = window.modifiers().platform;
+                    this.drop_cmd_held =
+                        crate::keybindings::platform_modifier_active(&window.modifiers());
                     this.update_drop_target(
                         pane_id,
                         e.bounds,
@@ -20674,7 +20676,7 @@ impl TakoApp {
                 this.drop_tmux_session(pane_id, drag.clone(), cx);
             }))
             .on_drop::<FileDrag>(cx.listener(move |this, drag: &FileDrag, window, cx| {
-                let cmd_held = window.modifiers().platform;
+                let cmd_held = crate::keybindings::platform_modifier_active(&window.modifiers());
                 if cmd_held {
                     this.drop_file_to_underlying_terminal(&drag.paths, pane_id, cx);
                 } else {
@@ -20683,7 +20685,8 @@ impl TakoApp {
             }))
             .on_drag_move::<ExternalPaths>(cx.listener(
                 move |this, e: &DragMoveEvent<ExternalPaths>, window, cx| {
-                    this.drop_cmd_held = window.modifiers().platform;
+                    this.drop_cmd_held =
+                        crate::keybindings::platform_modifier_active(&window.modifiers());
                     this.update_drop_target(
                         pane_id,
                         e.bounds,
@@ -20695,7 +20698,8 @@ impl TakoApp {
             ))
             .on_drop::<ExternalPaths>(cx.listener(
                 move |this, paths: &ExternalPaths, window, cx| {
-                    let cmd_held = window.modifiers().platform;
+                    let cmd_held =
+                        crate::keybindings::platform_modifier_active(&window.modifiers());
                     this.drop_files(pane_id, paths.paths(), cmd_held, cx);
                 },
             ))
@@ -31592,9 +31596,9 @@ impl Render for TakoApp {
 
         // D&D 中のみ、各ペインにドロップ先オーバーレイを重ねる（FR-2.16.10 / FR-3.11）。
         // gpui 側のドラッグが外部要因（Esc 等）で消えたフレームでは出さない。
-        // cmd 押下状態を描画フレームで同期（ドラッグ中に cmd を押し/離ししても反映。#415）
+        // 主修飾（Windows は Ctrl。#2844）の押下状態を描画フレームで同期（ドラッグ中に押し/離ししても反映。#415）
         if cx.has_active_drag() {
-            self.drop_cmd_held = window.modifiers().platform;
+            self.drop_cmd_held = crate::keybindings::platform_modifier_active(&window.modifiers());
         } else if self.drop_target.take().is_some() {
             // 外部ドラッグがウィンドウの外へ出たとき（`FileDropEvent::Exited`）は
             // gpui が `active_drag` を落とすだけで mouse up が来ないため、

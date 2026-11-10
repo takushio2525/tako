@@ -5475,8 +5475,8 @@ impl TakoApp {
                 self.git_branch_input = None;
                 cx.notify();
             }
-            "v" if ks.modifiers.platform => {
-                // ⌘V は paste() 経由（クリップボード読み出しは共通経路に任せる）
+            "v" if crate::keybindings::paste_key_active(ks) => {
+                // ⌘V（Windows は Ctrl+V。#2844）は paste() 経由（クリップボード読み出しは共通経路に任せる）
                 self.paste(cx);
             }
             key => {

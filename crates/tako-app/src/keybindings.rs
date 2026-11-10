@@ -754,7 +754,8 @@ pub fn link_modifier_active(modifiers: &Modifiers) -> bool {
 /// 「修飾 + クリック / Enter」の主修飾キーが押されているか（Issue #1601）。
 ///
 /// **キーバインド表に無い「修飾 + クリック / Enter」の判定は全部ここを通す**
-/// （ペイン / タブの × の確認スキップ・git のコミット確定・タスクの返答・設定の確定）。
+/// （ペイン / タブの × の確認スキップ・git のコミット確定・タスクの返答・設定の確定・
+/// #2844 の修飾キーを押しながらのファイルのドロップ）。
 /// `Modifiers::platform` を直接見ると Windows では Win キーになり、Win+クリック /
 /// Win+Enter は OS が持っていて実質押せない（#1601 の症状）。
 ///
@@ -767,6 +768,25 @@ pub fn platform_modifier_active(modifiers: &Modifiers) -> bool {
         Platform::current(),
         modifiers.platform,
         modifiers.control,
+    )
+}
+
+/// アプリ内の入力欄のキー処理が「貼り付け」として受ける打鍵か（Issue #2844）。
+///
+/// **入力欄の `"v"` の腕は全部ここを通す**（タスクの返答欄・git のブランチ名欄・設定窓の
+/// 編集欄）。`"v" if modifiers.platform` と直読みすると Windows では Win+V を見る。
+/// 判定の表は `tako_core::platform::keys::paste_key_active`（純粋関数）で、ここは
+/// GPUI の `Keystroke` をその引数へ落とすだけの薄い層。**分岐をここへ書かない**。
+///
+/// 主経路はバインド表の `PasteClipboard`（[`is_paste_keystroke`] がその写し）で、ここは
+/// 表に無い組み合わせの受け皿。二重に貼らないことは `貼り付けはバインド表の経路と二重に発火しない`
+pub fn paste_key_active(ks: &Keystroke) -> bool {
+    tako_core::platform::keys::paste_key_active(
+        Platform::current(),
+        &ks.key,
+        ks.modifiers.platform,
+        ks.modifiers.control,
+        ks.modifiers.alt,
     )
 }
 
@@ -2292,6 +2312,11 @@ mod tests {
                     "tako::FindInFiles",
                     tako_core::platform::keys::find_in_files(platform),
                 ),
+                // #2844: CLI `confirm-close` のヘルプが引く
+                (
+                    "tako::ClosePane",
+                    tako_core::platform::keys::close_pane(platform),
+                ),
             ] {
                 let from_bindings = shortcut_hint_for(action, platform).unwrap_or_else(|| {
                     panic!("{platform:?}: {action} に届くバインドが 1 本も無い")
@@ -2360,6 +2385,89 @@ mod tests {
             assert!(
                 taken.is_empty(),
                 "{platform:?}: {spec} をバインド表が握っている（入力欄の確定へ届かない）: {taken:?}"
+            );
+        }
+    }
+
+    /// #2844: 入力欄の貼り付けの 2 経路が同じ打鍵で二重に貼らないこと。**両 OS の表**を
+    /// macOS 上から見る。
+    ///
+    /// 主経路はバインド表の `PasteClipboard`（`paste()` が入力欄へ振り分ける）、受け皿は
+    /// 入力欄のキー処理の `"v"` の腕（[`paste_key_active`]）。GPUI は表が握った打鍵の
+    /// アクションを `on_key_down` より先に配り、アクションはバブルで伝播を止める
+    /// （gpui `window.rs` の `dispatch_key_event` → `dispatch_action_on_node`。ハンドラが
+    /// `propagate()` を呼ばないことは番犬 `issue1601_platform_modifier_watchdog` の規則 6）。
+    /// だから「表が握る打鍵」と「腕が受ける打鍵」の重なりは、表の側だけが貼る。照合は
+    /// 実配送と同じ `Keymap::bindings_for_input` で、修飾 4 つの全組み合わせを見る:
+    ///
+    /// - 表が握る打鍵を腕が貼り付けと見るなら、表の側も `PasteClipboard` であること
+    ///   （別のアクションだと、入力欄でその操作が走り案内どおりに貼れない）
+    /// - 各 OS の主の貼り付け（macOS = ⌘V / Windows = Ctrl+V）は表が握り、腕も同じ打鍵を
+    ///   貼り付けと見る（表が飛ばされる経路 = GPUI の `prefer_character_input` でも 0 回にならない）
+    #[test]
+    fn 貼り付けはバインド表の経路と二重に発火しない() {
+        use tako_core::platform::keys;
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let keymap = gpui::Keymap::new(bindings_for(platform));
+            let mut by_table = 0usize;
+            let mut by_arm_only = 0usize;
+            for bits in 0u8..16 {
+                let modifiers = Modifiers {
+                    platform: bits & 1 != 0,
+                    control: bits & 2 != 0,
+                    alt: bits & 4 != 0,
+                    shift: bits & 8 != 0,
+                    ..Modifiers::default()
+                };
+                let ks = Keystroke {
+                    modifiers,
+                    key: "v".into(),
+                    key_char: None,
+                };
+                let (bound, _) = keymap.bindings_for_input(&[ks.clone()], &[]);
+                let action = bound.first().map(|b| b.action().name().to_string());
+                let arm = keys::paste_key_active(
+                    platform,
+                    &ks.key,
+                    modifiers.platform,
+                    modifiers.control,
+                    modifiers.alt,
+                );
+                match action.as_deref() {
+                    Some("tako::PasteClipboard") => by_table += 1,
+                    // 表が握らない = 腕だけが受ける（貼るなら 1 回）
+                    None => by_arm_only += usize::from(arm),
+                    Some(other) => assert!(
+                        !arm,
+                        "{platform:?}: {modifiers:?}+V を表は {other} で握るのに、入力欄の腕は\
+                         貼り付けと見ている（入力欄では表の {other} が走り、貼れない）"
+                    ),
+                }
+            }
+            let primary = match platform {
+                Platform::MacOs => "cmd-v",
+                Platform::Windows => "ctrl-v",
+            };
+            let want = Keystroke::parse(primary).expect("貼り付けの打鍵");
+            let (bound, _) = keymap.bindings_for_input(&[want.clone()], &[]);
+            assert_eq!(
+                bound.first().map(|b| b.action().name()),
+                Some("tako::PasteClipboard"),
+                "{platform:?}: {primary} を表が PasteClipboard で握っていない"
+            );
+            assert!(
+                keys::paste_key_active(
+                    platform,
+                    &want.key,
+                    want.modifiers.platform,
+                    want.modifiers.control,
+                    want.modifiers.alt
+                ),
+                "{platform:?}: {primary} を入力欄の腕が貼り付けと見ていない"
+            );
+            assert!(by_table >= 1, "{platform:?}: 表が握る V の貼り付けが無い");
+            eprintln!(
+                "{platform:?}: V の 16 組み合わせ = 表が貼る {by_table} / 腕だけが貼る {by_arm_only}"
             );
         }
     }
