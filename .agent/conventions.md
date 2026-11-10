@@ -5864,7 +5864,8 @@ GPUI の `cmd` は platform 修飾で、Windows では **Win キー**へ解決�
   そのため `key_bindings()` の表も `cfg` をやめ、`bindings_for(platform)` が
   両プラットフォームの表から選ぶ形にしてある（**張るキーの集合は不変**）
 - 番犬は 2 本立て。`crates/tako-control/tests/ui_key_notation.rs` が**直書きの混入**を
-  ソース走査で止め（規則 A = 案内文を組む場所 / 規則 B = render への直書き）、
+  ソース走査で止め（規則 A = 案内文を組む場所 / 規則 B = render への直書き / 規則 C = clap のヘルプの
+  doc comment と属性。#2854）、
   `keybindings::tests::windowsの案内文にmacosのキー表記が出ない` が
   **組み上がった文言**を Windows 構成で検査する。前者だけだと「文言は正しいが
   Windows で嘘になる」を拾えず、後者だけだと新しい直書きを未然に止められない
@@ -5930,6 +5931,21 @@ Windows では Win キーになり、Win+クリック / Win+Enter は OS が持�
 - **CLI のヘルプに打鍵を書くなら `keys` の表から実行 OS で引く**（`#[command(about = format!(…))]`）。
   clap の doc comment はそのままヘルプ本文になるのに、`ui_key_notation` はコメントを落として見るので
   `cmd+W` の直書きが素通りしていた。ペインを閉じる打鍵は `keys::close_pane`（`⌘W` / `Ctrl+Shift+W`）
+- **#2854 で `tako edit` ほかのヘルプも同じ形にした**。組み立ては tako-cli の `help_keys`（`Platform` を
+  引数で受けるので macOS の単体から Windows の文言も確かめられる）。編集の移動・削除の打鍵は
+  **編集の打鍵表 `editor_keys::TABLE`（GUI の入口が引く正本）の先頭の打鍵**を `keys::editor_key` で引く
+  （macOS = `⌥← / Home / Page Down`・`⌥⌫ / ⌘⌫` / Windows = `Ctrl+← / Home / Page Down`・
+  `Ctrl+Backspace`。Windows に行頭までの削除の打鍵は無いので出さない）。検索欄の開閉は
+  `keys::find_preview`（`⌘F` / `Ctrl+Shift+F`）、shift は `keys::shift`（`⇧` / `Shift`）。
+  doc comment は打鍵を書かない説明にして、ヘルプ本文は `#[command(about = …, long_about = …)]` /
+  `#[arg(help = …)]` で渡す（clap は明示の about / help を doc comment より優先する。本文が複数段落の
+  ときは `long_about` も明示しないと doc comment の本文が `--help` に残る）
+- 番犬は `ui_key_notation` の**規則 C**: clap の derive（`Parser` / `Subcommand` / `Args` / `ValueEnum`）を
+  付けた型の範囲を切り出し、その中の doc comment と属性の文字列に macOS の打鍵表記（`⌘ ⌥ ⌃ ⇧ ⌫ ⌦ ⎋ ⏎`・
+  エスケープ形・`cmd+` などの語形）があれば `file:line` で名指す。組み上がったヘルプは tako-cli の
+  `issue2854_editのヘルプは実行osの表の打鍵を出す` が実行 OS で見る（Windows の CI ではヘルプ全体を辿り、
+  macOS の記号が 1 つも無いことを確かめる）。打鍵と実際のバインドの一致は tako-app の
+  `cliのヘルプが案内する編集の打鍵は実際に届く` / `案内文の打鍵表記はバインド表と一致する`（`FindPreview`）
 - 番犬に規則 5（本番コードの `Modifiers::platform` の直読みは関数単位の凍結表 `KNOWN_PLATFORM_READS`
   の外で増やさない。表に載るのは主修飾を選ばない読みだけで、理由を添える）と規則 6（`PasteClipboard` の
   ハンドラは `propagate()` を呼ばない）を足した
