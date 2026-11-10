@@ -17,6 +17,9 @@
 #   8. 上限に達した = 失敗ではない。最後にもう一度見て、そろっていれば緑・赤の結論を出す（#2047）
 #   9. gh の一時的な接続エラーはやり直し、届かないままなら到達性の 5 で終わる（赤の 1 と分ける。#1704）
 #  10. 書き込みの最中に子の SIGCHLD が届いても結論の行と終了コードが崩れない（bash 3.2 の EINTR。#2690）
+#  11. 期待名は PR の head の workflow から導き、base にあって head に無い job がこの PR の CI で
+#      走っていなければ既定では緑にしない（6）。head を読めないときだけ手元の木に落ちて 1 行で知らせる（#2883）。
+#      ここだけは偽 gh に加えて実 git の origin（bare）と別の clone を作り、head を origin から取らせる
 # 併せて期待名の導出（pull_request で起動する job のみ / name 無しは job id）と、
 # merge-pr.sh が「揃っていないときに merge を呼ばない」ことも見る。
 #
@@ -112,9 +115,17 @@ if [[ "$1" == "api" ]]; then
       ;;
     */commits/*) f="${M}/api-commit.json" ;;
     */compare/*) f="${M}/api-compare.json" ;;
+    # PR の head の SHA と base の名前（wait-pr-checks.sh が期待名の出どころを決める。#2883）
+    */pulls/*) f="${M}/api-pull.json" ;;
     *) f="" ;;
   esac
   [[ -n "${f}" && -f "${f}" ]] || { echo "mock: api の応答が無い: ${path}" >&2; exit 1; }
+  # checks と同じく "ERR <終了コード> <本文>" で gh のエラーを模す（#2883 の届かない腕）
+  if head -1 "${f}" | grep -q '^ERR '; then
+    code="$(head -1 "${f}" | awk '{print $2}')"
+    sed -e '1s/^ERR [0-9]* //' "${f}" >&2
+    exit "${code}"
+  fi
   emit "${f}" "$@"
   exit 0
 fi
@@ -1356,6 +1367,290 @@ while [[ ${t41} -lt ${T41_RUNS} ]]; do
   assert_has "merge しない理由に到達性を名指しする（${t41} 回目）" "merge しない: gh pr merge が GitHub API に届かなかった" "${out}"
   assert_hasnt "merge で書き込みが割り込まれない（${t41} 回目）" "write error" "${out}"
 done
+
+echo "== Test 42: CI に job が増えた後の main から、それより前に分かれた PR を待つ（#2883）=="
+# 再現の形（2026-11-10）: PR #2862 が windows-clippy を足して main に入った後、それより前の main から
+# 分かれた PR #2878（CI 7 本とも緑）を、main に追従した共有ツリーから merge-pr.sh したら返らなかった。
+# 実 git の origin（bare）に base（main = job を足した後）と PR の head（refs/pull/<PR>/head = 足す前）を
+# 置き、手元の木は main に追従させる。head のコミットは別の clone で作る = 手元に無い（origin から取らせる）
+GATE="Windows（clippy の指摘 0 件のゲート。#2850）"
+GATE_JOB="  windows-clippy:
+    name: ${GATE}
+    runs-on: windows-latest
+    steps:
+      - run: cargo clippy"
+ADDED="この PR が足した job（#2883）"
+ADDED_JOB="  added:
+    name: ${ADDED}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo added"
+
+# 実 git の操作に利用者の hooks・署名の設定を持ち込まない
+tgit() { git -c core.hooksPath=/dev/null -c commit.gpgsign=false -c user.email=probe@example.invalid -c user.name=probe "$@"; }
+
+# $1 = PR 番号, $2 = head に足す job（空可）, $3 = base（と手元の木）に足す job（空可）,
+# $4 = no-workflows なら head から .github を消す。head の SHA を HEAD_SHA_T に置き、api-pull.json を書く
+seed_pr_repos() {
+  local repo="${CASE_DIR}/repo" origin="${CASE_DIR}/origin.git" worker="${CASE_DIR}/worker"
+  local pr="$1" head_extra="${2:-}" base_extra="${3:-}" mode="${4:-}"
+  tgit -C "${repo}" add -A >/dev/null 2>&1
+  tgit -C "${repo}" commit -qm "分かれる前の main" >/dev/null 2>&1
+  tgit -C "${repo}" branch -M main >/dev/null 2>&1
+  tgit init -q --bare "${origin}" >/dev/null 2>&1
+  tgit -C "${repo}" remote add origin "${origin}"
+  tgit -C "${repo}" push -q origin main >/dev/null 2>&1
+  tgit clone -q -b main "${origin}" "${worker}" >/dev/null 2>&1
+  echo "PR の変更" > "${worker}/change.txt"
+  if [[ -n "${head_extra}" ]]; then printf '%s\n' "${head_extra}" >> "${worker}/.github/workflows/ci.yml"; fi
+  if [[ "${mode}" == "no-workflows" ]]; then rm -rf "${worker:?}/.github"; fi
+  tgit -C "${worker}" add -A >/dev/null 2>&1
+  tgit -C "${worker}" commit -qm "PR の head" >/dev/null 2>&1
+  tgit -C "${worker}" push -q origin "HEAD:refs/pull/${pr}/head" >/dev/null 2>&1
+  HEAD_SHA_T="$(git -C "${worker}" rev-parse HEAD)"
+  # head が分かれた後に base が job を足して進み、手元の木（共有ツリー）もそれに追従する
+  if [[ -n "${base_extra}" ]]; then
+    printf '%s\n' "${base_extra}" >> "${repo}/.github/workflows/ci.yml"
+    tgit -C "${repo}" commit -qam "base に job を足す" >/dev/null 2>&1
+    tgit -C "${repo}" push -q origin main >/dev/null 2>&1
+  fi
+  printf '{"head":{"sha":"%s"},"base":{"ref":"main"}}\n' "${HEAD_SHA_T}" > "${TAKO_GH_MOCK_DIR}/api-pull.json"
+}
+view_json() { # $1 = PR 番号
+  printf '{"number":%s,"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN",
+ "headRefName":"docs/2869-x","baseRefName":"main","title":"[ドキュメント] テスト用","url":"https://example.invalid/pr/%s"}\n' "$1" "$1"
+}
+expect_count() { grep -c '^  期待: ' <<<"$1"; }
+
+new_case t42legacy
+seed_pr_repos 2878 "" "${GATE_JOB}"
+assert_eq "前提: head のコミットは手元の木に無い" "$(git -C "${CASE_DIR}/repo" cat-file -e "${HEAD_SHA_T}^{commit}" 2>/dev/null && echo yes || echo no)" "no"
+green_checks > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(TAKO_2883_LEGACY=1 run_wait 2878 --timeout 3 --interval 1)"
+assert_eq "修正前（手元の木から導く）は走らない job を待ち、上限でタイムアウト 2" "$?" "2"
+assert_has "修正前は手元の木にだけある job を期待に入れる" "期待: ${GATE}" "${out}"
+assert_has "修正前は上限に達する" "上限 3 秒に達した" "${out}"
+assert_has "修正前は未登録のまま終わる" "未登録: ${GATE}" "${out}"
+
+new_case t42
+seed_pr_repos 2878 "" "${GATE_JOB}"
+green_checks > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(run_wait 2878 --timeout 20 --interval 1)"
+assert_eq "既定: head の集合は緑でも、base にだけある job が走っていなければ 6" "$?" "6"
+assert_has "期待名の出どころは PR の head" "期待名の出どころ: PR の head（${HEAD_SHA_T:0:7}）の workflow / 比べた base: main（origin の" "${out}"
+assert_hasnt "この PR では走らない job を期待に入れない" "期待: ${GATE}" "${out}"
+assert_eq "期待は head の 3 本" "$(expect_count "${out}")" "3"
+assert_has "最初に base との差を名指す" "注意: base にあって head に無い job（head が古い）: ${GATE}" "${out}"
+assert_has "既定の動きを最初に言う" "この PR の CI で走っていなければ緑にしない" "${out}"
+assert_has "結論で走っていない job を名指す" "緑にしない: base の main にある job がこの PR の CI で走っていない（head ${HEAD_SHA_T:0:7} が古い。#2883）: ${GATE}" "${out}"
+assert_has "取り込んで回し直す案内" "git fetch origin && git merge origin/main && git push" "${out}"
+assert_has "head の集合で判定する打ち直し方" "TAKO_WAIT_PR_CHECKS_SET=head bash scripts/wait-pr-checks.sh 2878" "${out}"
+assert_hasnt "緑で揃ったとは言わない" "CI が全部緑で揃った" "${out}"
+assert_hasnt "上限まで待たない" "上限 20 秒に達した" "${out}"
+assert_eq "確定の 2 回だけ見て終わる" "$(calls_of 'pr checks')" "2"
+assert_hasnt "head を読めた = 手元の木に落ちない" "手元の木の workflow から導く" "${out}"
+assert_eq "head のコミットを origin から取った" "$(git -C "${CASE_DIR}/repo" cat-file -e "${HEAD_SHA_T}^{commit}" 2>/dev/null && echo yes || echo no)" "yes"
+
+new_case t42head
+seed_pr_repos 2878 "" "${GATE_JOB}"
+green_checks > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(TAKO_WAIT_PR_CHECKS_SET=head run_wait 2878 --timeout 20 --interval 1)"
+assert_eq "TAKO_WAIT_PR_CHECKS_SET=head なら head の集合で緑 0" "$?" "0"
+assert_has "head の集合で緑と言う" "CI が全部緑で揃った（期待 3 本 / 報告 3 本）" "${out}"
+assert_has "選んだ動きを最初に言う" "TAKO_WAIT_PR_CHECKS_SET=head なので、この PR の CI で走っていなくても head の集合で判定する" "${out}"
+assert_has "緑でも走っていない job は注記で残す" "注記: base にあって head に無い次の job はこの PR の CI で走っていない（TAKO_WAIT_PR_CHECKS_SET=head = head の集合で判定した。#2883）: ${GATE}" "${out}"
+
+new_case t42tree
+seed_pr_repos 2878 "" "${GATE_JOB}"
+green_checks > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+# PR の head を握った作業ツリー（worker の clone）から待つ = 手元の木と head が同じ
+out="$(cd "${CASE_DIR}/worker" && record_run bash "${WAIT_SH}" 2878 --timeout 20 --interval 1)"
+assert_eq "head の作業ツリーから待っても答えは同じ 6（実行した木に依らない）" "$?" "6"
+assert_has "head の作業ツリーからでも同じ job を名指す" "緑にしない: base の main にある job がこの PR の CI で走っていない" "${out}"
+out="$(cd "${CASE_DIR}/worker" && TAKO_2883_LEGACY=1 record_run bash "${WAIT_SH}" 2878 --timeout 20 --interval 1)"
+assert_eq "修正前は head の作業ツリーからだと 0（木で答えが変わっていた）" "$?" "0"
+
+new_case t42merge
+seed_pr_repos 2878 "" "${GATE_JOB}"
+view_json 2878 > "${TAKO_GH_MOCK_DIR}/view.json"
+green_checks > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(run_merge 2878 --timeout 20 --interval 1)"
+assert_eq "merge-pr.sh も既定で 6 を返す" "$?" "6"
+assert_eq "merge を呼ばない" "$(calls_of 'pr merge')" "0"
+assert_has "merge しない理由を名指す" "merge しない: base にある job がこの PR の CI で走っていない（wait-pr-checks.sh の終了コード 6。head が古い）" "${out}"
+assert_has "打ち直しは merge-pr.sh の形で案内する" "TAKO_WAIT_PR_CHECKS_SET=head bash scripts/merge-pr.sh 2878" "${out}"
+assert_hasnt "wait-pr-checks.sh の打ち直しを案内しない" "TAKO_WAIT_PR_CHECKS_SET=head bash scripts/wait-pr-checks.sh" "${out}"
+assert_hasnt "CI が揃っていないとは言わない" "CI が揃っていない" "${out}"
+
+new_case t42mergehead
+seed_pr_repos 2878 "" "${GATE_JOB}"
+view_json 2878 > "${TAKO_GH_MOCK_DIR}/view.json"
+green_checks > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(TAKO_WAIT_PR_CHECKS_SET=head run_merge 2878 --timeout 20 --interval 1)"
+assert_eq "head の集合を選べば merge する" "$?" "0"
+assert_eq "squash で merge した" "$(cat "${TAKO_GH_MOCK_DIR}/merged" 2>/dev/null)" "pr merge 2878 --squash --delete-branch"
+
+new_case t42ran
+seed_pr_repos 2878 "" "${GATE_JOB}"
+# run が base の追加の後に作られた（merge コミットに job が入っていた）= この PR でも走った
+checks_json "${CF}|pass|2026-11-10T04:24:00Z" "${MAC}|pass|2026-11-10T04:56:50Z" "${WIN}|pass|2026-11-10T04:49:33Z" \
+  "${GATE}|pass|2026-11-10T04:50:00Z" > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(run_wait 2878 --timeout 20 --interval 1)"
+assert_eq "base にだけある job でも、この PR で走って緑なら 0" "$?" "0"
+assert_has "報告されたぶんも数える" "CI が全部緑で揃った（期待 3 本 / 報告 4 本）" "${out}"
+assert_hasnt "走った job は名指さない" "緑にしない: base の" "${out}"
+assert_hasnt "走った job は注記しない" "注記: base にあって head に無い" "${out}"
+
+new_case t42ranred
+seed_pr_repos 2878 "" "${GATE_JOB}"
+checks_json "${CF}|pass|2026-11-10T04:24:00Z" "${MAC}|pass|2026-11-10T04:56:50Z" "${WIN}|pass|2026-11-10T04:49:33Z" \
+  "${GATE}|fail|2026-11-10T04:50:00Z" > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(run_wait 2878 --timeout 20 --interval 1)"
+assert_eq "走った base の job が赤なら 1" "$?" "1"
+assert_has "赤の本数を出す" "失敗しているチェックが 1 本ある" "${out}"
+
+new_case t42ranpending
+seed_pr_repos 2878 "" "${GATE_JOB}"
+checks_json "${CF}|pass|2026-11-10T04:24:00Z" "${MAC}|pass|2026-11-10T04:56:50Z" "${WIN}|pass|2026-11-10T04:49:33Z" \
+  "${GATE}|pending|" > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(run_wait 2878 --timeout 2 --interval 1)"
+assert_eq "走っている base の job が実行中なら待つ（タイムアウト 2）" "$?" "2"
+assert_has "実行中の本数を出す" "実行中: 1 本" "${out}"
+
+new_case t42red
+seed_pr_repos 2878 "" "${GATE_JOB}"
+checks_json "${CF}|pass|2026-11-10T04:24:00Z" "${MAC}|fail|2026-11-10T04:56:50Z" "${WIN}|pass|2026-11-10T04:49:33Z" \
+  > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(run_wait 2878 --timeout 20 --interval 1)"
+assert_eq "head の集合に赤があれば、差があっても赤の 1" "$?" "1"
+assert_has "赤に差を添える" "あわせて base にあって head に無い job がこの PR の CI で走っていない（#2883）: ${GATE}" "${out}"
+
+new_case t42skip
+seed_pr_repos 2878 "" "${GATE_JOB}"
+# docs だけの PR（#2084）: Rust のジョブは skip。skip は従来どおり成功扱いで、差の扱いは変えない
+checks_json "${CF}|pass|2026-11-10T04:24:00Z" "${MAC}|skipping|2026-11-10T04:25:00Z" "${WIN}|skipping|2026-11-10T04:25:00Z" \
+  > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(run_wait 2878 --timeout 20 --interval 1)"
+assert_eq "docs だけの古い head でも、既定は 6（skip で済むかは名指して選ばせる）" "$?" "6"
+assert_has "skip の本数と選び方を添える" "この PR は 2 本が skip = docs だけの変更（#2084）" "${out}"
+out="$(TAKO_WAIT_PR_CHECKS_SET=head run_wait 2878 --timeout 20 --interval 1)"
+assert_eq "head の集合を選べば skip は従来どおり緑 0" "$?" "0"
+assert_has "skip の行は従来どおり" "うち 2 本は skip（成功扱い" "${out}"
+
+echo "== Test 43: 手元の木・head・base の workflow が同じなら答えは #2883 の前と変わらない =="
+# 時刻・経過・確認回数・期待名の出どころの行を除けば、修正前と同じ出力
+norm43() { grep -v -e '期待名の出どころ' -e '^\[' -e '^結果（' -e '^タイムアウト（' <<<"$1"; }
+for t43 in green:0 red:1 pending:2; do
+  arm="${t43%%:*}"
+  new_case "t43${arm}"
+  seed_pr_repos 2900 "" ""
+  case "${arm}" in
+    green) green_checks > "${TAKO_GH_MOCK_DIR}/checks.1.json" ;;
+    red) checks_json "${CF}|pass|2026-11-10T04:24:00Z" "${MAC}|pass|2026-11-10T04:56:50Z" "${WIN}|fail|2026-11-10T04:49:33Z" \
+      > "${TAKO_GH_MOCK_DIR}/checks.1.json" ;;
+    pending) checks_json "${CF}|pass|2026-11-10T04:24:00Z" "${MAC}|pending|" "${WIN}|pass|2026-11-10T04:49:33Z" \
+      > "${TAKO_GH_MOCK_DIR}/checks.1.json" ;;
+  esac
+  new_out="$(run_wait 2900 --timeout 2 --interval 1)"
+  new_rc=$?
+  old_out="$(TAKO_2883_LEGACY=1 run_wait 2900 --timeout 2 --interval 1)"
+  old_rc=$?
+  assert_eq "${arm}: 終了コードは ${t43#*:}" "${new_rc}" "${t43#*:}"
+  assert_eq "${arm}: 終了コードが修正前と同じ" "${new_rc}" "${old_rc}"
+  assert_eq "${arm}: 期待・結論の行が修正前と同じ" "$(norm43 "${new_out}")" "$(norm43 "${old_out}")"
+  assert_has "${arm}: head から導いた" "期待名の出どころ: PR の head（${HEAD_SHA_T:0:7}）の workflow" "${new_out}"
+  assert_hasnt "${arm}: 差が無ければ注意を出さない" "注意: base にあって" "${new_out}"
+  assert_hasnt "${arm}: head を読めた = 警告を出さない" "警告: PR の head" "${new_out}"
+done
+
+echo "== Test 44: head にだけある job（この PR が足した）は期待に入れて待つ（#2883）=="
+new_case t44
+seed_pr_repos 2901 "${ADDED_JOB}" ""
+green_checks > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(run_wait 2901 --timeout 2 --interval 1)"
+assert_eq "足した job が未登録のあいだは緑にしない（タイムアウト 2）" "$?" "2"
+assert_has "足した job を名指す" "head にだけある job（この PR が足した。待つ）: ${ADDED}" "${out}"
+assert_has "足した job を期待に入れる" "期待: ${ADDED}" "${out}"
+assert_has "未登録として残る" "未登録: ${ADDED}" "${out}"
+out="$(TAKO_2883_LEGACY=1 run_wait 2901 --timeout 2 --interval 1)"
+assert_eq "修正前は足した job を待たずに緑 0（早すぎる）" "$?" "0"
+new_case t44done
+seed_pr_repos 2901 "${ADDED_JOB}" ""
+checks_json "${CF}|pass|2026-11-10T04:24:00Z" "${MAC}|pass|2026-11-10T04:56:50Z" "${WIN}|pass|2026-11-10T04:49:33Z" \
+  "${ADDED}|pass|2026-11-10T04:30:00Z" > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(run_wait 2901 --timeout 20 --interval 1)"
+assert_eq "足した job も緑で揃えば 0" "$?" "0"
+assert_has "期待は 4 本" "CI が全部緑で揃った（期待 4 本 / 報告 4 本）" "${out}"
+
+new_case t44rename
+# job の改名: head は新しい名前・base は古い名前 = 古い名前は base にだけある（既定は 6 で選ばせる）
+seed_pr_repos 2902 "${ADDED_JOB}" "${GATE_JOB}"
+checks_json "${CF}|pass|2026-11-10T04:24:00Z" "${MAC}|pass|2026-11-10T04:56:50Z" "${WIN}|pass|2026-11-10T04:49:33Z" \
+  "${ADDED}|pass|2026-11-10T04:30:00Z" > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(run_wait 2902 --timeout 20 --interval 1)"
+assert_eq "両側に差があれば既定は 6" "$?" "6"
+assert_has "改名かもしれないことを添える" "（head にだけある job: ${ADDED}。名前を変えた job なら head の集合で構わない）" "${out}"
+
+echo "== Test 45: head を読めないときだけ手元の木に落ち、そのことを 1 行で知らせる（#2883）=="
+new_case t45api
+green_checks > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(run_wait 2903 --timeout 20 --interval 1)"
+assert_eq "gh で PR を引けなくても従来どおりの判定（緑 0）" "$?" "0"
+assert_has "手元の木に落ちたことを 1 行で知らせる（gh で引けない）" "警告: PR の head の workflow を読めないので、期待名を手元の木の workflow から導く（gh api で PR を引けない（終了コード 1: mock: api の応答が無い" "${out}"
+assert_eq "知らせるのは 1 行" "$(grep -c '手元の木の workflow から導く' <<<"${out}")" "1"
+
+new_case t45unreach
+printf '%s\n' "${GH_DNS_ERR}" > "${TAKO_GH_MOCK_DIR}/api-pull.json"
+green_checks > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(TAKO_GH_RETRY_ATTEMPTS=2 run_wait 2903 --timeout 20 --interval 1)"
+assert_eq "PR を引く口だけ届かなくても、checks が届けば従来どおり 0" "$?" "0"
+assert_has "届かなかったことを理由に添える" "GitHub API に届かない（gh api repos/{owner}/{repo}/pulls/2903 を 2 回試して全部が接続エラー" "${out}"
+
+new_case t45fetch
+seed_pr_repos 2904 "" "${GATE_JOB}"
+printf '{"head":{"sha":"%s"},"base":{"ref":"main"}}\n' "0123456789abcdef0123456789abcdef01234567" > "${TAKO_GH_MOCK_DIR}/api-pull.json"
+green_checks > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(run_wait 2904 --timeout 2 --interval 1)"
+assert_eq "head を origin から取れなければ手元の木で待つ（修正前と同じタイムアウト 2）" "$?" "2"
+assert_has "取れないことを知らせる" "（head 0123456 を origin から取れない。#2883 の前と同じ導出" "${out}"
+assert_has "手元の木の job を期待に入れる" "期待: ${GATE}" "${out}"
+
+new_case t45noorigin
+green_checks > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+printf '{"head":{"sha":"%s"},"base":{"ref":"main"}}\n' "0123456789abcdef0123456789abcdef01234567" > "${TAKO_GH_MOCK_DIR}/api-pull.json"
+out="$(run_wait 2905 --timeout 20 --interval 1)"
+assert_eq "origin が無くても従来どおり 0" "$?" "0"
+assert_has "origin が無いことも取れないとして知らせる" "（head 0123456 を origin から取れない" "${out}"
+
+new_case t45nowf
+seed_pr_repos 2906 "" "${GATE_JOB}" no-workflows
+green_checks > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(run_wait 2906 --timeout 2 --interval 1)"
+assert_eq "head に workflow が無ければ手元の木で待つ（タイムアウト 2）" "$?" "2"
+assert_has "workflow が無いことを知らせる" "（head ${HEAD_SHA_T:0:7} に .github/workflows の yml が無い。" "${out}"
+
+new_case t45base
+seed_pr_repos 2907 "" "${GATE_JOB}"
+printf '{"head":{"sha":"%s"},"base":{"ref":"no-such-base"}}\n' "${HEAD_SHA_T}" > "${TAKO_GH_MOCK_DIR}/api-pull.json"
+green_checks > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(run_wait 2907 --timeout 20 --interval 1)"
+assert_eq "base を読めなければ手元の木を base の代わりにして比べる（差があれば 6）" "$?" "6"
+assert_has "base の代わりにしたことを言う" "比べた base: 手元の木（origin/no-such-base を読めないので base の代わりにした）" "${out}"
+
+echo "== Test 46: 選び方の env と上書きの扱い（#2883）=="
+new_case t46
+green_checks > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(TAKO_WAIT_PR_CHECKS_SET=base run_wait 2908 --timeout 20 --interval 1)"
+assert_eq "TAKO_WAIT_PR_CHECKS_SET の知らない値は 3" "$?" "3"
+assert_has "受け付ける値を言う" "TAKO_WAIT_PR_CHECKS_SET は auto か head: base" "${out}"
+
+new_case t46expect
+seed_pr_repos 2909 "" "${GATE_JOB}"
+green_checks > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(TAKO_WAIT_PR_CHECKS_EXPECT="${CF},${MAC},${WIN}" run_wait 2909 --timeout 20 --interval 1)"
+assert_eq "TAKO_WAIT_PR_CHECKS_EXPECT は従来どおり書いた名前だけで判定する" "$?" "0"
+assert_eq "上書きでは PR を引かない" "$(calls_of 'pulls/')" "0"
+assert_has "出どころを言う" "期待名の出どころ: TAKO_WAIT_PR_CHECKS_EXPECT" "${out}"
 
 echo
 echo "=== 結果: PASS=${PASS} FAIL=${FAIL} ==="

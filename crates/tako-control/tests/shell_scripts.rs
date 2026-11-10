@@ -5680,7 +5680,7 @@ const SIGCHLD_OK_MARKER: &str = "tako:sigchld-ok";
 /// （スクリプトごと。例外宣言のものは数えない）。
 ///
 /// **増やさない**。減らしたら表も同じ数へ減らす（余りを残すと同じファイルの別の行で増やせる）。
-/// 0 になったら行ごと消す。PR の CI 待ちと merge の 4 本（`PR_GATE_SCRIPTS`）は載せない。
+/// 0 になったら行ごと消す。PR の CI 待ちと merge の 5 本（`PR_GATE_SCRIPTS`）は載せない。
 /// ここに載っているのは「`find -print0` の NUL 区切り（置換は NUL を運べない）」「起こしたまま
 /// 残す常駐（隔離 GUI・caffeinate・消し続けるループ）」を含む既存分で、1 本ずつ直す義務は無い
 /// （`.agent/conventions.md` の #2690 / #2736 の節に、実害の条件ごとの棚卸しの表）
@@ -5704,6 +5704,7 @@ const PR_GATE_SCRIPTS: &[&str] = &[
     "scripts/merge-pr.sh",
     "scripts/lib/gh-retry.sh",
     "scripts/lib/pr-conflict.sh",
+    "scripts/lib/pr-workflow-gap.sh",
 ];
 
 fn sigchld_exception(lines: &[&str], line_no: usize) -> bool {
