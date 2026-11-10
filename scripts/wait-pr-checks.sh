@@ -15,9 +15,29 @@
 #     2. その結論（どの名前がどの bucket か）を **2 回連続**で観測できたら確定
 #
 # 期待するチェック名の出どころ（ハードコードしない）:
-#   - `.github/workflows/*.yml` のうち pull_request で起動するものの job 名（`name:` / 無ければ job id）
+#   - **PR の head の** `.github/workflows/*.yml` のうち pull_request で起動するものの job 名
+#     （`name:` / 無ければ job id。#2883）。head の SHA と base の名前は `gh api …/pulls/<PR>` で引き、
+#     head のコミットが手元に無ければ origin から `refs/pull/<PR>/head` を取る
+#   - head を読めない（gh で引けない・origin から取れない・head に workflow が無い）ときだけ
+#     **実行した木の** workflow から導き、そのことを 1 行で知らせる（#2883 の前はいつもこれだった）
 #   - 外部連携のチェック（Cloudflare Pages）はワークフローから導出できないので EXTERNAL_CHECKS に持つ
 #   - 一時的に別の集合で待ちたいときだけ TAKO_WAIT_PR_CHECKS_EXPECT="A,B" で上書きできる
+#
+# 実行した木ではなく head から導く理由（#2883）:
+#   PR #2862 が CI に windows-clippy を足して main に入った後、それより前の main から分かれた
+#   PR #2878（CI 7 本とも緑）を main に追従した共有ツリーから merge-pr.sh すると、その PR では
+#   走らない windows-clippy を上限（6600 秒）まで待ち続けた。待つべきなのはその PR の CI が
+#   実際に作る job で、それを決めるのは PR 側の workflow であって、スクリプトを実行した木ではない。
+#
+# base にあって head に無い job は名指す（#2883）:
+#   head の集合だけで緑にすると、古い head が新しい品質のゲート（windows-clippy 等）を通らないまま
+#   main に入る。そこで base（`origin/<base>` を取り直した先頭。読めなければ実行した木）の job と
+#   比べ、base にだけある job を最初に 1 行で名指す。その job がこの PR の CI に登録されたなら
+#   （run が base の追加の後に作られた = merge コミットに入っていた）普通に結論へ数える。
+#   登録されないまま head の集合が緑で揃ったら、**既定では緑にせず 6 で終わる**
+#   （取り込んで回し直す案内と、head の集合で判定する打ち直し方を出す。案内は lib/pr-workflow-gap.sh）。
+#   head の集合で判定してよいと分かっているときだけ TAKO_WAIT_PR_CHECKS_SET=head を付ける
+#   （差は注記の 1 行で残る）。head にだけある job（この PR が足した）は期待に入る = 待つ
 #
 # skip されたチェック（bucket = skipping）は「完了・緑」として数える（#2084）:
 #   docs だけの PR では ci.yml が macOS / Windows の Rust ジョブを `if:` で skip する。
@@ -44,7 +64,8 @@
 # 使い方: bash scripts/wait-pr-checks.sh <PR番号> [--timeout <秒>] [--interval <秒>]
 # 終了コード: 0 = 全部緑 / 1 = 失敗あり / 2 = タイムアウト / 3 = 引数・gh のエラー /
 #             4 = base と衝突していて CI の run が作られない /
-#             5 = GitHub API に届かない（接続エラーがやり直しても続いた。CI の結論ではない）
+#             5 = GitHub API に届かない（接続エラーがやり直しても続いた。CI の結論ではない）/
+#             6 = head の集合では緑だが、base にある job がこの PR の CI で走っていない（#2883）
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -54,6 +75,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # gh の接続エラーのやり直しと到達性の終了コード（GH_UNREACHABLE_EXIT）も merge-pr.sh と共有する
 # shellcheck source=lib/gh-retry.sh
 . "${SCRIPT_DIR}/lib/gh-retry.sh"
+# base にある job が走っていないときの終了コード（PR_WORKFLOW_GAP_EXIT）と案内も merge-pr.sh と共有する（#2883）
+# shellcheck source=lib/pr-workflow-gap.sh
+. "${SCRIPT_DIR}/lib/pr-workflow-gap.sh"
 
 # 外部連携のチェック（GitHub App が PR ごとに 1 本出す）。ワークフローから導出できないぶんはここ
 EXTERNAL_CHECKS=("Cloudflare Pages")
@@ -89,6 +113,22 @@ LEGACY_1365="${TAKO_1365_LEGACY:-0}"
 LEGACY_2047="${TAKO_2047_LEGACY:-0}"
 if [[ "${LEGACY_2047}" == "1" ]]; then DEFAULT_TIMEOUT=2400; fi
 
+# A/B（検出力の確認・計測専用）。1 = **#2883 の前**へ戻す = 期待名を実行した木の workflow から導く腕
+#   （PR の head を見ない・base との差も見ない）。job が増えた後の main から、それより前に分かれた
+#   PR を待つと、その PR では走らない job を上限まで待ち続ける。scripts/test-wait-pr-checks.sh の
+#   Test 42 がこの腕で上限まで待つことを固定している
+LEGACY_2883="${TAKO_2883_LEGACY:-0}"
+
+# base にあって head に無い job が、この PR の CI で走っていないときの扱い（#2883）:
+#   auto（既定・空）= 緑にしない（6 で終わる。品質のゲートを黙って素通りさせない）
+#   head            = head の集合で判定する（差は注記の 1 行で残す）
+GAP_MODE="${TAKO_WAIT_PR_CHECKS_SET:-auto}"
+# 案内に出す打ち直しのコマンド（merge-pr.sh が自分の名前を付けて呼ぶ。表示にだけ使う）
+case "${TAKO_WAIT_PR_CHECKS_CALLER:-}" in
+  merge-pr.sh) RERUN_SCRIPT="scripts/merge-pr.sh" ;;
+  *) RERUN_SCRIPT="scripts/wait-pr-checks.sh" ;;
+esac
+
 die() {
   echo "エラー: $*" >&2
   exit 3
@@ -103,10 +143,14 @@ usage() {
   上限（既定 6600 秒）に達したら最後にもう一度状態を見て、そろっていればそれを結論にする。
   上限は --timeout か環境変数 TAKO_WAIT_PR_CHECKS_TIMEOUT（秒）で変えられる（--timeout が優先）。
   gh が接続エラーで落ちたら 1, 2, 4, 8 秒あけて 5 回まで試す。
+  待つチェック名は PR の head の workflow から導く（読めなければ手元の木。そのことを 1 行出す）。
+  base にあって head に無い job がこの PR の CI で走っていなければ緑にしない（6）。
+  head の集合で判定してよいときだけ環境変数 TAKO_WAIT_PR_CHECKS_SET=head を付ける。
 
 終了コード: 0 = 全部緑 / 1 = 失敗あり / 2 = タイムアウト / 3 = 引数・gh のエラー /
             4 = base と衝突していて CI の run が作られない（取り込んで push し直す）/
-            5 = GitHub API に届かない（CI の結論ではない。ネットワークが戻ってから打ち直す）
+            5 = GitHub API に届かない（CI の結論ではない。ネットワークが戻ってから打ち直す）/
+            6 = base にある job がこの PR の CI で走っていない（取り込んで回し直す）
 USAGE
 }
 
@@ -151,6 +195,10 @@ done
 [[ "${PR}" =~ ^[0-9]+$ ]] || die "PR 番号が数値ではない: ${PR}"
 [[ "${TIMEOUT}" =~ ^[0-9]+$ ]] || die "${TIMEOUT_SRC} が数値ではない: ${TIMEOUT}"
 [[ "${INTERVAL}" =~ ^[0-9]+$ ]] && [[ "${INTERVAL}" -ge 1 ]] || die "--interval は 1 以上の整数: ${INTERVAL}"
+case "${GAP_MODE}" in
+  auto | head) ;;
+  *) die "TAKO_WAIT_PR_CHECKS_SET は auto か head: ${GAP_MODE}" ;;
+esac
 command -v gh >/dev/null 2>&1 || die "gh が見つからない（https://cli.github.com/）"
 command -v jq >/dev/null 2>&1 || die "jq が見つからない（brew install jq）"
 
@@ -206,30 +254,165 @@ workflow_job_names() {
   ' "$1"
 }
 
-expected_checks() {
-  if [[ -n "${TAKO_WAIT_PR_CHECKS_EXPECT:-}" ]]; then
-    tr ',' '\n' <<<"${TAKO_WAIT_PR_CHECKS_EXPECT}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -v '^$'
-    return 0
-  fi
+# 実行した木の workflow から job 名（1 行 1 名前）。#2883 の前はいつもこれだった。
+# いまは head を読めないときの代わり（と、base を読めないときの base の代わり）にだけ使う
+local_job_names() {
   local dir f
   dir="$(repo_root)/.github/workflows"
-  if [[ -d "${dir}" ]]; then
-    for f in "${dir}"/*.yml "${dir}"/*.yaml; do
-      [[ -f "${f}" ]] || continue
-      workflow_on_pull_request "${f}" || continue
-      workflow_job_names "${f}"
-    done
-  fi
-  printf '%s\n' ${EXTERNAL_CHECKS[@]+"${EXTERNAL_CHECKS[@]}"}
+  [[ -d "${dir}" ]] || return 0
+  for f in "${dir}"/*.yml "${dir}"/*.yaml; do
+    [[ -f "${f}" ]] || continue
+    workflow_on_pull_request "${f}" || continue
+    workflow_job_names "${f}"
+  done
 }
 
+# コミット $1 の .github/workflows から job 名（1 行 1 名前）。
+# 戻り値: 0 = 読めた / 1 = workflow の yml が 1 本も無い / 2 = 載っているファイルを読めない
+# （読めないファイルを黙って飛ばすと期待名が欠けて早すぎる緑になる = #1313 の型なので、失敗として返す）
+commit_job_names() {
+  local commit="$1" f body n=0
+  while IFS= read -r f; do
+    case "${f}" in *.yml | *.yaml) ;; *) continue ;; esac
+    body="$(git show "${commit}:${f}" 2>/dev/null)" || return 2
+    n=$((n + 1))
+    workflow_on_pull_request - <<<"${body}" || continue
+    workflow_job_names - <<<"${body}"
+  done <<<"$(git ls-tree --name-only --full-tree "${commit}" .github/workflows/ 2>/dev/null || true)"
+  [[ ${n} -gt 0 ]] || return 1
+}
+
+have_commit() { git cat-file -e "$1^{commit}" 2>/dev/null; }
+
+# origin から取る（認証を対話で尋ねない・FETCH_HEAD を書かない・タグを取らない）。成否は呼び手が見る
+fetch_origin() {
+  GIT_TERMINAL_PROMPT=0 git fetch --quiet --no-tags --no-write-fetch-head origin "$@" >/dev/null 2>&1
+}
+
+# PR の head の SHA と base の名前（gh api の 1 回で両方を引く。待ちの中で衝突を見る
+# gh pr view とは別の口にして、そちらの呼び出しの回数を変えない）。
+# 戻り値: 0 = 引けた / 1 = 引けない（理由は READ_WHY）
+HEAD_SHA=""
+BASE_REF=""
+READ_WHY=""
+lookup_pr_refs() {
+  local sha="" ref=""
+  if ! gh_retry api "repos/{owner}/{repo}/pulls/${PR}" --jq '[.head.sha, .base.ref] | @tsv'; then
+    READ_WHY="$(gh_unreachable_reason)"
+    return 1
+  fi
+  if [[ ${GH_RC} -ne 0 || -z "${GH_OUT}" ]]; then
+    READ_WHY="gh api で PR を引けない（終了コード ${GH_RC}: $(gh_first_line "${GH_ERR}")）"
+    return 1
+  fi
+  IFS=$'\t' read -r sha ref <<<"${GH_OUT}"
+  if [[ ! "${sha}" =~ ^[0-9a-f]{7,64}$ || -z "${ref}" ]]; then
+    READ_WHY="gh api の応答から head の SHA と base を読めない（$(gh_first_line "${GH_OUT}")）"
+    return 1
+  fi
+  HEAD_SHA="${sha}"
+  BASE_REF="${ref}"
+}
+
+# head のコミットを手元に持つ（無ければ origin から取る）。0 = 持っている
+ensure_head_commit() {
+  have_commit "${HEAD_SHA}" && return 0
+  fetch_origin "refs/pull/${PR}/head" || true
+  have_commit "${HEAD_SHA}" && return 0
+  # 引いた直後に push されて refs/pull/<PR>/head が先へ進んでいたら SHA で取る
+  fetch_origin "${HEAD_SHA}" || true
+  have_commit "${HEAD_SHA}"
+}
+
+# base の job 名を BASE_NAMES に、出どころを BASE_SRC に置く。
+# base の先頭（origin/<base> を取り直したもの）を読めなければ実行した木で代える
+BASE_NAMES=""
+BASE_SRC=""
+read_base_names() {
+  local tip="" fetched=1
+  fetch_origin "${BASE_REF}" || fetched=0
+  tip="$(git rev-parse --verify --quiet "refs/remotes/origin/${BASE_REF}^{commit}" 2>/dev/null || true)"
+  if [[ -n "${tip}" ]] && BASE_NAMES="$(commit_job_names "${tip}")"; then
+    BASE_SRC="${BASE_REF}（origin の ${tip:0:7}）"
+    if [[ ${fetched} -eq 0 ]]; then BASE_SRC="${BASE_SRC}。取り直せなかったので手元の origin/${BASE_REF}"; fi
+    return 0
+  fi
+  BASE_NAMES="$(local_job_names)"
+  BASE_SRC="手元の木（origin/${BASE_REF} を読めないので base の代わりにした）"
+}
+
+# 期待名（外部連携を除く。1 行 1 名前）を JOB_NAMES に、出どころを EXPECT_SRC に置く。
+# head を読めたときは base と比べて BASE_ONLY（base にだけある = head が古い）/
+# HEAD_ONLY（head にだけある = この PR が足した）も埋める（#2883）
+JOB_NAMES=""
+EXPECT_SRC=""
+# 1 = 期待名を手元の木で代えた（警告の 1 行を出す）。理由は FALLBACK_WHY
+EXPECT_FALLBACK=0
+FALLBACK_WHY=""
+BASE_ONLY=()
+HEAD_ONLY=()
+derive_job_names() {
+  local rc=0 n
+  if [[ -n "${TAKO_WAIT_PR_CHECKS_EXPECT:-}" ]]; then
+    JOB_NAMES="$(tr ',' '\n' <<<"${TAKO_WAIT_PR_CHECKS_EXPECT}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -v '^$' || true)"
+    EXPECT_SRC="TAKO_WAIT_PR_CHECKS_EXPECT（head とも base とも比べない）"
+    return 0
+  fi
+  if [[ "${LEGACY_2883}" == "1" ]]; then
+    JOB_NAMES="$(local_job_names)"
+    EXPECT_SRC="手元の木の workflow（TAKO_2883_LEGACY=1 = #2883 の前の導出）"
+    return 0
+  fi
+  EXPECT_FALLBACK=1
+  if ! lookup_pr_refs; then
+    JOB_NAMES="$(local_job_names)"
+    FALLBACK_WHY="${READ_WHY}"
+    return 0
+  fi
+  if ! ensure_head_commit; then
+    JOB_NAMES="$(local_job_names)"
+    FALLBACK_WHY="head ${HEAD_SHA:0:7} を origin から取れない"
+    return 0
+  fi
+  JOB_NAMES="$(commit_job_names "${HEAD_SHA}")" || rc=$?
+  if [[ ${rc} -ne 0 ]]; then
+    JOB_NAMES="$(local_job_names)"
+    if [[ ${rc} -eq 1 ]]; then
+      FALLBACK_WHY="head ${HEAD_SHA:0:7} に .github/workflows の yml が無い"
+    else
+      FALLBACK_WHY="head ${HEAD_SHA:0:7} の workflow を読めない"
+    fi
+    return 0
+  fi
+  EXPECT_FALLBACK=0
+  read_base_names
+  EXPECT_SRC="PR の head（${HEAD_SHA:0:7}）の workflow / 比べた base: ${BASE_SRC}"
+  # here-string で比べる（パイプにしない = pipefail の下の grep -q の早抜けを作らない）
+  while IFS= read -r n; do
+    [[ -n "${n}" ]] || continue
+    grep -qxF -- "${n}" <<<"${JOB_NAMES}" || BASE_ONLY+=("${n}")
+  done <<<"$(awk '!seen[$0]++' <<<"${BASE_NAMES}")"
+  while IFS= read -r n; do
+    [[ -n "${n}" ]] || continue
+    grep -qxF -- "${n}" <<<"${BASE_NAMES}" || HEAD_ONLY+=("${n}")
+  done <<<"$(awk '!seen[$0]++' <<<"${JOB_NAMES}")"
+  return 0
+}
+
+derive_job_names
 EXPECTED=()
 # プロセス置換（`< <( … )`）は使わない（#2690）: その子はいつ終わるか決まらず、終わった瞬間に
 # 書き込みの最中だと /bin/bash 3.2 の echo が EINTR で落ち、set -e で 1 で抜ける。置換の子は
 # シェルが待って刈り取るので、書き込みの最中に SIGCHLD が届かない
 while IFS= read -r _name; do
   [[ -n "${_name}" ]] && EXPECTED+=("${_name}")
-done <<<"$(expected_checks | awk '!seen[$0]++')"
+done <<<"$(
+  {
+    printf '%s\n' "${JOB_NAMES}"
+    # 上書き（TAKO_WAIT_PR_CHECKS_EXPECT）は書いた名前だけで待つ（#2883 の前と同じ）
+    if [[ -z "${TAKO_WAIT_PR_CHECKS_EXPECT:-}" ]]; then printf '%s\n' ${EXTERNAL_CHECKS[@]+"${EXTERNAL_CHECKS[@]}"}; fi
+  } | awk '!seen[$0]++'
+)"
 [[ ${#EXPECTED[@]} -gt 0 ]] || die "期待するチェック名が 1 つも決まらない（.github/workflows を読めているか）"
 
 # ---------------------------------------------------------------- gh から今の状態を採る
@@ -286,6 +469,18 @@ at_of() { # 完了時刻（未完了は gh が 0001-01-01T00:00:00Z を返す）
     "" | 0001-01-01*) printf '%s' "-" ;;
     *) printf '%s' "${at}" ;;
   esac
+}
+
+# base にあって head に無い job のうち、この PR の CI に登録されていないもの（#2883）。
+# 登録されたもの（run が base の追加の後に作られた = merge コミットに入っていた）は、
+# 報告されたチェックとして evaluate がそのまま実行中・赤・skip を数える
+GAP_MISSING=()
+gap_unreported() {
+  local n
+  GAP_MISSING=()
+  for n in ${BASE_ONLY[@]+"${BASE_ONLY[@]}"}; do
+    [[ -n "$(field_of 1 "${n}")" ]] || GAP_MISSING+=("${n}")
+  done
 }
 
 MISSING=()
@@ -373,6 +568,24 @@ elapsed_text() {
 # ---------------------------------------------------------------- 待つ
 
 echo "PR #${PR} の CI を待つ（期待 ${#EXPECTED[@]} 本 / 上限 ${TIMEOUT} 秒 = ${TIMEOUT_SRC} / 間隔 ${INTERVAL} 秒）"
+if [[ ${EXPECT_FALLBACK} -eq 1 ]]; then
+  # head を読めない = #2883 の前と同じ導出に落ちる。job が増えた後の main から古い PR を待つと
+  # 上限まで返らないことがあるので、そのことを 1 行で残す
+  echo "警告: PR の head の workflow を読めないので、期待名を手元の木の workflow から導く（${FALLBACK_WHY}。#2883 の前と同じ導出 = head と木で job が違うと上限まで待つことがある）" >&2
+else
+  echo "  期待名の出どころ: ${EXPECT_SRC}"
+fi
+if [[ ${#BASE_ONLY[@]} -gt 0 ]]; then
+  echo "  注意: base にあって head に無い job（head が古い）: $(join_names ${BASE_ONLY[@]+"${BASE_ONLY[@]}"})"
+  if [[ "${GAP_MODE}" == "head" ]]; then
+    echo "    TAKO_WAIT_PR_CHECKS_SET=head なので、この PR の CI で走っていなくても head の集合で判定する（#2883）"
+  else
+    echo "    この PR の CI で走っていなければ緑にしない（#2883。head の集合で判定するなら TAKO_WAIT_PR_CHECKS_SET=head）"
+  fi
+fi
+if [[ ${#HEAD_ONLY[@]} -gt 0 ]]; then
+  echo "  head にだけある job（この PR が足した。待つ）: $(join_names ${HEAD_ONLY[@]+"${HEAD_ONLY[@]}"})"
+fi
 for _name in ${EXPECTED[@]+"${EXPECTED[@]}"}; do echo "  期待: ${_name}"; done
 
 START="$(date +%s)"
@@ -488,6 +701,10 @@ while :; do
     echo "タイムアウト（${TIMEOUT} 秒 + 最後の確認 ${FINAL_POLLS} 回 / ${POLLS} 回確認）: CI が揃わなかった"
     if [[ ${#MISSING[@]} -gt 0 ]]; then echo "  未登録: $(join_names ${MISSING[@]+"${MISSING[@]}"})"; fi
     if [[ ${PENDING_N} -gt 0 ]]; then echo "  実行中: ${PENDING_N} 本"; fi
+    gap_unreported
+    if [[ ${#GAP_MISSING[@]} -gt 0 ]]; then
+      echo "  base にあって head に無い job（この PR の CI で未登録・期待には入れていない）: $(join_names ${GAP_MISSING[@]+"${GAP_MISSING[@]}"})"
+    fi
     # 最後の確認を 2 回とも完了で見たのに確定しなかった = 観測ごとに結論が違った（GitHub API の揺れ）
     if [[ ${READY} -eq 1 && ${FINAL_POLLS} -ge 2 ]]; then echo "  完了の結論が観測ごとに揺れて確定しなかった"; fi
     echo "  merge してはいけない（CI の結論が出ていない）"
@@ -511,12 +728,26 @@ while IFS=$'\t' read -r bucket at name; do
   echo "  [${bucket}] ${name} — 完了 ${at}"
 done <<<"$(LC_ALL=C sort -t$'\t' -k3 <<<"${CHECKS_RAW}")"
 
+gap_unreported
 if [[ ${FAILED_N} -gt 0 ]]; then
   echo "失敗しているチェックが ${FAILED_N} 本ある。merge してはいけない"
+  if [[ ${#GAP_MISSING[@]} -gt 0 ]]; then
+    echo "  あわせて base にあって head に無い job がこの PR の CI で走っていない（#2883）: $(join_names ${GAP_MISSING[@]+"${GAP_MISSING[@]}"})"
+  fi
   exit 1
+fi
+# head の集合では緑。base にだけある job が走っていなければ、既定では緑にしない（#2883）
+if [[ ${#GAP_MISSING[@]} -gt 0 && "${GAP_MODE}" != "head" ]]; then
+  echo "head の集合（期待 ${#EXPECTED[@]} 本 / 報告 ${REPORTED_N} 本）は緑だが、base の job が走っていないので緑にしない"
+  pr_workflow_gap_report "bash ${RERUN_SCRIPT} ${PR}" "${BASE_REF}" "${HEAD_SHA:0:7}" "${SKIPPED_N}" \
+    "$(join_names ${HEAD_ONLY[@]+"${HEAD_ONLY[@]}"})" ${GAP_MISSING[@]+"${GAP_MISSING[@]}"}
+  exit "${PR_WORKFLOW_GAP_EXIT}"
 fi
 echo "CI が全部緑で揃った（期待 ${#EXPECTED[@]} 本 / 報告 ${REPORTED_N} 本）"
 if [[ ${SKIPPED_N} -gt 0 ]]; then
   echo "  うち ${SKIPPED_N} 本は skip（成功扱い。docs だけの変更で Rust の重いジョブを飛ばした等 = #2084）"
+fi
+if [[ ${#GAP_MISSING[@]} -gt 0 ]]; then
+  echo "  注記: base にあって head に無い次の job はこの PR の CI で走っていない（TAKO_WAIT_PR_CHECKS_SET=head = head の集合で判定した。#2883）: $(join_names ${GAP_MISSING[@]+"${GAP_MISSING[@]}"})"
 fi
 exit 0

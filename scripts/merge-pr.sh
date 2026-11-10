@@ -28,7 +28,10 @@
 #             1 = merge しなかった（CI 失敗・BEHIND・BLOCKED・draft・merge されずに CLOSED 等）/
 #             2 = CI が揃わずタイムアウト / 3 = 引数・gh のエラー /
 #             4 = base と衝突している（#1365。待ち側と同じ値 = 判定も案内も 1 実装）/
-#             5 = GitHub API に届かない（#1704。待ち側と同じ値。CI の結論ではないので打ち直す）
+#             5 = GitHub API に届かない（#1704。待ち側と同じ値。CI の結論ではないので打ち直す）/
+#             6 = base にある job がこの PR の CI で走っていない（#2883。待ち側と同じ値。
+#                 head が古い = 取り込んで回し直す。head の集合で判定するなら
+#                 TAKO_WAIT_PR_CHECKS_SET=head を付けて打ち直す）
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,6 +41,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # gh の接続エラーのやり直しと到達性の終了コード（GH_UNREACHABLE_EXIT）も待ち側と共有する（#1704）
 # shellcheck source=lib/gh-retry.sh
 . "${SCRIPT_DIR}/lib/gh-retry.sh"
+# base にある job が走っていないときの終了コード（PR_WORKFLOW_GAP_EXIT）も待ち側と共有する（#2883）
+# shellcheck source=lib/pr-workflow-gap.sh
+. "${SCRIPT_DIR}/lib/pr-workflow-gap.sh"
 
 # A/B（検出力の確認・計測専用）。1 = **修正前**のまま gh の --delete-branch に後始末を任せる
 # 腕。worktree から実行するとリモート head ブランチが消え残る（#1347）。
@@ -77,11 +83,15 @@ while [[ $# -gt 0 ]]; do
   （待ちの判定は scripts/wait-pr-checks.sh）。揃わなければ merge しない。
   待ちの上限も wait-pr-checks.sh と同じ（既定 6600 秒。--timeout か環境変数
   TAKO_WAIT_PR_CHECKS_TIMEOUT で変える。上限に達したら最後にもう一度状態を見る）。
+  待つチェック名は PR の head の workflow から導く。base にあって head に無い job が
+  この PR の CI で走っていなければ merge しない（6）。head の集合で判定してよいときだけ
+  環境変数 TAKO_WAIT_PR_CHECKS_SET=head を付けて打ち直す。
 
 終了コード: 0 = merge が成立している（すでに MERGED だった再実行も 0）/
             1 = merge しなかった / 2 = タイムアウト / 3 = 引数・gh のエラー /
             4 = base と衝突している（取り込んで push し直す）/
-            5 = GitHub API に届かない（CI の結論ではない。ネットワークが戻ってから打ち直す）
+            5 = GitHub API に届かない（CI の結論ではない。ネットワークが戻ってから打ち直す）/
+            6 = base にある job がこの PR の CI で走っていない（取り込んで回し直す）
 USAGE
       exit 0
       ;;
@@ -315,11 +325,15 @@ gate_state "待つ前"
 
 echo
 RC=0
-"${SCRIPT_DIR}/wait-pr-checks.sh" "${PR}" ${FORWARD[@]+"${FORWARD[@]}"} || RC=$?
+# 待ち側の案内（#2883 の打ち直しのコマンド）を merge-pr.sh の形にする。判定は変えない
+TAKO_WAIT_PR_CHECKS_CALLER=merge-pr.sh "${SCRIPT_DIR}/wait-pr-checks.sh" "${PR}" ${FORWARD[@]+"${FORWARD[@]}"} || RC=$?
 if [[ ${RC} -ne 0 ]]; then
   if [[ ${RC} -eq ${PR_CONFLICT_EXIT} ]]; then
     # 待ち側が案内を出しているので繰り返さない（#1365）
     echo "merge しない: base と衝突している（wait-pr-checks.sh の終了コード ${RC}）" >&2
+  elif [[ ${RC} -eq ${PR_WORKFLOW_GAP_EXIT} ]]; then
+    # 待ち側が名指しと打ち直し方を出しているので繰り返さない（#2883）。CI の赤ではない
+    echo "merge しない: base にある job がこの PR の CI で走っていない（wait-pr-checks.sh の終了コード ${RC}。head が古い）" >&2
   elif [[ ${RC} -eq ${GH_UNREACHABLE_EXIT} ]]; then
     # 届かない = 赤ではない（#1704）。「CI が揃っていない」と言うと赤と読まれる
     echo "merge しない: GitHub API に届かない（wait-pr-checks.sh の終了コード ${RC}。CI の結論ではない）" >&2

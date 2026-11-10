@@ -4274,7 +4274,7 @@ write を毎回待たせる = 負荷は生成しない。道具は `scripts/lib/
 **リポジトリ全体の `.sh`** の `<( … )` / `>( … )`・背景の `&` を #1924 と同じ字句解析で読み、
 file:line で名指す（`&&` / `>&2` / `2>&1` / `&>` / `|&`・文字列とコメント・クォート付きヒアドキュメントの
 本文は名指さない。`$( … )` の中は読む）。PR の CI 待ちと merge（`wait-pr-checks.sh` / `merge-pr.sh` /
-`lib/gh-retry.sh` / `lib/pr-conflict.sh`）は 0 で、凍結表にも例外宣言にも逃がさない。既存分は
+`lib/gh-retry.sh` / `lib/pr-conflict.sh` / `lib/pr-workflow-gap.sh`）は 0 で、凍結表にも例外宣言にも逃がさない。既存分は
 `ASYNC_CHILD_ERREXIT_FROZEN` でスクリプトごとの数を凍結した（増やさない・減らしたら表も同じ数へ）。
 終わるまでの間に何も書かない（`wait` で刈り取ってから書く）と監査して確かめた箇所だけ、その行か
 直前の行に `# tako:sigchld-ok <理由>` で外せる（理由の無い宣言は無効）。
@@ -4876,10 +4876,17 @@ CI 完了前に merge され（merge 04:24:10 / Windows 完了 04:48:24）、過
 - 判定は「**期待する名前が全部そろって**、報告されているチェックが全部 completed」。
   さらに**同じ結論を 2 回連続で観測**するまで確定しない（GitHub API は replica 差で
   in_progress / completed が両方向に揺れて返る）。揺れたら 1 行出して観測をやり直す
-- 期待する名前は `.github/workflows/*.yml` のうち **pull_request で起動するものの job 名**
-  から導く（ハードコードしない。`name:` が無い job は job id）。外部連携の
+- 期待する名前は **PR の head の** `.github/workflows/*.yml` のうち **pull_request で起動するものの job 名**
+  から導く（ハードコードしない。`name:` が無い job は job id。#2883）。外部連携の
   `Cloudflare Pages` だけは導出できないので `wait-pr-checks.sh` の `EXTERNAL_CHECKS` が正。
   job を増やす・改名する・matrix を入れるときはここが追従するかを見る
+- **待つ名前を実行した木から導かない**（#2883）。PR #2862 が windows-clippy を足した後、それより前の
+  main から分かれた PR #2878 を共有ツリーから merge-pr.sh すると、その PR では走らない job を上限まで
+  待ち続けた。head を読めない（gh で引けない・origin から取れない・head に workflow が無い）ときだけ
+  実行した木に落ち、そのことを 1 行出す。**base にあって head に無い job がこの PR の CI で走っていなければ
+  既定では緑にしない（6）**。古い head が新しい品質のゲートを通らないまま main に入るからで、案内は
+  「取り込んで回し直す」と「`TAKO_WAIT_PR_CHECKS_SET=head` を付けて head の集合で判定する」の 2 つ。
+  CI に job を足した直後は、それより前に分かれた PR がこの 6 で止まるのが正しい動き
 - **`if:` で skip されたチェック（bucket = `skipping`）は完了・緑として数える**（#2084）。
   docs だけの PR では macOS / Windows の Rust ジョブが skip されるが、チェック名は登録されるので
   期待名の判定はそのまま揃う。結果には skip の本数を 1 行添える（仕組みは
@@ -4888,7 +4895,7 @@ CI 完了前に merge され（merge 04:24:10 / Windows 完了 04:48:24）、過
   `--delete-branch`）。CONFLICTING / BEHIND / BLOCKED は待たずに理由を出して止まる。
   **worker も master もこの 1 実装を呼ぶ**（手順の記憶ではなく構造で守る）
 - 終了コードは共通で **0 = 全部緑 / 1 = 失敗・拒否 / 2 = タイムアウト / 3 = 引数・gh のエラー /
-  4 = base と衝突している / 5 = GitHub API に届かない**。`merge-pr.sh` の 0 は「**merge が成立している**」で、
+  4 = base と衝突している / 5 = GitHub API に届かない / 6 = base にある job がこの PR の CI で走っていない**。`merge-pr.sh` の 0 は「**merge が成立している**」で、
   **すでに MERGED だった PR への再実行も 0**（#1430。望んだ終わり方に到達しているので
   後始末だけ確かめて終わる。merge されずに CLOSED なのは 1）
 - **届かない = 赤ではない**（#1704）。9/24 に CI 全緑の PR #1669 / #1630 で `gh pr checks` が
