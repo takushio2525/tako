@@ -458,7 +458,9 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
      既存クライアントがそのまま繋ぎ直せる**を保つ）
   2. 収まらないなら `<$TMPDIR>/tako-<data dir の 16 桁 FNV-1a>.sock` へ逃がし、
      data dir 側には参照ファイル `tako.sock.path` だけを残す。**pid ではなくハッシュ**
-     なのは 1 の性質を短縮パスでも保つため。`$TMPDIR` 自体が深い機のために `/tmp` も候補
+     なのは 1 の性質を短縮パスでも保つため。`$TMPDIR` 自体が深い機のために `/tmp` も候補。
+     1〜2 の順と長さの測り方は ssh の ControlPath（下の項目）と共有し、正本は境界 B35
+     `platform::unix_socket::place_with`
   3. **symlink では解決しない**（`sun_path` の上限は繋ぐ側が `connect()` へ渡すパスに
      掛かるので、長いパスの symlink を置いてもクライアントが同じ上限で弾かれる）
   4. 生きた先客が居るパスは奪わない（先客が居れば pid 入り一時パスへ逃げる）。短縮パスは
@@ -550,6 +552,17 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
      **残る穴**: 1 本受けてから次のインスタンスを作るまでの一瞬は待ち受けが無く、その間に繋いだ
      クライアントは `ERROR_FILE_NOT_FOUND` で即座に失敗する（修正前からある窓。作り直しの間は
      この窓が最長 5 秒に伸びる）
+- **ssh の ControlPath の置き場（`tako-core::remote_fs::control_path`。#2855）**: IPC と同じ
+  境界 B35 の `place_with` を通る。違いは 2 つ。**上限から OpenSSH の一時の接尾辞 17 バイトを引く**
+  （master は `<ControlPath>.<16 文字>` へ bind してから link する = openssh-portable `mux.c` の
+  `muxserver_listen`。一時パスが `sun_path` を超えると `ENAMETOOLONG` → `cleanup_exit(255)` で、
+  **ログインの後に ssh ごと落ちる**。上限は macOS 86 / Linux 90 バイト。#2855 の前は安全域 92 で、
+  87〜92 バイトがすり抜けていた）。**短い置き場（`$TMPDIR` / `/tmp`）は書けるかも見る**（ソケットを
+  作るのは ssh なので、書けない置き場を渡すと同じく exit 255 = #1040 と同じ形）。どの候補も使えなければ
+  `None` = ControlPath を渡さずに多重化なしで繋ぎ、`remote_fs::multiplexing_for(host)` が偽になる
+  （`liveness` は `Unknown`・`ensure_master` は器を作らない・ペインの成功の出口は `ssh_progress` の
+  規則 ⑥・ペインを開く dispatch が persist.log へ長さの理由だけを 1 行）。多重化の無い Windows（B26）は
+  ControlPath を渡さないので上限を掛けない（第一候補のまま = 修正前と同じ答え）
 
 - **TODO(Phase 6): Windows named pipe**。`IpcServer::start` と CLI の transport は
   `#[cfg(windows)]` でスタブ化済み（サーバー起動失敗でもアプリは IPC なしで継続する）。
@@ -1488,6 +1501,7 @@ MCP / CLI から受け、UI 層がレイアウト矩形に変換して描画す�
 | 子孫の回収（B30 `platform::job`。ペインを閉じる・言語サーバを止める・打ち切り / 取り消し / 再起動） | 何もしない（PTY の HUP / stdin の EOF と kill / プロセスグループ・木への SIGTERM） | Job Object（`KILL_ON_JOB_CLOSE`。#2454 / #2462） |
 | cargo の共有 jobserver（B31 `platform::jobserver`。fifo の作成・`FIONREAD` で札を数える・札の出し入れ。#1998） | fifo（`mkfifo` + `O_RDWR \| O_NONBLOCK \| O_CLOEXEC`） | 対象外（`Unsupported`。名前付きセマフォは #2000） |
 | 8.3 の短い形を長い形へ戻す（B34 `platform::long_path`。claude の事前信頼の鍵を作る前。#2843） | 何もしない（8.3 の名前が無い） | `GetLongPathNameW`（`~` を含むときだけ問い合わせる。存在しない・8.3 の名前が無いボリュームは入力のまま。symlink は辿らない。A/B `TAKO_2843_LEGACY=1`） |
+| unix ドメインソケットのパスの上限と短い置き場（B35 `platform::unix_socket`。IPC の受け口と ssh の ControlPath が同じ `place_with` を通る。#1441 / #2855） | `sun_path` 104 − 終端 1 = 103 バイト（Linux は 107）。第一候補（data dir の下）→ `$TMPDIR` → `/tmp` の順に収まる最初の 1 つ。ssh は書けるか（`access(2)` の `W_OK \| X_OK`）も見る | 使う経路が無い（IPC は名前付きパイプ・ssh は多重化を渡さない = B26）。ControlPath は上限を掛けず第一候補のまま |
 | シェル統合 | zsh / bash / fish | PowerShell |
 
 trait で抽象化し、core/ と control/ は platform/ の trait のみに依存する。

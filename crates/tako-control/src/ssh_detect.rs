@@ -425,10 +425,9 @@ mod tests {
     /// ControlPath は macOS の既定 data_dir（**空白を含む**）で組む
     fn self_opened_argv(host: &str, port: u16) -> String {
         let dir = std::path::Path::new("/Users/testuser/Library/Application Support/tako");
-        let cp = tako_core::remote_fs::control_path_option(&tako_core::remote_fs::control_path_in(
-            Some(dir),
-            host,
-        ));
+        let cp = tako_core::remote_fs::control_path_in(Some(dir), host)
+            .expect("既定の data_dir は ControlPath の上限に収まる");
+        let cp = tako_core::remote_fs::control_path_option(&cp);
         format!(
             "/usr/bin/ssh -o {cp} -o ControlMaster=auto -o ControlPersist=600 \
              -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \

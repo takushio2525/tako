@@ -15167,8 +15167,9 @@ impl TakoApp {
             // #1137: 多重化が無いプラットフォームでは上のソケットが**構造的に作られない**
             // ので、`pane` 経路には成功を言える出口が残らない。代わりの出口（規則 ⑥）を
             // 使うかどうかはここで決める。A/B の legacy では「多重化が在る」と申告して
-            // ⑥ を止める（= #1137 前）
-            let multiplexing = tako_core::platform::ssh_client::multiplexing_available()
+            // ⑥ を止める（= #1137 前）。ControlPath の置き場が取れないホストも
+            // ソケットが作られないので同じ扱い（#2855）
+            let multiplexing = tako_core::remote_fs::multiplexing_for(&st.host)
                 || ssh_progress::legacy_silent_success();
             if std::env::var("TAKO_1090_DIAG").as_deref() == Ok("1") {
                 let nonempty: Vec<&String> =

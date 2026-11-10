@@ -48,6 +48,8 @@ pub mod shell_dialect;
 pub mod ssh_client;
 pub mod stack;
 pub mod support;
+/// unix ドメインソケットのパスの上限と短い置き場（境界 B35。IPC の受け口と ssh の ControlPath。#1441 / #2855）
+pub mod unix_socket;
 pub mod user_path;
 /// Windows の Web ビュー（WebView2）の置き場・ランタイムの版・生成の失敗の案内（#2431）
 pub mod webview2;
