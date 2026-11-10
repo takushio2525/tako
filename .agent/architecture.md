@@ -1502,6 +1502,7 @@ MCP / CLI から受け、UI 層がレイアウト矩形に変換して描画す�
 | cargo の共有 jobserver（B31 `platform::jobserver`。fifo の作成・`FIONREAD` で札を数える・札の出し入れ。#1998） | fifo（`mkfifo` + `O_RDWR \| O_NONBLOCK \| O_CLOEXEC`） | 対象外（`Unsupported`。名前付きセマフォは #2000） |
 | 8.3 の短い形を長い形へ戻す（B34 `platform::long_path`。claude の事前信頼の鍵を作る前。#2843） | 何もしない（8.3 の名前が無い） | `GetLongPathNameW`（`~` を含むときだけ問い合わせる。存在しない・8.3 の名前が無いボリュームは入力のまま。symlink は辿らない。A/B `TAKO_2843_LEGACY=1`） |
 | unix ドメインソケットのパスの上限と短い置き場（B35 `platform::unix_socket`。IPC の受け口と ssh の ControlPath が同じ `place_with` を通る。#1441 / #2855） | `sun_path` 104 − 終端 1 = 103 バイト（Linux は 107）。第一候補（data dir の下）→ `$TMPDIR` → `/tmp` の順に収まる最初の 1 つ。ssh は書けるか（`access(2)` の `W_OK \| X_OK`）も見る | 使う経路が無い（IPC は名前付きパイプ・ssh は多重化を渡さない = B26）。ControlPath は上限を掛けず第一候補のまま |
+| 窓の枠（B36 `tako-app::platform::window_chrome`。位置・寸法の適用 = `tako window move` / `resize`・最大化のトグル・元に戻す・アプリメニュー・枠の寸法と表記。呼び手は境界を名指す 1 経路で、`cfg` はこのファイルの中だけ。#2858） | NSWindow `setFrame:display:`（CoreGraphics のグローバル矩形を挟む）・`zoom_window()` のトグル・アプリ名メニューあり・メニューバー行 0・traffic lights の余白 68 | user32 `SetWindowPos`（論理 → 物理ピクセル）・最大化中なら `ShowWindowAsync(SW_RESTORE)`・アプリ名メニューなし（`menu_bar.rs` が窓の中に 1 行で描く）・メニューバー行 30・自前のウィンドウコントロール 102。macOS のアプリ名メニューだけの文言 5 つは `ui_text::menu` に残り、Windows で未使用の分の `allow(dead_code)` も向こうに残る（lint の属性で分岐ではない） |
 | シェル統合 | zsh / bash / fish | PowerShell |
 
 trait で抽象化し、core/ と control/ は platform/ の trait のみに依存する。

@@ -7,7 +7,8 @@
 //! 参照イメージは VSCode のカスタムタイトルバー（左からメニュー群、右端にウィンドウ
 //! コントロール、空き領域はウィンドウドラッグ）。
 //!
-//! 行を出すかどうかは `MENU_BAR_HEIGHT > 0.0`（cfg で 0 / 30）で決める。**関数本体は
+//! 行を出すかどうかは `MENU_BAR_HEIGHT > 0.0`（境界 B36 `platform::window_chrome` の cfg で 0 / 30）
+//! で決める。**関数本体は
 //! 両プラットフォームでコンパイルする**（`#[cfg]` でまるごと消すと macOS 側が
 //! コンパイルされず、Windows 実機でしか壊れに気づけない経路が増えるため）。
 //!
@@ -40,6 +41,7 @@ use gpui::{
 
 use super::*;
 use crate::file_icons::ui_icon;
+use crate::platform::window_chrome::{MENU_BAR_HEIGHT, WINDOW_CONTROLS_PX};
 
 /// メニューバーのラベル文字サイズ（px）
 const MENU_LABEL_SIZE: f32 = 12.5;
@@ -61,14 +63,9 @@ const DROPDOWN_ITEM_PAD: f32 = 10.0;
 /// サブメニュー項目のインデント（px）
 const DROPDOWN_SUBMENU_INDENT: f32 = 16.0;
 
-/// 自前ウィンドウコントロール（#584）1 個の一辺。bell / theme ボタンと同寸
-const WINDOW_CONTROL_SIZE: f32 = 30.0;
-/// 自前ウィンドウコントロール群の概算幅（3 ボタン + gap + 左マージン）。
-/// macOS は native traffic lights が同居するので描かない = 0
-#[cfg(target_os = "macos")]
-pub(crate) const WINDOW_CONTROLS_PX: f32 = 0.0;
-#[cfg(not(target_os = "macos"))]
-pub(crate) const WINDOW_CONTROLS_PX: f32 = WINDOW_CONTROL_SIZE * 3.0 + 12.0;
+/// 自前ウィンドウコントロール（#584）1 個の一辺。bell / theme ボタンと同寸。
+/// 群の幅 `WINDOW_CONTROLS_PX`（macOS は 0）は境界 B36 `platform::window_chrome` が持つ
+pub(crate) const WINDOW_CONTROL_SIZE: f32 = 30.0;
 
 /// in-window メニューバーの開閉状態（Issue #657）。
 ///
@@ -178,12 +175,8 @@ pub(crate) fn format_keystroke(modifiers: &gpui::Modifiers, key: &str) -> String
         out.push_str("Ctrl+");
     }
     if modifiers.platform {
-        // GPUI の platform 修飾は macOS = ⌘ / Windows = Win キー
-        out.push_str(if cfg!(target_os = "macos") {
-            "Cmd+"
-        } else {
-            "Win+"
-        });
+        // GPUI の platform 修飾は macOS = ⌘ / Windows = Win キー（表記は境界 B36）
+        out.push_str(crate::platform::window_chrome::platform_modifier_prefix());
     }
     if modifiers.alt {
         out.push_str("Alt+");
@@ -353,7 +346,7 @@ impl TakoApp {
     /// 呼ばずに言語が変わったときだけキャッシュする。`OwnedMenu` は `Clone` なので
     /// 保持できる（`Menu` は保持できない）
     pub(crate) fn refresh_menu_defs(&mut self) {
-        self.menu_defs = crate::app_menus()
+        self.menu_defs = crate::platform::window_chrome::app_menus()
             .into_iter()
             .map(|menu| menu.owned())
             .collect();

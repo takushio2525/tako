@@ -1833,6 +1833,256 @@ fn 番犬2856は戻した形を実際に落とす() {
     );
 }
 
+/// **#2858 の番犬**: 窓の枠まわりの OS 差（位置・寸法の適用・最大化のトグル・元に戻す・
+/// アプリメニュー・枠の寸法と表記）が、境界 B36（`tako-app/src/platform/window_chrome.rs`）の外へ
+/// 戻っていないこと。
+///
+/// 以前は `main.rs` / `menu_bar.rs` / `tab_bar.rs` に `#[cfg]` の腕が並んでいて、macOS の CI では
+/// Windows の腕が型検査されないので、片方を直しても他方が壊れていることに気付けなかった
+/// （#1538 の S3）。腕を境界の内側に閉じ、呼び手は `platform::window_chrome::…` を名指す 1 経路にした。
+/// ソースの走査なので **macOS からも Windows CI からも同じ判定が走る**。見るのは 5 つ:
+///
+/// 1. 移した名前の定義が tako-app の境界の外の本番コードに無い（`cfg` の有無を問わない。
+///    2 つ目の定義は「片方の OS の経路だけ直る」分岐の芽）
+/// 2. その定義が境界の中に在る（改名・削除でこの番犬が何も見ていない形を止める）
+/// 3. `cfg!` を移した元の関数（`window_menu` / `format_keystroke`）に OS の `cfg!` が戻っていない
+/// 4. 塊が 0 になった `menu_bar.rs` / `tab_bar.rs` の本番コードに OS の cfg が増えていない
+/// 5. `ui_text/menu.rs` に残す OS の cfg は `cfg_attr(not(target_os = "macos"), allow(dead_code))`
+///    の形だけで、#2858 の時点の 5 つから増えない（macOS のアプリ名メニューだけが使う i18n の文言。
+///    コードの分岐ではなく lint の属性 = 理由は同ファイルの冒頭の注記）
+#[test]
+fn 窓の枠のos差が境界の外に戻っていない() {
+    use production_range::code_view::code_view;
+
+    const BOUNDARY: &str = "crates/tako-app/src/platform/window_chrome.rs";
+    /// 境界へ移した名前（定数・関数）。`cfg!` を包む 2 つ（`zoom_label` / `platform_modifier_prefix`）も含む
+    const NAMES: &[&str] = &[
+        "set_window_frame",
+        "toggle_window_zoom",
+        "restore_window",
+        "app_menus",
+        "MENU_BAR_HEIGHT",
+        "WINDOW_CONTROLS_PX",
+        "TRAFFIC_LIGHTS_SPACER",
+        "zoom_label",
+        "platform_modifier_prefix",
+    ];
+    /// `cfg!` を境界へ移した元の関数（ファイル, 関数名）
+    const CFG_MACRO_MOVED_FROM: &[(&str, &str)] = &[
+        ("crates/tako-app/src/main.rs", "window_menu"),
+        ("crates/tako-app/src/menu_bar.rs", "format_keystroke"),
+    ];
+    /// 窓の枠の塊が 0 になったファイル（OS の cfg を増やさない）
+    const NO_OS_CFG: &[&str] = &[
+        "crates/tako-app/src/menu_bar.rs",
+        "crates/tako-app/src/tab_bar.rs",
+    ];
+    const UI_TEXT_MENU: &str = "crates/tako-app/src/ui_text/menu.rs";
+    const UI_TEXT_ALLOWED: &str = "#[cfg_attr(not(target_os = \"macos\"), allow(dead_code))]";
+    const UI_TEXT_MAX: usize = 5;
+
+    /// その行が名前を定義しているか（コードの眺めの行。`fn 名前(` / `fn 名前<` / `const 名前:` / `static 名前:`）
+    fn defines(line: &str, name: &str) -> bool {
+        [
+            format!("fn {name}("),
+            format!("fn {name}<"),
+            format!("const {name}:"),
+            format!("static {name}:"),
+        ]
+        .iter()
+        .any(|p| {
+            line.match_indices(p.as_str()).any(|(i, _)| {
+                i == 0 || {
+                    let b = line.as_bytes()[i - 1];
+                    !(b.is_ascii_alphanumeric() || b == b'_')
+                }
+            })
+        })
+    }
+    /// OS の述語を含む cfg（`#[cfg(…)]` / `#[cfg_attr(…)]` / `cfg!(…)`）の開始位置（バイト）
+    fn os_cfgs(code: &str) -> Vec<usize> {
+        const ATOMS: &[&str] = &[
+            "windows",
+            "unix",
+            "target_os",
+            "target_family",
+            "target_vendor",
+            "target_env",
+        ];
+        let b = code.as_bytes();
+        let mut out = Vec::new();
+        for head in ["#[cfg(", "#![cfg(", "#[cfg_attr(", "#![cfg_attr(", "cfg!("] {
+            for (at, _) in code.match_indices(head) {
+                if head == "cfg!("
+                    && at > 0
+                    && (b[at - 1].is_ascii_alphanumeric() || b[at - 1] == b'_')
+                {
+                    continue;
+                }
+                let open = at + head.len() - 1;
+                let mut depth = 0usize;
+                let mut close = None;
+                for (k, &c) in b.iter().enumerate().skip(open) {
+                    match c {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                close = Some(k);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(close) = close else { continue };
+                let pred = &code[open + 1..close];
+                let hit = ATOMS.iter().any(|a| {
+                    pred.match_indices(a).any(|(i, _)| {
+                        let pb = pred.as_bytes();
+                        let before =
+                            i == 0 || !(pb[i - 1].is_ascii_alphanumeric() || pb[i - 1] == b'_');
+                        let e = i + a.len();
+                        let after =
+                            e >= pb.len() || !(pb[e].is_ascii_alphanumeric() || pb[e] == b'_');
+                        before && after
+                    })
+                });
+                if hit && !out.contains(&at) {
+                    out.push(at);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+    fn line_of(text: &str, at: usize) -> usize {
+        text[..at].matches('\n').count() + 1
+    }
+    /// 本番コードの「コードだけの眺め」（テスト領域・コメント・文字列を空白へ潰す。行番号は原文と同じ）
+    fn product_code(rel: &str) -> (String, String) {
+        let raw = std::fs::read_to_string(repo_root().join(rel))
+            .unwrap_or_else(|e| panic!("{rel} を読めない: {e}"));
+        let code = code_view(&production_range::scan(&raw).text);
+        (raw, code)
+    }
+
+    let mut violations: Vec<String> = Vec::new();
+
+    // 1. 境界の外（tako-app の本番コード）に定義が無い
+    let product = production_range::product_sources();
+    let test_only = production_range::test_only_files(&product);
+    let outside: Vec<&String> = product
+        .iter()
+        .filter(|r| r.starts_with("crates/tako-app/src/"))
+        .filter(|r| !r.starts_with("crates/tako-app/src/platform/"))
+        .filter(|r| !test_only.contains(*r))
+        .collect();
+    assert!(
+        outside
+            .iter()
+            .any(|r| r.as_str() == "crates/tako-app/src/main.rs"),
+        "tako-app の本番コードの列挙が空振りしている（main.rs が無い）"
+    );
+    for rel in &outside {
+        let (_, code) = product_code(rel);
+        for (idx, line) in code.lines().enumerate() {
+            for name in NAMES {
+                if defines(line, name) {
+                    violations.push(format!(
+                        "{rel}:{}: `{name}` を境界の外で定義している（1）",
+                        idx + 1
+                    ));
+                }
+            }
+        }
+    }
+
+    // 2. 境界の中に在る
+    let (_, boundary) = product_code(BOUNDARY);
+    for name in NAMES {
+        if !boundary.lines().any(|l| defines(l, name)) {
+            violations.push(format!(
+                "{BOUNDARY}: `{name}` の定義が無い（改名・削除したならこの番犬の NAMES も直す。2）"
+            ));
+        }
+    }
+
+    // 3. cfg! を移した元の関数に OS の cfg! が戻っていない
+    for (rel, func) in CFG_MACRO_MOVED_FROM {
+        let (_, code) = product_code(rel);
+        let sig = format!("fn {func}(");
+        let Some(start) = code.find(&sig) else {
+            violations.push(format!(
+                "{rel}: `{sig}` が見つからない（改名したならこの番犬も直す。3）"
+            ));
+            continue;
+        };
+        let b = code.as_bytes();
+        let open = start + code[start..].find('{').expect("関数の本体の開き");
+        let mut depth = 0usize;
+        let mut end = b.len();
+        for (k, &c) in b.iter().enumerate().skip(open) {
+            match c {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = k;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        for at in os_cfgs(&code[open..end]) {
+            violations.push(format!(
+                "{rel}:{}: `{func}` の中に OS の cfg がある（3）",
+                line_of(&code, open + at)
+            ));
+        }
+    }
+
+    // 4. 塊が 0 になったファイルに OS の cfg が増えていない
+    for rel in NO_OS_CFG {
+        let (_, code) = product_code(rel);
+        for at in os_cfgs(&code) {
+            violations.push(format!(
+                "{rel}:{}: OS の cfg がある（4）",
+                line_of(&code, at)
+            ));
+        }
+    }
+
+    // 5. ui_text/menu.rs の OS の cfg は lint の属性の形だけ・5 つまで
+    let (raw, code) = product_code(UI_TEXT_MENU);
+    let raw_lines: Vec<&str> = raw.lines().collect();
+    let found = os_cfgs(&code);
+    for &at in &found {
+        let n = line_of(&code, at);
+        let text = raw_lines.get(n - 1).map(|l| l.trim()).unwrap_or("");
+        if text != UI_TEXT_ALLOWED {
+            violations.push(format!(
+                "{UI_TEXT_MENU}:{n}: 許すのは `{UI_TEXT_ALLOWED}` の形だけ（5）: {text}"
+            ));
+        }
+    }
+    if found.len() > UI_TEXT_MAX {
+        violations.push(format!(
+            "{UI_TEXT_MENU}: OS の cfg が {} 個（#2858 の時点の {UI_TEXT_MAX} 個から増えた。5）",
+            found.len()
+        ));
+    }
+
+    assert!(
+        violations.is_empty(),
+        "窓の枠の OS 差が境界 B36 の外にある:\n  {}\n\
+         → `{BOUNDARY}` に置き、呼び手は `platform::window_chrome::…` を名指してください。\
+         `cfg` を書いてよいのは境界の中の実装選択だけです（#2858 / 設計 §2.1）",
+        violations.join("\n  ")
+    );
+}
+
 /// **#2857 の番犬**: スリープ防止（境界 B9）の OS の腕は `tako_control::platform::power` /
 /// `platform::lid` の内側だけに置き、`sleep_guard.rs` は OS を意識しない判断と記録だけを持つ。
 ///

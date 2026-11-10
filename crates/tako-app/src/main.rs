@@ -280,16 +280,6 @@ fn resume_input(command: &str) -> Vec<u8> {
 /// タブバーの高さ（px）
 const TAB_BAR_HEIGHT: f32 = 44.0;
 
-/// in-window メニューバー行の高さ（px。Issue #657）。
-///
-/// macOS はメニューが OS のグローバルメニューバーへ載るのでこの行を持たない（= 0）。
-/// Windows は `gpui_windows` がウィンドウメニューを一切作らないため、tako が
-/// 自前の 1 行として描く（`menu_bar.rs`）
-#[cfg(target_os = "macos")]
-const MENU_BAR_HEIGHT: f32 = 0.0;
-#[cfg(not(target_os = "macos"))]
-const MENU_BAR_HEIGHT: f32 = 30.0;
-
 /// 上部クローム（メニューバー行 + タブバー行）の合計高さ（px。Issue #657）。
 ///
 /// **ペイン矩形・IME アンカー・境界ドラッグの当たり判定はすべてこれを起点にする**。
@@ -297,7 +287,7 @@ const MENU_BAR_HEIGHT: f32 = 30.0;
 /// 「クリック位置と選択位置が合わない」「候補ウィンドウが 30px 上に出る」といった
 /// 形で壊れる。上段に行を足すときはこの関数だけを直せば全経路が追従する
 const fn top_chrome_height() -> f32 {
-    MENU_BAR_HEIGHT + TAB_BAR_HEIGHT
+    platform::window_chrome::MENU_BAR_HEIGHT + TAB_BAR_HEIGHT
 }
 /// 人工ちらつきの注入（#932。検出力の実証用。既定は無効）
 fn inject_flicker() -> bool {
@@ -31346,7 +31336,7 @@ impl Render for TakoApp {
         let lang_now = tako_core::i18n::lang();
         if self.menus_lang != Some(lang_now) {
             self.menus_lang = Some(lang_now);
-            cx.set_menus(app_menus());
+            cx.set_menus(platform::window_chrome::app_menus());
             // in-window メニューバー（#657）も同じ契機で貼り直す。OS 側と同じ定義を
             // 使うので、mac のネイティブメニューと Windows の自前描画がずれない
             self.refresh_menu_defs();
@@ -32880,17 +32870,12 @@ fn view_menu() -> gpui::Menu {
 /// 「ウインドウ」メニュー（#657）。ズーム項目のラベルだけプラットフォームで違う
 /// （macOS = 「拡大・縮小」のトグル、Windows = 「最大化・元のサイズに戻す」）。
 ///
-/// ラベルの選択は呼び出し側の `#[cfg]` ではなく**この中の `cfg!`** で行う。
-/// `#[cfg]` で片方の呼び出しを消すと、使われなくなった `ui_text::menu` の関数が
-/// **dead_code になり `clippy -D warnings` の CI が落ちる**（macOS で実際に落ちた）
+/// ラベルの選択は境界の `platform::window_chrome::zoom_label` が持つ（#2858。
+/// `#[cfg]` ではなく `cfg!` で選ぶ理由もそちらの注記）
 fn window_menu() -> gpui::Menu {
     use crate::ui_text::menu as m;
     use gpui::{Menu, MenuItem};
-    let zoom_label = if cfg!(target_os = "macos") {
-        m::zoom_window()
-    } else {
-        m::maximize_restore()
-    };
+    let zoom_label = platform::window_chrome::zoom_label();
     Menu::new(m::window()).items(vec![
         MenuItem::action(m::minimize(), MinimizeWindow),
         MenuItem::action(zoom_label, ZoomWindow),
@@ -32905,81 +32890,6 @@ fn window_menu() -> gpui::Menu {
             MenuItem::action(m::focus_down(), FocusDown),
         ])),
     ])
-}
-
-/// アプリメニューバーを構成する（macOS: tako / File / Edit / View / Window / Help。#485）。
-///
-/// **すべての項目は実在の動作に配線する**（無反応のダミーを置かない）。項目名は
-/// `ui_text::menu` が言語別に解決し、言語切替時は `TakoApp::render` が貼り直す。
-/// ショートカット表示は GPUI が `keybindings::key_bindings()` から自動で引く
-#[cfg(target_os = "macos")]
-fn app_menus() -> Vec<gpui::Menu> {
-    use crate::ui_text::menu as m;
-    use gpui::{Menu, MenuItem, SystemMenuType};
-    vec![
-        Menu::new(m::APP).items(vec![
-            MenuItem::action(m::about(), AboutTako),
-            MenuItem::action(m::check_updates(), CheckForUpdates),
-            MenuItem::separator(),
-            MenuItem::action(m::settings(), OpenSettings),
-            MenuItem::separator(),
-            MenuItem::os_submenu(m::services(), SystemMenuType::Services),
-            MenuItem::separator(),
-            MenuItem::action(m::hide_app(), HideApp),
-            MenuItem::action(m::hide_others(), HideOthers),
-            MenuItem::action(m::show_all(), ShowAllApps),
-            MenuItem::separator(),
-            MenuItem::action(m::quit(), Quit),
-        ]),
-        Menu::new(m::file()).items(file_menu_common_items()),
-        edit_menu(),
-        view_menu(),
-        window_menu(),
-        Menu::new(m::help()).items(vec![
-            MenuItem::action(m::documentation(), OpenDocumentation),
-            MenuItem::action(m::report_issue(), ReportIssue),
-        ]),
-    ]
-}
-
-/// アプリメニューバーを構成する（Windows: ファイル / 編集 / 表示 / ウインドウ / ヘルプ。#657）。
-///
-/// `gpui_windows` の `Platform::set_menus` は渡された `Menu` を内部に保存するだけで
-/// ウィンドウメニューを作らないため、この構成は tako が自前で 1 行として描く
-/// （`menu_bar.rs`）。並びは Explorer / VSCode の作法に合わせ、**アプリ名メニューを
-/// 持たない**。About・アップデート確認は「ヘルプ」、設定・終了は「ファイル」末尾。
-///
-/// # macOS 固有項目を構造的に持たない（**これは安全装置**）
-///
-/// - `HideOthers` / `ShowAllApps` は `gpui_windows` の `hide_other_apps` /
-///   `unhide_other_apps` が `unimplemented!()` なので、**到達させると panic =
-///   アプリごと abort**（器の無いペインは全滅）する。`keybindings::macos_only_bindings`
-///   がバインドを張らないことで塞いでいるのと同じ地雷を、メニュー側でも塞ぐ
-/// - `HideApp` は Windows の `hide()` が no-op なので置いても無反応（ダミー禁止）
-/// - `Services` は macOS の OS サブメニュー
-///
-/// この不変条件は `windowsのメニューにmacos固有の項目が無い` が固定している
-#[cfg(not(target_os = "macos"))]
-fn app_menus() -> Vec<gpui::Menu> {
-    use crate::ui_text::menu as m;
-    use gpui::{Menu, MenuItem};
-    let mut file_items = file_menu_common_items();
-    file_items.push(MenuItem::separator());
-    file_items.push(MenuItem::action(m::settings(), OpenSettings));
-    file_items.push(MenuItem::action(m::quit(), Quit));
-    vec![
-        Menu::new(m::file()).items(file_items),
-        edit_menu(),
-        view_menu(),
-        window_menu(),
-        Menu::new(m::help()).items(vec![
-            MenuItem::action(m::about(), AboutTako),
-            MenuItem::action(m::check_updates(), CheckForUpdates),
-            MenuItem::separator(),
-            MenuItem::action(m::documentation(), OpenDocumentation),
-            MenuItem::action(m::report_issue(), ReportIssue),
-        ]),
-    ]
 }
 
 /// カンプ準拠のタイトルバー統合設定（#217。タブバー行に traffic lights を同居させる）
@@ -33009,7 +32919,7 @@ fn apply_window_state(window: &mut Window, op: tako_control::protocol::WindowSta
                 window.zoom_window();
             }
         }
-        WindowStateOp::Restore => restore_window(window),
+        WindowStateOp::Restore => platform::window_chrome::restore_window(window),
     }
 }
 
@@ -33020,7 +32930,8 @@ fn apply_window_state(window: &mut Window, op: tako_control::protocol::WindowSta
 /// ここは「その矩形へ置く」だけを行う。
 ///
 /// GPUI が公開しているのは `Window::resize`（寸法のみ）だけで**移動の口が無い**ので、
-/// 位置は OS へ直接頼む（`restore_window` が user32 を直に呼ぶのと同じ作法）。
+/// 位置は OS へ直接頼む（境界 B36 の `platform::window_chrome::set_window_frame`。
+/// `restore_window` が user32 を直に呼ぶのと同じ作法）。
 /// 寸法も同じ 1 回の呼び出しで渡す: `Window::resize` は macOS では
 /// `setContentSize:` を**別スレッドへ投げる**ので、直後に位置を当てると
 /// どちらが先に効くかで最終位置が揺れる
@@ -33033,218 +32944,7 @@ fn apply_window_geometry(
         return;
     }
     let display_id = window.display(cx).map(|d| u64::from(d.id()));
-    set_window_frame(window, geometry, display_id);
-}
-
-/// 窓の矩形を OS へ当てる（macOS）。
-///
-/// GPUI の窓矩形は「**そのディスプレイの左上が原点**・y は下向き」（`MacDisplay::bounds`
-/// の原点が常に `(0,0)` で、窓の生成・読み戻しの両方が画面の原点を足し引きしている）。
-/// NSWindow の frame は「**主ディスプレイの左下が原点**・y は上向き」なので、
-/// CoreGraphics のグローバル矩形（左上原点）を挟んで変換する。
-#[cfg(target_os = "macos")]
-fn set_window_frame(
-    window: &Window,
-    geometry: tako_control::protocol::WindowGeometry,
-    display_id: Option<u64>,
-) {
-    use std::ffi::c_void;
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct CgPoint {
-        x: f64,
-        y: f64,
-    }
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct CgSize {
-        width: f64,
-        height: f64,
-    }
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct CgRect {
-        origin: CgPoint,
-        size: CgSize,
-    }
-
-    #[link(name = "CoreGraphics", kind = "framework")]
-    unsafe extern "C" {
-        fn CGMainDisplayID() -> u32;
-        fn CGDisplayBounds(display: u32) -> CgRect;
-    }
-    // 宣言はクレート内の既存（`platform/pdf/macos.rs`）と**同じ形**にする。
-    // 別の型で宣言し直すと `clashing_extern_declarations` で落ちる
-    #[link(name = "objc", kind = "dylib")]
-    unsafe extern "C" {
-        fn sel_registerName(name: *const u8) -> *const c_void;
-        fn objc_msgSend(receiver: *const c_void, sel: *const c_void, ...) -> *const c_void;
-    }
-
-    /// `setFrame:display:` を呼ぶための型。**可変長で呼んではいけない**:
-    /// Apple ARM64 の可変長引数はスタックへ積まれるので、NSRect をそのまま渡すと
-    /// 引数が壊れる。同じシンボルを非可変長の型で呼び直す
-    type SetFrame = unsafe extern "C" fn(*const c_void, *const c_void, CgRect, bool);
-
-    let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(window) else {
-        return;
-    };
-    let raw_window_handle::RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
-        return;
-    };
-    // SAFETY: NSView は GPUI が窓を持っているあいだ有効。ここはメインスレッド
-    // （`cx.defer` の中）なので AppKit を直接叩いてよい
-    unsafe {
-        let ns_view = appkit.ns_view.as_ptr() as *const c_void;
-        let ns_window = objc_msgSend(ns_view, sel_registerName(c"window".as_ptr() as *const u8));
-        if ns_window.is_null() {
-            return;
-        }
-        let display = display_id
-            .map(|id| id as u32)
-            .unwrap_or_else(|| CGMainDisplayID());
-        let db = CGDisplayBounds(display);
-        let main_height = CGDisplayBounds(CGMainDisplayID()).size.height;
-        // 置き先ディスプレイ内の座標 → グローバル（左上原点）→ Cocoa（左下原点）
-        let global_x = db.origin.x + f64::from(geometry.x);
-        let global_top = db.origin.y + f64::from(geometry.y);
-        let frame = CgRect {
-            origin: CgPoint {
-                x: global_x,
-                y: main_height - (global_top + f64::from(geometry.height)),
-            },
-            size: CgSize {
-                width: f64::from(geometry.width),
-                height: f64::from(geometry.height),
-            },
-        };
-        let set_frame: SetFrame = std::mem::transmute(objc_msgSend as *const ());
-        set_frame(
-            ns_window,
-            sel_registerName(c"setFrame:display:".as_ptr() as *const u8),
-            frame,
-            true,
-        );
-    }
-}
-
-/// 窓の矩形を OS へ当てる（Windows。Issue #1442）。
-///
-/// GPUI Windows の窓矩形は仮想デスクトップのグローバル座標を DPI 倍率で割った
-/// **論理ピクセル**（`logical_point(x, y, scale_factor)`）なので、`SetWindowPos` へ
-/// 渡すときは倍率を掛けて物理ピクセルへ戻す。
-#[cfg(target_os = "windows")]
-fn set_window_frame(
-    window: &Window,
-    geometry: tako_control::protocol::WindowGeometry,
-    _display_id: Option<u64>,
-) {
-    /// `SWP_NOZORDER | SWP_NOACTIVATE`（winuser.h）。前後関係と入力焦点は動かさない
-    const SWP_FLAGS: u32 = 0x0004 | 0x0010;
-
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        fn SetWindowPos(
-            hwnd: isize,
-            insert_after: isize,
-            x: i32,
-            y: i32,
-            cx: i32,
-            cy: i32,
-            flags: u32,
-        ) -> i32;
-    }
-
-    let Some(hwnd) = native_window_handle(window) else {
-        return;
-    };
-    let scale = window.scale_factor();
-    // SAFETY: HWND は GPUI が生きているあいだ有効。SetWindowPos は対象ウィンドウの
-    // スレッドへ送るだけで、この場でブロックしない
-    unsafe {
-        SetWindowPos(
-            hwnd,
-            0,
-            (geometry.x * scale) as i32,
-            (geometry.y * scale) as i32,
-            (geometry.width * scale) as i32,
-            (geometry.height * scale) as i32,
-            SWP_FLAGS,
-        );
-    }
-}
-
-/// 窓の矩形を OS へ当てる（macOS / Windows 以外）。移動の口が無いので寸法だけ当てる
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn set_window_frame(
-    _window: &Window,
-    _geometry: tako_control::protocol::WindowGeometry,
-    _display_id: Option<u64>,
-) {
-}
-
-/// メニューの「拡大・縮小」（`ZoomWindow`）の実体（macOS。Issue #657）。
-///
-/// NSWindow の zoom はトグルなので**現状のまま**素直に呼ぶ（挙動不変）
-#[cfg(not(target_os = "windows"))]
-fn toggle_window_zoom(window: &mut Window) {
-    window.zoom_window();
-}
-
-/// メニューの「最大化・元のサイズに戻す」（`ZoomWindow`）の実体（Windows。Issue #657）。
-///
-/// GPUI Windows の `zoom()` は `SW_MAXIMIZE` 固定でトグルにならない（#584 で判明）。
-/// メニュー項目が「最大化しかできない」のは動作の欠けなので、復元は #584 で用意した
-/// `restore_window`（user32 の `SW_RESTORE`）へ回して状態で出し分ける
-#[cfg(target_os = "windows")]
-fn toggle_window_zoom(window: &mut Window) {
-    if window.is_maximized() {
-        restore_window(window);
-    } else {
-        window.zoom_window();
-    }
-}
-
-/// 最大化を解除して元のサイズへ戻す（Issue #584）。
-///
-/// macOS は NSWindow の zoom がトグルなので `zoom_window()` がそのまま復元になる。
-#[cfg(not(target_os = "windows"))]
-fn restore_window(window: &mut Window) {
-    if window.is_maximized() {
-        window.zoom_window();
-    }
-}
-
-/// Windows の復元（Issue #584）。
-///
-/// GPUI Windows の `zoom()` は `SW_MAXIMIZE` 固定で、復元手段を公開していない
-/// （rev `cafbf4b5`）。GUI のキャプションボタンは `WM_NCLBUTTONUP` の中で GPUI が
-/// `IsZoomed` を見て `SW_NORMAL` を送っているが、その経路は NC ヒットテスト由来で
-/// しか通らない。CLI / MCP からも復元できるよう、ここだけ user32 の
-/// `ShowWindowAsync` を直接呼ぶ（`windows` クレートを足さない最小 FFI。
-/// 既存の CoreGraphics / PDFKit 呼び出しと同じ作法）。
-#[cfg(target_os = "windows")]
-fn restore_window(window: &mut Window) {
-    /// `SW_RESTORE`（winuser.h）。最小化・最大化を解除して元のサイズ・位置へ戻す
-    const SW_RESTORE: i32 = 9;
-
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        fn ShowWindowAsync(hwnd: isize, n_cmd_show: i32) -> i32;
-    }
-
-    let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(window) else {
-        return;
-    };
-    let raw_window_handle::RawWindowHandle::Win32(win32) = handle.as_raw() else {
-        return;
-    };
-    // SAFETY: HWND は GPUI が生きている間有効。ShowWindowAsync は
-    // 対象ウィンドウのスレッドへポストするだけで、この場でブロックしない
-    unsafe {
-        ShowWindowAsync(win32.hwnd.get(), SW_RESTORE);
-    }
+    platform::window_chrome::set_window_frame(window, geometry, display_id);
 }
 
 thread_local! {
@@ -34116,7 +33816,7 @@ fn main() {
         // 同じ面へ開く。通常起動（`TAKO_DISPLAY` 未指定 かつ 非隔離）では None のまま
         resolve_target_display(cx);
         cx.bind_keys(key_bindings());
-        cx.set_menus(app_menus());
+        cx.set_menus(platform::window_chrome::app_menus());
         // #872: 「ウィンドウが 0 枚になったらプロセスを終わらせるか」は tako が決める。
         // GPUI の既定（`QuitMode::Default`）は **非 macOS で「最後のウィンドウが閉じたら
         // 終了」** で、しかも `PostQuitMessage(0)` → `ExitProcess(0)` なので
@@ -34188,7 +33888,7 @@ fn main() {
             with_active_window(cx, |window| window.minimize_window());
         });
         cx.on_action(|_: &ZoomWindow, cx: &mut App| {
-            with_active_window(cx, toggle_window_zoom);
+            with_active_window(cx, platform::window_chrome::toggle_window_zoom);
         });
         cx.on_action(|_: &ToggleFullScreen, cx: &mut App| {
             with_active_window(cx, |window| window.toggle_fullscreen());
@@ -106187,6 +105887,7 @@ mod drag_scroll_tests {
 #[cfg(test)]
 mod app_menu_tests {
     use super::*;
+    use crate::platform::window_chrome::app_menus;
     use gpui::{Menu, MenuItem};
 
     /// メニュー木を辿って (表示名, アクション名) を集める
