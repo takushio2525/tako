@@ -737,7 +737,10 @@ MCP は `tako_orchestrator_layout` が同名パラメータで 1:1。
    立て、初回フォルダの信頼ダイアログ自体を出さない（ダイアログが送信プロンプトを
    消費する問題の根治）。書けなかった場合もダイアログ検出 → Enter 承諾でフォールバック。
    Windows の claude は鍵を作業 dir の `\` を `/` にした形で持つので、鍵はその形で書く
-   （`claude_tui::claude_project_key`。#1886。`\` 区切りの鍵は信頼済みと読まれず、確認が通るまで tako mod も読まれない）
+   （`claude_tui::claude_project_key`。#1886。`\` 区切りの鍵は信頼済みと読まれず、確認が通るまで tako mod も読まれない）。
+   claude は鍵を自分のプロセスの作業 dir の形で引き、8.3 の短い形を正規化しない（ペインの PowerShell は位置を
+   長い形にするのでシェル経由の起動は長い形、直起動・cmd.exe は渡した形）。作業 dir が短い形なら長い形
+   （境界 B34 `platform::long_path`）の鍵と渡された形の鍵の両方を書く（`claude_project_keys`。#2843。A/B `TAKO_2843_LEGACY=1`）
 2. **貼り付けと送信の分離**: プロンプト本体は bracketed paste で入力欄へ貼り、送信の
    Enter は分離した単独キーとして遅延送信する（マルチラインもそのまま渡る。
    改行の 2 スペース平坦化は廃止）

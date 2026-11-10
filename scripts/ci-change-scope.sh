@@ -75,6 +75,8 @@ AGENT_INSTALL=(
   'crates/tako-control/src/claude_mod.rs|報告から mod_turn を組む関数（turn_json。#1886）'
   'crates/tako-control/tests/issue2842_claude_version_windows.rs|GUI の起動時の claude の版の控えを本物の claude.exe で確かめる検査（#2842）'
   'crates/tako-control/src/stale_binary.rs|その検査が確かめる版の読み取り（quick_claude_version。#2842）'
+  'crates/tako-control/tests/issue2843_short_path_trust_windows.rs|短い形の作業 dir の事前信頼の鍵を本物の claude で確かめる検査（#2843）'
+  'crates/tako-core/src/platform/long_path.rs|その検査が確かめる短い形を長い形へ戻す境界（B34。#2843）'
   'installer/windows/lib/user-path.ps1|実走の検査がユーザー環境変数 Path を戻す 1 実装'
   'scripts/ci-change-scope.sh|この判定そのもの'
   '.github/workflows/ci.yml|実走の段の配線'

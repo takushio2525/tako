@@ -915,13 +915,45 @@ pub const TRUST_KEY_LEGACY_ENV: &str = "TAKO_1886_LEGACY";
 /// Windows の claude は作業 dir の `\` を `/` にした形を鍵にする（CI のランナーで claude 2.1.319 が自分で書いた鍵は
 /// `C:/Users/…/work`、tako が書いていた鍵は同じパスの `C:\Users\…\work` で、違いは区切りだけだった）。
 /// `\` 区切りの鍵は信頼済みと読まれず、信頼の確認が出て、確認が通るまで hooks module（tako mod）も読まれない。
-/// unix はそのまま。判定は [`claude_project_key_in`]（OS と A/B を引数で受ける = macOS でも Windows の形を検査できる）
+/// unix はそのまま。判定は [`claude_project_key_in`]（OS と A/B を引数で受ける = macOS でも Windows の形を検査できる）。
+///
+/// #2843: 作業 dir が 8.3 の短い形（`C:\Users\<利用者名の頭>~1\…`）のときは長い形へ戻した鍵を返す（境界 B34
+/// `long_path::long_form`）。事前信頼が書く鍵の組は [`claude_project_keys`]（長い形の鍵が先頭 = この関数の答え）
 pub fn claude_project_key(cwd: &str) -> String {
-    let legacy = std::env::var_os(TRUST_KEY_LEGACY_ENV).is_some_and(|v| !v.is_empty());
-    claude_project_key_in(cwd, cfg!(windows), legacy)
+    claude_project_keys(cwd).swap_remove(0)
 }
 
-/// [`claude_project_key`] の本体。Windows は verbatim の前置き（`\\?\`）を剥がしてから `\` を `/` にする
+/// 事前信頼で書く鍵の組（#2843）。
+///
+/// claude は作業 dir を正規化せず、**自分のプロセスの作業 dir の形**で鍵を引く（Windows CI の実測 = 短い形の cwd の
+/// ConPTY から直に起こした claude は短い形の鍵、ペインの PowerShell 5.1 から打った claude は長い形の鍵で信頼を書いた。
+/// PowerShell は位置を長い形にする）。worker の spawn・handoff・git resolve はペインのシェルへ起動コマンドを打つので
+/// 既定のシェル（PowerShell）では長い形、位置を正規化しないシェル（cmd.exe）や直起動では渡した形になる。
+/// どちらで起こされても確認が出ないよう、長い形の鍵を先頭に、渡された形の鍵が違えばそれも並べる。
+/// 戻せないパス（存在しない・8.3 の名前が無いボリューム）と長い形の作業 dir は #1886 の答えの 1 本のまま。
+/// A/B は `TAKO_2843_LEGACY=1`（長い形へ戻さない = 渡された形の 1 本）と `TAKO_1886_LEGACY=1`（文字列そのまま）
+pub fn claude_project_keys(cwd: &str) -> Vec<String> {
+    let legacy = std::env::var_os(TRUST_KEY_LEGACY_ENV).is_some_and(|v| !v.is_empty());
+    if legacy {
+        // #1886 の修正前の腕は作業 dir の文字列そのまま（短い形も戻さない）
+        return vec![cwd.to_string()];
+    }
+    let long = tako_core::platform::long_path::long_form(cwd);
+    claude_project_keys_in(cwd, &long, cfg!(windows))
+}
+
+/// [`claude_project_keys`] の本体（純関数。`long` は長い形へ戻した作業 dir = 戻せなければ `cwd` と同じ）
+pub fn claude_project_keys_in(cwd: &str, long: &str, windows: bool) -> Vec<String> {
+    let primary = claude_project_key_in(long, windows, false);
+    let given = claude_project_key_in(cwd, windows, false);
+    if given == primary {
+        vec![primary]
+    } else {
+        vec![primary, given]
+    }
+}
+
+/// [`claude_project_key`] の形の本体。Windows は verbatim の前置き（`\\?\`）を剥がしてから `\` を `/` にする
 /// （claude の作業 dir は前置きを持たない）
 pub fn claude_project_key_in(cwd: &str, windows: bool, legacy: bool) -> String {
     if !windows || legacy {
@@ -931,8 +963,12 @@ pub fn claude_project_key_in(cwd: &str, windows: bool, legacy: bool) -> String {
 }
 
 fn ensure_trusted_at(path: &Path, cwd: &str) -> Result<bool, TrustWriteError> {
+    ensure_keys_trusted_at(path, &claude_project_keys(cwd))
+}
+
+/// 鍵の組（[`claude_project_keys`]）をすべて信頼済みにする。どれも済んでいれば書かない
+fn ensure_keys_trusted_at(path: &Path, keys: &[String]) -> Result<bool, TrustWriteError> {
     let shown = || path.display().to_string();
-    let key = claude_project_key(cwd);
     let mut root: serde_json::Value = match std::fs::read_to_string(path) {
         Ok(s) => serde_json::from_str(&s).map_err(|e| TrustWriteError::Parse {
             path: shown(),
@@ -957,22 +993,29 @@ fn ensure_trusted_at(path: &Path, cwd: &str) -> Result<bool, TrustWriteError> {
             path: shown(),
             field: "projects".to_string(),
         })?;
-    let entry = projects
-        .entry(key.clone())
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .ok_or_else(|| TrustWriteError::FieldNotObject {
-            path: shown(),
-            field: format!("projects.{key}"),
-        })?;
-    if entry
-        .get("hasTrustDialogAccepted")
-        .and_then(|v| v.as_bool())
-        == Some(true)
-    {
-        return Ok(true); // 既に信頼済み（書き込み不要）
+    let mut changed = false;
+    for key in keys {
+        let entry = projects
+            .entry(key.clone())
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| TrustWriteError::FieldNotObject {
+                path: shown(),
+                field: format!("projects.{key}"),
+            })?;
+        if entry
+            .get("hasTrustDialogAccepted")
+            .and_then(|v| v.as_bool())
+            == Some(true)
+        {
+            continue; // 既に信頼済み
+        }
+        entry.insert("hasTrustDialogAccepted".into(), json!(true));
+        changed = true;
     }
-    entry.insert("hasTrustDialogAccepted".into(), json!(true));
+    if !changed {
+        return Ok(true); // どの鍵も既に信頼済み（書き込み不要）
+    }
 
     write_claude_json(path, &root)?;
     Ok(true)
@@ -1668,6 +1711,106 @@ mod tests {
         );
         // 書き込みの鍵は claude_project_key の 1 本（unix ではテストの鍵そのまま = 既存のテストの前提）
         assert_eq!(claude_project_key("/work/proj"), "/work/proj");
+    }
+
+    /// #2843: 短い形を長い形へ戻す段（境界 B34）を足しても、`~` を含まない作業 dir の鍵は #1886 の答えのまま。
+    /// unix は `~` を含んでも変えない（短い形が実機で長い形の鍵になることは
+    /// `tests/issue2843_short_path_trust_windows.rs` が Windows で確かめる）
+    #[test]
+    fn issue2843_長い形の作業dirの鍵は1886の答えのまま() {
+        for cwd in [
+            r"C:\Users\winuser\tako 1886 データ\work",
+            r"\\?\C:\Users\winuser\work",
+            "C:/Users/winuser/work",
+            "/work/proj",
+        ] {
+            assert_eq!(
+                claude_project_key(cwd),
+                claude_project_key_in(cwd, cfg!(windows), false),
+                "{cwd}"
+            );
+        }
+        if !cfg!(windows) {
+            for cwd in ["/home/testuser/a~1/work", "/work/LONGFO~1"] {
+                assert_eq!(claude_project_key(cwd), cwd);
+                assert_eq!(claude_project_keys(cwd), vec![cwd.to_string()]);
+            }
+        }
+    }
+
+    /// #2843: 短い形の作業 dir は長い形の鍵を先頭に、渡された形の鍵も並べる（claude は自分のプロセスの作業 dir の
+    /// 形で引く = シェル経由は長い形・直起動は渡した形）。戻せない・戻す必要が無いときは 1 本
+    #[test]
+    fn issue2843_短い形は長い形の鍵と渡された形の鍵の両方を書く() {
+        let short = r"C:\work\LONGFO~1\proj";
+        let long = r"C:\work\long folder\proj";
+        assert_eq!(
+            claude_project_keys_in(short, long, true),
+            vec![
+                "C:/work/long folder/proj".to_string(),
+                "C:/work/LONGFO~1/proj".to_string()
+            ]
+        );
+        // `/` 区切り・verbatim の短い形も渡された形の鍵は claude の形（`/` 区切り・前置きなし）
+        assert_eq!(
+            claude_project_keys_in("C:/work/LONGFO~1/proj", long, true)[1],
+            "C:/work/LONGFO~1/proj"
+        );
+        assert_eq!(
+            claude_project_keys_in(r"\\?\C:\work\LONGFO~1\proj", long, true)[1],
+            "C:/work/LONGFO~1/proj"
+        );
+        // 戻せない（OS が答えない = long は入力のまま）・長い形・区切りだけ違う形は 1 本
+        assert_eq!(
+            claude_project_keys_in(short, short, true),
+            vec!["C:/work/LONGFO~1/proj".to_string()]
+        );
+        assert_eq!(
+            claude_project_keys_in(long, long, true),
+            vec!["C:/work/long folder/proj".to_string()]
+        );
+        assert_eq!(
+            claude_project_keys_in("C:/work/long folder/proj", long, true),
+            vec!["C:/work/long folder/proj".to_string()]
+        );
+        // unix は渡された形の 1 本
+        assert_eq!(
+            claude_project_keys_in("/work/proj", "/work/proj", false),
+            vec!["/work/proj".to_string()]
+        );
+    }
+
+    /// #2843: 鍵が 2 本のとき、両方を信頼済みにし、両方とも済んでいれば書かない
+    #[test]
+    fn issue2843_事前信頼は鍵の組をすべて信頼済みにする() {
+        let scratch = tako_core::test_residue::ScratchDir::new("issue2843-trust");
+        let path = scratch.path().join(".claude.json");
+        std::fs::write(
+            &path,
+            r#"{"projects":{"/b":{"hasTrustDialogAccepted":true,"history":[1]}}}"#,
+        )
+        .unwrap();
+        // 鍵の組そのものは OS で決まる（unix では 1 本）ので、書き込みの段へは 2 本の組を外から与える
+        let keys = vec!["/a".to_string(), "/b".to_string(), "/c".to_string()];
+        ensure_keys_trusted_at(&path, &keys).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let root: serde_json::Value = serde_json::from_str(&text).unwrap();
+        for key in &keys {
+            assert_eq!(
+                root["projects"][key]["hasTrustDialogAccepted"], true,
+                "{key}"
+            );
+        }
+        assert_eq!(
+            root["projects"]["/b"]["history"],
+            json!([1]),
+            "既存の鍵を保つ"
+        );
+        // どの鍵も済んでいれば書かない（中身を詰めた形に置き換えても、そのまま残る）
+        let compact = serde_json::to_string(&root).unwrap();
+        std::fs::write(&path, &compact).unwrap();
+        ensure_keys_trusted_at(&path, &keys).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), compact);
     }
 
     #[test]
