@@ -199,8 +199,9 @@ pub mod notes {
     /// プランへ書き戻そうとする（あるいは他人の元値でこのマシンの設定を上書きする）。
     /// 記録は倒したマシンのものだけが意味を持つ
     pub const LID_GUARD: Note = Note::new(
-        "蓋閉じ継続の元値の記録。倒したマシンでしか意味を持たないので共有しない",
-        "Saved lid-close action for this machine only; meaningless elsewhere, so it is not shared",
+        "蓋閉じ継続を倒した記録（倒したプロセスと元値）。倒したマシンでしか意味を持たないので共有しない",
+        "Who overrode the lid-close action and its saved value, for this machine only; meaningless \
+         elsewhere, so it is not shared",
     );
     /// usage 分析の観測と索引（#2200 / エピック #2192）。**共有すると鍵が壊れる**: ログインの鍵は
     /// このマシンの `machine_id` で塩付けしたハッシュなので、別のマシンでは同じログインが別の鍵になる

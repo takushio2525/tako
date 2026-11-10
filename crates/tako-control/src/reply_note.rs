@@ -522,6 +522,8 @@ pub enum ReplyNote {
     SleepGuardBatteryUnknown,
     /// `tako sleep-guard status`: 蓋閉じ継続が効かない理由（中身は同じ言語の `LidSkipReason`）
     SleepGuardLidSkip(String),
+    /// `tako sleep-guard status`: いま効いている蓋閉じ継続の上書きの持ち主（#2904。GUI から見た立場）
+    SleepGuardLidHolder(crate::platform::lid::LidHolder),
     /// `tako sleep-guard status`: 蓋閉じ中にディスプレイを消した
     SleepGuardDisplayOff,
     /// `tako sleep-guard set`: 変えた後の設定（値は設定の表記のまま）
@@ -2440,6 +2442,42 @@ impl ReplyNote {
             (Self::SleepGuardLidSkip(reason), Ja) => format!("蓋閉じ継続が効かない理由: {reason}"),
             (Self::SleepGuardLidSkip(reason), En) => {
                 format!("why staying awake with the lid closed is not applied: {reason}")
+            }
+            (Self::SleepGuardLidHolder(holder), Ja) => {
+                use crate::platform::lid::LidHolder;
+                let who = match holder {
+                    LidHolder::Mine => "この tako（設定 off・エージェントの一段落・終了で戻す）",
+                    LidHolder::OtherTako => {
+                        "同じデータディレクトリの別の tako（この tako は戻さない）"
+                    }
+                    LidHolder::Stale => {
+                        "もう居ない tako（異常終了の残り。隔離でなく他の tako が居なければ戻す）"
+                    }
+                    LidHolder::NoRecord => {
+                        "記録なし（tako 以外か別のデータディレクトリの tako。この tako は戻さない）"
+                    }
+                };
+                format!("蓋閉じ継続の上書きの持ち主: {who}")
+            }
+            (Self::SleepGuardLidHolder(holder), En) => {
+                use crate::platform::lid::LidHolder;
+                let who = match holder {
+                    LidHolder::Mine => {
+                        "this tako (released when the setting is off, agents go idle, or it quits)"
+                    }
+                    LidHolder::OtherTako => {
+                        "another tako with the same data directory (this tako does not release it)"
+                    }
+                    LidHolder::Stale => {
+                        "a tako that is no longer running (left over from a crash; released when \
+                         not isolated and no other tako is running)"
+                    }
+                    LidHolder::NoRecord => {
+                        "unrecorded (set outside tako or by a tako with another data directory; \
+                         this tako does not release it)"
+                    }
+                };
+                format!("lid-close override held by: {who}")
             }
             (Self::SleepGuardDisplayOff, Ja) => "ディスプレイ: 消灯済み（蓋閉じ中）".into(),
             (Self::SleepGuardDisplayOff, En) => "display: turned off (lid closed)".into(),

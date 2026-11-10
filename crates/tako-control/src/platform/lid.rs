@@ -6,8 +6,13 @@
 //!
 //! | OS | 手段 | 権限 | 倒した記録 |
 //! |---|---|---|---|
-//! | macOS | clamshell 検知 + sudoers + `pmset disablesleep`（[`pmset`]。#218。#2857 で `sleep_guard.rs` から移した） | 初回に管理者パスワード | 持たない（いまの値を IORegistry から読む） |
+//! | macOS | clamshell 検知 + sudoers + `pmset disablesleep`（[`pmset`]。#218。#2857 で `sleep_guard.rs` から移した） | 初回に管理者パスワード | 所有者つきで持つ（#2904。`lid-guard.json` の `method: pmset`。いまの値は IORegistry から読む） |
 //! | Windows | 電源プランの lid action（このファイルの本体 = 電源プランの腕。#697） | 不要 | 所有者つきで持つ（#1373） |
+//!
+//! どちらの腕も**自分が倒した上書きだけ**を戻す（設定 off・エージェントの一段落・正常終了）。
+//! 持ち主の死んだ記録は、macOS の腕は起動時の残留チェックと同じ門（隔離でない・他の tako が居ない）を
+//! 通ったときだけ戻す（記録が元値を持たず、いまの 1 が別の data dir の tako のものでないと言えないため。
+//! Windows の腕は #1373 のまま門を通さず、元値と `should_restore` で戻す）。
 //! | その他 | 持たない | — | — |
 //!
 //! 以下の節は電源プランの腕（Windows）の説明。[`supported`] / [`is_active`] / [`set_stay_awake`] /
@@ -123,11 +128,38 @@ impl RecordOwner {
     }
 }
 
+/// 記録がどちらの手段で倒したものか（#2904）。
+///
+/// `lid-guard.json` は data dir に 1 つで、OS の腕どうしで共有する。#2904 より前は電源プランの腕
+/// （Windows）だけが書いていたので、欄の無い記録は [`LidMethod::PowerPlan`] として読む
+/// （`serde(default)` = 旧い記録がそのまま読めるので移行の Step は要らない = #916）。
+/// 既定の値は**書き出さない**ので、電源プランの腕が書く記録は #2904 の前後でバイト単位で同じ
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LidMethod {
+    /// 電源プランの lid action（Windows。#697 / #1373）
+    #[default]
+    PowerPlan,
+    /// `pmset disablesleep`（macOS。#218 / #2904）。元値は持たない（戻す先は常に `0`）
+    Pmset,
+}
+
+impl LidMethod {
+    /// 既定（電源プランの腕）か。記録へ書き出さない判定に使う
+    pub fn is_power_plan(&self) -> bool {
+        *self == Self::PowerPlan
+    }
+}
+
 /// 倒す前に保存しておく元の状態。クラッシュしてもここから戻せる
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedLidState {
+    /// 倒した手段（#2904）。欄の無い記録は電源プランの腕（[`LidMethod::PowerPlan`]）
+    #[serde(default, skip_serializing_if = "LidMethod::is_power_plan")]
+    pub method: LidMethod,
     /// 倒した電源プランの GUID（文字列）。
-    /// ユーザーがプランを切り替えても、書いたプランへ戻せるように持つ
+    /// ユーザーがプランを切り替えても、書いたプランへ戻せるように持つ。
+    /// `pmset` の記録は手段名（[`pmset::RECORD_SCHEME`]）を入れる（GUID ではない）
     pub scheme: String,
     /// AC 側の元値。倒していなければ `None`
     pub ac: Option<u32>,
@@ -619,8 +651,9 @@ fn clear_saved_at(path: Option<&std::path::Path>) {
     *lock_cache() = Some(Ok(None));
 }
 
-/// テスト用: キャッシュを捨てて次回ディスクから読み直させる
-#[cfg(test)]
+/// キャッシュを捨てて次回ディスクから読み直させる（テストと、macOS の腕の終了時 = 1 回きりの判定で
+/// 写しを信じない。#2904）
+#[cfg(any(target_os = "macos", test))]
 fn invalidate_cache() {
     *lock_cache() = None;
 }
@@ -744,6 +777,7 @@ fn try_clear_residual(
 fn acquire(rails: &[Rail]) -> Result<(), LidError> {
     let scheme = imp::active_scheme()?;
     let mut state = SavedLidState {
+        method: LidMethod::PowerPlan,
         scheme: imp::guid_to_string(&scheme),
         ac: None,
         dc: None,
@@ -795,6 +829,10 @@ fn restore(saved: &SavedLidState) -> Result<(), LidError> {
 // `sleep_guard.rs` の `#[cfg(target_os = "macos")]` の塊に並んでいたもの、macOS 以外の腕は
 // 電源プランの腕（上の節）へそのまま渡す。判定（いつ倒す・いつ戻す）と記録（persist.log /
 // stderr）は呼び手が持つ。
+//
+// #2904 で macOS の腕も倒した主の記録（`lid-guard.json` の `method: pmset`）を持つようになった。
+// 記録の読み書き（写し・ロック・原子書き込み・壊れた記録の退避）と持ち主の判定（`claim_for`）は
+// 電源プランの腕と同じ 1 実装を使い、倒す・戻すの判定だけ手段ごと（`pmset::decide`）に持つ。
 
 /// macOS の手段（sudoers の限定登録 + `pmset disablesleep`。#218）
 pub mod pmset;
@@ -802,7 +840,191 @@ pub mod pmset;
 #[cfg(target_os = "macos")]
 use super::power::iokit;
 #[cfg(target_os = "macos")]
-use pmset::{is_sudoers_installed, set_disablesleep};
+use pmset::{is_sudoers_installed, set_disablesleep, PmsetAction};
+
+/// いま `disablesleep` が倒れているか（IORegistry の `SleepDisabled`。検証プロセスで偽の置き場が
+/// あればその値 = #2904）
+#[cfg(target_os = "macos")]
+fn pmset_disabled_now() -> bool {
+    pmset::fake_sleep_disabled().unwrap_or_else(iokit::sleep_disabled)
+}
+
+/// `pmset` の記録に対するこのプロセスの立場（#2904）。記録が無ければ `None`。
+/// 電源プランの記録（macOS では書かれない。別の機械から持ち込まれたもの）はこの機械の `pmset` とは
+/// 無関係なので「記録なし」として読む（倒すときに上書きする）
+#[cfg(target_os = "macos")]
+fn pmset_claim(saved: Option<&SavedLidState>) -> Option<RecordClaim> {
+    let saved = saved.filter(|s| s.method == LidMethod::Pmset)?;
+    Some(claim_for(saved.owner.as_ref(), me(), probe_owner))
+}
+
+/// このプロセスが倒した記録（持ち主 = 自分）
+#[cfg(target_os = "macos")]
+fn pmset_record() -> SavedLidState {
+    SavedLidState {
+        method: LidMethod::Pmset,
+        scheme: pmset::RECORD_SCHEME.to_string(),
+        ac: None,
+        dc: None,
+        owner: Some(me().clone()),
+    }
+}
+
+/// 自分のもの以外（持ち主の死んだ記録）へ手を出してよいかの門（#2904 の案 A）。
+/// 材料は起動時の残留チェック（[`clear_startup_residual`] を呼ぶ `sleep_guard::check_disablesleep_residual`）
+/// と同じ = 隔離されていない・他の tako が居ない
+#[cfg(target_os = "macos")]
+fn residual_gate_now() -> Result<(), &'static str> {
+    pmset::residual_gate(
+        tako_core::tmux_cleanup::is_isolated_value(std::env::var("TAKO_ISOLATED").ok().as_deref()),
+        tako_core::ports::other_tako_running,
+    )
+}
+
+/// `pmset` の上書きを要求（`enable`）に合わせる（#2904）。倒す・引き取る・戻す・記録を捨てるの 1 実装で、
+/// 周期（[`apply_override`]）も終了（[`restore_on_exit`]）もここを通る。
+///
+/// 写しで判定し、何かすると決まったらロックの下で記録を読み直して同じ判定をやり直す（#1373 の作法）。
+/// 実際にしたこと（何もしなければ [`PmsetAction::Nothing`]）を返す。記録を読めない・置き場が無いときは
+/// `Err` で、**持ち主が分からないまま `pmset` を打たない**
+#[cfg(target_os = "macos")]
+fn settle_pmset(
+    enable: bool,
+    gate: fn() -> Result<(), &'static str>,
+) -> Result<PmsetAction, String> {
+    let cached = load_saved().map_err(LidError::into_ja)?;
+    let claim = pmset_claim(cached.as_ref());
+    // 戻したいのに記録が無い = 何もしない（設定 off の間の毎 tick を IORegistry まで行かせない）
+    if !enable && claim.is_none() {
+        return Ok(PmsetAction::Nothing);
+    }
+    if pmset::decide(enable, pmset_disabled_now(), claim, gate) == PmsetAction::Nothing {
+        return Ok(PmsetAction::Nothing);
+    }
+    let path = state_path().ok_or_else(|| LidError::DataDirUnresolved.into_ja())?;
+    with_record(&path, |fresh| {
+        let action = pmset::decide(
+            enable,
+            pmset_disabled_now(),
+            pmset_claim(fresh.as_ref()),
+            gate,
+        );
+        Ok(run_pmset_action(action, &path).map(|()| action))
+    })
+    .map_err(LidError::into_ja)?
+}
+
+/// [`pmset::decide`] が返した操作を実行する（#2904）。**macOS の腕で `disablesleep 0` を打つのは
+/// ここと起動時の残留チェック（[`clear_startup_residual`]）と A/B の旧い腕だけ**（番犬
+/// `issue2904_lid_owner_watchdog`）。呼んでよいのは [`settle_pmset`] だけ（ロックの下で判定をやり直した後）
+#[cfg(target_os = "macos")]
+fn run_pmset_action(action: PmsetAction, path: &std::path::Path) -> Result<(), String> {
+    match action {
+        PmsetAction::Nothing => Ok(()),
+        PmsetAction::Acquire => {
+            // 記録を先に置く（倒したのに記録が無い = 戻す主の居ない上書き、を作らない。置いてから倒す
+            // 前に落ちても、残るのは持ち主の死んだ記録といまの 0 = 次に誰かが捨てる）
+            store_saved_at(path, &pmset_record()).map_err(LidError::into_ja)?;
+            if let Err(e) = set_disablesleep(true) {
+                clear_saved_at(Some(path));
+                return Err(e);
+            }
+            Ok(())
+        }
+        PmsetAction::TakeOver => store_saved_at(path, &pmset_record()).map_err(LidError::into_ja),
+        PmsetAction::Restore => {
+            // 戻せなければ記録を残す（次の周期でやり直す。終了時なら次の起動の残留チェックが戻す）
+            set_disablesleep(false)?;
+            clear_saved_at(Some(path));
+            Ok(())
+        }
+        PmsetAction::Forget => {
+            clear_saved_at(Some(path));
+            Ok(())
+        }
+    }
+}
+
+/// A/B の旧い腕（`TAKO_2904_LEGACY=1`）の周期: 記録を持たず、いまの値だけを見て倒す・戻す
+#[cfg(target_os = "macos")]
+fn legacy_2904_apply(enable: bool) -> Result<bool, String> {
+    let current_disabled = pmset_disabled_now();
+    if enable && !current_disabled {
+        set_disablesleep(true).map(|()| true)
+    } else if !enable && current_disabled {
+        set_disablesleep(false).map(|()| true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// A/B の旧い腕（`TAKO_2904_LEGACY=1`）の終了: sudoers 登録済みで倒れていれば、誰のものかを見ずに戻す
+#[cfg(target_os = "macos")]
+fn legacy_2904_restore_on_exit() -> ExitRestore {
+    if is_sudoers_installed() && pmset_disabled_now() && set_disablesleep(false).is_ok() {
+        return ExitRestore::Restored;
+    }
+    ExitRestore::Nothing
+}
+
+/// いま効いている上書きの持ち主（#2904。`tako sleep-guard status` / MCP `tako_sleep_guard` の
+/// `lid_override_holder`）。記録（`lid-guard.json`）に対する**このプロセス**の立場から決める
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LidHolder {
+    /// このプロセスが倒した（設定 off・エージェントの一段落・終了で戻す）
+    Mine,
+    /// 同じ data dir の別の生きた tako が倒した（このプロセスは戻さない）
+    OtherTako,
+    /// 倒した tako はもう居ない（異常終了の残り。隔離でなく他の tako が居ないときに戻す）
+    Stale,
+    /// 記録が無い（tako 以外・別の data dir の tako・#2904 より前の版が倒した）。tako が戻すのは
+    /// 起動時の残留チェックだけ
+    NoRecord,
+}
+
+impl LidHolder {
+    /// JSON の値（`lid_override_holder`）
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mine => "self",
+            Self::OtherTako => "other-tako",
+            Self::Stale => "stale",
+            Self::NoRecord => "no-record",
+        }
+    }
+
+    /// [`Self::as_str`] の逆
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        [Self::Mine, Self::OtherTako, Self::Stale, Self::NoRecord]
+            .into_iter()
+            .find(|h| h.as_str() == s)
+    }
+
+    /// 記録に対する立場から（記録が無ければ `None`）
+    pub fn of(claim: Option<RecordClaim>) -> Self {
+        match claim {
+            None => Self::NoRecord,
+            Some(RecordClaim::Mine) => Self::Mine,
+            Some(RecordClaim::Foreign { .. }) => Self::OtherTako,
+            Some(RecordClaim::Abandoned | RecordClaim::Unowned) => Self::Stale,
+        }
+    }
+}
+
+/// いま効いている上書きの持ち主（#2904）。`active` は呼び手が読んだ [`override_active`] の値
+/// （読み直さない）。効いていない・制御できない OS・記録を読めないときは `None`。
+/// 記録は写しを読む（毎 tick のディスク読みを作らない）
+pub fn override_holder(active: bool) -> Option<LidHolder> {
+    if !active || !control_supported() {
+        return None;
+    }
+    let saved = load_saved().ok()?;
+    #[cfg(target_os = "macos")]
+    let claim = pmset_claim(saved.as_ref());
+    #[cfg(not(target_os = "macos"))]
+    let claim = with_claim(saved.as_ref()).map(|(_, claim)| claim);
+    Some(LidHolder::of(claim))
+}
 
 /// 蓋を閉じたまま走らせ続ける制御をこの OS が持つか（#524 / #697）。
 /// 表の正本と経緯は `sleep_guard::lid_control_supported`
@@ -846,12 +1068,13 @@ pub fn is_closed() -> bool {
 
 /// いま蓋閉じ継続の上書きが効いているか。
 ///
-/// macOS = `pmset disablesleep` の現在値（IORegistry の `SleepDisabled`。root 不要。#218）、
+/// macOS = `pmset disablesleep` の現在値（IORegistry の `SleepDisabled`。root 不要。#218。
+/// **誰が倒したかは問わない** = 持ち主は [`override_holder`]）、
 /// Windows = 倒した記録が残っているか（[`is_active`]）
 pub fn override_active() -> bool {
     #[cfg(target_os = "macos")]
     {
-        iokit::sleep_disabled()
+        pmset_disabled_now()
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -861,31 +1084,38 @@ pub fn override_active() -> bool {
 
 /// 蓋閉じ継続の設定が off の間も、呼び手の周期（`sleep_guard::update`）で上書きを戻しに行くか（#2857）。
 ///
-/// Windows（電源プランの腕）は倒した記録に所有者を持ち、設定が off なら自分の上書きだけを戻す
-/// （#697 / #1373）。macOS の腕は設定が off の間は `pmset` に触らない（#218 からの挙動。#2857 の
-/// 移設では変えない）。off にした後の macOS の戻しは `tako sleep-guard remove-lid-sleep`・
-/// 終了時の [`restore_on_exit`]・次の起動の [`clear_startup_residual`] が受け持つ
+/// どちらの腕も倒した記録に所有者を持ち、設定が off なら**自分の上書きだけ**を戻す（Windows = #697 /
+/// #1373、macOS = #2904）。記録の無い上書き・生きた他の tako の上書きは off でも戻さない。
+/// A/B の旧い macOS の腕（`TAKO_2904_LEGACY=1`）だけは #218 からの挙動 = off の間は `pmset` に触らない
 pub fn restores_while_mode_off() -> bool {
-    !cfg!(target_os = "macos")
+    #[cfg(target_os = "macos")]
+    {
+        !pmset::legacy()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
 }
 
 /// 蓋閉じ継続を倒す / 戻す。倒した・戻したら `Ok(true)`、同じ状態なら何もせず `Ok(false)`
 /// （毎 tick 呼ばれる前提）。倒すべきかの判定は呼び手（`sleep_guard::lid_decision`）が持つ。
 ///
 /// `include_battery` はバッテリー側も倒すか。電源プランは AC / DC を別々に持つので倒すレールを
-/// 選ぶ（#1473）。macOS の `pmset -a` は電源を問わず効くので使わない
+/// 選ぶ（#1473）。macOS の `pmset -a` は電源を問わず効くので使わない。
+///
+/// どちらの腕も**自分が倒した上書きだけ**を戻す（Windows = #1373、macOS = #2904）。macOS で
+/// `Ok(true)` になるのは `pmset` を実際に打ったとき（倒した・戻した）だけで、持ち主の死んだ上書きの
+/// 引き取り・記録の掃除は `Ok(false)`
 pub fn apply_override(enable: bool, include_battery: bool) -> Result<bool, String> {
     #[cfg(target_os = "macos")]
     {
         let _ = include_battery;
-        let current_disabled = iokit::sleep_disabled();
-        if enable && !current_disabled {
-            set_disablesleep(true).map(|()| true)
-        } else if !enable && current_disabled {
-            set_disablesleep(false).map(|()| true)
-        } else {
-            Ok(false)
+        if pmset::legacy() {
+            return legacy_2904_apply(enable);
         }
+        settle_pmset(enable, residual_gate_now)
+            .map(|done| matches!(done, PmsetAction::Acquire | PmsetAction::Restore))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -902,7 +1132,9 @@ pub fn apply_override(enable: bool, include_battery: bool) -> Result<bool, Strin
 pub fn sync_display_sleep(lid_closed: bool, lid_sleep_disabled: bool) {
     #[cfg(target_os = "macos")]
     {
-        if lid_closed && lid_sleep_disabled {
+        // 偽の置き場（検証）の「倒れている」で本物の `pmset displaysleepnow` を打たない（#2904。
+        // 蓋を閉じて外部ディスプレイで使っている利用者の画面を検証起動が消す）
+        if lid_closed && lid_sleep_disabled && pmset::fake_sleep_disabled().is_none() {
             iokit::force_display_sleep();
         }
         if !lid_closed || !lid_sleep_disabled {
@@ -946,7 +1178,10 @@ pub enum StartupResidual {
 
 /// 起動時の残留チェック: 前回のクラッシュ・異常終了で倒したまま残った上書きを元へ戻す（#449 / #697）。
 ///
-/// 隔離（`is_isolated`）と他の tako の稼働（`other_instance_running`）の門は両方の腕が通る
+/// 隔離（`is_isolated`）と他の tako の稼働（`other_instance_running`）の門は両方の腕が通る。
+///
+/// macOS の腕は記録の有無を問わず戻す（#449 のまま。記録を持たない #2904 より前の版が倒したまま
+/// 落ちた残りも戻すため）。門を通った = 他の tako は居ないので、戻したら前回の記録も捨てる
 pub fn clear_startup_residual(is_isolated: bool, other_instance_running: bool) -> StartupResidual {
     #[cfg(target_os = "macos")]
     {
@@ -954,13 +1189,16 @@ pub fn clear_startup_residual(is_isolated: bool, other_instance_running: bool) -
             is_isolated,
             other_instance_running,
             is_sudoers_installed(),
-            iokit::sleep_disabled(),
+            pmset_disabled_now(),
         ) {
             return StartupResidual::PmsetSkipped(reason);
         }
         match set_disablesleep(false) {
             Err(e) => StartupResidual::PmsetFailed(e),
-            Ok(()) => StartupResidual::PmsetCleared,
+            Ok(()) => {
+                clear_saved();
+                StartupResidual::PmsetCleared
+            }
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -969,22 +1207,52 @@ pub fn clear_startup_residual(is_isolated: bool, other_instance_running: bool) -
     }
 }
 
-/// tako の正常終了で蓋閉じ継続の上書きを戻す（#218 / #697）。
+/// 正常終了での戻しの結果（#2904。呼び手 `sleep_guard::cleanup_on_exit` が persist.log へ残す）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitRestore {
+    /// 戻した（自分の上書き、または門を通った持ち主の死んだ残り）
+    Restored,
+    /// 上書きは効いているが戻さなかった（持ち主が自分ではない・門が閉じている）
+    Kept(LidHolder),
+    /// 戻すものが無かった（効いていない）
+    Nothing,
+}
+
+/// tako の正常終了で蓋閉じ継続の上書きを戻す（#218 / #697 / #2904）。
 ///
 /// **蓋の設定は OS が回収してくれない**（倒したまま終了すると、次に tako を起動するまで蓋を
 /// 閉じてもスリープしない）。起動時の残留復元（[`clear_startup_residual`]）は最後の砦であって、
-/// 正常終了ではここで戻す。macOS の腕の失敗は #2857 より前と同じく黙って捨てる（`Ok` を返す）
-pub fn restore_on_exit() -> Result<(), String> {
+/// 正常終了ではここで戻す。
+///
+/// **戻すのは自分が倒した上書きだけ**（#2904）。`disablesleep` は機械全体の設定なので、#2904 より前の
+/// macOS の腕は検証起動の tako の終了でも本番の GUI が倒した上書きを 0 へ戻していた。持ち主の死んだ
+/// 記録は起動時と同じ門（[`residual_gate_now`]）を通ったときだけ戻す。macOS は終了が 1 回きりなので
+/// 記録の写しを信じずディスクから読み直す。#2904 より前は macOS の腕の失敗を黙って捨てていたが、
+/// いまは `Err` を返す（呼び手が stderr と persist.log へ残す）
+pub fn restore_on_exit() -> Result<ExitRestore, String> {
     #[cfg(target_os = "macos")]
     {
-        if is_sudoers_installed() && iokit::sleep_disabled() {
-            let _ = set_disablesleep(false);
+        if pmset::legacy() {
+            return Ok(legacy_2904_restore_on_exit());
         }
-        Ok(())
+        invalidate_cache();
+        if settle_pmset(false, residual_gate_now)? == PmsetAction::Restore {
+            return Ok(ExitRestore::Restored);
+        }
+        Ok(match override_holder(pmset_disabled_now()) {
+            Some(holder) => ExitRestore::Kept(holder),
+            None => ExitRestore::Nothing,
+        })
     }
     #[cfg(not(target_os = "macos"))]
     {
-        set_stay_awake(false, false).map(|_| ())
+        if set_stay_awake(false, false)? {
+            return Ok(ExitRestore::Restored);
+        }
+        Ok(match override_holder(is_active()) {
+            Some(holder) => ExitRestore::Kept(holder),
+            None => ExitRestore::Nothing,
+        })
     }
 }
 
@@ -1249,6 +1517,7 @@ mod tests {
     /// 記録を 1 件でっち上げる。所有者以外は判定に効かない
     fn record_owned_by(o: Option<RecordOwner>) -> SavedLidState {
         SavedLidState {
+            method: LidMethod::PowerPlan,
             scheme: "381b4222-f694-41f0-9685-ff5bb260df2e".to_string(),
             ac: Some(1),
             dc: None,
@@ -1734,6 +2003,7 @@ mod tests {
     #[test]
     fn 記録の記法が往復する() {
         let state = SavedLidState {
+            method: LidMethod::PowerPlan,
             scheme: "381b4222-f694-41f0-9685-ff5bb260df2e".to_string(),
             ac: Some(1),
             dc: None,
@@ -1755,12 +2025,14 @@ mod tests {
     #[test]
     fn レールの一致は過不足なく見る() {
         let ac_only = SavedLidState {
+            method: LidMethod::PowerPlan,
             scheme: "x".to_string(),
             ac: Some(1),
             dc: None,
             owner: None,
         };
         let both = SavedLidState {
+            method: LidMethod::PowerPlan,
             scheme: "x".to_string(),
             ac: Some(1),
             dc: Some(1),
@@ -1786,6 +2058,7 @@ mod tests {
     #[test]
     fn 両レールを倒した記録() {
         let state = SavedLidState {
+            method: LidMethod::PowerPlan,
             scheme: "x".to_string(),
             ac: Some(1),
             dc: Some(2),
@@ -1850,6 +2123,7 @@ mod tests {
         invalidate_cache();
 
         let state = SavedLidState {
+            method: LidMethod::PowerPlan,
             scheme: "381b4222-f694-41f0-9685-ff5bb260df2e".to_string(),
             ac: Some(1),
             dc: None,

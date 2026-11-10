@@ -312,7 +312,9 @@ fn fingerprint() -> BTreeMap<String, Vec<String>> {
         ),
         (
             "crates/tako-control/src/platform/lid.rs",
-            &["SavedLidState", "RecordOwner"],
+            // #2904: `LidMethod` は `SavedLidState.method`（どちらの手段で倒したか）の語彙。
+            // 値を消すと旧い記録が読めなくなるので載せる（足すだけなら旧い tako は欄を無視する）
+            &["SavedLidState", "RecordOwner", "LidMethod"],
         ),
         (
             "crates/tako-core/src/remote_shortcuts.rs",

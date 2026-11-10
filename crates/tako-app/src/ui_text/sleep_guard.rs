@@ -278,6 +278,7 @@ mod tests {
             lid_battery_floor: tako_control::sleep_guard::DEFAULT_LID_BATTERY_FLOOR,
             battery_percent: Some(100),
             lid_skip_reason: None,
+            lid_override_holder: None,
         }
     }
 

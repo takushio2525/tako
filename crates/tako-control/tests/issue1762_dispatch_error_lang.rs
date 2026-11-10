@@ -18737,9 +18737,11 @@ fn reply_note_index(n: &ReplyNote) -> usize {
         ReplyNote::DialogAutoModeUnchecked => 338,
         // #2891: 既定の worker の起動に使われない worker_model / worker_effort
         ReplyNote::WorkerSettingUnused { .. } => 339,
+        // #2904: 蓋閉じ継続の上書きの持ち主
+        ReplyNote::SleepGuardLidHolder(_) => 340,
     }
 }
-const REPLY_NOTE_VARIANTS: usize = 340;
+const REPLY_NOTE_VARIANTS: usize = 341;
 
 /// 見本の Remote Control の理由・次の一手（中身は `claude_remote` の日英の `Note`）
 const RC_REASON: tako_core::platform::support::Note =
@@ -19679,6 +19681,26 @@ fn reply_note_table() -> Vec<(ReplyNote, String)> {
         (
             ReplyNote::SleepGuardDisplayOff,
             "ディスプレイ: 消灯済み（蓋閉じ中）".into(),
+        ),
+        // #2904 で足した行（#2365 より前の固定文は無い = 今の日本語を固定する）
+        (
+            ReplyNote::SleepGuardLidHolder(tako_control::platform::lid::LidHolder::Mine),
+            "蓋閉じ継続の上書きの持ち主: この tako（設定 off・エージェントの一段落・終了で戻す）".into(),
+        ),
+        (
+            ReplyNote::SleepGuardLidHolder(tako_control::platform::lid::LidHolder::OtherTako),
+            "蓋閉じ継続の上書きの持ち主: 同じデータディレクトリの別の tako（この tako は戻さない）"
+                .into(),
+        ),
+        (
+            ReplyNote::SleepGuardLidHolder(tako_control::platform::lid::LidHolder::Stale),
+            "蓋閉じ継続の上書きの持ち主: もう居ない tako（異常終了の残り。隔離でなく他の tako が居なければ戻す）"
+                .into(),
+        ),
+        (
+            ReplyNote::SleepGuardLidHolder(tako_control::platform::lid::LidHolder::NoRecord),
+            "蓋閉じ継続の上書きの持ち主: 記録なし（tako 以外か別のデータディレクトリの tako。この tako は戻さない）"
+                .into(),
         ),
         (
             ReplyNote::SleepGuardSettingsChanged {
