@@ -1373,9 +1373,6 @@ mod tests {
     /// 子（このテストバイナリの再実行）の待ちの上限
     const RESIDUE_DEADLINE: Duration = Duration::from_secs(600);
 
-    /// 子の一巡で外す 1 本（使い捨ての TMPDIR では成立しない。[`run_suite_in`] の中の説明）
-    const SKIP_IN_CHILD: &str = "ホストごとに_controlpath_が分かれる";
-
     /// #2448 の検出力を見る注入の目印。立っていると
     /// [`注入_打ち切った子の孫を親を失った形で残す`] が孫を残す（子にだけ渡す）
     const ORPHAN_INJECT: &str = "TAKO_2448_INJECT_ORPHAN";
@@ -1414,8 +1411,10 @@ mod tests {
     /// 標準出力はファイルへ落とす（パイプに溜めると全件の出力で詰まる）。
     ///
     /// TMPDIR は回ごとに分ける（前の回の残り = A/B の腕がわざと残したものを次の回が数えない）。
-    /// 名前を `t<n>` と短く保つ（100 回目までは元の `tmp` 以下の長さ）のは、TMPDIR の深さで
-    /// 成立が変わるテスト（[`SKIP_IN_CHILD`]）の予算を変えないため。`TAKO_1581_LEGACY` は外さずに子へ渡す（親に立てると子の一巡ごと
+    /// 名前を `t<n>` と短く保つ（100 回目までは元の `tmp` 以下の長さ）のは、子の TMPDIR を
+    /// 必要以上に深くしないため（子では全テストを外さずに回す。深い TMPDIR でだけ落ちていた
+    /// ssh の ControlPath は #2855 で上限に収まる置き場へ倒すようにした）。
+    /// `TAKO_1581_LEGACY` は外さずに子へ渡す（親に立てると子の一巡ごと
     /// 修正前の後始末になる = 番犬が名指しで落ちることを手で確かめる A/B）
     fn run_suite_in(scratch: &Path, args: &[&str], env: &[(&str, &str)]) -> SuiteRun {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1428,11 +1427,6 @@ mod tests {
         // Windows でコンソール窓を出さない（#628 / #586 の 1 実装を通す）
         crate::platform::process::no_console_window(&mut cmd);
         cmd.args(args);
-        // この 1 本だけは**使い捨ての TMPDIR では成立しない**: ssh の ControlPath は
-        // unix domain socket のパス長上限（`MAX_SOCKET_PATH` = 92）に収まる必要があり、
-        // 親の置き場の下へ潜らせた TMPDIR ではその予算を使い切る。
-        // 残骸を数えるという番犬の本題とは関係が無いので外す
-        cmd.args(["--skip", SKIP_IN_CHILD]);
         // #2448: 子を自分のプロセスグループの頭にする。テストが打ち切った子の孫は、親を失っても
         // このグループを抜けないので一巡の後に数えられる（tmux のペイン・PTY の子・
         // `probe::group_output_with_timeout` の子は自分のグループを持つので数えない）
@@ -1561,7 +1555,7 @@ mod tests {
             .collect()
     }
 
-    /// 子が一巡するテストの名前（`--list` の `<名前>: test` の行。子で外す 1 本は除く）
+    /// 子が一巡するテストの名前（`--list` の `<名前>: test` の行）
     fn suite_names() -> Vec<String> {
         let exe = std::env::current_exe().expect("テストバイナリのパス");
         let mut cmd = std::process::Command::new(exe);
@@ -1576,7 +1570,6 @@ mod tests {
         String::from_utf8_lossy(&stdout)
             .lines()
             .filter_map(|l| l.strip_suffix(": test"))
-            .filter(|n| !n.contains(SKIP_IN_CHILD))
             .map(str::to_string)
             .collect()
     }

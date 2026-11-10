@@ -20,6 +20,9 @@
 //! 4. どれも収まらなければ [`SocketPathKind::Overflow`]。bind は失敗するが、
 //!    **黙って縮退させない**ために理由（バイト長と上限）を申告する口を持つ
 //!
+//! 1〜3 の順と長さの測り方は ssh の ControlPath（#2855）と共有していて、正本は境界 B35
+//! [`crate::platform::unix_socket::place_with`]。ここは IPC の名前・参照ファイル・種別の申告を持つ。
+//!
 //! data dir 側には参照ファイル [`POINTER_NAME`]（実体パスを 1 行）だけを残す。
 //! **実体を symlink にしても解決にならない**: `sun_path` の上限は繋ぐ側が
 //! `connect()` へ渡すパスに掛かるので、長いパスの symlink を置いても
@@ -41,28 +44,12 @@ pub const WELL_KNOWN_NAME: &str = "tako.sock";
 /// data dir 側に残す参照ファイル名（中身は実体パス 1 行）
 pub const POINTER_NAME: &str = "tako.sock.path";
 
-/// `$TMPDIR` 自体が上限に収まらない機のための最後の候補
-pub const FALLBACK_TEMP: &str = "/tmp";
-
-/// `sockaddr_un.sun_path` の要素数（**終端 NUL を含む**）。macOS / BSD = 104
-pub const SUN_PATH_BSD: usize = 104;
-/// 同上。Linux = 108
-pub const SUN_PATH_LINUX: usize = 108;
-
-/// この OS でパスに使える最大バイト数（終端 NUL を除く）。
-///
-/// 実測（macOS 25.4 / 2026-09-13）: 103 バイトまで bind 成功・104 バイトで
-/// `AF_UNIX path too long`。std も `bytes.len() >= sun_path.len()` で弾く。
-///
-/// 純関数側（[`plan_with`] / [`resolve_with`]）が上限を**引数で受ける**ので、
-/// macOS から Linux の上限も検査できる（#515 / #905 と同じ作法）
-pub const fn max_path_bytes() -> usize {
-    if cfg!(target_os = "linux") {
-        SUN_PATH_LINUX - 1
-    } else {
-        SUN_PATH_BSD - 1
-    }
-}
+// 上限・長さの測り方・最後の候補は境界 B35 が正本（ssh の ControlPath と共有。#2855）。
+// 純関数側（[`plan_with`] / [`resolve_with`]）は上限を**引数で受ける**ので、
+// macOS から Linux の上限も検査できる（#515 / #905 と同じ作法）
+pub use crate::platform::unix_socket::{
+    max_path_bytes, path_bytes, FALLBACK_TEMP, SUN_PATH_BSD, SUN_PATH_LINUX,
+};
 
 /// ソケットパスの決まり方（診断・`check_health` に出す識別子）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,11 +112,6 @@ impl SocketPlan {
     }
 }
 
-/// パスのバイト長（`sun_path` へ入るのはこのバイト列）
-pub fn path_bytes(path: &Path) -> usize {
-    path.as_os_str().as_encoded_bytes().len()
-}
-
 /// data dir ごとに安定した短いファイル名（`tako-<16 桁>.sock`）。
 ///
 /// `/a/b` と `/a/b/` が別のソケットにならないよう、区切りの揺れは
@@ -141,43 +123,31 @@ pub fn short_name(data_dir: &Path) -> String {
 }
 
 /// 置き場を決める（**純関数**。env も実ファイルも見ないので、
-/// macOS から Linux の上限・深い `$TMPDIR` の機も検査できる）
+/// macOS から Linux の上限・深い `$TMPDIR` の機も検査できる）。
+///
+/// 候補の順と長さの測り方は境界 B35 の [`crate::platform::unix_socket::place_with`]
+/// （ssh の ControlPath と同じ 1 実装）。IPC は bind の失敗を自分で扱うので、
+/// 短い置き場の可否は見ない（どれも収まらなければ最も短い候補で [`SocketPathKind::Overflow`]）
 pub fn plan_with(data_dir: &Path, temp_dir: &Path, limit: usize) -> SocketPlan {
+    use crate::platform::unix_socket::{place_with, Placement};
     let well_known = data_dir.join(WELL_KNOWN_NAME);
     let well_known_bytes = path_bytes(&well_known);
-    if well_known_bytes <= limit {
-        return SocketPlan {
-            path: well_known,
-            kind: SocketPathKind::WellKnown,
-            pointer: None,
-            limit,
-            well_known_bytes,
-        };
-    }
-    let name = short_name(data_dir);
-    let pointer = Some(data_dir.join(POINTER_NAME));
-    let mut shortest: Option<PathBuf> = None;
-    for base in [temp_dir, Path::new(FALLBACK_TEMP)] {
-        let candidate = base.join(&name);
-        if path_bytes(&candidate) <= limit {
-            return SocketPlan {
-                path: candidate,
-                kind: SocketPathKind::Shortened,
-                pointer,
-                limit,
-                well_known_bytes,
-            };
-        }
-        if shortest
-            .as_ref()
-            .is_none_or(|s| path_bytes(&candidate) < path_bytes(s))
-        {
-            shortest = Some(candidate);
-        }
-    }
+    let (path, kind) = match place_with(
+        Some(well_known),
+        &short_name(data_dir),
+        temp_dir,
+        limit,
+        &|_| true,
+    ) {
+        Placement::Primary(path) => (path, SocketPathKind::WellKnown),
+        Placement::Shortened(path) => (path, SocketPathKind::Shortened),
+        Placement::Unplaceable(path) => (path, SocketPathKind::Overflow),
+    };
+    // 固定パス以外では data dir 側に参照ファイルを残す
+    let pointer = (kind != SocketPathKind::WellKnown).then(|| data_dir.join(POINTER_NAME));
     SocketPlan {
-        path: shortest.unwrap_or(well_known),
-        kind: SocketPathKind::Overflow,
+        path,
+        kind,
         pointer,
         limit,
         well_known_bytes,

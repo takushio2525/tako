@@ -14300,6 +14300,17 @@ fn dispatch_inner(
             if let Err(e) = tako_core::remote_fs::ensure_control_dir(&ssh_host) {
                 crate::diag::persist_log(&format!("ssh の ControlPath 置き場を作れない: {e}"));
             }
+            // #2855: 置き場がどこにも取れないときは ControlPath を渡さずに繋ぐ。
+            // 黙って縮退させない（パスは書かない = 長さの理由だけ）
+            if tako_core::platform::ssh_client::multiplexing_available()
+                && !tako_core::remote_fs::multiplexing_for(&ssh_host)
+            {
+                crate::diag::persist_log(&format!(
+                    "ssh の ControlPath を置ける場所が無い（data dir・$TMPDIR・/tmp のどれも \
+                     {} バイトに収まらないか書けない）ので多重化なしで繋ぐ（#2855）",
+                    tako_core::remote_fs::control_path_limit()
+                ));
+            }
             let argv = remote_ssh_argv(&ssh_host);
             let dir = remote_dir
                 .as_deref()
