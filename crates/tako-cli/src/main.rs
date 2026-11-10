@@ -9026,11 +9026,8 @@ fn local_ipc_report(lang: tako_core::i18n::Lang) -> Value {
 /// 接続情報ファイルが無ければ `None`（GUI を起動したことが無い・片付けられた）
 fn local_gui_report(lang: tako_core::i18n::Lang) -> Option<Value> {
     let info = tako_control::discovery::read()?;
-    let alive = if cfg!(target_os = "macos") {
-        tako_core::ports::is_live_tako_app(info.pid)
-    } else {
-        tako_core::platform::process::pid_alive(info.pid)
-    };
+    // macOS はプロセス名まで・他 OS は生死だけ（出し分けは境界 B5 の内側。#2856）
+    let alive = tako_core::platform::procinfo::tako_app_alive(info.pid);
     let (connect, error) = probe_socket(&info.socket);
     let state = match (alive, connect) {
         (false, _) => "not_running",

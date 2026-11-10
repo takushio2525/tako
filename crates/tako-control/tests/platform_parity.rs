@@ -1536,3 +1536,286 @@ fn collect_unguarded_spawns(
         }
     }
 }
+
+/// **#2856 の番犬**: listen ポート検知とプロセス検査の OS 実装は境界 B5
+/// （`tako_core::platform::procinfo`）の内側だけに置き、境界は境界の外を呼ばない。
+///
+/// ## なぜ止めるのか
+///
+/// #2856 まで macOS の実装（libproc）は `tako-core/src/ports.rs` にあり、境界の側
+/// （`platform::procinfo` / `platform::resources`）が `crate::ports::short_info` などを呼ぶ
+/// **逆向きの依存**になっていた。`ports.rs` は境界の外の production の OS 分岐が
+/// いちばん多いファイルで（#1538 の集計で 45 塊）、9/22 から 2 か月で +16 塊増えた
+/// （#1993 の資源の計測が、境界ではなく `ports.rs` に libproc の口を足したため）。
+/// 戻る形は 2 つで、どちらも macOS / Windows のビルドとテストは緑のまま通る:
+///
+/// 1. `ports.rs` に OS の `cfg`（`#[cfg]` / `cfg!` / `cfg_attr`）を足す
+///    → 境界の外に OS 分岐が増え、片方の腕が黙って何もしない形を生む
+/// 2. 境界の中から `crate::ports` を呼ぶ → 境界が外の実装に依存し、`ports.rs` が
+///    また「macOS の実装の正」になる
+///
+/// 見るのは本番コードだけ（`production_range::scan` の眺め。テスト領域・コメント・
+/// 文字列の中は数えない）。`ports.rs` は公開の名前の re-export だけを持つ
+const PORTS_RS: &str = "crates/tako-core/src/ports.rs";
+
+/// 境界 B5 の検査側（`crate::ports` を呼んではいけない側）。`procinfo/` の下は全部
+const PROCINFO_BOUNDARY: [&str; 2] = [
+    "crates/tako-core/src/platform/procinfo.rs",
+    "crates/tako-core/src/platform/resources.rs",
+];
+const PROCINFO_SUBDIR: &str = "crates/tako-core/src/platform/procinfo";
+
+/// cfg 述語に現れたら「OS の分岐」とみなす原子（#1538 の集計器と同じ）
+const OS_ATOMS: [&str; 6] = [
+    "windows",
+    "unix",
+    "target_os",
+    "target_family",
+    "target_vendor",
+    "target_env",
+];
+
+fn read_rel(rel: &str) -> String {
+    let path = repo_root().join(rel);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!("{rel} が読めない（消した / 改名したなら #2856 の番犬も直す）: {e}")
+    })
+}
+
+/// 本番コードの「コードだけの眺め」（テスト領域・コメント・文字列を空白へ潰す。行番号は保たれる）
+fn production_code_view(src: &str) -> String {
+    production_range::code_view_of(&production_range::scan(src).text)
+}
+
+/// 述語に OS の原子が**識別子として**現れるか（`windows_sys` などの部分一致は除く）
+fn mentions_os_atom(pred: &str) -> bool {
+    let bytes = pred.as_bytes();
+    let is_id = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    OS_ATOMS.iter().any(|atom| {
+        pred.match_indices(atom).any(|(s, _)| {
+            let e = s + atom.len();
+            (s == 0 || !is_id(bytes[s - 1])) && (e >= bytes.len() || !is_id(bytes[e]))
+        })
+    })
+}
+
+fn close_paren(view: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, &b) in view.iter().enumerate().skip(open) {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// コードの眺めの中の OS の cfg（`#[cfg(…)]` / `#![cfg(…)]` / `#[cfg_attr(述語, …)]` / `cfg!(…)`）の
+/// `(行番号, 原文の頭)`。`cfg_attr` は先頭の引数（述語）だけを見る
+fn os_cfg_sites(view: &str) -> Vec<(usize, &'static str)> {
+    const HEADS: [(&str, bool); 5] = [
+        ("#![cfg_attr(", true),
+        ("#[cfg_attr(", true),
+        ("#![cfg(", false),
+        ("#[cfg(", false),
+        ("cfg!(", false),
+    ];
+    let bytes = view.as_bytes();
+    let mut sites = std::collections::BTreeSet::new();
+    for (head, is_attr) in HEADS {
+        for (at, _) in view.match_indices(head) {
+            // `cfg!(` は識別子の途中（`my_cfg!(`）を除く
+            if head == "cfg!(" && at > 0 && {
+                let b = bytes[at - 1];
+                b.is_ascii_alphanumeric() || b == b'_'
+            } {
+                continue;
+            }
+            let open = at + head.len() - 1;
+            let Some(close) = close_paren(bytes, open) else {
+                continue;
+            };
+            let inner = &view[open + 1..close];
+            let pred = if is_attr {
+                let mut depth = 0usize;
+                let end = inner
+                    .char_indices()
+                    .find(|&(_, c)| {
+                        match c {
+                            '(' => depth += 1,
+                            ')' => depth = depth.saturating_sub(1),
+                            ',' if depth == 0 => return true,
+                            _ => {}
+                        }
+                        false
+                    })
+                    .map_or(inner.len(), |(i, _)| i);
+                &inner[..end]
+            } else {
+                inner
+            };
+            if mentions_os_atom(pred) {
+                sites.insert((view[..at].matches('\n').count() + 1, head));
+            }
+        }
+    }
+    sites.into_iter().collect()
+}
+
+/// コードの眺めの中で `crate::ports` / `super::ports` のように**パスの途中の `ports`** を指す行と、
+/// `ports` を含む `use` 文の行。ローカル変数の `ports`（`let mut ports` / `insert(root, ports)`）は当たらない
+fn ports_path_sites(view: &str) -> Vec<usize> {
+    let bytes = view.as_bytes();
+    let is_id = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let line_of = |at: usize| view[..at].matches('\n').count() + 1;
+    let mut lines = std::collections::BTreeSet::new();
+    for (at, _) in view.match_indices("ports") {
+        let end = at + "ports".len();
+        if (at > 0 && is_id(bytes[at - 1])) || (end < bytes.len() && is_id(bytes[end])) {
+            continue; // `listen_ports` / `ports_x` などの別の識別子
+        }
+        // 直前（空白を飛ばして）が `::` = パスの途中の `ports`
+        let before = view[..at].trim_end();
+        if before.ends_with("::") {
+            lines.insert(line_of(at));
+        }
+    }
+    // `use crate::{ports::x, …};` のようにまとめた形
+    for (at, _) in view.match_indices("use ") {
+        if at > 0 && is_id(bytes[at - 1]) {
+            continue;
+        }
+        let Some(semi) = view[at..].find(';') else {
+            continue;
+        };
+        let stmt = &view[at..at + semi];
+        let names = stmt.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'));
+        if names.into_iter().any(|w| w == "ports") {
+            lines.insert(line_of(at));
+        }
+    }
+    lines.into_iter().collect()
+}
+
+fn check_ports_rs_has_no_os_cfg(src: &str, rel: &str) {
+    let sites = os_cfg_sites(&production_code_view(src));
+    assert!(
+        sites.is_empty(),
+        "{} — `ports.rs` の本番コードに OS の cfg が戻っている（#2856）。\n\
+         OS ごとの実装は境界 B5 `tako_core::platform::procinfo` の内側\
+         （macOS は `procinfo/macos.rs`）へ置き、`ports.rs` からは名前を re-export するだけにする",
+        sites
+            .iter()
+            .map(|(line, head)| format!("{rel}:{line} `{head}…`"))
+            .collect::<Vec<_>>()
+            .join(" / ")
+    );
+}
+
+fn check_boundary_not_calling_ports(src: &str, rel: &str) {
+    let lines = ports_path_sites(&production_code_view(src));
+    assert!(
+        lines.is_empty(),
+        "{} — 境界 B5 の内側から境界の外の `crate::ports` を参照している（#2856）。\n\
+         `ports.rs` は公開の名前を re-export するだけの層で、実装は境界の側にある。\
+         境界の内側の口（`procinfo` の関数・`procinfo/macos.rs` の libproc の口）を呼ぶこと",
+        lines
+            .iter()
+            .map(|line| format!("{rel}:{line}"))
+            .collect::<Vec<_>>()
+            .join(" / ")
+    );
+}
+
+/// 境界 B5 の検査側のファイル（`procinfo.rs`・`procinfo/` の下すべて・`resources.rs`）
+fn procinfo_boundary_files() -> Vec<String> {
+    let root = repo_root();
+    let mut files: Vec<String> = PROCINFO_BOUNDARY.iter().map(|s| s.to_string()).collect();
+    let dir = root.join(PROCINFO_SUBDIR);
+    let mut sub: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{PROCINFO_SUBDIR} が読めない（#2856 の置き場）: {e}"))
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+        .map(|p| {
+            p.strip_prefix(&root)
+                .unwrap_or(&p)
+                .display()
+                .to_string()
+                .replace('\\', "/")
+        })
+        .collect();
+    sub.sort();
+    assert!(
+        sub.iter().any(|f| f.ends_with("/procinfo/macos.rs")),
+        "{PROCINFO_SUBDIR}/macos.rs が無い（macOS の腕の置き場を変えたなら #2856 の番犬も直す）: {sub:?}"
+    );
+    files.extend(sub);
+    files
+}
+
+#[test]
+fn ports_rsの本番コードにosのcfgが戻っていない() {
+    check_ports_rs_has_no_os_cfg(&read_rel(PORTS_RS), PORTS_RS);
+}
+
+#[test]
+fn 境界のprocinfoとresourcesがportsを呼んでいない() {
+    for rel in procinfo_boundary_files() {
+        check_boundary_not_calling_ports(&read_rel(&rel), &rel);
+    }
+}
+
+/// 番犬に検出力があること: 戻した形の断片を同じ検査へ通し、落ちる / 落ちないを確かめる
+/// （リポジトリのファイルは触らない）
+#[test]
+fn 番犬2856は戻した形を実際に落とす() {
+    let caught = |f: &dyn Fn()| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err();
+    // 1. ports.rs に OS の cfg を戻す 3 つの形は落ちる
+    for legacy in [
+        "#[cfg(target_os = \"macos\")]\npub fn other_tako_pids() -> Vec<u32> { Vec::new() }\n",
+        "#[cfg_attr(not(windows), allow(dead_code))]\nfn group_by_root() {}\n",
+        "pub fn alive(pid: u32) -> bool { if cfg!(unix) { true } else { pid == 0 } }\n",
+    ] {
+        assert!(
+            caught(&|| check_ports_rs_has_no_os_cfg(legacy, "注入")),
+            "ports.rs の OS の cfg を見逃した: {legacy}"
+        );
+    }
+    // OS でない cfg・テスト領域・コメント・文字列の中は当たらない
+    check_ports_rs_has_no_os_cfg(
+        "pub use crate::platform::procinfo::scan;\n\
+         #[cfg(feature = \"x\")]\nfn f() {}\n\
+         // #[cfg(unix)] は説明\n\
+         const S: &str = \"#[cfg(windows)]\";\n\
+         #[cfg(test)]\nmod tests {\n    #[cfg(target_os = \"macos\")]\n    fn t() {}\n}\n",
+        "注入",
+    );
+    // 2. 境界から crate::ports を呼ぶ形は落ちる（直呼び・use・まとめた use・super 越し）
+    for legacy in [
+        "fn parent_pid(pid: u32) -> Option<u32> {\n    crate::ports::short_info(pid as i32).map(|(p, _, _)| p)\n}\n",
+        "use crate::ports::argv0_name;\n",
+        "use crate::{paths, ports::short_info};\n",
+        "fn f() { super::super::ports::scan(&[]); }\n",
+    ] {
+        assert!(
+            caught(&|| check_boundary_not_calling_ports(legacy, "注入")),
+            "境界からの crate::ports の参照を見逃した: {legacy}"
+        );
+    }
+    // ローカル変数の `ports`・別の識別子・コメント・テスト領域は当たらない
+    check_boundary_not_calling_ports(
+        "fn g(root: u64) {\n    let mut ports = Vec::new();\n    ports.push(1);\n\
+         let mut result = std::collections::HashMap::new();\n    result.insert(root, ports);\n\
+         let listen_ports = 0;\n    let _ = listen_ports;\n}\n\
+         // crate::ports は re-export の層\n\
+         #[cfg(test)]\nmod tests {\n    use crate::ports::scan;\n}\n",
+        "注入",
+    );
+}
