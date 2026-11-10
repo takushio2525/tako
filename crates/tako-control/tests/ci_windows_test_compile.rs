@@ -35,7 +35,9 @@
 //!    ゲートが無いあいだに 36 件まで積み上がった。1 の「コンパイル検査」の数には入れない
 //! 5. clippy の指摘 0 件のゲート（#2850）= 同じ `scripts/warning-gate.sh` に、macOS ジョブの clippy と
 //!    **同じ feature 宇宙**の `cargo clippy` を全部通す blocking ステップ。Windows の cfg の内側は
-//!    macOS の clippy から見えず、Windows の clippy は着手時まで一度も回っていなかった（13 件）
+//!    macOS の clippy から見えず、Windows の clippy は着手時まで一度も回っていなかった（13 件）。
+//!    **windows ジョブの段ではなく、並走する別ジョブ `windows-clippy`** に置く（clippy は build の成果物を
+//!    使い回せず、段にすると windows ジョブが約 13 分伸びて上限 90 分の手前まで来た）
 //!
 //! Windows に存在しない仕組みを見るテストは、**理由つきで名指し skip**
 //! （`#[cfg(...)]` / `#[cfg_attr(windows, ignore = "理由")]`）へ寄せた。
@@ -87,17 +89,20 @@ fn steps(job: &str) -> Vec<String> {
 /// 警告ゲート（#1537）の 1 実装。CI の Windows ジョブと `scripts/check-windows.sh` が通す
 const WARNING_GATE: &str = "scripts/warning-gate.sh";
 
-/// `macos:` ジョブの本文だけを切り出す（[`windows_job`] と同じ読み方）
-fn macos_job(ci: &str) -> String {
+/// job id（字下げ 2）を指定してその本文だけを切り出す（[`windows_job`] と同じ読み方）。
+/// 見出しの行まで一致させるので、`windows:` と `windows-clippy:` を取り違えない
+fn job_body(ci: &str, id: &str) -> String {
     let (_, rest) = ci
-        .split_once("\n  macos:")
-        .expect("CI に macos ジョブが無い");
+        .split_once(&format!("\n  {id}:\n"))
+        .unwrap_or_else(|| panic!("CI に {id} ジョブが無い"));
     rest.lines()
-        .skip(1)
         .take_while(|line| line.trim().is_empty() || line.starts_with("    "))
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// Windows の clippy のゲートを持つ job（#2850。windows ジョブと並走する）
+const CLIPPY_JOB: &str = "windows-clippy";
 
 /// コメント行（`#` 始まり）を落とす。説明文の中の文字列に当たって誤検知しないため
 fn without_comments(source: &str) -> String {
@@ -302,33 +307,67 @@ fn windowsジョブがコンパイラの警告を0件に保つ() {
 
 /// #2850: Windows の cfg の内側を clippy の指摘 0 件に保つ。
 ///
+/// - **windows ジョブの段ではなく、並走する別ジョブ [`CLIPPY_JOB`] に置く**: clippy は check の単位で組むので
+///   windows ジョブのビルドの成果物を使い回せず、段にすると windows ジョブが約 13 分伸びる（PR #2862 の実測で
+///   81.5 分 = 上限 90 分の手前）。windows ジョブへ戻したらここで落ちる
 /// - macOS ジョブの clippy と**同じ feature 宇宙を全部**回す（片側だけ宇宙を足し引きしたらここで落ちる。
 ///   着手時の 13 件のうち 1 件は visual-test の宇宙にしか出なかった）
 /// - `-- -D warnings` を付けない: 最初に指摘の出たクレートで止まり、依存するクレートが検査されない。
 ///   件数と位置はゲート（[`WARNING_GATE`]）が数えて名指す（CI の注釈にも出る）
-/// - テストのコンパイルが通っていれば、テストの全数が赤でも走る（`!cancelled()` + `test-build`）
-/// - Windows のツールチェーンに clippy を入れる（dtolnay の既定は minimal で clippy が無い）
+/// - Windows のランナーで回し、走らせる判定（`if:`）は macOS ジョブの lint と同じ行にする
+///   （docs だけなら skip = #2084・定期実行では走らない）
+/// - ツールチェーンに clippy を入れ（dtolnay の既定は minimal で clippy が無い）、版は windows ジョブと揃える
 /// - 手元の `scripts/check-windows.sh` も `cargo xwin clippy` で同じ宇宙を回す
 #[test]
-fn windowsジョブがclippyの指摘を0件に保つ() {
+fn windowsのclippyの指摘を並走するジョブで0件に保つ() {
     let ci = ci_yaml();
-    let job = without_comments(&windows_job(&ci));
-    let steps = steps(&job);
-    let gate: Vec<(usize, &String)> = steps
+    let windows = without_comments(&windows_job(&ci));
+    assert!(
+        !windows.contains("cargo clippy"),
+        "windows ジョブに clippy の段がある（#2850。clippy は build の成果物を使い回せず、段にすると windows ジョブが\
+         約 13 分伸びて上限 90 分の手前まで来る。並走する {CLIPPY_JOB} ジョブに置く）\n{windows}"
+    );
+    let job = without_comments(&job_body(&ci, CLIPPY_JOB));
+    let mac = without_comments(&job_body(&ci, "macos"));
+
+    // ジョブの見出し: Windows のランナー・変更範囲の判定を待つ・走らせる判定は macOS の lint と同じ行
+    let header = |body: &str, key: &str| -> Option<String> {
+        body.lines()
+            .find(|line| line.starts_with(&format!("    {key}:")))
+            .map(|line| line.trim_end().to_string())
+    };
+    assert_eq!(
+        header(&job, "runs-on").as_deref(),
+        Some("    runs-on: windows-latest"),
+        "{CLIPPY_JOB} ジョブが Windows のランナーで回っていない（#2850。Windows の cfg の内側は macOS の clippy から見えない）\n{job}"
+    );
+    assert_eq!(
+        header(&job, "needs").as_deref(),
+        Some("    needs: changes"),
+        "{CLIPPY_JOB} ジョブが変更範囲の判定（#2084）を待っていない\n{job}"
+    );
+    let mac_if = header(&mac, "if").expect("macOS ジョブに走らせる判定（if:）がある（#2084）");
+    assert_eq!(
+        header(&job, "if"),
+        Some(mac_if.clone()),
+        "{CLIPPY_JOB} ジョブの走らせる判定が macOS ジョブの lint と違う（#2850。docs だけなら skip = #2084・\
+         定期実行では走らない、に揃える）\n{job}"
+    );
+
+    let job_steps = steps(&job);
+    let gate: Vec<&String> = job_steps
         .iter()
-        .enumerate()
-        .filter(|(_, s)| s.contains(&format!("{WARNING_GATE} cargo clippy")))
+        .filter(|s| s.contains(&format!("{WARNING_GATE} cargo clippy")))
         .collect();
     assert_eq!(
         gate.len(),
         1,
-        "Windows ジョブに clippy の指摘 0 件のゲート（{WARNING_GATE} cargo clippy）の段が 1 本ない（#2850）。\
+        "{CLIPPY_JOB} ジョブに clippy の指摘 0 件のゲート（{WARNING_GATE} cargo clippy）の段が 1 本ない（#2850）。\
          Windows の cfg の内側は macOS の clippy から見えない\n{job}"
     );
-    let (gate_at, gate) = gate[0];
+    let gate = gate[0];
 
     // macOS ジョブの clippy の宇宙（`run: cargo clippy … -- -D warnings`）をすべて Windows でも回す
-    let mac = without_comments(&macos_job(&ci));
     let universes: Vec<String> = mac
         .lines()
         .filter_map(|line| line.trim().strip_prefix("run: "))
@@ -352,34 +391,38 @@ fn windowsジョブがclippyの指摘を0件に保つ() {
          依存するクレートが検査されない。数えるのは {WARNING_GATE}）\n{gate}"
     );
     assert!(
-        !gate.contains("continue-on-error"),
-        "Windows の clippy のゲートが非ブロッキングになっている（#2850）\n{gate}"
+        !job.contains("continue-on-error"),
+        "Windows の clippy のゲートが非ブロッキングになっている（#2850）\n{job}"
     );
     assert!(
         gate.contains("exit \"$rc\""),
         "Windows の clippy のゲートが途中の宇宙の結果を捨てている（#2850。全部回してから終了コードを返す）\n{gate}"
     );
-    assert!(
-        gate.contains("!cancelled()") && gate.contains("steps.test-build.outcome == 'success'"),
-        "Windows の clippy のゲートがテストのコンパイルの成否だけで走る形になっていない（#2850。\
-         テストが赤でも clippy の結果を同じ CI で読むため）\n{gate}"
-    );
-    let full_at = steps
-        .iter()
-        .position(|s| s.contains("cargo test --workspace --no-fail-fast"))
-        .expect("テストの全数の段がある（#1278）");
-    assert!(
-        full_at < gate_at,
-        "clippy のゲートはテストの全数の後ろに置く（#2850。赤でも後ろの段を skip させず、テストの結果を先に読む）\n{job}"
-    );
-    let toolchain = steps
-        .iter()
-        .find(|s| s.contains("dtolnay/rust-toolchain"))
-        .expect("Windows ジョブにツールチェーンの段がある");
+
+    // ツールチェーン: clippy を入れ、版は windows ジョブ（build / test）と揃える
+    let toolchain_of = |body: &str| -> String {
+        steps(body)
+            .into_iter()
+            .find(|s| s.contains("dtolnay/rust-toolchain"))
+            .unwrap_or_else(|| panic!("ツールチェーンの段が無い\n{body}"))
+    };
+    let toolchain = toolchain_of(&job);
     assert!(
         toolchain.contains("components:") && toolchain.contains("clippy"),
-        "Windows ジョブのツールチェーンに clippy が入っていない（#2850。dtolnay の既定は minimal）\n{toolchain}"
+        "{CLIPPY_JOB} ジョブのツールチェーンに clippy が入っていない（#2850。dtolnay の既定は minimal）\n{toolchain}"
     );
+    let version = |step: &str| -> Option<String> {
+        step.lines()
+            .find_map(|line| line.trim().strip_prefix("toolchain: "))
+            .map(str::to_string)
+    };
+    let windows_toolchain = toolchain_of(&windows);
+    assert!(
+        version(&toolchain).is_some() && version(&toolchain) == version(&windows_toolchain),
+        "{CLIPPY_JOB} ジョブと windows ジョブのツールチェーンの版がずれている（#2850。lint と build / test で\
+         違う rustc を見ることになる）\n{toolchain}\n{windows_toolchain}"
+    );
+
     let check = without_comments(
         &std::fs::read_to_string(repo_root().join("scripts/check-windows.sh"))
             .expect("scripts/check-windows.sh を読める"),
