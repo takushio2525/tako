@@ -29,6 +29,10 @@
 //! 3. 名指しの小さな実行ステップ（Win32 FFI = #1282 / psmux = #1314）は blocking のまま
 //!    **`--workspace` を付けてはいけない**。全数ステップを 1 本に保ち、
 //!    「どのステップが何を見たか」をログから読めるようにするため
+//! 4. コンパイラの警告 0 件のゲート（#1537 / #1827）= `scripts/warning-gate.sh` に
+//!    `cargo build --workspace` と `cargo test --workspace --no-run` の両方を通す blocking ステップ。
+//!    Windows の cfg の内側だけで出る警告は macOS の clippy（`-D warnings`）からは見えず、
+//!    ゲートが無いあいだに 36 件まで積み上がった。1 の「コンパイル検査」の数には入れない
 //!
 //! Windows に存在しない仕組みを見るテストは、**理由つきで名指し skip**
 //! （`#[cfg(...)]` / `#[cfg_attr(windows, ignore = "理由")]`）へ寄せた。
@@ -77,6 +81,9 @@ fn steps(job: &str) -> Vec<String> {
     out
 }
 
+/// 警告ゲート（#1537）の 1 実装。CI の Windows ジョブと `scripts/check-windows.sh` が通す
+const WARNING_GATE: &str = "scripts/warning-gate.sh";
+
 /// コメント行（`#` 始まり）を落とす。説明文の中の文字列に当たって誤検知しないため
 fn without_comments(source: &str) -> String {
     source
@@ -96,9 +103,11 @@ fn windowsジョブがテストのコンパイルをblockingで検査する() {
         "windows ジョブのステップを切り出せていない（この番犬の読み取りが壊れている）"
     );
 
+    // 警告ゲート（#1537）も `cargo test --workspace --no-run` を通すが、テストのコンパイルの
+    // 担当ではない（済んだ単位の警告を再生させて数えるだけ）ので数に入れない
     let compile: Vec<&String> = steps
         .iter()
-        .filter(|s| s.contains("cargo test") && s.contains("--no-run"))
+        .filter(|s| s.contains("cargo test") && s.contains("--no-run") && !s.contains(WARNING_GATE))
         .collect();
     assert_eq!(
         compile.len(),
@@ -188,5 +197,89 @@ fn windows固有ffiの実行検査がblockingで置かれている() {
         !ffi[0].contains("continue-on-error"),
         "FFI の実行検査が非ブロッキングになっている（#1282。壊れても緑のまま通る）\n{}",
         ffi[0]
+    );
+}
+
+/// #1537 / #1827: Windows の cfg の内側だけで出るコンパイラの警告を **0 件に保つ** ゲートが、
+/// ビルドとテストのコンパイルの両方を見る形で blocking に置かれていること。
+///
+/// macOS は clippy の `-D warnings` で 0 件を保っているが、Windows の cfg の内側（unix 向けの補助が
+/// Windows で未使用 など）は見えない。ゲートが無いあいだに 9 月の 31 件から 11 月の 36 件まで
+/// 積み上がり、新しい警告が埋もれていた。
+///
+/// - `cargo build` も数える: 統合テストの無い tako-app の**非テストの bin** は `--no-run` では
+///   作られないので、製品コードの dead_code（11 月の 36 件のうち 11 件）が見えなくなる
+/// - テストのコンパイルが通っていれば、テストの全数が赤でも走る（`!cancelled()` + `test-build`）
+/// - Windows ジョブで `RUSTFLAGS` を env に置かない: `.cargo/config.toml` の
+///   `[target.x86_64-pc-windows-msvc] rustflags`（`+crt-static` = #587）を丸ごと上書きし、
+///   配布物が VC++ の DLL を要求する形に変わる（`-D warnings` を RUSTFLAGS で渡す形へ「簡単に」しない）
+/// - 手元の `scripts/check-windows.sh` も同じ 1 実装を通す（手元と CI で数え方をずらさない）
+#[test]
+fn windowsジョブがコンパイラの警告を0件に保つ() {
+    let ci = ci_yaml();
+    let raw = windows_job(&ci);
+    let job = without_comments(&raw);
+    let steps = steps(&job);
+    let gate: Vec<(usize, &String)> = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.contains(WARNING_GATE))
+        .collect();
+    assert_eq!(
+        gate.len(),
+        1,
+        "Windows ジョブに警告 0 件のゲート（{WARNING_GATE}）の段が 1 本ない（#1537）。\
+         ゲートが無いと Windows の cfg の内側だけの警告が積み上がる\n{job}"
+    );
+    let (gate_at, gate) = gate[0];
+    for command in ["cargo build --workspace", "cargo test --workspace --no-run"] {
+        assert!(
+            gate.contains(&format!("{WARNING_GATE} {command}")),
+            "警告ゲートが `{command}` を数えていない（#1537。build は tako-app の非テストの bin、\
+             test --no-run はテストの cfg の内側と統合テストの担当）\n{gate}"
+        );
+    }
+    assert!(
+        !gate.contains("continue-on-error"),
+        "警告ゲートが非ブロッキングになっている（#1537。警告が積み上がった元の形）\n{gate}"
+    );
+    assert!(
+        gate.contains("exit \"$rc\""),
+        "警告ゲートが片方の結果を捨てている（#1537。`shell: bash` は最初の失敗で抜けるので、\
+         両方を回してから終了コードを返す）\n{gate}"
+    );
+    assert!(
+        gate.contains("!cancelled()") && gate.contains("steps.test-build.outcome == 'success'"),
+        "警告ゲートがテストのコンパイルの成否だけで走る形になっていない（#1537。\
+         テストが赤でも警告の結果を同じ CI で読むため）\n{gate}"
+    );
+    let compile_at = steps
+        .iter()
+        .position(|s| s.contains("id: test-build"))
+        .expect("テストのコンパイルの段に id: test-build が無い（#1537 のゲートの if が参照する）");
+    assert!(
+        steps[compile_at].contains("cargo test --workspace --no-run"),
+        "id: test-build がテストのコンパイルの段に付いていない\n{}",
+        steps[compile_at]
+    );
+    let full_at = steps
+        .iter()
+        .position(|s| s.contains("cargo test --workspace --no-fail-fast"))
+        .expect("テストの全数の段がある（#1278）");
+    assert!(
+        compile_at < full_at && full_at < gate_at,
+        "警告ゲートはテストのコンパイルと全数の後ろに置く（#1537。再生させる単位が揃ってから数える）\n{job}"
+    );
+    assert!(
+        !job.contains("RUSTFLAGS"),
+        "Windows ジョブが RUSTFLAGS を置いている（#1537。.cargo/config.toml の +crt-static = #587 を\
+         上書きする。警告は {WARNING_GATE} で数える）\n{job}"
+    );
+    let check = std::fs::read_to_string(repo_root().join("scripts/check-windows.sh"))
+        .expect("scripts/check-windows.sh を読める");
+    assert!(
+        without_comments(&check).contains(WARNING_GATE),
+        "scripts/check-windows.sh が警告ゲートを通していない（#1537。手元の xwin check と CI で\
+         数え方がずれる）"
     );
 }

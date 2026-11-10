@@ -130,4 +130,5 @@ Windows 側で機能実装に入るときは、次を読む。
 - `.agent/plans/2026-07-windows-port-survey.md` — 何が動かないかの全数調査
 
 macOS 側で開発している人は、コミット前に `scripts/check-windows.sh` を回すと
-Windows のコンパイル崩れを持ち込まずに済む。
+Windows のコンパイル崩れと警告（0 件に保つ。CI の Windows ジョブも同じ数え方で落とす = #1537）を
+持ち込まずに済む。

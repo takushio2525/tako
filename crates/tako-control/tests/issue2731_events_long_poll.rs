@@ -27,6 +27,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tako_control::ipc::IncomingRequest;
 use tako_control::mcp::McpServer;
+// 実ソケットの往復（unix）だけが使う（#1537）
+#[cfg(unix)]
 use tako_control::protocol::Request;
 use tako_core::events::{MAX_WAITERS, MAX_WAIT_MS};
 use tako_core::{Pane, PaneOrigin};

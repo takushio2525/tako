@@ -4972,9 +4972,19 @@ CI 完了前に merge され（merge 04:24:10 / Windows 完了 04:48:24）、過
   その先のクレートが 1 件も走らない（実測 2026-09-22 の main: tako-app の 1 件で止まり
   tako-control / tako-core は 0 件実行）。全数が採れないと 1 回の CI で 1 件しか直せない
 - ステップの順は「コンパイル検査（`--no-run`）→ 名指しの実行検査（Win32 FFI = #1282 /
-  psmux = #1314）→ **全数**」。名指しを**手前**に置くのは、全数が赤いと以降のステップが
+  psmux = #1314）→ **全数** → 警告ゲート」。名指しを**手前**に置くのは、全数が赤いと以降のステップが
   skip されて「FFI は通ったのか」が読めなくなるため。名指しのステップに
   `--workspace` を付けてはいけない（全数を 1 本に保ち、ログで責任を分ける）
+- **コンパイラの警告も 0 件に保つ**（#1537 / #1827）。Windows の cfg の内側だけで出る警告は
+  macOS の clippy（`-D warnings`）からは見えず、ゲートが無いあいだに 36 件まで積み上がった。
+  段「Windows のコンパイラの警告 0 件のゲート」が `scripts/warning-gate.sh` に
+  `cargo build --workspace` と `cargo test --workspace --no-run` の両方を通す（済んだ単位の警告を
+  再生させて数えるので数秒。build も数えるのは、統合テストの無い tako-app の非テストの bin が
+  `--no-run` では作られないため）。テストのコンパイル（`id: test-build`）が通っていれば全数が赤でも走る。
+  **`RUSTFLAGS=-D warnings` で代えない**（`.cargo/config.toml` の `+crt-static` = #587 を上書きする）。
+  手元は `scripts/check-windows.sh` が同じ 1 実装を通す。直し方の順（消す / 使う側の cfg へ寄せる /
+  理由つきの `#[cfg_attr(windows, allow(dead_code))]`）は `.agent/commands.md` の同名の行。
+  番犬 `ci_windows_test_compile.rs` の `windowsジョブがコンパイラの警告を0件に保つ`
 
 ### CI ランナーと実機は別物として扱う
 

@@ -46,6 +46,8 @@ mod production_range;
 
 use production_range::code_view::without_comments;
 
+// 使い手は unix のテスト（`resolve_within_location`）だけ（#1537）
+#[cfg(unix)]
 const BIN_RESOLVE: &str = "crates/tako-core/src/bin_resolve.rs";
 const GIT: &str = "crates/tako-core/src/git.rs";
 const TMUX: &str = "crates/tako-core/src/tmux.rs";
@@ -498,6 +500,7 @@ fn 逆戻りを名指しできる() {
 }
 
 /// `fn resolve_within` の場所（1 の名指し先）
+#[cfg(unix)]
 fn resolve_within_location() -> String {
     let src = read(BIN_RESOLVE);
     let (at, _) =

@@ -380,6 +380,8 @@ pub fn plan_here(home: &Path) -> Option<Placement> {
 mod tests {
     use super::*;
 
+    // `temp_home` と `cleanup` は実際に symlink を置く unix のテストだけが使う（#1537）
+    #[cfg(unix)]
     fn temp_home(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "tako-cli-path-{tag}-{}-{:?}",
@@ -392,6 +394,7 @@ mod tests {
     }
 
     /// **一時ディレクトリ配下であることを確認してから消す**
+    #[cfg(unix)]
     fn cleanup(dir: &Path) {
         assert!(
             dir.starts_with(std::env::temp_dir()),

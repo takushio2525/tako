@@ -763,7 +763,8 @@ vd_ensure 2>"$STUB_ERR"
 
 // ── #1817: 器に作らせるのは常設の 1 枚だけ・座標と状態も物理画面を断る ──────────────
 
-/// `VD_RC_NOT_VIRTUAL=<数>` の値（ヘルパと番犬で番号をずらさない）
+/// `VD_RC_NOT_VIRTUAL=<数>` の値（ヘルパと番犬で番号をずらさない）。使い手は unix のテストだけ（#1537）
+#[cfg(unix)]
 fn rc_not_virtual(src: &str) -> i32 {
     src.lines()
         .find_map(|l| l.strip_prefix("VD_RC_NOT_VIRTUAL="))

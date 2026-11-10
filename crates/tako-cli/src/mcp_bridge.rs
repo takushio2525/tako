@@ -129,7 +129,8 @@ pub fn handoff_to_small_bridge() {
     }
 }
 
-/// 引き渡し先（.app の外・置かれていなければ `None`）
+/// 引き渡し先（.app の外・置かれていなければ `None`）。呼び手は unix の引き渡しだけ（#1537）
+#[cfg(unix)]
 fn small_bridge_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     // Homebrew の `bin/tako` は .app の中への symlink なので、実体の置き場で判定する

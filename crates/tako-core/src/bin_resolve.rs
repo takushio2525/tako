@@ -90,7 +90,9 @@ pub fn set_notice_sink(sink: fn(&str)) {
     NOTICES.install(sink);
 }
 
-/// tako-core の打ち切りの知らせを persist.log の受け口へ 1 行流す（受け口が来る前は溜める）
+/// tako-core の打ち切りの知らせを persist.log の受け口へ 1 行流す（受け口が来る前は溜める）。
+/// 呼び手は unix のログインシェルでの検出の打ち切り（`platform::exe`）だけ（#1537）
+#[cfg(unix)]
 pub(crate) fn notify(line: &str) {
     NOTICES.emit(line);
 }

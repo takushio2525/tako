@@ -196,7 +196,8 @@ impl Item {
         self
     }
 
-    /// 改行で区切った複数の続きの行を足す
+    /// 改行で区切った複数の続きの行を足す（呼び手は macOS の `fda_item` だけ。#1537）
+    #[cfg(target_os = "macos")]
     fn lines_of(mut self, text: &str) -> Self {
         self.lines.extend(text.lines().map(str::to_string));
         self

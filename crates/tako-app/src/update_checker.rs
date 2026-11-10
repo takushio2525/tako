@@ -1979,7 +1979,9 @@ mod tests {
     /// 子を名指しするときの目印（無ければ子の本体は走らない）
     const BREW_PROBE_ENV: &str = "TAKO_1253_BREW_PROBE";
 
-    /// 子のテスト名（`--exact` で名指しするので、改名したらここも直す）
+    /// 子のテスト名（`--exact` で名指しするので、改名したらここも直す）。
+    /// 使い手は macOS のテスト（`テストプロセスはbrewを起こさない`）だけ（#1537）
+    #[cfg(target_os = "macos")]
     const BREW_PROBE_CHILD: &str = "update_checker::tests::子プロセス_配布系統を判別する";
 
     /// 親から起こされたときだけ配布系統の判別を通す（本番なら brew を起こす経路）

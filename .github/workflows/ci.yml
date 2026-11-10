@@ -450,6 +450,11 @@ jobs:
       # scripts/wait-pr-checks.sh の 1 実装で、master / worker もこれを呼ぶ = #1333）
       - name: CI 完了待ちのモックテスト
         run: bash scripts/test-wait-pr-checks.sh
+      # Windows の警告ゲート（#1537 / #1827）のテスト。偽の cargo（Windows の CRLF・`\` の位置・重複の数え方）と、
+      # 一時ディレクトリの小さなクレートに対する本物の cargo（済んだビルドの再生・テストの cfg の内側）で回す。
+      # **ゲートが警告を見落とす・数え違える形へ戻ったらここで落ちる**（数秒）
+      - name: Windows の警告ゲートのテスト（#1537）
+        run: bash scripts/test-warning-gate-1537.sh
       # PWA の Playwright e2e（件数は spec を足すたびに増えるので書かない）。
       # **この e2e は CI で 1 度も走っておらず、
       # 走らせ方もどこにも書かれていなかった**ので、#425 の契約変更（承認カードを
@@ -582,6 +587,7 @@ jobs:
       # **追加の所要時間は実質ゼロ**: 下のテスト実行はここで作ったテストバイナリを
       # そのまま使う（実機実測: `--no-run` の後の `cargo test --workspace` は再コンパイル 0）
       - name: テストのコンパイル検査（#1264。結果ではなくビルドを守る）
+        id: test-build
         run: cargo test --workspace --no-run
       # #1282: 器の列挙が使う Win32 FFI（`NtQueryInformationProcess` でのコマンドライン /
       # `GetProcessTimes` での起動時刻）は **macOS では 1 行も実行できない**。
@@ -753,6 +759,24 @@ jobs:
       # これでは「直したら次が出る」を 1 PR 1 往復でしか進められない
       - name: テスト（#1278 で blocking 化。全数を採るため --no-fail-fast）
         run: cargo test --workspace --no-fail-fast
+      # #1537 / #1827: Windows の cfg の内側だけで出るコンパイラの警告（unix 向けの補助が Windows で未使用 など）を
+      # 0 件に保つ。macOS は clippy の -D warnings で 0 件を保っているが、Windows の cfg の内側を見るゲートが無く、
+      # 9 月の 31 件から 11 月の 36 件まで積み上がって新しい警告が埋もれていた。上のビルドとテストのコンパイルで
+      # 済んだ単位の警告を cargo に再生させて数える（再コンパイル 0・数秒）。`cargo build` も数えるのは、
+      # 統合テストの無い tako-app の非テストの bin が `--no-run` では作られないため。
+      # RUSTFLAGS=-D warnings にしないのは、env の RUSTFLAGS が .cargo/config.toml の +crt-static を上書きするため
+      # （理由の全文と数え方は scripts/warning-gate.sh。手元の scripts/check-windows.sh も同じ 1 実装を通す）。
+      # テストの全数の後ろに置き、テストのコンパイルが通っていればテストが赤でも走らせる（両方を 1 回の CI で読む）。
+      # Git を一度外す #2433 の実走より手前に置く。**Windows でだけ出る警告を足すとここで落ちる**（位置は PR の
+      # チェックの注釈にも名指しで出る。番犬 crates/tako-control/tests/ci_windows_test_compile.rs）
+      - name: Windows のコンパイラの警告 0 件のゲート（#1537 / #1827）
+        if: ${{ !cancelled() && steps.test-build.outcome == 'success' }}
+        shell: bash
+        run: |
+          rc=0
+          bash scripts/warning-gate.sh cargo build --workspace || rc=$?
+          bash scripts/warning-gate.sh cargo test --workspace --no-run || rc=$?
+          exit "$rc"
       # #2433: 任意依存の導入代行を本物の winget で回す（製品の口 `tako setup deps install`）。psmux を利用者の権限で
       # 入れて導入の前後の status を記録し、Git は一度外してから「同意なし = 起こさない → --yes = 入る」を確かめて元の
       # 置き場（machine）へ戻す。**外部（winget の取得元・GitHub Releases）から取るので、導入代行に関わるパスを変えた
