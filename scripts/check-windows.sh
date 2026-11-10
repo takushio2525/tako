@@ -9,15 +9,56 @@
 #
 # 使い方:
 #   scripts/check-windows.sh            # CI の Windows ジョブと同じ 3 つの feature 宇宙を clippy で検査
-#   scripts/check-windows.sh -p tako-core   # cargo の追加引数はそのまま渡る（1 本だけ回す）
+#   scripts/check-windows.sh -p tako-core   # cargo の追加引数はそのまま渡る（1 本だけ回す）。
+#                                           # -p / --package ならそのクレートと依存だけを検査する（#2851）
 #
 # 終了コード: 0 = エラーも警告も clippy の指摘も無い / 3 = 警告か clippy の指摘がある
-#             （エラーは無い。#1537 / #2850）/ 2 = 前提ツールが足りない / それ以外 = cargo のエラー
+#             （エラーは無い。#1537 / #2850）/ 2 = 前提ツールが足りない・値の無い -p（#2851）/
+#             それ以外 = cargo のエラー
 set -euo pipefail
 
 TARGET="x86_64-pc-windows-msvc"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+
+# **範囲の指定（`-p` / `--package`）を勝たせる**（#2851）。cargo は `--workspace` と `-p` が並ぶと
+# `--workspace` を勝たせて全メンバーを検査し、`--workspace` が 2 つ並ぶと `cannot be used multiple
+# times` で断る（2026-11-10 実測）。以前は引数に関係なく `--workspace` を足していたので、`-p tako-core`
+# でも全クレートを検査し（他のクレートの警告でも 3）、`--workspace` を渡すと必ず失敗した。
+# `-p` / `--package`（`--package=<名>`・`-p<名>` も）か、自分で渡した `--workspace`（旧名 `--all`）が
+# あれば足さない。無ければ従来どおり足す（`--exclude` は `--workspace` が要る）。
+# 値の無い `-p` / `--package`（最後の引数・次が `-` で始まる）は止める: cargo 単体は断るが、cargo-xwin は
+# 黙って捨てて全メンバーを検査し、絞ったつもりで全体の答えを返す（2026-11-10 実測）
+SCOPE=(--workspace)
+scope_package=0
+scope_workspace=0
+expect_value=0
+missing_value=0
+for arg in "$@"; do
+  if [ "$expect_value" -eq 1 ]; then
+    expect_value=0
+    case "$arg" in -*) missing_value=1 ;; esac
+  fi
+  case "$arg" in
+    -p | --package) scope_package=1 expect_value=1 ;;
+    -p?* | --package=*) scope_package=1 ;;
+    --workspace | --all) scope_workspace=1 ;;
+  esac
+done
+if [ "$expect_value" -eq 1 ]; then
+  missing_value=1
+fi
+if [ "$missing_value" -eq 1 ]; then
+  echo "check-windows.sh: -p / --package の後にクレート名がありません（例: scripts/check-windows.sh -p tako-core）" >&2
+  echo "  値の無い -p は cargo-xwin が黙って捨て、全メンバーを検査してしまうので止めます" >&2
+  exit 2
+fi
+if [ "$scope_package" -eq 1 ] || [ "$scope_workspace" -eq 1 ]; then
+  SCOPE=()
+fi
+if [ "$scope_package" -eq 1 ] && [ "$scope_workspace" -eq 1 ]; then
+  echo "注意: --workspace と -p / --package を両方渡すと、cargo は --workspace を勝たせて全メンバーを検査します（絞るなら --workspace を外す）" >&2
+fi
 
 missing=()
 
@@ -129,4 +170,4 @@ if [ "$#" -eq 0 ]; then
   done
   exit "$rc"
 fi
-xwin_clippy --workspace ${ALL_TARGETS[@]+"${ALL_TARGETS[@]}"} "$@"
+xwin_clippy ${SCOPE[@]+"${SCOPE[@]}"} ${ALL_TARGETS[@]+"${ALL_TARGETS[@]}"} "$@"

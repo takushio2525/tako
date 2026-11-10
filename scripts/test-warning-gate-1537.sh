@@ -14,6 +14,10 @@
 #      済んだビルドに当てても再コンパイル無しで数える（色つきで作った後でも）・警告の無いクレートは 0
 #   A2 / B2. clippy の段（#2850）: 偽の cargo で見出し・直し方・注釈を clippy の指摘として言う / 本物の
 #      clippy で本体とテストの cfg の内側の指摘を拾い、済んだ単位は検査し直さずに数える
+#   C. scripts/check-windows.sh の範囲の指定（#2851）: 偽の cargo / rustup / brew の砂場で、実物の
+#      スクリプトが cargo へ渡す引数を固定する。引数なしは 3 つの宇宙のまま / `-p` `--package`
+#      `--package=` `-p<名>` では `--workspace` を足さない / 自分で渡した `--workspace` に重ねない /
+#      値の無い `-p` は cargo を起こさずに 2 / 絞った範囲でもゲートが数えて 3 で名指す
 # 配線（CI の Windows ジョブと scripts/check-windows.sh がこのゲートを通すこと）は
 # Rust の番犬 crates/tako-control/tests/ci_windows_test_compile.rs が見る
 # 検出力: 色を切らない写しのゲートは、色つきの CI と同じ条件で警告を見落とすことを確かめる
@@ -272,6 +276,102 @@ EOF
   fi
   unset CARGO_TARGET_DIR
 fi
+
+echo "C. check-windows.sh の範囲の指定（#2851。偽の cargo / rustup / brew の砂場）"
+# 実物の check-windows.sh と warning-gate.sh を一時のリポジトリの根へ写し、`cargo xwin` へ渡った引数を
+# 1 回 1 行で記録する。PWA のビルドは何もしない偽物に差し替える（npm を起こさない）
+CW="${TMP}/cw"
+CW_LOG="${TMP}/cw-calls.txt"
+mkdir -p "${CW}/scripts" "${CW}/bin" "${CW}/llvm/bin" "${CW}/gpui"
+command cp -f "${REPO_ROOT}/scripts/check-windows.sh" "${REPO_ROOT}/scripts/warning-gate.sh" "${CW}/scripts/"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${CW}/scripts/build-pwa.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${CW}/llvm/bin/clang-cl"
+printf '#!/usr/bin/env bash\nexit 0\n' >"${CW}/bin/cargo-xwin"
+printf '#!/usr/bin/env bash\necho x86_64-pc-windows-msvc\n' >"${CW}/bin/rustup"
+printf '#!/usr/bin/env bash\necho "%s"\n' "${CW}/llvm" >"${CW}/bin/brew"
+cat >"${CW}/bin/cargo" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  metadata)
+    printf '{"packages":[{"name":"gpui","manifest_path":"%s/Cargo.toml"}]}\n' "$CW_GPUI"
+    exit 0
+    ;;
+  xwin)
+    shift
+    printf '%s\n' "$*" >>"$CW_LOG"
+    cat "$FAKE_OUT"
+    exit "${FAKE_RC:-0}"
+    ;;
+esac
+echo "偽の cargo: 知らない副コマンド: $*" >&2
+exit 99
+EOF
+fake_exec_warm "${CW}/scripts/build-pwa.sh" "${CW}/llvm/bin/clang-cl" "${CW}/bin/cargo-xwin" \
+  "${CW}/bin/rustup" "${CW}/bin/brew" "${CW}/bin/cargo"
+
+cw_run() { # $1 = 偽の cargo の出力, $2 = 終了コード, 残り = check-windows.sh の引数
+  local file="$1" rc="$2"
+  shift 2
+  : >"$CW_LOG"
+  out="$(env PATH="${CW}/bin:${PATH}" CW_LOG="$CW_LOG" CW_GPUI="${CW}/gpui" \
+    FAKE_OUT="$file" FAKE_RC="$rc" bash "${CW}/scripts/check-windows.sh" "$@" 2>&1)"
+  code=$?
+  calls="$(cat "$CW_LOG")"
+}
+W="clippy --target x86_64-pc-windows-msvc"
+
+cw_run "${TMP}/clean.txt" 0
+assert_eq "引数なし: 3 つの宇宙を修正前と同じ引数で回す" "$calls" "$(printf '%s\n' \
+  "$W --workspace --all-targets" \
+  "$W -p tako-app --features visual-test --all-targets" \
+  "$W -p tako-core -p tako-control -p tako-cli --all-targets")"
+assert_eq "引数なし: 指摘 0 件は 0" "$code" "0"
+
+cw_run "${TMP}/clean.txt" 0 -p tako-core
+assert_eq "-p <名>: --workspace を足さない" "$calls" "$W --all-targets -p tako-core"
+assert_lacks "-p だけなら同時指定の注意を出さない" "全メンバーを検査します" "$out"
+cw_run "${TMP}/clean.txt" 0 --package tako-core
+assert_eq "--package <名>: --workspace を足さない" "$calls" "$W --all-targets --package tako-core"
+cw_run "${TMP}/clean.txt" 0 --package=tako-core
+assert_eq "--package=<名>: --workspace を足さない" "$calls" "$W --all-targets --package=tako-core"
+cw_run "${TMP}/clean.txt" 0 -ptako-core
+assert_eq "-p<名>（くっつけた形）: --workspace を足さない" "$calls" "$W --all-targets -ptako-core"
+cw_run "${TMP}/clean.txt" 0 -p tako-core -p tako-cli
+assert_eq "-p を 2 つ: --workspace を足さない" "$calls" "$W --all-targets -p tako-core -p tako-cli"
+
+cw_run "${TMP}/clean.txt" 0 --lib
+assert_eq "範囲の指定が無い追加の引数: 従来どおり --workspace を足す" "$calls" "$W --workspace --all-targets --lib"
+cw_run "${TMP}/clean.txt" 0 --exclude tako-app
+assert_eq "--exclude（--workspace が要る）: --workspace を足す" "$calls" "$W --workspace --all-targets --exclude tako-app"
+cw_run "${TMP}/clean.txt" 0 --workspace
+assert_eq "自分で渡した --workspace に重ねない（cargo は 2 つ目を断る）" "$calls" "$W --all-targets --workspace"
+cw_run "${TMP}/clean.txt" 0 --all
+assert_eq "旧名の --all にも --workspace を重ねない" "$calls" "$W --all-targets --all"
+cw_run "${TMP}/clean.txt" 0 --workspace -p tako-core
+assert_eq "--workspace と -p の同時指定: 渡されたまま cargo へ" "$calls" "$W --all-targets --workspace -p tako-core"
+assert_has "--workspace と -p の同時指定: cargo が全メンバーを検査すると言う" "全メンバーを検査します" "$out"
+
+cw_run "${TMP}/clippy.txt" 0 -p tako-control
+assert_eq "-p で絞っても指摘があれば 3" "$code" "3"
+assert_has "-p で絞っても clippy ゲートが数える" "clippy ゲート（#2850）: 自分のクレートに clippy の指摘（コンパイラの警告を含む）が 1 件あります" "$out"
+assert_has "-p で絞っても位置を名指す" "crates/tako-control/src/fda.rs:20:9: unneeded \`return\` statement" "$out"
+cw_run "${TMP}/clippy.txt" 0 -p tako-core --message-format=json
+assert_eq "-p と --message-format: ゲートを通さず cargo の終了コード" "$code" "0"
+assert_lacks "-p と --message-format: ゲートの判定を出さない" "clippy ゲート（#2850）" "$out"
+assert_eq "-p と --message-format: --workspace を足さない" "$calls" "$W --all-targets -p tako-core --message-format=json"
+# 値の無い -p は cargo-xwin が黙って捨てて全メンバーを検査する（2026-11-10 実測）ので、cargo を起こさずに止める
+cw_run "${TMP}/clean.txt" 0 -p
+assert_eq "-p の値が無い（最後の引数）: 使い方の誤りの 2" "$code" "2"
+assert_eq "-p の値が無い: cargo を起こさない" "$calls" ""
+assert_has "-p の値が無い: クレート名が無いと言う" "-p / --package の後にクレート名がありません" "$out"
+cw_run "${TMP}/clean.txt" 0 --lib --package
+assert_eq "--package の値が無い（最後の引数）: 2" "$code" "2"
+cw_run "${TMP}/clean.txt" 0 -p --lib
+assert_eq "-p の次が別のオプション: 2" "$code" "2"
+assert_eq "-p の次が別のオプション: cargo を起こさない" "$calls" ""
+cw_run "${TMP}/error.txt" 101 -p nosuch
+assert_eq "存在しないクレート名: cargo の断り（終了コード）をそのまま返す" "$code" "101"
+assert_eq "存在しないクレート名: --workspace で埋めない" "$calls" "$W --all-targets -p nosuch"
 
 echo
 echo "PASS=${PASS} FAIL=${FAIL}"
