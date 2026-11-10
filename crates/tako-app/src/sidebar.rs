@@ -277,6 +277,22 @@ const COPY_PROGRESS_TICK: std::time::Duration = std::time::Duration::from_millis
 pub(crate) const COPY_CANCEL_PROBE: &str = "<copy-cancel>";
 /// 帯の残り時間の目安の実矩形（#1895。出ているときだけ載る = visual-test `tree-keyboard-copy` が見る）
 pub(crate) const COPY_ETA_PROBE: &str = "<copy-eta>";
+/// 共有の通知欄の実矩形（#2760。出ているときだけ載る = visual-test `tree-notice-2760` が見る）
+pub(crate) const NOTICE_PROBE: &str = "<notice>";
+
+/// 共有の通知欄の字の大きさ（#919）
+const NOTICE_TEXT_PX: f32 = 11.0;
+/// 通知欄の上下の余白
+const NOTICE_PAD_Y: f32 = 5.0;
+/// 通知欄の本文の 1 行の高さ（#2760）。GPUI の既定（字の大きさ × 黄金比 = `phi()`）と同じ値を
+/// 明示して置き、高さの上限の計算と描画を同じ数で揃える（見た目は #2760 の前と変わらない）
+pub(crate) const NOTICE_LINE_PX: f32 = NOTICE_TEXT_PX * 1.618_034;
+/// 通知欄が本文に使う行数の上限（#2760）。幅 240px のサイドバーで、ルートからの相対パスへ縮めた
+/// 断り（`tako_core::paths::shorten_paths_in_text`）が収まる行数
+pub(crate) const NOTICE_MAX_LINES: f32 = 4.0;
+/// 通知欄の高さの上限（#2760。余白 + 行 × 上限 + 下の枠線 1px）。超えた分は通知欄の中で
+/// スクロールして読む（ツリーの行を窓の外へ押し出さない）
+pub(crate) const NOTICE_MAX_H: f32 = NOTICE_PAD_Y * 2.0 + NOTICE_LINE_PX * NOTICE_MAX_LINES + 1.0;
 
 /// いま見えているローカルの行の並び（⇧クリックの範囲・見えない行を外す基準。#1867）
 pub(crate) fn tree_visible_order(rows: &[filetree::Row]) -> Vec<std::path::PathBuf> {
@@ -973,6 +989,9 @@ impl TakoApp {
             .remote_notice
             .as_ref()
             .map(|n| (n.text.clone(), n.is_error));
+        // #2760: 通知欄の中のスクロールと、実矩形の採取（行と同じ器へ `NOTICE_PROBE` の名前で載せる）
+        let notice_scroll = self.notice_scroll.clone();
+        let notice_rects = row_rects.clone();
         let copy_progress = self.render_copy_progress(&theme, cx);
         // #789: 親（root render）が渡す幅と同じ実効幅を使う（要求値ではない）
         let sidebar_w = self.effective_sidebar_width();
@@ -1173,12 +1192,21 @@ impl TakoApp {
                 // #919: リモート操作の通知（成功は数秒、失敗は次の操作まで残す）。
                 // 汎用のトーストが無いので、ユーザーが見ている場所へ出す
                 .children(remote_notice.map(|(text, is_error)| {
-                    div()
+                    // #2760: 高さに上限を置き、超えた分は通知欄の中でスクロールして読む
+                    // （長い断りがツリーの行を窓の外へ押し出さない）。A/B は旧の形（上限なし）
+                    let capped = !Self::legacy_2760();
+                    let notice = div()
                         .id("remote-notice")
                         .flex_none()
                         .px(px(10.0))
-                        .py(px(5.0))
-                        .text_size(px(11.0))
+                        .py(px(NOTICE_PAD_Y))
+                        .text_size(px(NOTICE_TEXT_PX))
+                        .when(capped, |d| {
+                            d.line_height(px(NOTICE_LINE_PX))
+                                .max_h(px(NOTICE_MAX_H))
+                                .overflow_y_scroll()
+                                .track_scroll(&notice_scroll)
+                        })
                         .border_b_1()
                         .border_color(hsla_alpha(theme.pane_border, 0.6))
                         .bg(rgba_alpha(
@@ -1195,7 +1223,30 @@ impl TakoApp {
                             this.remote_notice = None;
                             cx.notify();
                         }))
-                        .child(SharedString::from(text))
+                        .child(SharedString::from(text));
+                    // 何も描かない矩形採取（`tree_row_probe` のときだけ。visual-test が高さを測る）は
+                    // 通知欄の外側の包みへ置く（スクロールの器の中の絶対配置の子は中身の高さに数えられうる =
+                    // 測る側が製品の配置を変えないよう、器の外で同じ矩形を採る）
+                    div()
+                        .flex_none()
+                        .child(notice)
+                        .when_some(notice_rects.clone(), |d, rects| {
+                            d.relative().child(
+                                canvas(
+                                    move |bounds, _, _| {
+                                        rects.borrow_mut().push((
+                                            std::path::PathBuf::from(NOTICE_PROBE),
+                                            bounds,
+                                        ))
+                                    },
+                                    |_, _, _, _| (),
+                                )
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .size_full(),
+                            )
+                        })
                 }))
                 .child(
                     div()
@@ -2887,6 +2938,33 @@ impl TakoApp {
             is_error,
             at: std::time::Instant::now(),
         });
+        // #2760: 前の通知を読み進めていても、新しい通知は頭から見せる
+        self.notice_scroll
+            .set_offset(gpui::point(gpui::px(0.0), gpui::px(0.0)));
+    }
+
+    /// #2760 の A/B。`TAKO_2760_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
+    /// （ツリーの断りの通知へ絶対パスをそのまま載せ、通知欄の高さに上限を置かない =
+    /// 長いパスの断りがツリーの行を窓の外へ押し出す）
+    pub(crate) fn legacy_2760() -> bool {
+        static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *LEGACY.get_or_init(|| std::env::var("TAKO_2760_LEGACY").map(|v| v == "1") == Ok(true))
+    }
+
+    /// ファイルツリーの通知の文のパスを、ルートからの相対（ルートの外はホームを `~`）へ縮める
+    /// （#2760。規則の正本は `tako_core::paths::shorten_paths_in_text`）。
+    ///
+    /// 通知はツリーの真上に出るので、ルートの絶対パスは見出しの行と重複する情報になる。
+    /// CLI / MCP の応答（dispatch の文面）は変えない = 縮めるのは画面へ出すこの 1 か所だけ
+    pub(crate) fn tree_notice_text(&self, text: String) -> String {
+        if Self::legacy_2760() {
+            return text;
+        }
+        tako_core::paths::shorten_paths_in_text(
+            &text,
+            self.filetree.roots(),
+            tako_core::paths::home_dir().as_deref(),
+        )
     }
 
     /// ユーザーの操作が失敗したことを画面へ出す唯一の口（#1399 / #1417）。
@@ -2915,6 +2993,12 @@ impl TakoApp {
             return;
         }
         Self::log_ui_failure(area, arm, diag_op, class);
+        // #2760: ツリーの通知は dispatch の文面（絶対パス入り）を包むので、画面へ出す前に縮める
+        let text = if area == NoticeArea::Tree {
+            self.tree_notice_text(text)
+        } else {
+            text
+        };
         self.set_remote_notice(text, true);
     }
 
