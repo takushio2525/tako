@@ -6132,7 +6132,13 @@ docs の Issue 参照 17 件のうち 10 件が closed だった。
 
 内部リンクは**断片（`#見出し`）まで見る**。生成ページの見出しは件数で変わる
 （`agent-support.md` の系統別の節は「対応が 1 件でもあるか」で文言が分かれる）ので、
-手書きページからのアンカーが静かに切れる。
+手書きページからのアンカーが静かに切れる。**同じページ内の `href="#…"` も同じページの id と
+突き合わせる**（#2898。見出しを改名すると本文と目次から「3. 節」へのリンクが静かに切れる。
+以前は `/` 始まりだけを見ていて、#2889 で CI が緑のまま当たった）。空の `#` と `#_top`
+（Starlight の目次の「概要」）は数えない。id は Starlight の見出しの id も、改名した見出しの旧 id を
+残すために手で置いた `<div id="…" class="tako-anchor">` も同じに数える。dist の写しを検査するときは
+`node docs/scripts/verify-links.mjs <ディレクトリ>`、判定の境界は
+`node docs/scripts/test-verify-links.mjs`（CI の `docs` ジョブで `test-middleware.mjs` と並んで走る）が固定している。
 
 配信の設定も同じジョブで見る（#1708）。`node docs/scripts/test-middleware.mjs` は
 旧ドメイン転送（`docs/functions/_middleware.js`）が細工したホスト・ポート・パスでも

@@ -109,6 +109,7 @@ jobs:
         working-directory: docs
         run: |
           node scripts/test-middleware.mjs
+          node scripts/test-verify-links.mjs
           node scripts/verify-headers.mjs
       # docs と能力マトリクスが「追跡先」として貼る Issue が open か。
       # 閉じた Issue を指したままだと、読む側が残りの仕事を辿れなくなる
