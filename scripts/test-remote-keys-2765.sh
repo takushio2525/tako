@@ -170,7 +170,7 @@ if [ "$(tk list | jq '.tabs | length')" != "1" ]; then
   exit 1
 fi
 pane_ids() { tk list 2>/dev/null | jq -r '.tabs[].panes[].id' | sort -n; }
-ROOT_PANE="$(pane_ids | head -1)"
+ROOT_PANE="$(pane_ids | sed -n 1p)"
 case "$ROOT_PANE" in ''|*[!0-9]*) echo "隔離 GUI のペインが読めない（'${ROOT_PANE}'）"; exit 1 ;; esac
 pass "隔離 tako-app が起動して CLI から見える（pid ${APP_PID}・ペイン ${ROOT_PANE}）"
 
@@ -184,7 +184,8 @@ wait_until() {
   return 1
 }
 has_file() { [ -e "$1" ]; }
-pane_shows() { tk read --pane "$1" 2>/dev/null | grep -q -- "$2"; }
+# pipefail の下では grep -q へパイプしない（読み手が先に抜けると左辺が SIGPIPE で落ちる間欠 = #1633）
+pane_shows() { local out; out="$(tk read --pane "$1" 2>/dev/null)" && [[ "$out" == *"$2"* ]]; }
 
 # 記録係のペインを作る。$1 = 名前（記録のファイル名）・$2 = 先に画面へ出すファイル（任意）。ペイン ID を出す。
 # 記録係は raw・echo なしの端末で 1 バイトずつを 16 進 1 行でファイルへ書く（^C も 03 のまま届く = ISIG なし）
@@ -195,7 +196,7 @@ recorder_pane() {
   tk split --pane "$ROOT_PANE" --down >/dev/null 2>&1
   wait_until 100 test "$(pane_ids | wc -l)" -gt "$(printf '%s\n' "$before" | wc -l)" || return 1
   after="$(pane_ids)"
-  pane="$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | head -1)"
+  pane="$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | sed -n 1p)"
   [ -n "$pane" ] || return 1
   cmd="stty raw -echo; exec perl -e '\$|=1; binmode STDIN; while (sysread(STDIN, my \$b, 1)) { printf \"%02x\\n\", ord \$b }' > $rec"
   [ -n "$show" ] && cmd="clear; cat $show; $cmd"

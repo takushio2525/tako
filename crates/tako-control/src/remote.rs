@@ -8145,7 +8145,14 @@ mod tests {
                 Some("Escape"),
                 Some("human"),
             );
-            let kept = app_conn.read().expect("lock").client.is_some();
+            // 接続を捨てたか。ロックは取らない（IPC のロックは `with_app_ipc` の中だけ = #1403 の番犬）。
+            // 呼び終えた後は持ち主がこの 1 つだけなので取り出して読む（#2774 のテストと同じ形）
+            let kept = Arc::try_unwrap(app_conn)
+                .ok()
+                .and_then(|lock| lock.into_inner().ok())
+                .expect("呼び終えた後は接続の持ち主が 1 つだけ残る")
+                .client
+                .is_some();
             let seen = server.join().expect("偽 app");
             (out, kept, seen)
         };
