@@ -631,7 +631,9 @@ mod tests {
     /// 形の正本は `remote_fs` 側なのでそこから組む（写すと食い違う）
     fn spaced_control_path_opt(host: &str) -> String {
         let dir = std::path::Path::new("/Users/testuser/Library/Application Support/tako");
-        crate::remote_fs::control_path_option(&crate::remote_fs::control_path_in(Some(dir), host))
+        let cp = crate::remote_fs::control_path_in(Some(dir), host)
+            .expect("既定の data_dir は ControlPath の上限に収まる");
+        crate::remote_fs::control_path_option(&cp)
     }
 
     #[test]

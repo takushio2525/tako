@@ -828,32 +828,96 @@ pub fn control_dir() -> Option<PathBuf> {
     crate::paths::data_dir().map(|d| d.join("ssh"))
 }
 
-/// unix domain socket のパス長上限（macOS の `sun_path` は 104 バイト）に対する安全域。
-/// これを超えるなら短い置き場（temp）へ逃がす
-const MAX_SOCKET_PATH: usize = 92;
+/// OpenSSH の master が ControlPath の後ろへ足す一時の接尾辞のバイト数（`.` + 16 文字。#2855）。
+///
+/// master は ControlPath へ直接 bind しない。`<ControlPath>.<16 文字>` へ bind してから
+/// link で据える（openssh-portable `mux.c` の `muxserver_listen`: `char rbuf[16+1]` /
+/// `xasprintf(&options.control_path, "%s.%s", orig_control_path, rbuf)`）。この一時パスが
+/// `sun_path` に収まらないと `unix_listener` が `ENAMETOOLONG` を返し、`EINVAL` /
+/// `EADDRINUSE` ではないので `cleanup_exit(255)` になる。つまり**ログインの後に ssh ごと落ちる**
+/// （多重化なしへは縮退しない）。ControlPath そのものが `sun_path` 以上なら、繋ぐ前に
+/// `fatal("ControlPath too long …")`（同 `muxclient`）
+pub const OPENSSH_MUX_TEMP_SUFFIX: usize = 17;
 
-/// ホストごとの ControlPath（純粋関数）。
+/// ControlPath に使える最大バイト数（macOS 86・Linux 90。#2855）。
+///
+/// #2855 より前は安全域 92 を使っていて、87〜92 バイトの ControlPath は
+/// [`OPENSSH_MUX_TEMP_SUFFIX`] を足すと `sun_path` を超えていた
+pub const fn control_path_limit() -> usize {
+    crate::platform::unix_socket::max_path_bytes() - OPENSSH_MUX_TEMP_SUFFIX
+}
+
+/// ホストごとの ControlPath（`None` = どこにも置けない = 多重化なしで繋ぐ。#2855）。
+///
+/// 決め方は境界 B35 の [`crate::platform::unix_socket::place_with`]（IPC の受け口と同じ 1 実装）:
+///
+/// 1. `<data_dir>/ssh/<16 桁>.sock` が [`control_path_limit`] に収まればそこ。macOS の既定
+///    （`~/Library/Application Support/tako/ssh/<16 桁>.sock` = 66 + ユーザー名のバイト数）は
+///    ユーザー名が 20 バイトまでならここ
+/// 2. 収まらなければ `<$TMPDIR>/tako-ssh-<16 桁>.sock` → `/tmp/tako-ssh-<16 桁>.sock` のうち、
+///    上限に収まり、置き場に書ける最初の 1 つ（ソケットを作るのは ssh なので、書けない置き場を
+///    渡すとログインの後に exit 255 で落ちる = #1040 と同じ形）
+/// 3. どれも使えなければ `None`。ControlPath を渡さずに繋ぐ（認証は操作ごとになるが、繋がる）
 ///
 /// ホスト名をハッシュへ落とすのは、`user@host:port` の記号がそのままパスへ出るのを
 /// 避けるためと、長いホスト名でソケットのパス長上限を割らないため。
-///
-/// `<data_dir>` 側が上限を割る場合は temp へ逃がす: macOS の既定
-/// （`~/Library/Application Support/tako/ssh/<16 桁>.sock` = 80 バイト）でも余裕が
-/// 少なく、ユーザー名が長いと超える
-pub fn control_path_in(data_dir: Option<&Path>, host: &str) -> PathBuf {
-    let name = format!("{}.sock", short_hash(host));
-    if let Some(dir) = data_dir {
-        let candidate = dir.join("ssh").join(&name);
-        if candidate.to_string_lossy().len() <= MAX_SOCKET_PATH {
-            return candidate;
-        }
-    }
-    std::env::temp_dir().join(format!("tako-ssh-{name}"))
+/// 中身は [`control_path_with`]（純関数）
+pub fn control_path_in(data_dir: Option<&Path>, host: &str) -> Option<PathBuf> {
+    control_path_with(
+        data_dir,
+        &std::env::temp_dir(),
+        control_path_limit_here(),
+        host,
+        &crate::platform::unix_socket::dir_accepts_socket,
+    )
 }
 
-/// ホストごとの ControlPath
+/// 実行中のプラットフォームで ControlPath に掛ける上限。
+///
+/// 多重化の無いプラットフォーム（Windows。#1090）は ControlPath を ssh へ 1 つも渡さないので、
+/// `sun_path` も OpenSSH の一時の接尾辞も効かない = 上限を掛けない（第一候補のまま = #2855 の前と
+/// 同じ答え）。そこでの答えを読むのは「ソケットが在るか」を見る側だけで、ソケットは作られない
+fn control_path_limit_here() -> usize {
+    use crate::platform::{ssh_client::multiplexing, support::Platform};
+    if multiplexing(Platform::current()) {
+        control_path_limit()
+    } else {
+        usize::MAX
+    }
+}
+
+/// [`control_path_in`] の中身（**純関数**。`$TMPDIR`・上限・短い置き場の可否を引数で受けるので、
+/// 深い `$TMPDIR` や書けない置き場を実ファイルなしで検査できる）
+pub fn control_path_with(
+    data_dir: Option<&Path>,
+    temp_dir: &Path,
+    limit: usize,
+    host: &str,
+    short_dir_usable: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let name = format!("{}.sock", short_hash(host));
+    crate::platform::unix_socket::place_with(
+        data_dir.map(|dir| dir.join("ssh").join(&name)),
+        &format!("tako-ssh-{name}"),
+        temp_dir,
+        limit,
+        short_dir_usable,
+    )
+    .into_usable()
+}
+
+/// ホストごとの ControlPath（`None` の意味は [`control_path_in`]）
 pub fn control_path(host: &str) -> Option<PathBuf> {
-    Some(control_path_in(crate::paths::data_dir().as_deref(), host))
+    control_path_in(crate::paths::data_dir().as_deref(), host)
+}
+
+/// このホストへの ssh で接続多重化（ControlMaster）を使うか（#1090 の能力 + #2855 の置き場）。
+///
+/// 能力があっても ControlPath の置き場がどこにも取れなければ使わない。そのときは
+/// ControlPath を渡さずに繋ぐので、多重化の無いプラットフォームと同じ縮退になる
+/// （[`liveness`] は `Unknown`・ペインの成功の出口は `ssh_progress` の規則 ⑥）
+pub fn multiplexing_for(host: &str) -> bool {
+    crate::platform::ssh_client::multiplexing_available() && control_path(host).is_some()
 }
 
 /// ControlPath の置き場（`<data_dir>/ssh/`）を用意する（#1040）。
@@ -925,15 +989,24 @@ fn common_opts(host: &str, batch: bool) -> Vec<String> {
 /// 能力を引数にしてあるので **macOS 上から Windows 側の形を検証できる**
 /// （`platform::support` / `platform::dpi` と同じ作法）
 pub(crate) fn common_opts_with(host: &str, batch: bool, multiplexing: bool) -> Vec<String> {
-    let mut opts = Vec::new();
     let control = if multiplexing {
         control_path(host)
     } else {
         None
     };
+    common_opts_for(control.as_deref(), batch)
+}
+
+/// `-o` の組み立て（ControlPath を引数で受ける**純関数**）。
+///
+/// ControlPath が無い（多重化の無いプラットフォーム・置き場がどこにも取れないホスト = #2855）なら
+/// `ControlPath` / `ControlMaster` / `ControlPersist` を 1 つも渡さない = 多重化なしで繋ぐ。
+/// 待ち上限と keepalive は多重化と無関係なので常に渡す
+fn common_opts_for(control: Option<&Path>, batch: bool) -> Vec<String> {
+    let mut opts = Vec::new();
     if let Some(cp) = control {
         opts.push("-o".into());
-        opts.push(control_path_option(&cp));
+        opts.push(control_path_option(cp));
         opts.push("-o".into());
         opts.push("ControlMaster=auto".into());
         opts.push("-o".into());
@@ -1368,7 +1441,7 @@ pub enum Liveness {
     Live,
     /// 接続が死んでいる（ソケットが無い / 応答しない）
     Dead,
-    /// 判定できない（多重化が無いので見るべきソケットが無い）
+    /// 判定できない（多重化が無い・ControlPath の置き場が無いので見るべきソケットが無い）
     Unknown,
 }
 
@@ -1383,9 +1456,12 @@ impl Liveness {
     }
 }
 
-/// ホストへの接続の生死（[`Liveness`] の doc を参照）
+/// ホストへの接続の生死（[`Liveness`] の doc を参照）。
+///
+/// ControlPath の置き場が無いホスト（#2855）も、多重化の無いプラットフォームと同じく
+/// `Unknown`。`Dead` で埋めると自動再接続（#1040）が撃ち続ける
 pub fn liveness(host: &str) -> Liveness {
-    if !crate::platform::ssh_client::multiplexing_available() {
+    if !multiplexing_for(host) {
         return Liveness::Unknown;
     }
     if master_alive(host) {
@@ -1424,8 +1500,9 @@ pub fn ensure_master(host: &str) -> Result<(), RemoteError> {
     // 多重化が無いプラットフォームでは束ねる器を作らない（#1090）。
     // **失敗検知が消えるわけではない**: 直後に走る sftp / ssh 自身が同じ分類済み
     // エラー（[`RemoteError`]）を返すので、「フォルダを開く前に失敗を捕まえる」
-    // という #919 の契約はそのまま成立する。違うのは「認証が 1 回で済むか」だけ
-    if !crate::platform::ssh_client::multiplexing_available() {
+    // という #919 の契約はそのまま成立する。違うのは「認証が 1 回で済むか」だけ。
+    // ControlPath の置き場がどこにも取れないホストも同じ扱い（#2855）
+    if !multiplexing_for(host) {
         return Ok(());
     }
     if master_alive(host) {
@@ -1439,11 +1516,8 @@ pub fn ensure_master(host: &str) -> Result<(), RemoteError> {
         ));
     };
     let Some(cp) = control_path(host) else {
-        return Err(RemoteError::new(
-            RemoteErrorKind::Other,
-            host,
-            "data_dir を解決できない",
-        ));
+        // 上の判定の後に置き場が使えなくなった（`$TMPDIR` が消えた等）。多重化なしで続ける
+        return Ok(());
     };
     if let Err(e) = ensure_control_dir(host) {
         return Err(RemoteError::new(
@@ -2912,19 +2986,194 @@ drwx******    1 -        -           49152 Aug 23 22:34 dev
         assert!(legacy.contains("ARGS=-l\n"), "{legacy}");
     }
 
+    /// 実行中の `$TMPDIR` で決まる答え。**`$TMPDIR` の深さに依らず**、OpenSSH の一時の接尾辞を
+    /// 足しても `sun_path` に収まる（#2855。一巡の番犬の子 = 深い `$TMPDIR` でも走る）
     #[test]
     fn ホストごとに_controlpath_が分かれる() {
-        let a = control_path("alpha");
-        let b = control_path("beta");
+        let limit = control_path_limit_here();
+        let a = control_path("alpha").expect("`/tmp` か `$TMPDIR` には置ける");
+        let b = control_path("beta").expect("`/tmp` か `$TMPDIR` には置ける");
         assert_ne!(a, b);
-        // ソケットのパス長（macOS は約 104 バイト）に収まる短さ
-        if let Some(p) = a {
+        for p in [&a, &b] {
+            let bytes = crate::platform::unix_socket::path_bytes(p);
             assert!(
-                p.display().to_string().len() <= MAX_SOCKET_PATH,
+                bytes <= limit,
+                "ControlPath が {bytes} バイトで上限 {limit} を超える（$TMPDIR {} バイト）: {}",
+                crate::platform::unix_socket::path_bytes(&std::env::temp_dir()),
+                p.display()
+            );
+        }
+        assert_eq!(short_hash("alpha").len(), 16);
+    }
+
+    /// macOS の上限（`sun_path` 104 − 終端 1 − OpenSSH の一時の接尾辞 17）
+    const MAC_LIMIT: usize =
+        crate::platform::unix_socket::SUN_PATH_BSD - 1 - OPENSSH_MUX_TEMP_SUFFIX;
+
+    fn usable(_: &Path) -> bool {
+        true
+    }
+
+    fn unusable(_: &Path) -> bool {
+        false
+    }
+
+    /// 長さ `bytes` の `$TMPDIR` 相当（存在しなくてよい = 純関数へ渡すだけ）
+    fn tmp_of(bytes: usize) -> PathBuf {
+        PathBuf::from(format!("/{}", "d".repeat(bytes - 1)))
+    }
+
+    #[test]
+    fn controlpath_の上限は_openssh_の一時の接尾辞のぶんを残す() {
+        // master は `<ControlPath>.<16 文字>` へ bind してから link する（mux.c の muxserver_listen）
+        assert_eq!(OPENSSH_MUX_TEMP_SUFFIX, ".".len() + 16);
+        assert_eq!(MAC_LIMIT, 86);
+        assert_eq!(
+            control_path_limit() + OPENSSH_MUX_TEMP_SUFFIX,
+            crate::platform::unix_socket::max_path_bytes()
+        );
+        // 第一候補は上限ちょうどまで使い、1 バイト超えたら短い置き場へ倒す
+        let name_len = "/ssh/".len() + 16 + ".sock".len();
+        let at = tmp_of(MAC_LIMIT - name_len);
+        let cp = control_path_with(Some(&at), &tmp_of(20), MAC_LIMIT, "win", &usable)
+            .expect("上限ちょうどは置ける");
+        assert_eq!(crate::platform::unix_socket::path_bytes(&cp), MAC_LIMIT);
+        assert!(cp.starts_with(&at), "{}", cp.display());
+        let over = tmp_of(MAC_LIMIT - name_len + 1);
+        let cp = control_path_with(Some(&over), &tmp_of(20), MAC_LIMIT, "win", &usable)
+            .expect("短い置き場へ倒せる");
+        assert!(cp.starts_with(tmp_of(20)), "{}", cp.display());
+    }
+
+    #[test]
+    fn 深い_tmpdir_でも上限に収まる置き場へ倒す() {
+        for tmp_bytes in [75, 94, 113, 300] {
+            let tmp = tmp_of(tmp_bytes);
+            let data = tmp.join("tako-test-data-12345");
+            // #2855 の前の答え（`$TMPDIR` へ長さを見ずに逃がす）は sun_path そのものを超えていた
+            let legacy = tmp.join(format!("tako-ssh-{}.sock", short_hash("alpha")));
+            assert!(
+                crate::platform::unix_socket::path_bytes(&legacy)
+                    > crate::platform::unix_socket::SUN_PATH_BSD - 1,
+                "前提: $TMPDIR {tmp_bytes} バイトの旧い答えは上限を超える"
+            );
+            let a = control_path_with(Some(&data), &tmp, MAC_LIMIT, "alpha", &usable)
+                .expect("`/tmp` へ倒せる");
+            let b = control_path_with(Some(&data), &tmp, MAC_LIMIT, "beta", &usable)
+                .expect("`/tmp` へ倒せる");
+            assert_eq!(a.parent(), Some(Path::new("/tmp")), "{}", a.display());
+            assert_ne!(a, b);
+            for p in [&a, &b] {
+                assert!(crate::platform::unix_socket::path_bytes(p) <= MAC_LIMIT);
+            }
+        }
+    }
+
+    #[test]
+    fn 書けない短い置き場は飛ばし_どこにも置けなければ多重化なし() {
+        let long = PathBuf::from(format!("/tmp/{}", "x".repeat(120)));
+        let shallow = tmp_of(20);
+        // `$TMPDIR` に書けなければ `/tmp`
+        let only_tmp = |dir: &Path| dir == Path::new("/tmp");
+        let cp = control_path_with(Some(&long), &shallow, MAC_LIMIT, "win", &only_tmp)
+            .expect("`/tmp` へ倒せる");
+        assert_eq!(cp.parent(), Some(Path::new("/tmp")), "{}", cp.display());
+        // どちらにも書けない
+        assert_eq!(
+            control_path_with(Some(&long), &shallow, MAC_LIMIT, "win", &unusable),
+            None
+        );
+        // `/tmp` にも収まらない上限（`/tmp/tako-ssh-<16 桁>.sock` = 35 バイト）
+        assert_eq!(
+            control_path_with(Some(&long), &shallow, 34, "win", &usable),
+            None
+        );
+        // 第一候補は呼び手（ensure_control_dir）が作る dir なので、短い置き場の可否は見ない
+        let home = PathBuf::from("/Users/testuser/Library/Application Support/tako");
+        assert!(control_path_with(Some(&home), &shallow, MAC_LIMIT, "win", &unusable).is_some());
+    }
+
+    #[test]
+    fn ホスト名が長くても記号を含んでも長さは変わらない() {
+        let tmp = tmp_of(94);
+        let data = tmp.join("tako-test-data-12345");
+        let hosts = [
+            "win".to_string(),
+            "testuser@example.com:2222".to_string(),
+            format!("{}.example.com", "h".repeat(300)),
+            "ホスト 名;$(rm -rf x)\"'`".to_string(),
+        ];
+        let paths: Vec<PathBuf> = hosts
+            .iter()
+            .map(|h| {
+                control_path_with(Some(&data), &tmp, MAC_LIMIT, h, &usable)
+                    .expect("`/tmp` へ倒せる")
+            })
+            .collect();
+        for p in &paths {
+            assert_eq!(
+                crate::platform::unix_socket::path_bytes(p),
+                "/tmp/tako-ssh-".len() + 16 + ".sock".len(),
                 "{}",
                 p.display()
             );
-            assert_eq!(short_hash("alpha").len(), 16);
+            assert!(p.to_string_lossy().is_ascii(), "{}", p.display());
+        }
+        let unique: std::collections::BTreeSet<&PathBuf> = paths.iter().collect();
+        assert_eq!(unique.len(), paths.len(), "{paths:?}");
+    }
+
+    /// 置き場が取れないとき（`None`）は ControlPath を渡さない = 多重化なしで繋ぐ（#2855）。
+    /// 置き場の 1 実装（[`control_path`]）と、`-o` を組む側・生死の判定が同じ答えを見ている
+    #[test]
+    fn 置き場が無いホストは多重化なしの形と判定になる() {
+        let src = include_str!("remote_fs.rs");
+        let production = src.split("#[cfg(test)]\nmod tests {").next().unwrap_or(src);
+        // 生死の判定は置き場まで見る（能力だけを見ると `Dead` で埋めて自動再接続が撃ち続ける）
+        let liveness_body = production
+            .split_once("pub fn liveness(host: &str) -> Liveness {")
+            .map(|(_, rest)| rest.split("\n}\n").next().unwrap_or(""))
+            .unwrap_or("");
+        assert!(
+            liveness_body.contains("if !multiplexing_for(host) {"),
+            "liveness が置き場の有無を見ていない: {liveness_body}"
+        );
+        let ensure_body = production
+            .split_once("pub fn ensure_master(host: &str) -> Result<(), RemoteError> {")
+            .map(|(_, rest)| rest.split("\n}\n").next().unwrap_or(""))
+            .unwrap_or("");
+        assert!(
+            ensure_body.contains("if !multiplexing_for(host) {"),
+            "ensure_master が置き場の有無を見ていない: {ensure_body}"
+        );
+        // `-o` を組む側は置き場の 1 実装（`control_path`）の答えを使う
+        let opts_body = production
+            .split_once("pub(crate) fn common_opts_with(")
+            .map(|(_, rest)| rest.split("\n}\n").next().unwrap_or(""))
+            .unwrap_or("");
+        assert!(
+            opts_body.contains("control_path(host)")
+                && opts_body.contains("common_opts_for(control.as_deref(), batch)"),
+            "common_opts_with が置き場の答えで -o を組んでいない: {opts_body}"
+        );
+        // 置き場が無ければ多重化の -o を 1 つも渡さない。待ち上限と keepalive は残る
+        for batch in [false, true] {
+            let none = common_opts_for(None, batch).join(" ");
+            assert!(!none.contains("Control"), "{none}");
+            assert!(
+                none.contains(&format!("ConnectTimeout={CONNECT_TIMEOUT_SECS}")),
+                "{none}"
+            );
+            assert_eq!(none.contains("BatchMode=yes"), batch, "{none}");
+            let cp = PathBuf::from("/tmp/tako-ssh-0123456789abcdef.sock");
+            let some = common_opts_for(Some(&cp), batch).join(" ");
+            for want in [
+                control_path_option(&cp),
+                "ControlMaster=auto".to_string(),
+                format!("ControlPersist={CONTROL_PERSIST_SECS}"),
+            ] {
+                assert!(some.contains(&want), "{want} が無い: {some}");
+            }
         }
     }
 
@@ -2934,7 +3183,7 @@ drwx******    1 -        -           49152 Aug 23 22:34 dev
         // OpenSSH が `keyword controlpath extra arguments at end of line` で全操作を
         // 失敗させる（実測。#833 と同型の罠）
         let dir = PathBuf::from("/Users/u/Library/Application Support/tako");
-        let cp = control_path_in(Some(&dir), "win");
+        let cp = control_path_in(Some(&dir), "win").expect("既定の data_dir は上限に収まる");
         assert!(cp.to_string_lossy().contains(' '), "{}", cp.display());
         let opt = control_path_option(&cp);
         assert!(opt.starts_with("ControlPath=\""), "{opt}");
@@ -2950,8 +3199,11 @@ drwx******    1 -        -           49152 Aug 23 22:34 dev
     fn 長すぎる_data_dir_では短い置き場へ逃がす() {
         // unix domain socket のパス長上限を割ると bind に失敗して接続できない
         let long = PathBuf::from(format!("/tmp/{}", "x".repeat(120)));
-        let cp = control_path_in(Some(&long), "win");
+        let tmp = tmp_of(48);
+        let cp = control_path_with(Some(&long), &tmp, MAC_LIMIT, "win", &usable)
+            .expect("`$TMPDIR` へ倒せる");
         assert!(!cp.starts_with(&long), "{}", cp.display());
+        assert_eq!(cp.parent(), Some(tmp.as_path()), "{}", cp.display());
         assert!(
             cp.file_name()
                 .map(|n| n.to_string_lossy().starts_with("tako-ssh-"))
@@ -2960,7 +3212,27 @@ drwx******    1 -        -           49152 Aug 23 22:34 dev
             cp.display()
         );
         // data_dir が解決できないときも同じ逃げ場
-        assert_eq!(control_path_in(None, "win"), cp);
+        assert_eq!(
+            control_path_with(None, &tmp, MAC_LIMIT, "win", &usable),
+            Some(cp)
+        );
+    }
+
+    /// 多重化の無いプラットフォーム（Windows）は ControlPath を渡さないので上限を掛けない
+    /// （#2855 の前と同じ = 第一候補のまま）。macOS 上からも宣言の形を確かめる
+    #[test]
+    fn 多重化の無いプラットフォームでは_controlpath_の上限を掛けない() {
+        use crate::platform::{ssh_client::multiplexing, support::Platform};
+        let expected = if multiplexing(Platform::current()) {
+            control_path_limit()
+        } else {
+            usize::MAX
+        };
+        assert_eq!(control_path_limit_here(), expected);
+        let long = PathBuf::from(format!("/tmp/{}", "x".repeat(120)));
+        let cp = control_path_with(Some(&long), &tmp_of(48), usize::MAX, "win", &unusable)
+            .expect("上限が無ければ第一候補");
+        assert!(cp.starts_with(&long), "{}", cp.display());
     }
 
     #[test]

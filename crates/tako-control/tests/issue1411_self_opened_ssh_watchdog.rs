@@ -185,10 +185,9 @@ fn 材料を読むのは走査が起きる_tickだけ() {
 /// macOS の既定 data_dir（**空白を含む**）で tako が組む SSH ペインのコマンド行
 fn self_opened_argv(host: &str, port: u16) -> String {
     let dir = Path::new("/Users/testuser/Library/Application Support/tako");
-    let cp = tako_core::remote_fs::control_path_option(&tako_core::remote_fs::control_path_in(
-        Some(dir),
-        host,
-    ));
+    let cp = tako_core::remote_fs::control_path_in(Some(dir), host)
+        .expect("既定の data_dir は ControlPath の上限に収まる");
+    let cp = tako_core::remote_fs::control_path_option(&cp);
     format!(
         "/usr/bin/ssh -o {cp} -o ControlMaster=auto -o ControlPersist=600 \
          -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -p {port} {host}"
