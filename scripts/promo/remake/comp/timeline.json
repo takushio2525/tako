@@ -1,0 +1,543 @@
+{
+  "fps": 30,
+  "duration": 95,
+  "bar": 2.5,
+  "scenes": [
+    {
+      "id": "act1",
+      "start": 0,
+      "end": 20
+    },
+    {
+      "id": "fleet",
+      "start": 20,
+      "end": 40,
+      "footage": "fleet",
+      "viewportIn": false,
+      "chip": "違い 1",
+      "head": "1 グループ = 1 タブ。司令塔つき。",
+      "subs": [
+        {
+          "t0": 0.3,
+          "t1": 3.4,
+          "html": "<code>tako master</code> と打つと、そのペインが司令塔に"
+        },
+        {
+          "t0": 3.6,
+          "t1": 8.2,
+          "html": "日本語で頼むと、作業を分けて担当を立てる"
+        },
+        {
+          "t0": 8.4,
+          "t1": 13.6,
+          "html": "担当は同じタブに並ぶ。全体は右パネルで"
+        },
+        {
+          "t0": 13.8,
+          "t1": 19.6,
+          "html": "完了を検知して、検収してから報告"
+        }
+      ],
+      "clips": [
+        {
+          "at": [
+            0,
+            3.0
+          ],
+          "src": [
+            "rec:type_master-0.3",
+            "rec:ask+0.25"
+          ]
+        },
+        {
+          "at": [
+            3.0,
+            7.8
+          ],
+          "src": [
+            "rec:ask+0.25",
+            "docs:prompt1+0.6"
+          ]
+        },
+        {
+          "at": [
+            7.8,
+            13.4
+          ],
+          "src": [
+            "docs:prompt1+0.6",
+            "master:done_docs+0.2"
+          ]
+        },
+        {
+          "at": [
+            13.4,
+            19.4
+          ],
+          "src": [
+            "master:done_docs+0.2",
+            "master:report+1.6"
+          ]
+        },
+        {
+          "at": [
+            19.4,
+            20
+          ],
+          "src": [
+            "master:report+1.6",
+            "master:report+2.2"
+          ]
+        }
+      ],
+      "cam": [
+        {
+          "t": 0,
+          "z": 1.6,
+          "x": 0.2,
+          "y": 0.2
+        },
+        {
+          "t": 3.7,
+          "z": 1.6,
+          "x": 0.2,
+          "y": 0.2
+        },
+        {
+          "t": 5.1,
+          "z": 1,
+          "x": 0.5,
+          "y": 0.5
+        },
+        {
+          "t": 13.3,
+          "z": 1,
+          "x": 0.5,
+          "y": 0.5
+        },
+        {
+          "t": 14.7,
+          "z": 1.55,
+          "x": 0.2,
+          "y": 0.42
+        },
+        {
+          "t": 20,
+          "z": 1.55,
+          "x": 0.2,
+          "y": 0.42
+        }
+      ],
+      "callouts": [
+        {
+          "t0": 8.9,
+          "t1": 13.0,
+          "x": 0.05,
+          "y": 0.8,
+          "text": "司令塔"
+        },
+        {
+          "t0": 9.3,
+          "t1": 13.0,
+          "x": 0.6,
+          "y": 0.54,
+          "text": "担当 × 3"
+        },
+        {
+          "t0": 9.7,
+          "t1": 13.0,
+          "x": 0.8,
+          "y": 0.45,
+          "text": "全体の見取り図"
+        }
+      ],
+      "sfx": [
+        {
+          "beat": "master:spawn_api",
+          "kind": "pop",
+          "note": 76
+        },
+        {
+          "beat": "master:spawn_search",
+          "kind": "pop",
+          "note": 78
+        },
+        {
+          "beat": "master:spawn_docs",
+          "kind": "pop",
+          "note": 81
+        },
+        {
+          "beat": "master:panel",
+          "kind": "pop",
+          "note": 86,
+          "vel": 0.8
+        },
+        {
+          "beat": "master:done_docs",
+          "kind": "pop",
+          "note": 81,
+          "vel": 0.7
+        },
+        {
+          "beat": "master:done_api",
+          "kind": "pop",
+          "note": 83,
+          "vel": 0.7
+        },
+        {
+          "beat": "master:done_search",
+          "kind": "pop",
+          "note": 86,
+          "vel": 0.7
+        }
+      ]
+    },
+    {
+      "id": "drive",
+      "start": 40,
+      "end": 55,
+      "footage": "drive",
+      "chip": "違い 2",
+      "head": "AI が、画面を動かせる。",
+      "subs": [
+        {
+          "t0": 0.4,
+          "t1": 4.3,
+          "html": "<code>tako split</code> でペインを割り、dev サーバーを起動"
+        },
+        {
+          "t0": 4.5,
+          "t1": 8.5,
+          "html": "<code>tako open</code> で、README を隣にプレビュー"
+        },
+        {
+          "t0": 8.8,
+          "t1": 14.6,
+          "html": "テーマの切り替えも。画面の操作は、CLI / MCP からもできる"
+        }
+      ],
+      "clips": [
+        {
+          "at": [
+            0,
+            6.8
+          ],
+          "src": [
+            "rec:ask1-0.6",
+            "guide:done1+1.0"
+          ]
+        },
+        {
+          "at": [
+            6.8,
+            8.6
+          ],
+          "src": [
+            "rec:ask2-0.9",
+            "rec:ask2+0.3"
+          ]
+        },
+        {
+          "at": [
+            8.6,
+            14.4
+          ],
+          "src": [
+            "rec:ask2+0.3",
+            "guide:done2+2.6"
+          ]
+        },
+        {
+          "at": [
+            14.4,
+            15
+          ],
+          "src": [
+            "guide:done2+2.6",
+            "guide:done2+3.0"
+          ]
+        }
+      ],
+      "cam": [
+        {
+          "t": 0,
+          "z": 1.5,
+          "x": 0.22,
+          "y": 0.2
+        },
+        {
+          "t": 1.5,
+          "z": 1.5,
+          "x": 0.22,
+          "y": 0.2
+        },
+        {
+          "t": 2.7,
+          "z": 1,
+          "x": 0.5,
+          "y": 0.5
+        },
+        {
+          "t": 15,
+          "z": 1,
+          "x": 0.5,
+          "y": 0.5
+        }
+      ],
+      "callouts": [],
+      "sfx": [
+        {
+          "beat": "guide:split",
+          "kind": "pop",
+          "note": 76
+        },
+        {
+          "beat": "guide:open",
+          "kind": "pop",
+          "note": 81
+        },
+        {
+          "beat": "guide:theme",
+          "kind": "pop",
+          "note": 88
+        }
+      ]
+    },
+    {
+      "id": "restore",
+      "start": 55,
+      "end": 65,
+      "footage": "restore-before",
+      "chip": "違い 3",
+      "head": "閉じても、続いている。",
+      "gap": {
+        "title": "tako を終了",
+        "note": "エージェントも dev サーバーも、裏で動いたまま"
+      },
+      "subs": [
+        {
+          "t0": 0.4,
+          "t1": 2.9,
+          "html": "作業の途中で、tako を終了する"
+        },
+        {
+          "t0": 5.5,
+          "t1": 9.7,
+          "html": "開き直すと、続きから。<code>tmux</code> の中で動き続けていた"
+        }
+      ],
+      "clips": [
+        {
+          "at": [
+            0,
+            3.0
+          ],
+          "footage": "restore-before",
+          "src": [
+            2.6,
+            6.8
+          ]
+        },
+        {
+          "at": [
+            5.0,
+            10
+          ],
+          "footage": "restore-after",
+          "src": [
+            0.2,
+            8.6
+          ]
+        }
+      ],
+      "vis": [
+        {
+          "t": 0,
+          "o": 1
+        },
+        {
+          "t": 2.5,
+          "o": 1
+        },
+        {
+          "t": 3.0,
+          "o": 0
+        },
+        {
+          "t": 5.0,
+          "o": 0
+        },
+        {
+          "t": 5.6,
+          "o": 1
+        }
+      ],
+      "cam": [
+        {
+          "t": 0,
+          "z": 1,
+          "x": 0.5,
+          "y": 0.5
+        }
+      ],
+      "callouts": [
+        {
+          "t0": 6.6,
+          "t1": 9.6,
+          "x": 0.745,
+          "y": 0.8,
+          "text": "閉じている間も、進んでいた"
+        }
+      ],
+      "sfx": []
+    },
+    {
+      "id": "compare",
+      "start": 65,
+      "end": 75
+    },
+    {
+      "id": "stance",
+      "start": 75,
+      "end": 85
+    },
+    {
+      "id": "cta",
+      "start": 85,
+      "end": 95
+    }
+  ],
+  "sfx": [
+    {
+      "t": 2.2,
+      "kind": "pop",
+      "note": 69,
+      "vel": 0.5
+    },
+    {
+      "t": 2.53,
+      "kind": "pop",
+      "note": 71,
+      "vel": 0.5
+    },
+    {
+      "t": 2.86,
+      "kind": "pop",
+      "note": 74,
+      "vel": 0.5
+    },
+    {
+      "t": 3.19,
+      "kind": "pop",
+      "note": 76,
+      "vel": 0.5
+    },
+    {
+      "t": 3.52,
+      "kind": "pop",
+      "note": 78,
+      "vel": 0.5
+    },
+    {
+      "t": 3.85,
+      "kind": "pop",
+      "note": 81,
+      "vel": 0.5
+    },
+    {
+      "t": 4.18,
+      "kind": "pop",
+      "note": 83,
+      "vel": 0.5
+    },
+    {
+      "t": 5.9,
+      "kind": "pop",
+      "note": 73,
+      "vel": 0.7
+    },
+    {
+      "t": 7.15,
+      "kind": "pop",
+      "note": 71,
+      "vel": 0.7
+    },
+    {
+      "t": 8.4,
+      "kind": "pop",
+      "note": 69,
+      "vel": 0.7
+    },
+    {
+      "t": 19.75,
+      "kind": "whoosh"
+    },
+    {
+      "t": 39.75,
+      "kind": "whoosh"
+    },
+    {
+      "t": 54.75,
+      "kind": "whoosh"
+    },
+    {
+      "t": 57.5,
+      "kind": "down"
+    },
+    {
+      "t": 60.0,
+      "kind": "up"
+    },
+    {
+      "t": 64.75,
+      "kind": "whoosh"
+    },
+    {
+      "t": 66.3,
+      "kind": "pop",
+      "note": 74,
+      "vel": 0.6
+    },
+    {
+      "t": 67.9,
+      "kind": "pop",
+      "note": 76,
+      "vel": 0.6
+    },
+    {
+      "t": 69.5,
+      "kind": "pop",
+      "note": 78,
+      "vel": 0.6
+    },
+    {
+      "t": 71.1,
+      "kind": "pop",
+      "note": 81,
+      "vel": 0.6
+    },
+    {
+      "t": 74.75,
+      "kind": "whoosh"
+    },
+    {
+      "t": 78.4,
+      "kind": "pop",
+      "note": 76,
+      "vel": 0.6
+    },
+    {
+      "t": 79.3,
+      "kind": "pop",
+      "note": 78,
+      "vel": 0.6
+    },
+    {
+      "t": 80.2,
+      "kind": "pop",
+      "note": 81,
+      "vel": 0.6
+    }
+  ]
+}

@@ -1,0 +1,71 @@
+diff --git a/crates/tako-app/src/main.rs b/crates/tako-app/src/main.rs
+index 7419dbe..0434ee6 100644
+--- a/crates/tako-app/src/main.rs
++++ b/crates/tako-app/src/main.rs
+@@ -34167,6 +34167,11 @@ fn main() {
+         })
+         .detach();
+ 
++        // PROMO-REC-LOCAL（コミットしない収録専用の差分）
++        #[cfg(feature = "visual-test")]
++        if let Some(dir) = std::env::var_os("TAKO_PROMO_REC_DIR") {
++            self_test::run_promo_recorder(window, std::path::PathBuf::from(dir), cx);
++        }
+         if std::env::var_os("TAKO_VISUAL_TEST").is_some() {
+             #[cfg(feature = "visual-test")]
+             {
+@@ -50503,6 +50508,54 @@ mod self_test {
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ 
++    /// PROMO-REC-LOCAL（コミットしない収録専用の差分）: 窓の最終 scene を一定間隔で読み戻し、
++    /// `TAKO_PROMO_REC_DIR` へ生の RGBA で書く。`<dir>/REC` が在る間だけ撮る。
++    /// 画面ロック中は OS の画面収録（screencapture / ScreenCaptureKit）が通らないための代替で、
++    /// UI の描画・状態には触らない（visual-test の `capture_frame` と同じ読み戻し）
++    #[cfg(feature = "visual-test")]
++    pub fn run_promo_recorder(window: WindowHandle<TakoApp>, dir: std::path::PathBuf, cx: &mut App) {
++        let any: AnyWindowHandle = window.into();
++        let interval = std::env::var("TAKO_PROMO_REC_INTERVAL_MS")
++            .ok()
++            .and_then(|v| v.parse::<u64>().ok())
++            .unwrap_or(150);
++        let (tx, rx) = std::sync::mpsc::sync_channel::<(u128, image::RgbaImage)>(6);
++        let out = dir.clone();
++        std::thread::spawn(move || {
++            let mut last: Option<u64> = None;
++            while let Ok((ms, img)) = rx.recv() {
++                let fp = frame_fingerprint(&img);
++                if last == Some(fp) {
++                    continue;
++                }
++                last = Some(fp);
++                let name = format!("f-{ms}-{}x{}.rgba", img.width(), img.height());
++                let tmp = out.join(format!("{name}.part"));
++                if std::fs::write(&tmp, img.as_raw()).is_ok() {
++                    let _ = std::fs::rename(&tmp, out.join(name));
++                }
++            }
++        });
++        cx.spawn(async move |cx: &mut AsyncApp| {
++            loop {
++                cx.background_executor()
++                    .timer(Duration::from_millis(interval))
++                    .await;
++                if !dir.join("REC").exists() {
++                    continue;
++                }
++                if let Some((img, _scale)) = capture_frame(any, cx) {
++                    let ms = std::time::SystemTime::now()
++                        .duration_since(std::time::UNIX_EPOCH)
++                        .map(|d| d.as_millis())
++                        .unwrap_or(0);
++                    let _ = tx.try_send((ms, img));
++                }
++            }
++        })
++        .detach();
++    }
++
+     /// #152 / #589 / #656 専用の実描画ピクセル検証。通常セルフテストから独立させ、既存の
+     /// PTY / fd ストレス項目のタイミングに左右されず scene だけを検査する。
+     #[cfg(feature = "visual-test")]

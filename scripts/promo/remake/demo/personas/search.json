@@ -1,0 +1,70 @@
+{
+  "title": "担当: search",
+  "footer": "demo · 担当の台本",
+  "promptLines": 1,
+  "turns": [
+    [
+      {
+        "busy": "作業中"
+      },
+      {
+        "wait": 800,
+        "say": "方針: 部分一致 + ページング",
+        "color": "text"
+      },
+      {
+        "wait": 1200,
+        "tool": "Read",
+        "arg": "api/products.ts"
+      },
+      {
+        "wait": 1100,
+        "tool": "Read",
+        "arg": "db/schema.sql"
+      },
+      {
+        "wait": 1600,
+        "tool": "Edit",
+        "arg": "api/search.ts +74"
+      },
+      {
+        "wait": 1500,
+        "tool": "Edit",
+        "arg": "db/queries.ts +23"
+      },
+      {
+        "wait": 1400,
+        "tool": "Edit",
+        "arg": "test/search.test.ts"
+      },
+      {
+        "wait": 1300,
+        "tool": "Run",
+        "arg": "npm test search"
+      },
+      {
+        "wait": 2300,
+        "say": "9 passed (2.3s)",
+        "color": "ok",
+        "indent": 6
+      },
+      {
+        "wait": 1300,
+        "tool": "Run",
+        "arg": "npm run lint"
+      },
+      {
+        "wait": 1600,
+        "say": "no problems",
+        "color": "ok",
+        "indent": 6
+      },
+      {
+        "wait": 700,
+        "say": "完了: 5 files · 9 tests",
+        "color": "ok",
+        "beat": "done"
+      }
+    ]
+  ]
+}
