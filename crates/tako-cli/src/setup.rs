@@ -3402,8 +3402,6 @@ pub fn run_changes(json: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// `tako setup` — メインのセットアップフロー。
-/// 通常実行と `--yes` はどちらも積極的自動化で質問ゼロ。`--answers` は検出値より優先する。
 /// 設定・データファイルのスキーマ移行を実行する（#916 の恒久原則: 手動移行はさせない）。
 ///
 /// 冪等で、移したものがあるときだけ 1 行出す（無ければ無言）。失敗しても setup 自体は
@@ -3423,6 +3421,33 @@ fn run_data_migration_stage() {
     eprintln!();
 }
 
+/// [`opens_dialogue`] が見る文脈。**この構造体の外の条件で判断を分けない**
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DialogueContext {
+    /// 選んだ系統が使える（導入済み・ログイン済み。#1501。未認証で起こすとログイン画面で止まる）
+    pub(crate) usable_agent: bool,
+    /// `--yes` / `--answers`（[`run_setup`] の `assume_yes`）
+    pub(crate) assume_yes: bool,
+    /// stdin が端末か
+    pub(crate) stdin_is_terminal: bool,
+    /// `--answers` の `launch_agent: none`
+    pub(crate) launch_none: bool,
+}
+
+/// setup の最後に対話のアシスタントを開くか（Issue #295 / #322 / #391。**純粋関数**なので
+/// `--help` の説明 = `main.rs` の `help_text_parity` がここと突き合わせる。#2897）
+pub(crate) fn opens_dialogue(ctx: DialogueContext) -> bool {
+    ctx.usable_agent && !ctx.assume_yes && ctx.stdin_is_terminal && !ctx.launch_none
+}
+
+/// `tako setup` — メインのセットアップフロー。
+///
+/// 設定値は聞かず、検出値 → 前回値 → 既定値で決める（#262。個別の見直しは `--review` だけ）。
+/// 端末の通常実行で聞くのは足りないものを入れてよいかだけ（使えるエージェント CLI が無いときの
+/// 導入と、未検出の依存 = #1499）で、選んだ系統がログイン済みなら最後に対話のアシスタントを開く。
+/// `assume_yes`（`--yes` / `--answers`）は標準入力を読まず、導入を同意扱いで進め
+/// （`--answers` の `install: false` なら入れない）、対話のアシスタントも開かない。
+/// `--answers` の値は検出値より優先する。`--help` の説明（`main.rs` の `Setup`）と同じ契約（#2897）
 pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Result<(), String> {
     crate::local_data_gate()?;
     eprintln!("tako セットアップ");
@@ -3906,10 +3931,12 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
     // スキップ条件: --yes / 非 TTY / --answers launch_agent=none /
     // **選んだ系統が使えない**（未導入・未認証。#1501。起こしてもログイン画面で止まる）
     let usable_agent = selected_agent.filter(|agent| agent.authenticated);
-    let skip_agent = usable_agent.is_none()
-        || assume_yes
-        || !std::io::IsTerminal::is_terminal(&std::io::stdin())
-        || answers.launch_agent.as_deref().is_some_and(|v| v == "none");
+    let skip_agent = !opens_dialogue(DialogueContext {
+        usable_agent: usable_agent.is_some(),
+        assume_yes,
+        stdin_is_terminal: std::io::IsTerminal::is_terminal(&std::io::stdin()),
+        launch_none: answers.launch_agent.as_deref() == Some("none"),
+    });
 
     // 設定共有（#513 / #793）。標準経路は状態表示だけ = 質問を増やさない（#262）
     apply_config_share(
