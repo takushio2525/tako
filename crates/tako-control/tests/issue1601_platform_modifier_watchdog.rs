@@ -34,10 +34,10 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-#[path = "common/code_view.rs"]
-mod code_view;
 #[path = "common/production_range.rs"]
 mod production_range;
+// code_view は production_range が読み込むものを使う（2 回読むと clippy::duplicate_mod）
+use production_range::code_view;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
