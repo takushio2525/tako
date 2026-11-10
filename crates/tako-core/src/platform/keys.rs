@@ -695,7 +695,13 @@ mod tests {
         // Windows で直読みと答えが食い違う 2 点が #2844 の症状そのもの
         // （直読みは Ctrl+V = 貼らない・Win+V = 貼る、だった）
         assert!(paste_key_active(Platform::Windows, "v", false, true, false));
-        assert!(!paste_key_active(Platform::Windows, "v", true, false, false));
+        assert!(!paste_key_active(
+            Platform::Windows,
+            "v",
+            true,
+            false,
+            false
+        ));
     }
 
     /// #1601: リンク（#763）と「修飾 + クリック / Enter」の残りが**同じ表**を見ること。
