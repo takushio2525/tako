@@ -1688,6 +1688,7 @@ tako orchestrator profiles show
 tako orchestrator profiles set default --model claude-opus-4-6 --effort max
 tako orchestrator profiles set default --clear-model   # claude 既定モデルに戻す
 tako orchestrator profiles set sol --master-agent codex --model gpt-5.6-sol --effort xhigh
+tako orchestrator profiles set default --agent claude --agent-effort medium   # worker の思考量
 tako orchestrator profiles set default --ctx-threshold 55   # 自動ハンドオフの閾値（50〜60）
 tako orchestrator profiles set takodev --cwd ~/dev/tako      # master をこのフォルダで起動する
 ```
@@ -1697,13 +1698,18 @@ tako orchestrator profiles set takodev --cwd ~/dev/tako      # master をこの�
 | `--master-agent` / `--clear-master-agent` | master のエージェント CLI（claude / codex。agy は master 非対応） |
 | `--model` / `--clear-model` | master のモデル指定 / 解除 |
 | `--effort` | master の思考量 |
-| `--worker-model` / `--clear-worker-model` | 子 worker 用の固定モデル / 解除 |
-| `--worker-effort` | 子 worker の思考量 |
+| `--agent` + `--agent-model` / `--agent-effort` | エージェント CLI ごとの worker のモデル / 思考量（`worker_agents.<系統>`） |
+| `--worker-model` / `--clear-worker-model` | `--worker-model-policy fixed` のときの worker のモデル / 解除 |
+| `--worker-effort` | `--worker-model-policy fixed` のときの worker の思考量 |
 | `--worker-agent` / `--clear-worker-agent` | worker の既定エージェント CLI（claude / codex / agy） |
 | `--worker-model-policy` | `inherit` / `fixed` / `delegate` |
 | `--cwd` / `--clear-cwd` | master・solo を起動するフォルダ / 解除（絶対パスか `~/` 始まり。存在しないパスはエラー） |
 | `--ctx-threshold` / `--clear-ctx-threshold` | 自動ハンドオフを始めるコンテキスト使用率（%。50〜60。既定 60） |
 | `--auto-handoff` | 閾値を超えたら tako が引き継ぎを促すか（既定 true） |
+
+worker のモデルと思考量は、spawn が「spawn の指定 → worker のアカウントの既定 → `worker_agents.<系統>` → `worker_model_policy`」の順で決めます（codex / agy へは claude の表記のアカウントの既定とポリシーを渡しません）。`tako setup` が作るプロファイルは `worker_agents.claude.effort` を持つので、worker の思考量を変えるなら `--agent claude --agent-effort <値>` を使います（`--worker-effort` / `--worker-model` は `fixed` のときだけ使われ、`worker_agents` の値が先に効きます。効かない指定は応答の `warnings` に理由と直し方が出ます）。
+
+`show` / `set` の応答の `resolved_worker_model` / `resolved_worker_effort` / `resolved_worker_agent` は、spawn がエージェントを指定せずに立てたときに実際に付く値です。`resolved_workers.<系統>` には、そのエージェントで立てたときの値と出どころ（`account` / `agent_config` / `profile_policy` / `cli_default`。spawn の応答の `model_source` / `effort_source` と同じ語）が載ります。
 
 `--cwd` を設定すると、引き継ぎ（`tako orchestrator handoff`）で立つ後任 master もそのフォルダで起動します。未設定なら**前任 master と同じフォルダ**を引き継ぎます（フックや direnv のようにフォルダに依存する設定が後任だけ効かなくなるのを防ぐため）。引き継ぎの応答には実際に使ったフォルダ（`cwd`）と決め手（`cwd_source`）が載ります。
 

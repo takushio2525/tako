@@ -259,6 +259,29 @@ spawn の応答は `model`（`--model` に**宣言した**値。`null` = CLI 既
 無言で別のモデルへ解決する = #1638）。実際のモデルは spawn の時点では分からないので、
 `workers` / `worker_status` の `model_actual` を見る（下の `workers` 節）。
 
+**`profiles show` / `set` の「resolved」は spawn と同じ 1 実装（#2891）**。アカウント（spawn 指定 >
+`worker_account` > `master_account`）→ 系統（spawn 指定 > `worker_agent` > claude）→ 上の表の順、を
+`Profile::plan_worker_launch_typed` が 1 か所で決め、spawn（`spawn_place`）と `profile_to_json` の両方が呼ぶ。
+応答の `resolved_worker_model` / `resolved_worker_effort` / `resolved_worker_agent` は spawn が agent / model /
+effort / account を省いて立てたときの値、`resolved_workers.<系統>` は `spawn --agent <系統>` の値と出どころ
+（spawn の応答と同じ `model_source` / `effort_source` の語）。spawn が断る状態（未登録のアカウント・不正な
+系統名）では null と `resolved_worker_error`（spawn と同じ断りの文）。修正前の欄はポリシーの段だけ
+（`Profile::resolve_worker_effort()`）を載せていたので、`worker_agents.<agent>.effort` やアカウントの既定が
+効いていても古い値を「resolved」と名乗っていた（欄の名前と型はそのまま・値の意味を spawn の実値へ直した。
+名指しで読むのは master / setup の対話の LLM だけで、どちらも実値として読んでいた）。
+
+**使われない `worker_model` / `worker_effort` は master のプロファイルの応答の `warnings` に注記**
+（`ReplyNote::WorkerSettingUnused`・日英は表示言語）。理由は 3 つ: ポリシーが inherit / delegate（使うのは
+fixed だけ）・既定の worker が codex / agy（claude の語彙を渡さない = #1013 のマトリクス）・上の段（アカウントの
+既定 / `worker_agents.<系統>`）が先に決める。`tako setup` が作るプロファイル（inherit +
+`worker_agents.claude.effort`）では `--worker-effort` はポリシーでも上の段でも使われないので、注記は
+`--agent <系統> --agent-<欄> <値>` を案内する（アカウントの既定が決めているときは案内しない）。solo は worker を
+spawn しないので出さない。番犬は `tests/issue2891_resolved_worker_launch.rs`（MCP の tools/call → dispatch で
+show の resolved と spawn の応答・起動コマンドの `--model` / `--effort` を突き合わせる + ソースの形）。
+
+`tako master` の起動の行（`WorkerPolicy*`）と master の system prompt の「Worker Model Policy」節は、いまも
+ポリシーの段の値（`worker_model_label()` / `resolve_worker_effort()`）を出す（#2891 の範囲外。#2907）。
+
 ### master のエージェント種別（claude / codex。Issue #127）
 
 master / solo は claude 以外に codex でも起動できる。プロファイルに `master_agent` を書く:

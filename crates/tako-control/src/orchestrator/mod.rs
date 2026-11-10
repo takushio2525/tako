@@ -1152,6 +1152,117 @@ pub struct ResolvedWorkerLaunch {
     pub extra_args: Vec<String>,
 }
 
+/// spawn が worker を起こす値を決めた結果（[`Profile::plan_worker_launch_typed`]。#2891）
+#[derive(Debug, Clone)]
+pub struct WorkerLaunchPlan {
+    /// 使うアカウント名（spawn 指定 > worker_account > master_account。無ければ `None`）
+    pub account_name: Option<String>,
+    /// 解決したアカウント（env 計画の `CLAUDE_CONFIG_DIR` に使う）
+    pub account: Option<ResolvedAccount>,
+    /// 系統と model / effort（どの段から来たかつき）
+    pub launch: ResolvedWorkerLaunch,
+}
+
+/// [`Profile::plan_worker_launch_typed`] がどの段で断ったか（spawn は段ごとに断りの種類が違う）
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkerLaunchPlanError {
+    /// アカウントを解決できない（accounts.yaml が読めない・未登録の名前）
+    Account(ConfigError),
+    /// worker の系統名が不正
+    Agent(ConfigError),
+}
+
+impl WorkerLaunchPlanError {
+    /// 中の断り
+    pub fn config_error(&self) -> &ConfigError {
+        match self {
+            Self::Account(e) | Self::Agent(e) => e,
+        }
+    }
+}
+
+/// worker の起動値のどちらの欄か（#2891 の注記）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerLaunchField {
+    Model,
+    Effort,
+}
+
+impl WorkerLaunchField {
+    /// `model` / `effort`（`worker_agents.<agent>.<欄>` と `--agent-<欄>` の綴り）
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Effort => "effort",
+        }
+    }
+
+    /// プロファイルのキー（`worker_model` / `worker_effort`）
+    pub fn profile_key(self) -> &'static str {
+        match self {
+            Self::Model => "worker_model",
+            Self::Effort => "worker_effort",
+        }
+    }
+}
+
+/// プロファイルの `worker_model` / `worker_effort` が既定の worker の起動に使われない理由（#2891）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnusedWorkerReason {
+    /// worker_model_policy が inherit / delegate（使うのは fixed のときだけ）
+    Policy,
+    /// 既定の worker の系統が claude の語彙の既定を受け取らない（codex / agy。#1013 のマトリクス）
+    NotInherited,
+    /// 上の段（アカウントの既定 / `worker_agents.<agent>`）が先に決めた
+    Shadowed,
+}
+
+/// 使われない `worker_model` / `worker_effort` と、代わりに spawn が使う値（#2891）
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnusedWorkerSetting {
+    pub field: WorkerLaunchField,
+    /// プロファイルに書いてある値
+    pub value: String,
+    pub reason: UnusedWorkerReason,
+    /// プロファイルの `worker_model_policy`
+    pub policy: WorkerModelPolicy,
+    /// 既定の worker の系統
+    pub agent: WorkerAgent,
+    /// spawn が実際に使う値（`None` = CLI の既定に委ねる）
+    pub effective: Option<String>,
+    /// `effective` がどの段から来たか
+    pub source: LaunchValueSource,
+    /// `source` がアカウントのときの名前
+    pub account: Option<String>,
+}
+
+impl UnusedWorkerSetting {
+    /// `worker_agents.<agent>.<欄>` を書けば効くか（上にアカウントの既定・spawn の指定が無い）
+    pub fn agent_config_fixes(&self) -> bool {
+        !matches!(
+            self.source,
+            LaunchValueSource::Account | LaunchValueSource::Explicit
+        )
+    }
+
+    /// 直し方の `--agent-<欄>` に写してよい値。`worker_model` / `worker_effort` は claude の語彙なので、
+    /// それを受け取らない系統（codex / agy）へは写さない（`None` = 呼び手がプレースホルダを置く。#1013）
+    pub fn fix_value(&self) -> Option<&str> {
+        inherits_claude_vocabulary_defaults(self.agent).then_some(self.value.as_str())
+    }
+}
+
+impl WorkerModelPolicy {
+    /// YAML / 応答の表記（`inherit` / `fixed` / `delegate`）
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Inherit => "inherit",
+            Self::Fixed => "fixed",
+            Self::Delegate => "delegate",
+        }
+    }
+}
+
 /// プロファイル設定。
 /// `model` が `None` の場合は claude CLI の既定モデルに委ねる（`--model` を付けない）。
 /// 1M コンテキスト版（`[1m]` サフィックス）は Max / API プラン限定のため、
@@ -1760,6 +1871,103 @@ impl Profile {
             remote_control: self.remote_control_enabled(),
             extra_args: cfg.map(|c| c.args.clone()).unwrap_or_default(),
         }
+    }
+
+    /// spawn が worker を起こす値（アカウント・系統・model / effort）を決める **1 実装**（#2891）。
+    ///
+    /// spawn（`dispatch` の `spawn_place`）と `profiles show` / `set` の `resolved_worker_*` /
+    /// `resolved_workers` がこれを呼ぶ。同じ順を別に書き写すと「resolved」と名乗る欄が spawn の
+    /// 起動値とずれる（#2891 の実発生: 欄はポリシーの段だけを見て `worker_agents` を見ていなかった）。
+    /// 番犬は `tests/issue2891_resolved_worker_launch.rs`。
+    ///
+    /// 順: アカウント（spawn 指定 > worker_account > master_account）→ 系統（spawn 指定 >
+    /// worker_agent > claude）→ model / effort（[`Self::resolve_agent_launch_with_account`]）。
+    /// アカウントの既定は claude の語彙なので、明示指定と同じ段に混ぜず `AccountDefaults` で渡す（#1013）
+    pub fn plan_worker_launch_typed(
+        &self,
+        agent: Option<&str>,
+        account: Option<&str>,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<WorkerLaunchPlan, WorkerLaunchPlanError> {
+        let account_name = self.resolve_worker_account_name(account);
+        let resolved_account = match account_name {
+            Some(name) => Some(
+                AccountsConfig::load_typed()
+                    .and_then(|accounts| accounts.resolve_typed(name))
+                    .map_err(WorkerLaunchPlanError::Account)?,
+            ),
+            None => None,
+        };
+        let worker_agent = self
+            .resolve_worker_agent_typed(agent)
+            .map_err(WorkerLaunchPlanError::Agent)?;
+        let account_defaults = AccountDefaults {
+            model: resolved_account
+                .as_ref()
+                .and_then(|a| a.default_model.as_deref()),
+            effort: resolved_account
+                .as_ref()
+                .and_then(|a| a.default_effort.as_deref()),
+        };
+        let launch =
+            self.resolve_agent_launch_with_account(worker_agent, model, effort, account_defaults);
+        Ok(WorkerLaunchPlan {
+            account_name: account_name.map(str::to_string),
+            account: resolved_account,
+            launch,
+        })
+    }
+
+    /// `worker_model` / `worker_effort` のうち、`plan`（既定の worker の spawn の値）に使われていないもの（#2891）。
+    ///
+    /// 使われるのは「ポリシーが fixed・系統が claude の語彙を受け取る・上の段（spawn の指定 /
+    /// アカウントの既定 / `worker_agents.<agent>`）が決めていない」ときだけ。setup が作る既定の
+    /// プロファイル（inherit + `worker_agents.claude.effort`）では `--worker-effort` はどちらの理由でも
+    /// 効かないので、黙って受け付けずに応答の warnings で言う
+    pub fn unused_worker_settings(&self, plan: &WorkerLaunchPlan) -> Vec<UnusedWorkerSetting> {
+        let launch = &plan.launch;
+        [
+            (
+                WorkerLaunchField::Model,
+                self.worker_model.as_deref(),
+                launch.model.as_deref(),
+                launch.model_source,
+            ),
+            (
+                WorkerLaunchField::Effort,
+                self.worker_effort.as_deref(),
+                launch.effort.as_deref(),
+                launch.effort_source,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(field, value, effective, source)| {
+            let value = value?;
+            let reason = if self.worker_model_policy != WorkerModelPolicy::Fixed {
+                UnusedWorkerReason::Policy
+            } else if !inherits_claude_vocabulary_defaults(launch.agent) {
+                UnusedWorkerReason::NotInherited
+            } else if source != LaunchValueSource::ProfilePolicy {
+                UnusedWorkerReason::Shadowed
+            } else {
+                return None;
+            };
+            Some(UnusedWorkerSetting {
+                field,
+                value: value.to_string(),
+                reason,
+                policy: self.worker_model_policy,
+                agent: launch.agent,
+                effective: effective.map(str::to_string),
+                source,
+                account: plan
+                    .account_name
+                    .clone()
+                    .filter(|_| source == LaunchValueSource::Account),
+            })
+        })
+        .collect()
     }
 
     /// プロファイルを YAML ファイルから読み込む
@@ -6650,6 +6858,100 @@ prompt_blocks:
         assert_eq!(launch.effort.as_deref(), Some("low"));
         assert!(launch.skip_permissions);
         assert_eq!(launch.extra_args, vec!["--verbose".to_string()]);
+    }
+
+    /// setup が作る既定のプロファイル（inherit + worker_agents.claude.effort: high。#2891 の再現の土台）
+    fn setup_default_2891() -> Profile {
+        let mut agents = std::collections::BTreeMap::new();
+        agents.insert(
+            "claude".to_string(),
+            AgentWorkerConfig {
+                effort: Some("high".into()),
+                ..Default::default()
+            },
+        );
+        Profile {
+            master_agent: Some("claude".into()),
+            effort: "high".into(),
+            worker_agent: Some("claude".into()),
+            worker_agents: agents,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn plan_worker_launch_はアカウントなしで解決と同じ値を返す_2891() {
+        // アカウントを参照しないプロファイルは accounts.yaml を読まない（純粋に解決だけ）
+        let mut p = setup_default_2891();
+        p.worker_agents.get_mut("claude").expect("claude").effort = Some("medium".into());
+        let plan = p
+            .plan_worker_launch_typed(None, None, None, None)
+            .expect("解決できる");
+        assert_eq!(plan.account_name, None);
+        assert_eq!(
+            plan.launch,
+            p.resolve_agent_launch(WorkerAgent::Claude, None, None)
+        );
+        assert_eq!(plan.launch.effort.as_deref(), Some("medium"));
+        assert_eq!(plan.launch.effort_source, LaunchValueSource::AgentConfig);
+        // ポリシーの段だけの値は high のまま（#2891 の食い違いの元）
+        assert_eq!(p.resolve_worker_effort(), "high");
+        // 系統の指定は spawn --agent と同じ
+        let codex = p
+            .plan_worker_launch_typed(Some("codex"), None, None, None)
+            .expect("codex");
+        assert_eq!(codex.launch.agent, WorkerAgent::Codex);
+        assert_eq!(codex.launch.effort_source, LaunchValueSource::CliDefault);
+        // 不正な系統名は系統の段の断り
+        assert!(matches!(
+            p.plan_worker_launch_typed(Some("nope"), None, None, None),
+            Err(WorkerLaunchPlanError::Agent(_))
+        ));
+    }
+
+    #[test]
+    fn unused_worker_settings_はポリシーと上の段と系統で拾い使われるときは拾わない_2891() {
+        let unused = |p: &Profile| {
+            let plan = p
+                .plan_worker_launch_typed(None, None, None, None)
+                .expect("解決できる");
+            p.unused_worker_settings(&plan)
+        };
+        // 再現 1: inherit に worker_effort → ポリシーで使われない（spawn は worker_agents の high）
+        let mut p = setup_default_2891();
+        p.worker_effort = Some("medium".into());
+        let got = unused(&p);
+        assert_eq!(got.len(), 1, "{got:#?}");
+        assert_eq!(got[0].field, WorkerLaunchField::Effort);
+        assert_eq!(got[0].reason, UnusedWorkerReason::Policy);
+        assert_eq!(got[0].effective.as_deref(), Some("high"));
+        assert_eq!(got[0].source, LaunchValueSource::AgentConfig);
+        assert!(got[0].agent_config_fixes());
+        assert_eq!(got[0].fix_value(), Some("medium"));
+        // delegate も同じ理由
+        p.worker_model_policy = WorkerModelPolicy::Delegate;
+        p.worker_model = Some("claude-sonnet-x".into());
+        let got = unused(&p);
+        assert_eq!(got.len(), 2, "{got:#?}");
+        assert!(got.iter().all(|u| u.reason == UnusedWorkerReason::Policy));
+        // fixed でも worker_agents.claude.effort が先 → effort だけ上の段で使われない（model は使われる）
+        p.worker_model_policy = WorkerModelPolicy::Fixed;
+        let got = unused(&p);
+        assert_eq!(got.len(), 1, "{got:#?}");
+        assert_eq!(got[0].field, WorkerLaunchField::Effort);
+        assert_eq!(got[0].reason, UnusedWorkerReason::Shadowed);
+        // 上の段を外すと fixed の値がそのまま使われる = 何も拾わない
+        p.worker_agents.clear();
+        assert_eq!(unused(&p), Vec::new());
+        // 既定の worker が codex: claude の語彙は渡さない（直し方に値を写さない）
+        p.worker_agent = Some("codex".into());
+        let got = unused(&p);
+        assert_eq!(got.len(), 2, "{got:#?}");
+        assert!(got
+            .iter()
+            .all(|u| u.reason == UnusedWorkerReason::NotInherited && u.fix_value().is_none()));
+        // 何も書いていなければ何も拾わない
+        assert_eq!(unused(&setup_default_2891()), Vec::new());
     }
 
     #[test]
