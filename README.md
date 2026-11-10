@@ -40,9 +40,11 @@ brew install --cask takushio2525/tako/tako
 
 更新は `brew upgrade --cask takushio2525/tako/tako`、またはアプリ内の更新通知から行えます。
 tako CLI も同時に PATH へ入るため、`tako` コマンドがそのまま使えます。
+初回起動で Gatekeeper の警告が出たら、下の「zip を手動で」の手順 2 と同じく許可してください。
 
 Update with `brew upgrade --cask takushio2525/tako/tako`, or from the in-app update notification.
 The cask also links the `tako` CLI into your PATH.
+If Gatekeeper blocks the first launch, allow it as in step 2 of the manual zip section below.
 
 ### macOS: zip を手動で / macOS: manual zip
 
@@ -50,11 +52,12 @@ The cask also links the `tako` CLI into your PATH.
 Grab `tako-vX.X.X-macos-arm64.zip` from the [Releases](https://github.com/takushio2525/tako/releases) page.
 
 1. zip をダブルクリックで展開し、`tako.app` を `/Applications` へドラッグ / Extract and drag `tako.app` into `/Applications`
-2. 未署名のため初回起動時に Gatekeeper の警告が出ます / macOS Gatekeeper warns on first launch (not notarized yet):
-   - `tako.app` をダブルクリックして警告が出たら一旦キャンセル / Double-click, then cancel the warning
-   - **システム設定 → プライバシーとセキュリティ** を開く / Open **System Settings → Privacy & Security**
-   - 下部の「"tako"は開発元を確認できないため〜」の隣の **「このまま開く」** をクリック / Click **"Open Anyway"** next to the tako warning
-   - もう一度 `tako.app` を起動すると「開く」ボタンが表示される / Launch again and click **"Open"**
+2. 公証（notarization）をまだ受けていないため、初回起動時に Gatekeeper の警告が出ます / macOS Gatekeeper blocks the first launch (not notarized yet):
+   - `tako.app` をダブルクリックして警告が出たら、「ゴミ箱に入れる」ではないほうのボタン（「完了」など）で閉じる / Double-click, then close the warning with the button that is not **Move to Trash** (e.g. **Done**)
+   - **システム設定 → プライバシーとセキュリティ** を開く（macOS 12 以前は **システム環境設定 → セキュリティとプライバシー → 一般**）/ Open **System Settings → Privacy & Security** (macOS 12 or earlier: **System Preferences → Security & Privacy → General**)
+   - 「セキュリティ」の欄の tako の行の隣にある **「このまま開く」** をクリックし、続くパスワード（Touch ID）や確認のダイアログに答える。ボタンは開こうとしてから約 1 時間だけ出ます / Click **"Open Anyway"** next to the tako message under Security, then confirm with your password (or Touch ID) and any follow-up dialog. The button appears for about an hour after the blocked launch
+   - ターミナルなら `xattr -dr com.apple.quarantine /Applications/tako.app` でも同じです / Or run `xattr -dr com.apple.quarantine /Applications/tako.app` in Terminal
+   - macOS 15 以降は、右クリック →「開く」では警告を越えられません / On macOS 15 and later, Control-click → Open no longer gets past the warning
 
 ### Windows: インストーラー / ポータブル zip / Windows: installer or portable zip
 
