@@ -252,7 +252,7 @@ mod imp {
     }
 
     pub(super) fn processes() -> Option<Vec<RawProc>> {
-        let pids = crate::ports::list_pids();
+        let pids = crate::platform::procinfo::list_pids();
         if pids.is_empty() {
             return None;
         }
@@ -261,7 +261,7 @@ mod imp {
         let me = unsafe { libc::getuid() };
         let mut out = Vec::with_capacity(pids.len());
         for pid in pids {
-            let Some((ppid, uid, name)) = crate::ports::short_info(pid) else {
+            let Some((ppid, uid, name)) = crate::platform::procinfo::short_info(pid) else {
                 continue; // 列挙と問い合わせの間に終わった
             };
             // SAFETY: POD の構造体なので全 0 は正しい値
@@ -302,11 +302,11 @@ mod imp {
     }
 
     pub(super) fn details_buffer() -> Option<Vec<u8>> {
-        crate::ports::procargs_buffer_len().map(|len| vec![0u8; len])
+        crate::platform::procinfo::procargs_buffer_len().map(|len| vec![0u8; len])
     }
 
     pub(super) fn details(buf: &mut [u8], pid: u32, names: &[&str]) -> Option<Details> {
-        let (argv, env) = crate::ports::argv_and_env(pid, buf, names)?;
+        let (argv, env) = crate::platform::procinfo::argv_and_env(pid, buf, names)?;
         Some(Details { argv, env })
     }
 }

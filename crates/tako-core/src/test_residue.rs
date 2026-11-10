@@ -1501,7 +1501,7 @@ mod tests {
     ///
     /// 親を失った孫はグループを抜けないのでここに残る。出ていく途中のものは
     /// [`ORPHAN_SETTLE_TICKS`] 回まで消えるのを待つ。残ったものは pid 指定の SIGKILL で片付ける
-    /// （番犬自身が残骸を残さない）。ゾンビは載らない（`ports::short_info` が引けない。
+    /// （番犬自身が残骸を残さない）。ゾンビは載らない（`procinfo::short_info` が引けない。
     /// 親の居ないゾンビは launchd がすぐ刈る）
     #[cfg(target_os = "macos")]
     fn take_orphans(pgid: u32) -> Vec<String> {
@@ -1513,12 +1513,12 @@ mod tests {
             std::thread::sleep(ORPHAN_TICK);
             left = group_members(pgid);
         }
-        let mut buf = vec![0u8; crate::ports::procargs_buffer_len().unwrap_or(0)];
+        let mut buf = vec![0u8; crate::platform::procinfo::procargs_buffer_len().unwrap_or(0)];
         left.into_iter()
             .map(|(pid, comm)| {
                 let argv = u32::try_from(pid)
                     .ok()
-                    .and_then(|p| crate::ports::argv_and_env(p, &mut buf, &[]))
+                    .and_then(|p| crate::platform::procinfo::argv_and_env(p, &mut buf, &[]))
                     .and_then(|(argv, _)| argv)
                     .unwrap_or(comm);
                 // SAFETY: 自分の uid で、自分が起こした子のグループに残ったプロセスだけへ送る
@@ -1544,12 +1544,12 @@ mod tests {
         };
         // SAFETY: 自分の uid を読むだけ
         let uid = unsafe { libc::getuid() };
-        crate::ports::list_pids()
+        crate::platform::procinfo::list_pids()
             .into_iter()
             // SAFETY: pid の所属グループを読むだけ（居なければ -1）
             .filter(|&pid| unsafe { libc::getpgid(pid) } == pgid)
             .filter_map(|pid| {
-                let (_, owner, comm) = crate::ports::short_info(pid)?;
+                let (_, owner, comm) = crate::platform::procinfo::short_info(pid)?;
                 (owner == uid).then_some((pid, comm))
             })
             .collect()
