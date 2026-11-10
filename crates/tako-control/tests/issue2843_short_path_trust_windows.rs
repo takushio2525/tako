@@ -179,13 +179,22 @@ fn issue2843_短い形の作業dirの鍵は長い形の鍵と渡された形の�
         ("short-verbatim", format!(r"\\?\{}", dirs.short_work)),
     ] {
         let got = claude_project_keys(&cwd);
+        // 欠けた鍵ごとに、どの起こし方で確認が出るかを名指す
+        let mut why = Vec::new();
+        if !got.contains(&want[0]) {
+            why.push("長い形の鍵が無い = 短い形を長い形へ戻す段（境界 B34）が効いていない = シェル経由の起動で確認が出る");
+        }
+        if !got.contains(&want[1]) {
+            why.push("渡された形の鍵が無い = 直起動・位置を正規化しないシェルで確認が出る");
+        }
         assert_eq!(
             got,
             want,
-            "[#2843 {label}] 短い形の作業 dir {} の鍵の組が {:?} でなく {:?}（長い形の鍵が無い = 短い形を長い形へ戻す段 = 境界 B34 が効いていない）",
+            "[#2843 {label}] 短い形の作業 dir {} の鍵の組が {:?} でなく {:?}（{}）",
             dirs.mask(&cwd),
             masked(&want),
-            masked(&got)
+            masked(&got),
+            why.join("・")
         );
         assert_eq!(claude_project_key(&cwd), long_key, "[#2843 {label}]");
     }
