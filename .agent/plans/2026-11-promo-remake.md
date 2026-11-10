@@ -113,6 +113,8 @@ cmux は README と LICENSE（公開の文書）だけを読んだ。ソース�
 
 新しい依存は足していない（Node・ffmpeg・`web/tako-remote` の Playwright はどれも既存）。
 
+同じ仕組みで作った別の動画: 入れ方・使い方動画（#2866）= `.agent/plans/2026-11-howto-video.md`・`scripts/promo/howto/`。
+
 ### 偽のエージェント（本物の claude / codex / agy を起こさない）
 
 収録では `demo/agent-sim.mjs` を `claude` / `codex` / `agy` の名前で PATH の先頭に置く。tako は本物の CLI と同じ手順
