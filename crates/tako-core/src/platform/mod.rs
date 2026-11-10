@@ -30,6 +30,8 @@ pub mod job;
 pub mod jobserver;
 pub mod keys;
 pub mod locale;
+/// 8.3 の短い形を長い形へ戻す（境界 B34。#2843）
+pub mod long_path;
 pub mod path;
 /// 本人だけが読み書きできるファイル・置き場（境界 B32。#1632）
 pub mod private_file;

@@ -672,7 +672,13 @@ S2〜S5 は S1 の後なら並行できるが、`progress.md` の衝突（#1228�
   `bounded_claude_version`（版リソース → `claude --version`）が返るまでに作るペイン（起動時の復元を含む）が
   `claude_unknown` で注入されなかった → #2842 で、パスに版が無ければ exe の版リソース（境界 B16 の `exe::file_version`）を
   読む形へ直した（A/B `TAKO_2842_LEGACY=1`）。本物の claude.exe での確認は同じ ps1 の段
-  （`crates/tako-control/tests/issue2842_claude_version_windows.rs`）。
+  （`crates/tako-control/tests/issue2842_claude_version_windows.rs`）。(4) 作業 dir が 8.3 の短い形
+  （利用者名に空白・日本語・9 文字以上を含む PC の `TEMP` 由来など）だと、claude は鍵を正規化せず自分のプロセスの
+  作業 dir の形で引く（短い形の cwd の ConPTY から直に起こすと短い形・ペインの PowerShell 5.1 から打つと PowerShell が
+  位置を長い形にするので長い形。run 42731844788 / 42731760676）。tako の worker の起動はシェルへ打つので、短い形のまま
+  書いた事前信頼では確認が出ていた → #2843 で、短い形なら長い形（境界 B34 `platform::long_path`）の鍵と渡された形の
+  鍵の両方を書く（`claude_tui::claude_project_keys`。A/B `TAKO_2843_LEGACY=1`）。本物の claude.exe での確認は同じ ps1 の段
+  （`crates/tako-control/tests/issue2843_short_path_trust_windows.rs`）。
   残り: 器（psmux）のペインの `update-environment` 経由・実機の GUI・本物のアカウント
 - desktop / VS Code 拡張 / Remote Control の surface は未実測（tako のペインは terminal だけなので
   S1〜S5 には影響しない）
