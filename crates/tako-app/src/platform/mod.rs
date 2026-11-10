@@ -2,7 +2,7 @@
 //!
 //! `.agent/plans/2026-07-windows-port-architecture.md` §2.1 の規約により、
 //! tako-core / tako-control に属さない境界（B11 Web ビュー・B12 ドキュメントレンダラ・
-//! B14 配布と自動更新）は各クレート内の `platform/` に同じ形で置く。
+//! B14 配布と自動更新・B36 窓の枠）は各クレート内の `platform/` に同じ形で置く。
 //!
 //! **`#[cfg(target_os)]` を書いてよいのはこの配下の実装選択だけ**で、
 //! 呼び出し側（`preview` / `preview_render` / UI）は単一のコードパスを持つ。
@@ -14,3 +14,5 @@ pub mod installer_update;
 pub mod pdf;
 /// 利用者が待っている重い background 処理を App Nap に間引かせない（#1916 / #1926）
 pub mod user_work;
+/// 窓の枠まわりの OS 差（位置・寸法の適用・最大化・元に戻す・アプリメニュー・枠の寸法。境界 B36。#2858）
+pub mod window_chrome;

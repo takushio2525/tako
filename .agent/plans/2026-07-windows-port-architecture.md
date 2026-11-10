@@ -86,7 +86,7 @@ crates/tako-core/src/platform/
 └── unix/           ← macOS 以外の unix と共有する部分
 ```
 
-`tako-control` / `tako-app` 固有の境界（B3・B4・B9・B11・B12・B14・B15）は
+`tako-control` / `tako-app` 固有の境界（B3・B4・B9・B11・B12・B14・B15・B36）は
 各クレート内に同じ形の `platform/` を置く。**新規に `cfg` を書きたくなったら、
 まずその境界が既にあるかを探し、無ければ境界を作るところから始める。**
 
