@@ -12,8 +12,10 @@
 //! ## 直し方（2 段構え）
 //!
 //! 1. **終了時に自分の dir を消す**（[`arm_self_cleanup`]）。作った瞬間に武装するので
-//!    「作る経路が消す経路を持つ」形になる。`libc::atexit` は `main` からの復帰でも
-//!    `std::process::exit`（libtest が失敗時に呼ぶ）でも走る
+//!    「作る経路が消す経路を持つ」形になる。unix の `libc::atexit` は `main` からの復帰でも
+//!    `std::process::exit`（libtest が失敗時に呼ぶ）でも走る。**Windows の `std::process::exit` は
+//!    `ExitProcess` を直接呼んで CRT の `atexit` を飛ばす**ので、TLS コールバックの
+//!    `DLL_PROCESS_DETACH` からも同じ後始末を呼ぶ（#1581。下の「Windows の終了時」）
 //! 2. **起動時に残骸を掃く**（[`sweep_stale_on_start`]）。1 は SIGKILL / abort では
 //!    走らないので、次のテストプロセスが pid の生死で判定して回収する
 //!
@@ -42,6 +44,26 @@
 //! `sh -c "…; sleep 600"` を打ち切ると、`sleep` が親を失ってテストのプロセスグループのまま眠る）。
 //! 掃除の仕組みは持たず、一巡の番犬（テストモジュールの `テストを一巡してもtmpdirに残骸が残らない`）が
 //! 子を自分のプロセスグループで起こして、終わった後にグループへ残ったものを数えて名指す（macOS）。
+//!
+//! ## Windows の終了時（#1581）
+//!
+//! Rust の `std::process::exit` は Windows では `ExitProcess` を直接呼ぶ（std の `sys/exit.rs`）。
+//! `ExitProcess` は CRT の `atexit` の表を実行しないので、**libtest が 1 本でも落ちて
+//! `process::exit(101)` で終わる回**は終了時の後始末が 1 度も走らず、武装した置き場が
+//! 全部残っていた（Windows CI の実測: 一巡の子が 1 本落ちた回に `tako-agent-config-` /
+//! `tako-test-data-` / `tako-test-scratch-` の 3 件。子の診断に `atexit` へ入った記録が無い）。
+//! `main` から戻る経路だけが CRT の `exit()` を通って `atexit` を走らせる。
+//!
+//! 終わり方を問わず通るのは、ローダーが EXE の TLS コールバックへ送る
+//! `DLL_PROCESS_DETACH` だけなので、そこからも同じ後始末を呼ぶ（std 自身もスレッドローカルの
+//! 破棄にこの仕組みを使っている）。呼ばれる時点では他のスレッドは止められているので、
+//! 一覧の錠は待たずに取れたときだけ使う。`atexit` は残す（unix の経路は変えない。
+//! Windows の `main` からの復帰では両方が走り、後から来た側は「もう無い」で済む）。
+//!
+//! 孫の作業ディレクトリが置き場の中に残っていると `remove_dir_all` は `os error 32` で
+//! 失敗する（孫が終わるまで消えない）が、一巡では 1 件も出ていないので待ちは入れていない。
+//! 中のファイルを孫が開いたまま・読み取り専用のファイルは、どちらもそのまま消える
+//! （Rust のハンドルは `FILE_SHARE_DELETE` つきで、`remove_dir_all` は POSIX の削除で通る）
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -130,6 +152,17 @@ pub const REUSE_SLACK: Duration = Duration::from_secs(2);
 pub fn legacy_1296() -> bool {
     matches!(
         std::env::var("TAKO_1296_LEGACY").ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
+/// A/B 用の逃げ道（`TAKO_1581_LEGACY=1`）。Windows の TLS コールバックからの後始末を切って
+/// **修正前を再現**する（`ExitProcess` で終わる回は何も消さない）。読むのは武装する時点の 1 度だけ
+/// （コールバックの中では環境変数を読まない = 止められたスレッドが錠を握っている可能性がある）。
+/// 番犬がこれを立てて「失敗で終わる子の置き場が残ること」を Windows で実測する
+pub fn legacy_1581() -> bool {
+    matches!(
+        std::env::var("TAKO_1581_LEGACY").ok().as_deref(),
         Some("1" | "true" | "on")
     )
 }
@@ -652,8 +685,9 @@ pub fn report_json(temp: &Path, items: &[Residue], outcome: &SweepOutcome) -> se
 
 /// このプロセスが作った使い捨て dir を**終了時に消す**（#1296 の案 1）。
 ///
-/// `libc::atexit` に登録するので、`main` からの復帰でも
-/// `std::process::exit`（libtest が失敗時に呼ぶ）でも走る。
+/// `libc::atexit` に登録するので、unix では `main` からの復帰でも
+/// `std::process::exit`（libtest が失敗時に呼ぶ）でも走る。Windows の `std::process::exit` は
+/// `atexit` を飛ばすので、TLS コールバックの `DLL_PROCESS_DETACH` からも呼ぶ（#1581。`exit_hook`）。
 /// SIGKILL / abort では走らないので [`sweep_stale_on_start`] と併用する
 pub fn arm_self_cleanup(dir: &Path) {
     if legacy_1296() {
@@ -672,7 +706,72 @@ pub fn arm_self_cleanup(dir: &Path) {
         unsafe {
             libc::atexit(remove_own_dirs);
         }
+        // Windows の `ExitProcess` で終わる回（libtest の失敗・`process::exit`）の受け口（#1581）
+        #[cfg(windows)]
+        if !legacy_1581() {
+            exit_hook::arm();
+        }
     });
+}
+
+/// Windows の終了時の受け口（#1581）。モジュール冒頭の「Windows の終了時」を参照。
+///
+/// TLS コールバックの表（`.CRT$XL?` の節）へ 1 本足し、ローダーが送る
+/// `DLL_PROCESS_DETACH` で `remove_own_dirs` を呼ぶ。`ExitProcess` でも `main` からの復帰でも
+/// 必ず通る（Windows CI の実測: 失敗 / `process::exit(7)` / `process::exit(0)` で終わった子の
+/// 置き場が、修正前は 3 通りとも残り、ここを通すと 3 通りとも消えた）。
+///
+/// 表には製品バイナリにも載るが、`arm` されたプロセス（= `arm_self_cleanup` を通った
+/// テストプロセス）でだけ働く。スレッドの開始・終了でも呼ばれるので、理由の比較 1 回で抜ける
+#[cfg(windows)]
+mod exit_hook {
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// `arm` されたか。コールバックの中では環境変数を読まず、これだけを見る
+    static ARMED: AtomicBool = AtomicBool::new(false);
+
+    // CRT の TLS ディレクトリ。参照しないとリンカが TLS の支えごと捨て、表のコールバックが
+    // 呼ばれない（std の `sys/thread_local/guard/windows.rs` と同じ手当て。x86 の綴りの差は
+    // C の名前の飾りが吸収する）
+    extern "C" {
+        #[link_name = "_tls_used"]
+        static TLS_USED: u8;
+    }
+
+    /// 表へ載せる 1 本。`.CRT$XLA`（CRT の始まりの印）と `.CRT$XLZ`（終わりの印）の間は
+    /// 節の名前順に並ぶので、std の `.CRT$XLB` より後に呼ばれる
+    #[used]
+    #[link_section = ".CRT$XLM"]
+    static ON_DETACH: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) = on_detach;
+
+    pub(super) fn arm() {
+        // SAFETY: どちらもリンカが用意する静的な値を 1 バイト読むだけ。volatile なのは
+        // 「使われていない」と見なされて捨てられないため（std と同じ）
+        unsafe {
+            std::ptr::from_ref(&TLS_USED).read_volatile();
+            std::ptr::from_ref(&ON_DETACH).read_volatile();
+        }
+        ARMED.store(true, Ordering::Release);
+    }
+
+    /// ローダーから呼ばれる。`reason` が `DLL_PROCESS_DETACH`（= 0）の 1 回だけ働く
+    unsafe extern "system" fn on_detach(_module: *mut c_void, reason: u32, _reserved: *mut c_void) {
+        const DLL_PROCESS_DETACH: u32 = 0;
+        if reason != DLL_PROCESS_DETACH || !ARMED.load(Ordering::Acquire) {
+            return;
+        }
+        // 他のスレッドは止められた後なので、一覧の錠をそのどれかが握ったまま止まっていたら
+        // 二度と空かない。待たずに諦める（残ったぶんは次のテストプロセスの起動時の掃除が回収する）。
+        // 試しに取った錠はこの文の終わりで手放す
+        let held = matches!(
+            super::own_dirs().try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        if !held {
+            super::remove_own_dirs();
+        }
+    }
 }
 
 fn own_dirs() -> &'static std::sync::Mutex<Vec<PathBuf>> {
@@ -680,8 +779,9 @@ fn own_dirs() -> &'static std::sync::Mutex<Vec<PathBuf>> {
     OWN.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
-/// `atexit` から呼ばれる後始末。**失敗しても何も言わない**
-/// （プロセスは既に終了処理に入っていて、診断の出口が無い）
+/// `atexit`（と Windows の TLS コールバック = #1581）から呼ばれる後始末。**失敗しても何も言わない**
+/// （プロセスは既に終了処理に入っていて、診断の出口が無い）。待ちも入れない
+/// （終了処理を止めないため。2 回目に呼ばれた側は「もう無い」で即座に済む）
 extern "C" fn remove_own_dirs() {
     let own = own_dirs().lock().unwrap_or_else(|e| e.into_inner());
     for dir in own.iter() {
@@ -1280,6 +1380,13 @@ mod tests {
     /// [`注入_打ち切った子の孫を親を失った形で残す`] が孫を残す（子にだけ渡す）
     const ORPHAN_INJECT: &str = "TAKO_2448_INJECT_ORPHAN";
 
+    /// #1581 の注入の目印。立っていると [`注入_武装した置き場を作って失敗で終わる`] が
+    /// 置き場 3 種を作ってから落ちる = 子が libtest の `process::exit(101)` で終わる（子にだけ渡す）
+    const FAIL_INJECT: &str = "TAKO_1581_INJECT_FAIL";
+
+    /// [`FAIL_INJECT`] で落ちるテストの名前（子へ `--exact` で渡す）
+    const FAIL_INJECT_TEST: &str = "test_residue::tests::注入_武装した置き場を作って失敗で終わる";
+
     /// 子が終わった後、そのグループの残りが出ていくのを待つ刻みと回数（40 × 50 ms）。
     /// SIGKILL を受けて出ていく途中のものはこの間に消え、眠り続ける孫は残る
     #[cfg(target_os = "macos")]
@@ -1295,15 +1402,26 @@ mod tests {
         orphans: Vec<String>,
         /// 子の標準出力と標準エラー
         out: String,
+        /// 子の pid（置き場の名前の `<pid>`）
+        pid: u32,
+        /// 子が成功で終わったか（libtest は 1 本でも落ちると `process::exit(101)` で終わる）
+        success: bool,
     }
 
     /// このテストバイナリを**使い捨ての TMPDIR** で回し、残った `tako-*` の名前と、
     /// 子のプロセスグループに残ったプロセス（#2448）を返す。
     /// `args` は libtest へそのまま渡す（filter、または `--exact` と名前）。`env` は子にだけ足す。
-    /// 標準出力はファイルへ落とす（パイプに溜めると全件の出力で詰まる）
+    /// 標準出力はファイルへ落とす（パイプに溜めると全件の出力で詰まる）。
+    ///
+    /// TMPDIR は回ごとに分ける（前の回の残り = A/B の腕がわざと残したものを次の回が数えない）。
+    /// 名前を `t<n>` と短く保つ（100 回目までは元の `tmp` 以下の長さ）のは、TMPDIR の深さで
+    /// 成立が変わるテスト（[`SKIP_IN_CHILD`]）の予算を変えないため。`TAKO_1581_LEGACY` は外さずに子へ渡す（親に立てると子の一巡ごと
+    /// 修正前の後始末になる = 番犬が名指しで落ちることを手で確かめる A/B）
     fn run_suite_in(scratch: &Path, args: &[&str], env: &[(&str, &str)]) -> SuiteRun {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let log = scratch.join("child.log");
-        let tmp = scratch.join("tmp");
+        let tmp = scratch.join(format!("t{seq}"));
         std::fs::create_dir_all(&tmp).expect("子の TMPDIR を作れる");
         let exe = std::env::current_exe().expect("テストバイナリのパス");
         let mut cmd = std::process::Command::new(exe);
@@ -1341,12 +1459,13 @@ mod tests {
             )
             .env_remove("TAKO_1312_LEGACY")
             .env_remove(ORPHAN_INJECT)
+            .env_remove(FAIL_INJECT)
             .envs(env.iter().copied());
         let mut child = cmd.spawn().expect("子を起こせる");
         let deadline = std::time::Instant::now() + RESIDUE_DEADLINE;
-        loop {
+        let success = loop {
             match child.try_wait().expect("子の状態を読める") {
-                Some(_) => break,
+                Some(status) => break status.success(),
                 None if std::time::Instant::now() >= deadline => {
                     // 子のグループごと止める（中のテストが起こした孫も残さない）
                     #[cfg(unix)]
@@ -1362,7 +1481,7 @@ mod tests {
                 }
                 None => std::thread::sleep(Duration::from_millis(50)),
             }
-        }
+        };
         let orphans = take_orphans(child.id());
         let out = std::fs::read_to_string(&log).unwrap_or_default();
         let mut residues: Vec<String> = std::fs::read_dir(&tmp)
@@ -1379,6 +1498,8 @@ mod tests {
             residues,
             orphans,
             out,
+            pid: child.id(),
+            success,
         }
     }
 
@@ -1507,6 +1628,37 @@ mod tests {
         );
     }
 
+    /// #1581 の検出力を見る注入。目印（[`FAIL_INJECT`]）があるときだけ、武装した置き場を
+    /// 3 種（`tako-test-scratch-` / `tako-test-data-` / `tako-agent-config-`）作ってから落ちる。
+    /// 子は libtest の `process::exit(101)` で終わる = Windows では `ExitProcess` で CRT の
+    /// `atexit` を飛ばす経路（一巡の子が落ちたときと同じ）。普段の一巡では何もしない
+    #[test]
+    fn 注入_武装した置き場を作って失敗で終わる() {
+        if std::env::var_os(FAIL_INJECT).is_none() {
+            return;
+        }
+        let made = [
+            scratch_root(),
+            crate::paths::data_dir().expect("テストの data dir"),
+            crate::paths::ensure_verification_agent_home(),
+        ];
+        for dir in &made {
+            // 置き場は子の使い捨ての TMPDIR の下にある（本物の置き場を作っていない）
+            assert!(
+                dir.starts_with(std::env::temp_dir()) && dir.is_dir(),
+                "置き場が一時ディレクトリの下に出来ていない: {dir:?}"
+            );
+            std::fs::write(dir.join("1581.txt"), b"x").expect("中へ書ける");
+        }
+        // 読み取り専用のファイルが中にあっても消える（Windows の削除は読み取り専用の属性で断られうる）
+        let ro = made[0].join("1581-readonly.txt");
+        std::fs::write(&ro, b"x").expect("中へ書ける");
+        let mut perm = std::fs::metadata(&ro).expect("属性を読める").permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&ro, perm).expect("読み取り専用にできる");
+        panic!("#1581 の注入: 置き場を作ったまま失敗で終わる");
+    }
+
     /// `test result: …; N passed;` の合計（ok / FAILED のどちらの行からも採る）
     fn passed_count(out: &str) -> usize {
         out.lines()
@@ -1523,21 +1675,19 @@ mod tests {
     /// 「器を使った」ではなく、このバイナリをもう一度回して**実際に数える**
     /// （#1296 の `test_data_residue` と同じ作法）。検出力は
     /// `TAKO_1312_LEGACY=1`（修正前 = 作りっぱなし）の腕が受け持つ
-    /// **Windows では skip**（#1581）。`arm_self_cleanup` の `atexit` から呼ぶ
-    /// `remove_dir_all` は、**中のファイルに開いたハンドルが 1 つでもあると
-    /// Windows では失敗する**（unix は最後のハンドルが閉じるまで保留されるだけ）。
-    /// atexit が走るのは終了処理中なので、テスト中に起こした孫プロセスがまだ
-    /// 握っていると消えない。
     ///
-    /// **起動時の掃除（`sweep_stale_on_start`）はここには効かない**。#1278 の
-    /// 見立ては「生存判定の `ports::process_alive` が非 unix で常に `true`」だったが、
-    /// この経路は #1296 の初版から境界（`OwnerProbe::alive`）を通っており
-    /// `ports::process_alive` は一度も使っていない（#1557 の調査で実測）。
-    /// そもそもこの検査は**子の終了直後に数える**形で、残る 3 件は子自身の pid =
-    /// 起動時に走る掃除の窓には原理的に入らない（`tako-agent-config-` は
-    /// [`KINDS`] の `auto: false` でそもそも対象外）。
-    /// 機序の確定と手当ては #1581 に残る（案 2 = `remove_own_dirs` の短いリトライ /
-    /// 案 3 = 番犬側の固定待ち。どちらも実機が要る）
+    /// **失敗で終わる子の置き場も数える**（#1581）。libtest は 1 本でも落ちると
+    /// `process::exit(101)` で終わり、Windows の `process::exit` は `ExitProcess` = CRT の
+    /// `atexit` を飛ばす。修正前の Windows はここで武装した 3 種が必ず残っていた
+    /// （一巡の子は TMPDIR の深さで成立しない 1 本 = #2847 で毎回落ちていて、そのたびに 3 件）。
+    /// 一巡の成否に頼らないよう、注入（[`注入_武装した置き場を作って失敗で終わる`]）で
+    /// 失敗の経路を毎回通し、A/B（`TAKO_1581_LEGACY=1` = TLS コールバックの後始末を切る）で
+    /// Windows では 3 種とも残る・macOS では変わらず残らないことを同じ回で見る。
+    /// 親に `TAKO_1581_LEGACY=1` を立てると子へもそのまま渡り、この番犬が残骸を名指しで落ちる。
+    ///
+    /// **起動時の掃除（`sweep_stale_on_start`）はここには効かない**。この検査は**子の終了直後に
+    /// 数える**形で、残るのは子自身の pid = 起動時に走る掃除の窓には原理的に入らない
+    /// （`tako-agent-config-` は [`KINDS`] の `auto: false` でそもそも対象外）。
     ///
     /// **同じ一巡で、親を失った孫プロセスも数える**（#2448。macOS）。子は自分のプロセスグループを
     /// 率いて走り、終わった後にそのグループへ残ったものがテストの置き去りにした孫。10/28 の実物は
@@ -1546,10 +1696,6 @@ mod tests {
     /// もう 1 回走るので、`cargo test` 1 回で 2 本）。残っていたら一覧の二分探索でテストを名指す。
     /// 検出力は注入（[`注入_打ち切った子の孫を親を失った形で残す`]）を毎回名指せることで見る
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows は atexit 時のハンドル保持で残骸が消えない（#1581）"
-    )]
     fn テストを一巡してもtmpdirに残骸が残らない() {
         if std::env::var_os(RESIDUE_CHILD).is_some() || legacy_1312() {
             return; // 子（再帰の停止条件）と A/B の腕では回さない
@@ -1591,6 +1737,59 @@ mod tests {
                 run.orphans
             );
         }
+
+        // #1581: 失敗で終わる子（libtest の `process::exit(101)`）の置き場も残らない
+        let failing = run_suite_in(
+            scratch.path(),
+            &["--exact", FAIL_INJECT_TEST],
+            &[(FAIL_INJECT, "1")],
+        );
+        assert!(
+            !failing.success
+                && failing
+                    .out
+                    .contains(&format!("test {FAIL_INJECT_TEST} ... FAILED")),
+            "注入した失敗で子が落ちていない = 失敗で終わる経路を検査できていない。末尾:\n{}",
+            failing
+                .out
+                .lines()
+                .rev()
+                .take(20)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert!(
+            failing.residues.is_empty(),
+            "失敗で終わった子の置き場が {} 件残った（#1581）: {:?}\n\
+             Windows の process::exit は ExitProcess を直接呼び、CRT の atexit を飛ばす。\
+             後始末は test_residue::arm_self_cleanup が TLS コールバックの DLL_PROCESS_DETACH からも呼ぶ\
+             （TAKO_1581_LEGACY=1 が立っていないか）",
+            failing.residues.len(),
+            failing.residues
+        );
+        // A/B: TLS コールバックの後始末を切ると、Windows では同じ手順で 3 種とも残る = 検出力がある。
+        // macOS は `process::exit` = `libc::exit` で atexit が走るので、切っても残らない（挙動を変えていない）
+        let legacy = run_suite_in(
+            scratch.path(),
+            &["--exact", FAIL_INJECT_TEST],
+            &[(FAIL_INJECT, "1"), ("TAKO_1581_LEGACY", "1")],
+        );
+        let expected: Vec<String> = if cfg!(windows) {
+            [
+                "tako-agent-config-",
+                "tako-test-data-",
+                "tako-test-scratch-",
+            ]
+            .iter()
+            .map(|prefix| format!("{prefix}{}", legacy.pid))
+            .collect()
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            legacy.residues, expected,
+            "TAKO_1581_LEGACY=1 の失敗で終わる子の残り方が違う（Windows = 3 種とも残る / それ以外 = 残らない）"
+        );
 
         // A/B: 器を修正前（作りっぱなし）へ戻すと同じ手順で残る = 検出力がある
         let legacy = run_suite_in(
