@@ -5865,7 +5865,8 @@ GPUI の `cmd` は platform 修飾で、Windows では **Win キー**へ解決�
   両プラットフォームの表から選ぶ形にしてある（**張るキーの集合は不変**）
 - 番犬は 2 本立て。`crates/tako-control/tests/ui_key_notation.rs` が**直書きの混入**を
   ソース走査で止め（規則 A = 案内文を組む場所 / 規則 B = render への直書き / 規則 C = clap のヘルプの
-  doc comment と属性。#2854）、
+  doc comment と属性。#2854。記号の `\u{…}` エスケープ形は 3 規則とも同じ `mark_hits` で**値で読む**ので、
+  `\u{21E7}` / `\u{21e7}` / `\u{021e7}` のどの綴りでも当たる = #2867）、
   `keybindings::tests::windowsの案内文にmacosのキー表記が出ない` が
   **組み上がった文言**を Windows 構成で検査する。前者だけだと「文言は正しいが
   Windows で嘘になる」を拾えず、後者だけだと新しい直書きを未然に止められない

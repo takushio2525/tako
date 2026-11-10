@@ -81,20 +81,61 @@ const ALLOWED: &[(&str, &str)] = &[
     ),
 ];
 
-/// macOS 固有のキー表記。**エスケープ形（`\u{2318}`）も同じ扱い**にする
-/// （リテラルだけ見張ると `"\u{2318}K"` と書いて素通りできてしまう）
-const FORBIDDEN: &[(&str, &str)] = &[
-    ("\u{2318}", "command 記号"),
-    ("\\u{2318}", "command 記号（エスケープ形）"),
-    ("\u{2325}", "option 記号"),
-    ("\\u{2325}", "option 記号（エスケープ形）"),
-    ("\u{2303}", "control 記号"),
-    ("\\u{2303}", "control 記号（エスケープ形）"),
-    ("\u{21e7}", "shift 記号"),
-    ("\\u{21e7}", "shift 記号（エスケープ形）"),
-    ("Cmd+", "Cmd 表記"),
-    ("Cmd-", "Cmd 表記"),
+/// macOS 固有のキー記号（規則 A / B）。**エスケープ形（`\u{2318}`）も同じ扱い**にする
+/// （リテラルだけ見張ると `"\u{2318}K"` と書いて素通りできてしまう）。エスケープ形は
+/// 綴りではなく値で読む（`mark_hits`）ので、`\u{21E7}` / `\u{21e7}` / `\u{021e7}` のどれでも当たる
+/// （#2867。それまでは小文字の綴りだけを探していて、大文字の `\u{21E7}` が素通りした）
+const KEY_MARKS: &[(char, &str)] = &[
+    ('\u{2318}', "command 記号"),
+    ('\u{2325}', "option 記号"),
+    ('\u{2303}', "control 記号"),
+    ('\u{21e7}', "shift 記号"),
 ];
+
+/// macOS 固有のキー表記の語形（規則 A / B）。綴りのまま見る（小文字の `cmd-up` は
+/// GPUI のバインドの書式で、`editor_keys` の表などが使う）
+const KEY_WORDS: &[(&str, &str)] = &[("Cmd+", "Cmd 表記"), ("Cmd-", "Cmd 表記")];
+
+/// `text` に現れる `\u{…}` エスケープを（書かれた綴り, 表す文字）で返す。
+///
+/// 綴りの文字列一致ではなく値で読むので、大文字小文字・先頭の 0・`_` の区切りを問わない（#2867）。
+/// 16 進として読めないもの（`format!` の `{}` の手前に偶然 `\u` があった等）は捨てる
+fn unicode_escapes(text: &str) -> impl Iterator<Item = (String, char)> + '_ {
+    text.match_indices("\\u{").filter_map(move |(at, _)| {
+        let (digits, _) = text[at..].strip_prefix("\\u{")?.split_once('}')?;
+        let hex: String = digits.chars().filter(|&c| c != '_').collect();
+        let ch = u32::from_str_radix(&hex, 16)
+            .ok()
+            .and_then(char::from_u32)?;
+        Some((format!("\\u{{{digits}}}"), ch))
+    })
+}
+
+/// `text` に現れる記号を名前で返す（記号そのもの / `\u{…}` のエスケープ形。1 記号につき 1 件）。
+/// 規則 A / B（`KEY_MARKS`）と規則 C（`HELP_MARKS`）が同じ照合を通る
+fn mark_hits(text: &str, marks: &[(char, &str)]) -> Vec<String> {
+    let escapes: Vec<(String, char)> = unicode_escapes(text).collect();
+    let mut hits = Vec::new();
+    for (mark, what) in marks {
+        if text.contains(*mark) {
+            hits.push(format!("{what} `{mark}`"));
+        } else if let Some((written, _)) = escapes.iter().find(|(_, c)| c == mark) {
+            hits.push(format!("{what}（エスケープ形） `{written}`"));
+        }
+    }
+    hits
+}
+
+/// 規則 A / B の 1 行分（記号は `mark_hits`・語形は綴りのまま）
+fn key_notation_in(line: &str) -> Vec<String> {
+    let mut hits = mark_hits(line, KEY_MARKS);
+    for (word, what) in KEY_WORDS {
+        if line.contains(word) {
+            hits.push(format!("{what} `{word}`"));
+        }
+    }
+    hits
+}
 
 /// Rust ソースからコメント（`//` 行コメント / `/* */` ブロックコメント）を落とす。
 ///
@@ -239,22 +280,32 @@ fn scan(path: &Path, root: &Path, render_only: bool, hits: &mut Vec<String>) {
     let Ok(src) = std::fs::read_to_string(path) else {
         return;
     };
-    // 早期スキップ（大半のファイルはここで抜ける）
-    if !FORBIDDEN.iter().any(|(needle, _)| src.contains(needle)) {
-        return;
+    let rel = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string();
+    hits.extend(scan_key_notation(&src, &rel, render_only));
+}
+
+/// 規則 A / B の走査 1 ファイル分（`rel` は名指しに使うパス）
+fn scan_key_notation(src: &str, rel: &str, render_only: bool) -> Vec<String> {
+    // 早期スキップ（大半のファイルはここで抜ける）。行ごとと同じ照合で見るので、
+    // ここだけ綴りに依って取りこぼすことはない
+    if key_notation_in(src).is_empty() {
+        return Vec::new();
     }
-    let code = strip_comments(&src);
+    let code = strip_comments(src);
+    let mut hits = Vec::new();
     for (lineno, line) in code.lines().enumerate() {
         if render_only && !RENDER_CALLS.iter().any(|c| line.contains(c)) {
             continue;
         }
-        for (needle, what) in FORBIDDEN {
-            if line.contains(needle) {
-                let rel = path.strip_prefix(root).unwrap_or(path).display();
-                hits.push(format!("{rel}:{}: {what} `{needle}`", lineno + 1));
-            }
+        for what in key_notation_in(line) {
+            hits.push(format!("{rel}:{}: {what}", lineno + 1));
         }
     }
+    hits
 }
 
 /// 規則 A: 画面 / CLI / MCP に出る文章を組む場所へ macOS の打鍵表記を直書きしない
@@ -322,10 +373,48 @@ fn renderコードにmacosのキー表記を直書きしていない() {
     );
 }
 
+/// 規則 A / B の検出力: エスケープ形は綴り（大文字小文字・先頭の 0）を問わず値で拾い、
+/// 隣の値・コメントの中は拾わない（#2867。大文字の `\u{21E7}` が素通りしていた）
+#[test]
+fn 規則aはエスケープ形を綴りを問わず拾う() {
+    let src = r#"
+// コメントの \u{21E7} は対象外
+let a = "\u{21E7}Tab";
+let b = "\u{21e7}Tab";
+let c = "\u{021E7}Tab";
+let d = "⇧Tab";
+let e = "\u{2318}K";
+let f = "\u{21E8} \u{2319}";
+let g = "Cmd+K";
+"#;
+    let hits = scan_key_notation(src, "fixture.rs", false);
+    let lines: Vec<&str> = hits
+        .iter()
+        .map(|h| h.split(": ").next().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "fixture.rs:3", // 大文字のエスケープ形
+            "fixture.rs:4", // 小文字のエスケープ形
+            "fixture.rs:5", // 先頭の 0
+            "fixture.rs:6", // 記号そのもの
+            "fixture.rs:7", // command 記号のエスケープ形
+            "fixture.rs:9", // 語形
+        ],
+        "{hits:#?}"
+    );
+    assert!(
+        hits[0].ends_with("shift 記号（エスケープ形） `\\u{21E7}`"),
+        "書かれた綴りのまま名指す: {hits:#?}"
+    );
+}
+
 /// 規則 C の対象: この derive を付けた型のヘルプは doc comment と属性から組まれる
 const CLAP_DERIVES: &[&str] = &["Parser", "Subcommand", "Args", "ValueEnum"];
 
-/// 規則 C で見る macOS の打鍵記号（エスケープ形 `\u{2318}` / `\u{232B}` も大文字小文字を問わず見る）。
+/// 規則 C で見る macOS の打鍵記号（エスケープ形 `\u{2318}` / `\u{232B}` も規則 A と同じ
+/// `mark_hits` で値で読む = 大文字小文字を問わない）。
 /// 規則 A の 4 つに、ヘルプで書かれがちな削除・escape・return の記号を足した（#2854 の `⌘⌫`）
 const HELP_MARKS: &[(char, &str)] = &[
     ('\u{2318}', "command 記号"),
@@ -424,15 +513,7 @@ fn clap_item_spans(src: &str) -> Vec<(usize, usize)> {
 /// ヘルプの 1 行に macOS の打鍵表記があれば、その名前を返す
 fn help_marks_in(text: &str) -> Vec<String> {
     let lower = text.to_lowercase();
-    let mut hits = Vec::new();
-    for (mark, what) in HELP_MARKS {
-        let escaped = format!("\\u{{{:x}}}", *mark as u32);
-        if text.contains(*mark) {
-            hits.push(format!("{what} `{mark}`"));
-        } else if lower.contains(&escaped) {
-            hits.push(format!("{what}（エスケープ形） `{escaped}`"));
-        }
-    }
+    let mut hits = mark_hits(text, HELP_MARKS);
     for (word, what) in HELP_WORDS {
         let as_word = lower.match_indices(word).any(|(i, _)| {
             let prev = lower[..i].chars().next_back();
