@@ -17,7 +17,7 @@ use std::path::PathBuf;
 pub fn is_granted() -> bool {
     #[cfg(not(target_os = "macos"))]
     {
-        return true;
+        true
     }
     #[cfg(target_os = "macos")]
     {

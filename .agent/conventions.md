@@ -4997,6 +4997,20 @@ CI 完了前に merge され（merge 04:24:10 / Windows 完了 04:48:24）、過
   手元は `scripts/check-windows.sh` が同じ 1 実装を通す。直し方の順（消す / 使う側の cfg へ寄せる /
   理由つきの `#[cfg_attr(windows, allow(dead_code))]`）は `.agent/commands.md` の同名の行。
   番犬 `ci_windows_test_compile.rs` の `windowsジョブがコンパイラの警告を0件に保つ`
+- **clippy の指摘も 0 件に保つ**（#2850）。Windows でだけコンパイルされる行は macOS の clippy から見えず、
+  Windows の clippy は一度も回っていなかった（着手時 13 件。うち 1 件は visual-test の宇宙にしか出ない）。
+  **windows ジョブと並走する別ジョブ `windows-clippy`**（「Windows（clippy の指摘 0 件のゲート。#2850）」）が
+  macOS ジョブの clippy と**同じ 3 つの feature 宇宙**を同じ `scripts/warning-gate.sh` に通す
+  （`-- -D warnings` は付けない = 最初に指摘の出たクレートで止まり依存先が検査されない）。
+  **windows ジョブの段にしない**: clippy は check の単位でビルドの成果物を使い回せず約 13 分かかるので、段にすると
+  windows ジョブがそのぶん伸びる（段だった PR #2862 の run で 81.5 分 = 上限 90 分の手前）。別ジョブは約 15 分で
+  windows ジョブより先に終わる。**キャッシュは持たない**（licenses ジョブと同じ。速くしても CI の待ちは縮まず、
+  clippy の単位の rust-cache 約 1.4 GiB が Actions のキャッシュの上限 10 GiB をあふれさせる）。
+  走らせる判定は macOS ジョブの lint と同じ（docs だけなら skip = #2084・定期実行では走らない）。
+  実測と直し方の順は `.agent/commands.md` の Windows のクロス検査の行。手元は `scripts/check-windows.sh` が
+  xwin の clippy で同じ 3 つを回す。番犬 `ci_windows_test_compile.rs` の
+  `windowsのclippyの指摘を並走するジョブで0件に保つ`（windows ジョブへ戻す・宇宙の足し引き・判定や
+  ツールチェーンの版のずれ・キャッシュを足すのを名指しで落とす）
 
 ### CI ランナーと実機は別物として扱う
 
@@ -5109,6 +5123,10 @@ Windows（約 30 分）を回した。macOS のランナーは同時に数本し
 - ライセンス一覧の検査（`licenses` ジョブ・ubuntu。#1851）は macOS / Windows と同じく判定で skip する。
   依存（`Cargo.*`）も `THIRD-PARTY-LICENSES.md` も docs/ と .agent/ の外なので、触れば必ず走る。
   仕組みは `.agent/release.md`「配布物に同梱するライセンス」
+- Windows の clippy のゲート（`windows-clippy` ジョブ。#2850）も同じ判定で skip し、macOS ジョブの lint と同じく
+  定期実行でも走らない（`if:` は macOS ジョブと同じ行。番犬 `ci_windows_test_compile.rs` が突き合わせる）。
+  待ちの期待するチェック名は `wait-pr-checks.sh` が ci.yml の job 名から導くので、job を足し引きしても手で
+  揃える箇所は無い（本数と名前を本物の ci.yml で突き合わせるのは `scripts/test-ci-change-scope-2084.sh` の E 節）
 - push（main）も同じ判定で skip する。docs だけのコミットは直前の main と Rust の入力が同じ
   なので、full を回しても新しく見るものが無い（docs の検査と番犬は main でも走る）
 - **外部から本物を取る段は、関わるパスを変えたときだけ走らせる**（#2791）。Windows ジョブの

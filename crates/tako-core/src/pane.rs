@@ -101,8 +101,10 @@ pub struct Pane {
     /// spawn 元ペイン（オーケストレーター worker 用。セッション内で使い捨て、永続化不要）
     spawned_by: Option<PaneId>,
     /// 実行ペイン（run-interactive / Code Runner / カード）のメタデータ。
-    /// セッション内で使い捨て（#1657 で終了コードの状態と再利用の鍵も持つ）
-    interactive_meta: Option<crate::run_pane::InteractiveMeta>,
+    /// セッション内で使い捨て（#1657 で終了コードの状態と再利用の鍵も持つ）。
+    /// 箱に入れるのは `PaneNode::Leaf` を太らせないため（clippy の large_enum_variant。
+    /// Windows は `PathBuf` が unix より大きく、箱なしだと閾値を超えていた = #2850）
+    interactive_meta: Option<Box<crate::run_pane::InteractiveMeta>>,
     /// 終了コードの側路ファイル（`crate::run_pane`）。実行ペイン（#1657）と
     /// `tako split --command` の失敗時の保持（#1778）が持つ。**実行ペインのメタとは別**に
     /// 置くのは、保持のペインを実行ペイン（バッジ・`list` の `run`・auto_close）に
@@ -266,15 +268,15 @@ impl Pane {
 
     /// 実行ペインのメタデータ（実行ペインでなければ `None`）
     pub fn interactive_meta(&self) -> Option<&crate::run_pane::InteractiveMeta> {
-        self.interactive_meta.as_ref()
+        self.interactive_meta.as_deref()
     }
 
     pub fn interactive_meta_mut(&mut self) -> Option<&mut crate::run_pane::InteractiveMeta> {
-        self.interactive_meta.as_mut()
+        self.interactive_meta.as_deref_mut()
     }
 
     pub fn set_interactive_meta(&mut self, meta: crate::run_pane::InteractiveMeta) {
-        self.interactive_meta = Some(meta);
+        self.interactive_meta = Some(Box::new(meta));
     }
 
     /// 終了コードの側路ファイル（持たなければ `None`。#1657 / #1778）

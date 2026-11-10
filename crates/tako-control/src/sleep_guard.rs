@@ -1692,7 +1692,7 @@ pub fn update(config: SleepGuardConfig, busy_agents: usize) -> SleepGuardState {
             }
         }
 
-        return SleepGuardState {
+        SleepGuardState {
             assertion_held: crate::platform::power::is_held(),
             mode,
             power_condition,
@@ -1717,7 +1717,7 @@ pub fn update(config: SleepGuardConfig, busy_agents: usize) -> SleepGuardState {
             battery_percent: battery,
             lid_skip_reason: None,
         }
-        .with_decision();
+        .with_decision()
     }
     #[cfg(target_os = "macos")]
     {
@@ -1829,7 +1829,7 @@ pub fn status(config: SleepGuardConfig) -> SleepGuardState {
     {
         // 副作用なし: 取得・解放は行わず、いまの保持状態と電源だけを読む
         let lid_supported = lid_control_supported();
-        return SleepGuardState {
+        SleepGuardState {
             assertion_held: crate::platform::power::is_held(),
             mode,
             power_condition,
@@ -1852,7 +1852,7 @@ pub fn status(config: SleepGuardConfig) -> SleepGuardState {
             battery_percent: battery,
             lid_skip_reason: None,
         }
-        .with_decision();
+        .with_decision()
     }
     #[cfg(target_os = "macos")]
     {

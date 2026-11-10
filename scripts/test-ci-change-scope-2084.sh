@@ -299,7 +299,8 @@ job_ids() {
 # 配線の検査。問題を 1 行 1 件で出す（何も出なければ合格）
 wiring_problems() {
   local yml="$1" body id step
-  for id in macos windows licenses; do
+  # windows-clippy は Windows の clippy のゲート（#2850。windows ジョブと並走する別ジョブ）
+  for id in macos windows windows-clippy licenses; do
     body="$(job_body "${yml}" "${id}")"
     grep -qE '^    needs: changes[ \t]*$' <<<"${body}" || echo "${id}: needs: changes が無い"
     grep -qF "if: needs.changes.outputs.rust == 'true'" <<<"${body}" || echo "${id}: rust=true のときだけ走る if が無い"
@@ -336,13 +337,14 @@ wiring_problems() {
 }
 probs="$(wiring_problems "${CI_YML}")"
 assert_eq "本物の ci.yml の配線に問題が無い" "${probs}" ""
-assert_eq "job は changes / docs / docs-watchdogs / macos / windows / licenses" "$(job_ids "${CI_YML}" | tr '\n' ' ')" "changes docs docs-watchdogs macos windows licenses "
+assert_eq "job は changes / docs / docs-watchdogs / macos / windows / windows-clippy / licenses" "$(job_ids "${CI_YML}" | tr '\n' ' ')" "changes docs docs-watchdogs macos windows windows-clippy licenses "
 
 echo "== D 検出力: 壊した写しを配線の検査が名指しする =="
 # macOS ジョブの if を消す
 grep -v "^    if: needs.changes.outputs.rust == 'true'" "${CI_YML}" > "${TMP}/ci-noif.yml"
 probs="$(wiring_problems "${TMP}/ci-noif.yml")"
 assert_has "（注入）macOS の if が無いことを名指しする" "macos: rust=true のときだけ走る if が無い" "${probs}"
+assert_has "（注入）Windows の clippy のゲートの if が無いことを名指しする（#2850）" "windows-clippy: rust=true のときだけ走る if が無い" "${probs}"
 # docs の検査を macOS ジョブへ戻す（docs ジョブから消して macOS の steps 先頭へ足す）
 awk '
   /^  macos:/ { in_mac = 1 }
@@ -454,11 +456,11 @@ printf '#!/usr/bin/env bash\necho "no checks reported on the '"'"'x'"'"' branch"
 chmod +x "${TMP}/ghbin/gh"
 out="$(PATH="${TMP}/ghbin:${PATH}" bash "${REPO_ROOT}/scripts/wait-pr-checks.sh" 2084 --timeout 0 --interval 1 2>&1)"
 for name in "変更範囲の判定（#2084）" "docs（ビルド + 検査）" "docs / .agent を読む Rust の番犬（ubuntu。#2084）" \
-  "macOS（build + lint + test）" "Windows（build + test スモーク）" "ライセンス一覧が依存と一致（#1851）" \
-  "Cloudflare Pages"; do
+  "macOS（build + lint + test）" "Windows（build + test スモーク）" "Windows（clippy の指摘 0 件のゲート。#2850）" \
+  "ライセンス一覧が依存と一致（#1851）" "Cloudflare Pages"; do
   assert_has "期待名: ${name}" "期待: ${name}" "${out}"
 done
-assert_eq "期待は 7 本" "$(grep -c '^  期待: ' <<<"${out}" | tr -d ' ')" "7"
+assert_eq "期待は 8 本" "$(grep -c '^  期待: ' <<<"${out}" | tr -d ' ')" "8"
 
 echo
 echo "=== 結果: PASS=${PASS} FAIL=${FAIL} ==="

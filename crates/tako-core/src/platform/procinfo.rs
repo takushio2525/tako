@@ -885,7 +885,7 @@ mod imp {
             }
             let us = &*buf.as_ptr().cast::<UnicodeString>();
             let len = us.length as usize;
-            if us.buffer.is_null() || len == 0 || len % 2 != 0 {
+            if us.buffer.is_null() || len == 0 || !len.is_multiple_of(2) {
                 return None;
             }
             // `Buffer` はこのバッファの内側を指しているはず。外を指していたら読まない

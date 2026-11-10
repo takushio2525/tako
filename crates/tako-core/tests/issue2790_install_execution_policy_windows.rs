@@ -312,7 +312,7 @@ fn issue2790_終了コードはfileで走らせたときと同じ() {
     let policy = enforced_policy();
     let dir = ScratchDir::new("i2790-exit");
     let script = write_fake(&dir);
-    let cases: [(&str, Option<(&str, &str)>, i32); 3] = [
+    let cases = [
         ("exit7", Some(("TAKO_2790_EXIT", "7")), 7),
         ("throw", Some(("TAKO_2790_THROW", "1")), 1),
         ("done", None, 0),
