@@ -11,8 +11,8 @@
 //!   `?lines=N` で履歴 N 行込み。cursor / size も返す）
 //! - `GET  /api/panes/:id/scrollback` — スクロールバック履歴（プレーンテキスト。
 //!   `?lines=N` で履歴 N 行。CLI `tako remote scrollback` / MCP 用）
-//! - `POST /api/panes/:id/input` — テキスト送信（tmux send-keys。`{text, newline}` か
-//!   `{keys: "..."}` で生キーシーケンス送信）
+//! - `POST /api/panes/:id/input` — テキスト送信（dispatch `Send`。`{text, newline}`）か
+//!   生のキー送信（`{keys: "Escape"}`・空白区切りで列 `"C-c C-c"`。dispatch `SendKeys` = #2765）
 //! - `POST /api/panes/:id/close` — ペインを閉じる（tmux kill-pane）
 //! - `POST /api/panes/:id/resize` — 明示リサイズ（`{cols, rows}` で tmux resize-window、
 //!   `{reset: true}` で manual 解除。CLI `tako tmux resize` / MCP 用。
@@ -5886,6 +5886,65 @@ fn input_reply(reply: &Value) -> (u16, Value) {
     }
 }
 
+/// A/B: #2765 前へ戻す（スマホの `{keys}` をキー名の文字のまま `Send` の本文で打つ・断りで接続を捨てる）
+pub const KEYS_LEGACY_ENV: &str = "TAKO_2765_LEGACY";
+
+/// スマホの `{keys}` を #2765 前の形で送るか。要求のたびに読む（daemon を立て直さずに切り替えられる）
+fn keys_legacy() -> bool {
+    env_on(KEYS_LEGACY_ENV)
+}
+
+/// `{keys}` の名前の列（#2765）。空白で区切った 1 語ずつがキー名（#42 の `tmux send-keys` と同じ綴り =
+/// `"C-c C-c"` は 2 回）。語彙の正本は `tako_core::backend::key_name_bytes`（dispatch の `SendKeys` が
+/// 名前をバイト列へ直し、1 つでも知らない名前・空の列なら 1 バイトも送らずに断る）
+fn key_names(keys: &str) -> Vec<String> {
+    keys.split_whitespace().map(str::to_string).collect()
+}
+
+/// スマホの入力（`POST /api/panes/<id>/input`）を dispatch の要求へ写す（#2765）。
+///
+/// `{keys}` は生のキー = [`Request::SendKeys`](crate::protocol::Request::SendKeys)（MCP
+/// `tako_send_input` の `keys` / CLI `tako send --key` と同じ 1 実装。選択肢ダイアログの表示中は
+/// Escape・矢印も断る = #2743）。PWA のクイックキー（esc / tab / ^C / ↑ / ↓）と ctrl の組み合わせ
+/// （`C-<英字>`）がここを通る。#281 で `tmux send-keys` から dispatch へ寄せたときに `Send` の本文へ
+/// 写していたので、キー名が文字のまま打たれていた（`Escape` → `E s c a p e`）。
+/// `legacy` は A/B（`TAKO_2765_LEGACY=1`）= その修正前の形
+fn input_request(
+    pane: Option<u64>,
+    tmux_session: Option<String>,
+    text: &str,
+    newline: bool,
+    keys: Option<&str>,
+    paste_guard: Option<&str>,
+    legacy: bool,
+) -> crate::protocol::Request {
+    match keys {
+        Some(keys) if !legacy => crate::protocol::Request::SendKeys {
+            pane,
+            keys: key_names(keys),
+            tmux_session,
+        },
+        Some(keys) => crate::protocol::Request::Send {
+            pane,
+            text: keys.to_string(),
+            newline: false,
+            tmux_session,
+            await_prompt: false,
+            paste_guard: None,
+            attachments: Vec::new(),
+        },
+        None => crate::protocol::Request::Send {
+            pane,
+            text: text.to_string(),
+            newline,
+            tmux_session,
+            await_prompt: false,
+            paste_guard: paste_guard.map(str::to_string),
+            attachments: Vec::new(),
+        },
+    }
+}
+
 /// IPC 経由で Send dispatch を呼ぶ。app が不在なら 503 を返す。
 /// `pane` は tako PaneId（GUI 側 resolve_pane で解決 = 送達検証フローが効く正規経路）、
 /// `tmux_session` はペイン消失時のフォールバック用**セッション名**。
@@ -5902,27 +5961,21 @@ fn dispatch_send(
     keys: Option<&str>,
     paste_guard: Option<&str>,
 ) -> Result<Value, (u16, String)> {
-    let request = if let Some(keys_str) = keys {
-        crate::protocol::Request::Send {
-            pane,
-            text: keys_str.to_string(),
-            newline: false,
-            tmux_session,
-            await_prompt: false,
-            paste_guard: None,
-            attachments: Vec::new(),
-        }
-    } else {
-        crate::protocol::Request::Send {
-            pane,
-            text: text.to_string(),
-            newline,
-            tmux_session,
-            await_prompt: false,
-            paste_guard: paste_guard.map(str::to_string),
-            attachments: Vec::new(),
-        }
-    };
+    let request = input_request(
+        pane,
+        tmux_session,
+        text,
+        newline,
+        keys,
+        paste_guard,
+        keys_legacy(),
+    );
+    // #2765: キーの断り（知らない名前・選択肢ダイアログの表示中）は app の答え = 接続は健全なので
+    // 捨てずに 400（[`app_dispatch`] の 1 実装）。捨てると次の再接続まで（5 秒）スマホの操作が全部 503 になる。
+    // テキストの送信は従来どおり（断りも 502 + 接続を捨てる）
+    if matches!(request, crate::protocol::Request::SendKeys { .. }) {
+        return app_dispatch(app_conn, request, crate::remote_refusal::AppVia::Input);
+    }
 
     let mut conn = app_conn
         .write()
@@ -6951,7 +7004,8 @@ fn handle_api_v2_routes(
                     return respond(request, 400, Some(json!({ "error": e }).to_string()));
                 }
             };
-            // IPC 経由で dispatch Send を呼ぶ（H-7: #95 送達検証が効く）
+            // IPC 経由で dispatch Send を呼ぶ（H-7: #95 送達検証が効く）。`{keys}` は生のキー =
+            // dispatch SendKeys（#2765。写し方は `input_request`）
             let keys = parsed["keys"].as_str().map(|s| s.to_string());
             let text = parsed["text"].as_str().unwrap_or("").to_string();
             let newline = parsed["newline"].as_bool().unwrap_or(true);
@@ -7953,6 +8007,179 @@ mod urlencoding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2765: スマホの `{keys}` は生のキー（`SendKeys`）へ写り、名前は空白で区切る（#42 の綴り）。
+    /// テキストの送信は従来どおり `Send`（貼り付けの確認の印つき）。A/B は修正前の形 = 名前を本文で打つ
+    #[test]
+    fn issue2765_keysはsend_keysへ写り名前は空白で区切る() {
+        use crate::protocol::Request;
+        let keys_of = |keys: &str| match input_request(
+            Some(7),
+            Some("tako-s".into()),
+            "",
+            true,
+            Some(keys),
+            Some("human"),
+            false,
+        ) {
+            Request::SendKeys {
+                pane,
+                keys,
+                tmux_session,
+            } => {
+                assert_eq!(pane, Some(7));
+                assert_eq!(tmux_session.as_deref(), Some("tako-s"));
+                keys
+            }
+            other => {
+                panic!("#2765: {{keys}} が SendKeys へ写らない（名前を文字で打つ）: {other:?}")
+            }
+        };
+        // PWA のクイックキーの名前（esc / tab / ^C / ↑ / ↓）と ctrl の組み合わせ（`C-<英字>`）
+        for name in ["Escape", "Tab", "C-c", "Up", "Down", "C-a"] {
+            assert_eq!(keys_of(name), vec![name.to_string()]);
+        }
+        assert_eq!(keys_of("C-c C-c"), vec!["C-c", "C-c"]);
+        assert_eq!(keys_of("  Escape   Enter "), vec!["Escape", "Enter"]);
+        // 空の列は dispatch が断る（`KeyRefusal::Empty`）。ここで本文へ落とさない
+        assert_eq!(keys_of(""), Vec::<String>::new());
+
+        // テキストは Send のまま（paste_guard の印も付く）
+        match input_request(Some(7), None, "ls", true, None, Some("human"), false) {
+            Request::Send {
+                text,
+                newline,
+                paste_guard,
+                ..
+            } => {
+                assert_eq!((text.as_str(), newline), ("ls", true));
+                assert_eq!(paste_guard.as_deref(), Some("human"));
+            }
+            other => panic!("テキストは Send: {other:?}"),
+        }
+        // A/B（TAKO_2765_LEGACY=1）: 修正前は名前を改行なしの本文で打っていた
+        match input_request(Some(7), None, "", true, Some("Escape"), Some("human"), true) {
+            Request::Send {
+                text,
+                newline,
+                paste_guard,
+                ..
+            } => {
+                assert_eq!((text.as_str(), newline), ("Escape", false));
+                assert_eq!(paste_guard, None, "キーには貼り付けの印を付けない（#2050）");
+            }
+            other => panic!("A/B は修正前の Send: {other:?}"),
+        }
+    }
+
+    /// #2765 の偽の app: 1 本ずつ受けて要求の封筒（`method` / `params`）を控え、`reply` の封筒で答える
+    #[cfg(unix)]
+    fn fake_app_2765(
+        dir: &std::path::Path,
+        reply: crate::protocol::ResponseEnvelope,
+        connections: usize,
+    ) -> (String, std::thread::JoinHandle<Vec<Value>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let sock = dir.join("app.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("UDS");
+        let body = serde_json::to_string(&reply).expect("JSON");
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..connections {
+                let Ok((stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut line = String::new();
+                let _ = BufReader::new(stream.try_clone().expect("clone")).read_line(&mut line);
+                let envelope: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+                seen.push(envelope);
+                let mut w = stream;
+                let _ = writeln!(w, "{body}");
+            }
+            seen
+        });
+        (sock.display().to_string(), server)
+    }
+
+    /// #2765: キーの断り（知らない名前・ダイアログ中）は app の答え = 400 で返し、IPC の接続を捨てない
+    /// （捨てると次の再接続まで 5 秒、スマホの操作が全部 503 になる）。送る要求は SendKeys。
+    /// A/B（`TAKO_2765_LEGACY=1`）は修正前 = 名前を本文の Send で打ち、断りは 502 で接続を捨てる
+    #[cfg(unix)]
+    #[test]
+    fn issue2765_keysの断りは400でipc接続を捨てない() {
+        // A/B の env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2765_keysの断りは400でipc接続を捨てない) {
+            return;
+        }
+        let refusal = "選択肢ダイアログ（usage_limit）が表示中のため送信を中止した";
+        let run = |legacy: bool| {
+            if legacy {
+                std::env::set_var(KEYS_LEGACY_ENV, "1");
+            } else {
+                std::env::remove_var(KEYS_LEGACY_ENV);
+            }
+            let dir = tako_core::test_residue::ScratchDir::new("i2765");
+            let (socket, server) = fake_app_2765(
+                &dir,
+                crate::protocol::ResponseEnvelope::err(
+                    1,
+                    crate::protocol::error_code::OPERATION,
+                    refusal,
+                ),
+                1,
+            );
+            let app_conn = Arc::new(RwLock::new(AppConnection {
+                client: Some(AppIpcClient {
+                    socket,
+                    token: "t".into(),
+                    read_timeout: APP_IPC_READ_TIMEOUT,
+                }),
+                last_attempt: std::time::Instant::now(),
+            }));
+            let out = dispatch_send(
+                &app_conn,
+                Some(3),
+                None,
+                "",
+                true,
+                Some("Escape"),
+                Some("human"),
+            );
+            let kept = app_conn.read().expect("lock").client.is_some();
+            let seen = server.join().expect("偽 app");
+            (out, kept, seen)
+        };
+
+        let (out, kept, seen) = run(false);
+        assert_eq!(
+            out.as_ref().map_err(|e| e.0),
+            Err(400),
+            "#2765: キーの断りは 400: {out:?}"
+        );
+        assert!(
+            out.as_ref().is_err_and(|e| e.1 == refusal),
+            "断りの文は app の文のまま: {out:?}"
+        );
+        assert!(
+            kept,
+            "#2765: 断りで IPC の接続を捨てた（次の 5 秒が 503 になる）"
+        );
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0]["method"], "send_keys",
+            "#2765: {{keys}} が SendKeys で届かない: {}",
+            seen[0]
+        );
+        assert_eq!(seen[0]["params"]["keys"], json!(["Escape"]));
+
+        // A/B: 修正前の形（名前を本文で打つ・断りで接続を捨てる）
+        let (out, kept, seen) = run(true);
+        std::env::remove_var(KEYS_LEGACY_ENV);
+        assert_eq!(out.as_ref().map_err(|e| e.0), Err(502), "{out:?}");
+        assert!(!kept, "A/B は修正前どおり接続を捨てる");
+        assert_eq!(seen[0]["method"], "send", "{}", seen[0]);
+        assert_eq!(seen[0]["params"]["text"], "Escape");
+    }
 
     /// #2582: daemon の門は `tako remote serve` ちょうどだけ（`--help` や別のサブコマンドでは外さない）
     #[test]

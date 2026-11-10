@@ -234,7 +234,8 @@ FR-2.2.2 追補 3（Issue #2743・2026-11-05）: **生のキーと添付**。外
 - 添付の写し（最大 20 MB の読み書き）は UI スレッドで待たない: 準備の段（UI）で送れる状態か
   （ダイアログ）と写す先（ペインの cwd）を決め、写すのは `OffloadJob::SendAttach`（background）、
   送る本体は着地 `OffloadContinuation::SendAttached`（同期の腕と同じ `send_reply`）
-- remote daemon の `{keys}` / `/api/upload` の挙動は変えていない（置き場の名前と上限は共有）
+- remote daemon の `{keys}` / `/api/upload` の挙動は変えていない（置き場の名前と上限は共有）。
+  daemon の `{keys}` は後に #2765（追補 6）で `SendKeys` へ寄せた
 
 FR-2.2.2 追補 4（Issue #2824・2026-11-09）: **`keys` / `attachments` の Windows（ConPTY）**。
 #2743 の実 PTY テストを Windows CI の実 ConPTY でも回す（記録係 = テストバイナリ自身を ConPTY の子として
@@ -301,6 +302,27 @@ Windows CI の実 ConPTY の実測: 器（psmux 3.4.0）のペインへ作って
 - A/B: `TAKO_2826_LEGACY=1`（作りたてのペインへも修正前と同じく即時に書く）
 - 改行なしの送信は範囲外: 作りたてのペインへ「改行つき → 改行なし」の順に続けて送ると、改行なしの方が
   先に届きうる（送達フローを待たない）。続けて送るなら 1 行ずつ改行つきで送る
+
+FR-2.2.2 追補 6（Issue #2765・2026-11-10）: **スマホのクイックキーはキーとして届く**。PWA の term ビューの
+クイックキー（esc / tab / ^C / ↑ / ↓）・停止ボタン・ctrl の組み合わせ（`C-<英字>`）は、キー名を remote daemon の
+`POST /api/panes/<id>/input` の `{keys}` で送る。#281 で daemon の送り先を `tmux send-keys`（名前を解釈する）から
+dispatch へ寄せたとき `{keys}` を `Send` の本文へ写していたので、ペインには**名前の文字**が打たれていた
+（隔離 GUI の器のペイン + 隔離 daemon の実測: `Escape` → `45 73 63 61 70 65`・`C-c` → `43 2d 63`・`Up` → `55 70`。
+PWA のボタンからの通しでも同じ）。
+
+- daemon の `{keys}` は dispatch の `Request::SendKeys`（追補 3 と同じ 1 実装 = 語彙の正本
+  `tako_core::backend::key_name_bytes`）へ写す（`remote::input_request`）。名前は空白で区切った 1 語ずつ
+  （#42 の `tmux send-keys` と同じ綴り = `"C-c C-c"` は 2 回）。届くバイトは `Escape` = `1b`・`C-c` = `03`・
+  `Up` = `1b 5b 41`・`Down` = `1b 5b 42`・`Tab` = `09`・`C-<英字>` = 制御文字 1 バイト（大文字も同じ）
+- 断り: 知らない名前・空の列は 1 バイトも送らない（`KeyRefusal`）。選択肢ダイアログの表示中は Escape・矢印も
+  断る（追補 3 と同じ `Reason::DialogBlocksSend` の文。ダイアログへの応答は `/api/panes/<id>/respond`）。
+  HTTP はどちらも **400**（app の断り = IPC の接続を捨てない `app_dispatch` の 1 実装）。修正前は断りが 502 で
+  接続を捨て、次の再接続まで（5 秒）スマホの操作が全部 503 になっていた。テキストの送信（`{text}`）の状態コードは
+  変えていない
+- A/B: `TAKO_2765_LEGACY=1`（daemon の env。要求のたびに読む）で修正前の形（名前を本文の `Send` で打つ・断りは 502 で
+  接続を捨てる）。単体は remote.rs の `issue2765_*`、番犬は `crates/tako-control/tests/issue2765_remote_keys_watchdog.rs`
+  （daemon の `{keys}` の行き先・PWA が送る名前が語彙にあるか）、実経路は `scripts/test-remote-keys-2765.sh`
+  （ペインの記録係が受けたバイトを 16 進で読む・PWA の live spec `e2e/quick-keys-2765-live.spec.js` を含む）
 
 FR-2.2.8 の「明確なエラー」は FR-2.2.9 の解決順（環境変数 → 接続情報ファイル）を
 すべて試した上での不在を意味する（tako が起動していれば、tako の外からでも接続できる）。
