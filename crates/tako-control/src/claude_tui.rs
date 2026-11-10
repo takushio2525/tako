@@ -915,10 +915,20 @@ pub const TRUST_KEY_LEGACY_ENV: &str = "TAKO_1886_LEGACY";
 /// Windows の claude は作業 dir の `\` を `/` にした形を鍵にする（CI のランナーで claude 2.1.319 が自分で書いた鍵は
 /// `C:/Users/…/work`、tako が書いていた鍵は同じパスの `C:\Users\…\work` で、違いは区切りだけだった）。
 /// `\` 区切りの鍵は信頼済みと読まれず、信頼の確認が出て、確認が通るまで hooks module（tako mod）も読まれない。
-/// unix はそのまま。判定は [`claude_project_key_in`]（OS と A/B を引数で受ける = macOS でも Windows の形を検査できる）
+/// unix はそのまま。判定は [`claude_project_key_in`]（OS と A/B を引数で受ける = macOS でも Windows の形を検査できる）。
+///
+/// #2843: 作業 dir が 8.3 の短い形（`C:\Users\WINUSE~1\…`）のときは、先に長い形へ戻す
+/// （境界 B34 `long_path::long_form`。claude は短い形の cwd から起こしても長い形の鍵で引く = Windows CI の実測）。
+/// 戻せないパス（存在しない・8.3 の名前が無いボリューム）は従来の答えのまま。A/B は `TAKO_2843_LEGACY=1`
 pub fn claude_project_key(cwd: &str) -> String {
     let legacy = std::env::var_os(TRUST_KEY_LEGACY_ENV).is_some_and(|v| !v.is_empty());
-    claude_project_key_in(cwd, cfg!(windows), legacy)
+    // #1886 の修正前の腕は作業 dir の文字列そのまま（短い形も戻さない）
+    let cwd = if legacy {
+        std::borrow::Cow::Borrowed(cwd)
+    } else {
+        tako_core::platform::long_path::long_form(cwd)
+    };
+    claude_project_key_in(&cwd, cfg!(windows), legacy)
 }
 
 /// [`claude_project_key`] の本体。Windows は verbatim の前置き（`\\?\`）を剥がしてから `\` を `/` にする
@@ -1668,6 +1678,30 @@ mod tests {
         );
         // 書き込みの鍵は claude_project_key の 1 本（unix ではテストの鍵そのまま = 既存のテストの前提）
         assert_eq!(claude_project_key("/work/proj"), "/work/proj");
+    }
+
+    /// #2843: 短い形を長い形へ戻す段（境界 B34）を足しても、`~` を含まない作業 dir の鍵は #1886 の答えのまま。
+    /// unix は `~` を含んでも変えない（短い形が実機で長い形の鍵になることは
+    /// `tests/issue2843_short_path_trust_windows.rs` が Windows で確かめる）
+    #[test]
+    fn issue2843_長い形の作業dirの鍵は1886の答えのまま() {
+        for cwd in [
+            r"C:\Users\winuser\tako 1886 データ\work",
+            r"\\?\C:\Users\winuser\work",
+            "C:/Users/winuser/work",
+            "/work/proj",
+        ] {
+            assert_eq!(
+                claude_project_key(cwd),
+                claude_project_key_in(cwd, cfg!(windows), false),
+                "{cwd}"
+            );
+        }
+        if !cfg!(windows) {
+            for cwd in ["/home/testuser/a~1/work", "/work/WINUSE~1"] {
+                assert_eq!(claude_project_key(cwd), cwd);
+            }
+        }
     }
 
     #[test]

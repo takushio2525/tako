@@ -26,9 +26,12 @@
          部品（展開・注入の 3 段・ConPTY・名前付きパイプの IpcServer・ModHub）で組み、4 つの組み合わせ
          （env だけ / env の ; 連結 + ペインの PowerShell から打つ / skills/tako の写しだけ / 注入しない対照）で
          claude を起こして、報告の到着・mod_turn・ターン状態の遷移・/exit の ended を見る
-      5. 偽の API が受けた要求の要約を TAKO1886_API の行で残す
+      5. crates/tako-control/tests/issue2843_short_path_trust_windows.rs を --include-ignored で回す（#2843）。作業 dir が
+         8.3 の短い形のとき、claude が引く鍵（直起動 / ペインの PowerShell から打つ形）と、製品の事前信頼が短い形の
+         cwd から長い形の鍵を書いて信頼の確認が出ないこと・修正前の答え（短い形の鍵）では確認が出ることを見る
+      6. 偽の API が受けた要求の要約を TAKO1886_API の行で残す
 
-    結果はテストの TAKO1886_* / TAKO2842_* の行と末尾の表で CI のログへ残る。ユーザー環境変数 Path（HKCU。導入が足す）は
+    結果はテストの TAKO1886_* / TAKO2842_* / TAKO2843_* の行と末尾の表で CI のログへ残る。ユーザー環境変数 Path（HKCU。導入が足す）は
     finally で戻して、戻ったことまで確かめる。そのため GitHub Actions の使い捨てランナー以外では走らせない。
 
 .PARAMETER Tako
@@ -218,6 +221,39 @@ try {
         }
     }
     if ($testExit -ne 0) { $failures += "[#1886 実測] $TestName が終了コード $testExit（上の TAKO1886_* の行と表を見る）" }
+
+    # #2843: 作業 dir が 8.3 の短い形のとき、claude が引く鍵（直起動 / ペインの PowerShell から打つ形）と、製品の事前信頼が
+    # 短い形の cwd から長い形の鍵を書いて確認が出ないこと・修正前の答え（短い形の鍵）では確認が出ることを見る。
+    # 同じファイルの常設の検査（claude を起こさない）も一緒に回し、別のボリューム（RUNNER_TEMP が TEMP と別のドライブなら）で
+    # 戻さない枝も見る。8.3 の名前の作られ方はボリュームごとなので fsutil の答えも残す
+    $script:Stage = '短い形の作業 dir（#2843）'
+    $otherVolume = $null
+    $tempRoot = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetTempPath())
+    if ($env:RUNNER_TEMP -and [System.IO.Path]::GetPathRoot($env:RUNNER_TEMP) -ne $tempRoot) {
+        $otherVolume = Join-Path $env:RUNNER_TEMP "tako-2843-$PID"
+        New-Item -ItemType Directory -Path $otherVolume -Force | Out-Null
+    }
+    foreach ($drive in @($tempRoot, $(if ($otherVolume) { [System.IO.Path]::GetPathRoot($otherVolume) }))) {
+        if (-not $drive) { continue }
+        try { $q = (& fsutil 8dot3name query $drive.TrimEnd('\') 2>&1 | Out-String) } catch { $q = "fsutil を読めない: $_" }
+        Write-Host "TAKO2843_8DOT3 drive=$($drive.TrimEnd('\')) | $(Format-OneLine $q 300)"
+    }
+    $env:TAKO_2843_CLAUDE_EXE = $ClaudeExe
+    $env:TAKO_2843_HOME = $Sandbox.Home
+    $env:TAKO_2843_API_URL = "http://127.0.0.1:$($fake.Port)"
+    if ($otherVolume) { $env:TAKO_2843_OTHER_VOLUME_DIR = $otherVolume }
+    Push-Location $RepoRoot
+    try {
+        & cargo test -p tako-control --test issue2843_short_path_trust_windows -- --include-ignored --nocapture --test-threads=1
+        $shortExit = $LASTEXITCODE
+    } finally {
+        Pop-Location
+        foreach ($k in @('TAKO_2843_CLAUDE_EXE', 'TAKO_2843_HOME', 'TAKO_2843_API_URL', 'TAKO_2843_OTHER_VOLUME_DIR')) {
+            Remove-Item -LiteralPath "Env:$k" -ErrorAction SilentlyContinue
+        }
+        if ($otherVolume) { Remove-Item -LiteralPath $otherVolume -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    if ($shortExit -ne 0) { $failures += "[#2843 短い形の作業 dir] issue2843_short_path_trust_windows が終了コード $shortExit（上の TAKO2843_* の行を見る）" }
 } catch {
     $failures += $(if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { [string]$_ })
 } finally {
