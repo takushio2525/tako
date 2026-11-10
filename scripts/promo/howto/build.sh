@@ -1,13 +1,13 @@
 #!/bin/bash
-# build.sh — 入れ方・使い方動画（#2866）を書き出す: 舞台を組む → 音を合成 → 映像を描く → 音量をそろえて合わせる → 検査。
+# build.sh — 入れ方・使い方動画（v2 = #2886。v1 は #2866）を書き出す: 舞台を組む → 音を合成 → 映像を描く → 音量をそろえて合わせる → 検査。
 #
 # 合成・描画・音の仕組みは #2864 の scripts/promo/remake のものを使う（stage.mjs が作業用の置き場に並べる）。
 # 音量のそろえ方と検査の項目は #2864 の build.sh と同じ（目標 -15 LUFS・1 回測って固定のゲイン・デコードの全走査）。
 # 台本・根拠・作り方の全体は .agent/plans/2026-11-howto-video.md。
 #
-# 前提: record.sh で実画面を収録済み（TAKO_PROMO_OUT/scenes。既定 ~/Movies/tako-promo/howto/scenes）。
+# 前提: record.sh で実画面を収録済み（TAKO_PROMO_OUT/scenes。既定 ~/Movies/tako-promo/howto-v2/scenes）。
 # 使い方: bash scripts/promo/howto/build.sh [出力.mp4]
-#   既定の出力は ~/Movies/tako-promo/tako-howto-v1.mp4（リポジトリには入れない）
+#   既定の出力は ~/Movies/tako-promo/tako-howto-v2.mp4（リポジトリには入れない。v1 の mp4 と収録は上書きしない）
 #   確認用のフレーム（等間隔 TAKO_PROMO_CHECK_FRAMES 枚。既定 12）は <出力の隣>/checks/<名前>/ に出す
 #   指定した秒の 1 枚だけ描く: bash scripts/promo/howto/build.sh --stills 12.5,48,120 <出力の dir>
 #   音だけを直したとき（映像は描き直さない）: TAKO_HOWTO_REUSE_VIDEO=1 bash scripts/promo/howto/build.sh
@@ -18,7 +18,7 @@ set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
-export TAKO_PROMO_OUT=${TAKO_PROMO_OUT:-$HOME/Movies/tako-promo/howto}
+export TAKO_PROMO_OUT=${TAKO_PROMO_OUT:-$HOME/Movies/tako-promo/howto-v2}
 WORK="$TAKO_PROMO_OUT/work"
 LUFS=${TAKO_PROMO_LUFS:--15}
 FRAMES=${TAKO_PROMO_CHECK_FRAMES:-12}
@@ -39,7 +39,7 @@ if [ "${1:-}" = "--stills" ]; then
     exit 0
 fi
 
-OUT=${1:-$HOME/Movies/tako-promo/tako-howto-v1.mp4}
+OUT=${1:-$HOME/Movies/tako-promo/tako-howto-v2.mp4}
 mkdir -p "$(dirname "$OUT")" || die "出力先を作れない"
 
 echo "== 1/4 音を合成"

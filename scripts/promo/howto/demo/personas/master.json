@@ -8,36 +8,6 @@
   "turns": [
     [
       {
-        "busy": "登録中"
-      },
-      {
-        "wait": 1000,
-        "say": "プロジェクトとして登録します。",
-        "color": "text"
-      },
-      {
-        "wait": 800,
-        "tool": "add",
-        "arg": "shop-app  ~/shop-app"
-      },
-      {
-        "exec": "tako orchestrator projects add --key shop-app --cwd \"$HOME/shop-app\" --description 'デモ用のショップ API'",
-        "code": "added"
-      },
-      {
-        "wait": 900,
-        "say": "登録しました: shop-app（~/shop-app）",
-        "color": "ok",
-        "beat": "project_done"
-      },
-      {
-        "say": "以後の依頼は、担当（worker）を立てて進めます。",
-        "color": "dim",
-        "indent": 2
-      }
-    ],
-    [
-      {
         "busy": "分解中"
       },
       {
