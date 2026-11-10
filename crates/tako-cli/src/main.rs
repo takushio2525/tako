@@ -3361,7 +3361,8 @@ enum ProfilesCommand {
         /// master の thinking effort
         #[arg(long)]
         effort: Option<String>,
-        /// 子 worker の thinking effort
+        /// worker_model_policy=fixed 時の子 worker の thinking effort（worker_agents の effort が先に効く。
+        /// worker の effort を変えるなら --agent <系統> --agent-effort。実効値は応答の resolved_workers）
         #[arg(long)]
         worker_effort: Option<String>,
         /// worker の既定エージェント種別（claude / codex / agy。--clear-worker-agent と排他）

@@ -62,6 +62,11 @@ worker ポリシーが設定されているため、ユーザーが変更を希�
 - agy が選ばれ、claude / codex が未導入の場合、setup 自体は進められるが `tako master` の前に
   claude または codex の導入が必要
 - `worker_agents` に複数 CLI があれば、master はタスクに応じて使い分けられる
+- worker の effort / モデルを変えるときは `tako orchestrator profiles set default --agent <worker の系統>
+  --agent-effort <値>`（モデルは `--agent-model`）= `worker_agents.<系統>` を書く。`--worker-effort` /
+  `--worker-model` は `worker_model_policy: fixed` のときだけ使われ、`worker_agents.<系統>` が先に効く。
+  変えた後は応答の `resolved_workers.<系統>`（spawn が実際に付ける値と出どころ）で確かめてから報告し、
+  `warnings` に「使われません」が出たらその案内に従う
 
 # フロー判定
 
