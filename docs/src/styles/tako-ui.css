@@ -684,24 +684,68 @@
 }
 /* 列は明示する。自動配置のままだと、狭い枠でリンクの行が隠れたときに
  * 説明とボタンの列が入れ替わる（#2077） */
-.tk-welcome > .tk-welcome-title,
-.tk-welcome > .tk-welcome-line {
+.tk-welcome > .tk-welcome-title {
   grid-column: 1;
 }
-.tk-welcome > .tk-welcome-links,
-.tk-welcome > .tk-ubtn {
+.tk-welcome > .tk-welcome-links {
   grid-column: 2;
 }
 .tk-welcome-links {
   display: flex;
+  align-items: center;
   gap: 1em;
   justify-content: flex-end;
   color: var(--ui-muted);
   font-size: 0.9em;
 }
-.tk-welcome-line {
-  color: var(--ui-fg2);
+.tk-welcome-later {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+}
+.tk-welcome-later .tk-ic {
+  width: 0.8em;
+  height: 0.8em;
+}
+/* 「次にやること」の段（#2879）。段どうしは同じ場所に重ね、手順で入れ替える
+ * （器の高さはいちばん高い段に揃うので、切り替えで下のペインが跳ねない） */
+.tk-welcome-steps {
+  grid-column: 1 / -1;
+  display: grid;
+}
+.tk-welcome-step {
+  grid-area: 1 / 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.15em 1em;
+  align-items: center;
+  /* 低い段（説明が 1 行）は、いちばん高い段に揃った器の縦の真ん中に寄せる */
+  align-content: center;
+}
+.tk-welcome-desc,
+.tk-welcome-detail {
+  grid-column: 1;
   overflow-wrap: anywhere;
+}
+.tk-welcome-desc {
+  color: var(--ui-fg);
+  font-weight: 500;
+}
+/* 対話で決めることの 1 行（実物は本文より一段小さく淡い色） */
+.tk-welcome-detail {
+  color: var(--ui-muted);
+  font-size: 0.9em;
+}
+.tk-welcome-step > .tk-ubtn {
+  grid-column: 2;
+  grid-row: 1;
+}
+.tk-welcome-step.has-detail > .tk-ubtn {
+  grid-row: 1 / span 2;
+}
+/* JS が動かない環境では段の入れ替えが起きないので、最初の段だけを見せる（重なって読めなくなるため） */
+.tk-scrolly:not([data-motion]) .tk-welcome-step:not(:first-child) {
+  display: none;
 }
 .tk-ubtn {
   display: inline-flex;
@@ -721,13 +765,12 @@
   border-color: var(--ui-accent);
   color: var(--ui-crust);
 }
-.tk-ubtn.is-sub {
-  background: var(--ui-chip);
-  border-color: var(--ui-line);
-  color: var(--ui-accent);
-}
 @container tkframe (max-width: 30rem) {
   .tk-welcome-links {
+    display: none;
+  }
+  /* 実物も狭い窓では 1 行に畳む（省略記号）。図では詳細の行ごと畳んで、下のペインの場所を残す */
+  .tk-welcome-detail {
     display: none;
   }
 }

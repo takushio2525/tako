@@ -4,7 +4,8 @@
  * 事実の出どころ: installer/windows/tako.iss（per-user・PATH 追加は既定オン・Windows 10 1809 以降 x64）/
  * 台帳 W 節（未署名なので SmartScreen が出ることがある・Windows のメニュー行）/
  * crates/tako-control/src/shell_integration.rs・setup_deps.rs の出力の形（シェル統合は $PROFILE を書かずペインの起動時に読む = #2432・
- * psmux は winget で入れる = #2433）。パスは架空。
+ * psmux は winget で入れる = #2433）/ 初回起動のバナーと setup のタブ（#2879 のボタン → setup → 対話 → master の形。
+ * ボタンは GUI の隣の tako.exe で setup を打つ = crates/tako-control/src/welcome.rs の launch_for_flow）。パスは架空。
  */
 import Scrolly from '../motion/Scrolly.astro';
 import Step from '../motion/Step.astro';
@@ -39,38 +40,48 @@ import Cmd from '../motion/Cmd.astro';
 			<TakoWindow
 				os="windows"
 				tabs={[
-					{ label: 'my-app', activeAt: '6' },
+					{ label: '1', activeAt: '6' },
 					{ label: 'setup', at: '7', activeAt: '7', state: 'running' },
 				]}
 				height={25}
-				cwd="~\my-app"
+				cwd="~"
 			>
-				<div slot="banner" data-at="6" data-fx="unfold">
-					<div><WelcomeBanner pressAt="6" /></div>
+				<div slot="banner" data-at="6+" data-fx="unfold">
+					<div>
+						<WelcomeBanner
+							stages={[
+								{ step: 'setup', at: '6', pressAt: '6' },
+								{ step: 'running', at: '7' },
+							]}
+						/>
+					</div>
 				</div>
 				<div class="tk-stack tk-fill" style="flex: 1">
 					<div data-at="6" data-fx="fade" class="tk-split">
-						<Pane n={1} title="my-app" state="idle" focus>
-							<span class="tk-l"><span class="tk-p">PS C:\Users\winuser\my-app&gt;</span> <span class="tk-cur"></span></span>
+						<Pane n={1} title="ターミナル" state="idle" focus>
+							<span class="tk-l"><span class="tk-p">PS C:\Users\winuser&gt;</span> <span class="tk-cur"></span></span>
 						</Pane>
 					</div>
 					<div data-at="7" data-fx="fade" class="tk-split">
-						<Pane n={2} title="setup" state="running" focus>
-							<span class="tk-l tk-b">tako セットアップ</span>
-							<span class="tk-l tk-dim">═════════════════</span>
-							<span class="tk-l" data-at="7" style="--d: .2s"><span class="tk-acc">[設定]</span> シェル統合: PowerShell のプロファイルへ tako の管理ブロックを置きます</span>
-							<span class="tk-l" data-at="7" style="--d: .5s"><span class="tk-ok">[OK]</span> シェル統合: 配置しました</span>
-							<span class="tk-l" data-at="7" style="--d: .7s"><span class="tk-acc">[検出]</span> claude（認証済み）</span>
-							<span class="tk-l" data-at="7" style="--d: .9s"><span class="tk-warn">[任意]</span> psmux: 見つかりません（任意）</span>
-							<span class="tk-l tk-dim" data-at="7" style="--d: 1s">    導入: winget install --id marlocarlo.psmux …</span>
-							<span class="tk-l" data-at="7" style="--d: 1.05s">    psmux をインストールしますか？ [y/N]: y</span>
-							<span class="tk-l" data-at="7" style="--d: 1.1s"><span class="tk-ok">[OK]</span> psmux: C:\Users\winuser\AppData\Local\Microsoft\WinGet\Links\psmux.exe（インストール完了）</span>
-							<span class="tk-l" data-at="7" style="--d: 1.2s"><span class="tk-ok">[OK]</span> Claude MCP: tako が登録済み</span>
-							<span class="tk-l tk-ok tk-b" data-at="7" style="--d: 1.5s">セットアップが完了しました。</span>
+						<Pane n={1} title="ターミナル" state="running" focus>
+							<div data-fx="log">
+								<span class="tk-l"><span class="tk-p">PS C:\Users\winuser&gt;</span> C:\Users\winuser\AppData\Local\Programs\tako\tako.exe setup</span>
+								<span class="tk-l tk-b">tako セットアップ</span>
+								<span class="tk-l tk-dim">═════════════════</span>
+								<span class="tk-l" data-at="7" style="--d: .2s">  <span class="tk-ok">[OK]</span> シェル統合: tako が開く PowerShell へ起動時に読ませます（PowerShell 7 / Windows PowerShell 5.1。$PROFILE は書き換えません）</span>
+								<span class="tk-l" data-at="7" style="--d: .5s">    <span class="tk-acc">[検出]</span> claude: ~\.local\bin\claude.exe（認証済み / pro）</span>
+								<span class="tk-l" data-at="7" style="--d: .7s">  <span class="tk-warn">[任意]</span> psmux: 見つかりません（任意）</span>
+								<span class="tk-l tk-dim" data-at="7" style="--d: .8s">      導入: winget install --id marlocarlo.psmux …</span>
+								<span class="tk-l" data-at="7" style="--d: .9s">    psmux をインストールしますか？ [y/N]: y</span>
+								<span class="tk-l" data-at="7" style="--d: 1s">  <span class="tk-ok">[OK]</span> psmux: C:\Users\winuser\AppData\Local\Microsoft\WinGet\Links\psmux.exe（インストール完了）</span>
+								<span class="tk-l" data-at="7" style="--d: 1.1s">  <span class="tk-acc">[設定]</span> Claude MCP を自動登録します</span>
+								<span class="tk-l tk-ok tk-b" data-at="7" style="--d: 1.4s">セットアップが完了しました。</span>
+								<span class="tk-l" data-at="7" style="--d: 1.7s">対話アシスタントを起動します。設定の変更・解説・次の一歩の相談ができます。</span>
+							</div>
 						</Pane>
 					</div>
 				</div>
-				<Pointer slot="overlay" path="6:84,37 7:-" click="6" />
+				<Pointer slot="overlay" path="6:88,43 7:-" click="6" />
 			</TakoWindow>
 		</div>
 	</div>
@@ -91,11 +102,11 @@ import Cmd from '../motion/Cmd.astro';
 		<p>最後の画面の「tako を実行する」がオンのまま「完了」を押すと、tako が起動します。スタートメニューにも「tako」が入ります。</p>
 	</Step>
 	<Step title="初回起動">
-		<p>Windows 版は窓の上端にメニュー（ファイル・編集・表示…）が並び、その下は macOS 版と同じタブとペインです。シェルは PowerShell です。「tako へようこそ」の<strong>「セットアップを実行」</strong>を押します。</p>
+		<p>Windows 版は窓の上端にメニュー（ファイル・編集・表示…）が並び、その下は macOS 版と同じタブとペインです。シェルは PowerShell です。起動しただけでは何も走りません。「tako へようこそ」の<strong>「セットアップを実行」</strong>を押します。</p>
 	</Step>
 	<Step title="セットアップ">
-		<p>新しいタブで <code>tako setup</code> が走ります。Windows では、ペインの作業フォルダを追うために <strong>PowerShell のプロファイルへ tako の管理ブロックを 1 つ足します</strong>（何をどこへ書くかを先に表示します。<code>tako shell-integration uninstall</code> で外せます）。</p>
-		<p>再起動しても画面を残す psmux など、入っていない道具はその場で入れるかを 1 回聞き、winget で入れます（git は Windows の管理者の確認が出ます）。後から入れるなら下の 1 行です。あとは macOS と同じく <code>tako master</code> で始められます。</p>
+		<p>新しいタブで <code>tako setup</code> が走ります。ペインの作業フォルダを追う仕組み（シェル統合）は、tako がペインの PowerShell を開くときに読み込ませるので、<strong><code>$PROFILE</code> は書き換えません</strong>。</p>
+		<p>再起動しても画面を残す psmux など、入っていない道具はその場で入れるかを 1 回聞き、winget で入れます（git は Windows の管理者の確認が出ます）。後から入れるなら下の 1 行です。setup の最後に対話のアシスタントが開き、閉じるとバナーに「master を起動」が出ます。ここから先は macOS と同じです。</p>
 		<Cmd prompt="PS>">tako setup deps install</Cmd>
 	</Step>
 </Scrolly>

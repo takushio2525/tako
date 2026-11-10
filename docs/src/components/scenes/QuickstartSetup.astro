@@ -1,11 +1,18 @@
 ---
 /**
- * 場面: 初回のセットアップ（バナー →「setup」タブ → [OK] が積まれる →「残り N 件」→ 再実行で素通り）。4 手順。
- * 事実の出どころ: 台帳 1 節 / crates/tako-app/src/main.rs の run_setup_command（バナーを閉じて新しいタブ
- * 「setup」で tako setup を打つ）/ crates/tako-cli/src/setup.rs の出力（run_setup・run_dependency_check・
- * configure_agent_mcp・print_setup_summary の後の 1 行）/ crates/tako-control/src/setup_remaining.rs の render
- * （残りの一覧の文面）/ setup_bootstrap.rs の tako CLI の段 / shell_integration.rs の result_lines。
- * 出力は実物の行の一部を抜き出したもの（段の順は実物どおり）。パスは架空。
+ * 場面: 初回のセットアップ（#2879 のボタン → setup → 対話 → master の形。ログインがまだの人の道筋）。6 手順。
+ * バナー「セットアップを実行」→「setup」タブ → [OK] が積まれる →「残り 1 件: ログイン」とバナーの「ログイン」→
+ * 「セットアップを続ける」で 2 回目の setup → 対話のアシスタント →「master を起動」。
+ * 事実の出どころ:
+ *   - バナーの段と文言: crates/tako-control/src/welcome.rs の next_step_guided（setup → login → continue →
+ *     running(dialogue) → master）/ crates/tako-app/src/ui_text/welcome.rs
+ *   - ボタンが打つ行: welcome::launch_for_flow（setup の段は GUI の隣の CLI で setup。ログインは同じタブ）
+ *   - setup の出力: crates/tako-cli/src/setup.rs（run_setup・run_dependency_check・configure_agent_mcp・
+ *     print_setup_summary の後の 1 行・最後の対話アシスタント）/ crates/tako-control/src/setup_remaining.rs の
+ *     render（残りの一覧の文面）/ setup_bootstrap.rs の tako CLI の段 / shell_integration.rs の result_lines
+ *   - 実経路: scripts/test-first-run-2879.sh の A 節（ログイン → continue → 対話 → master）
+ * 出力は実物の行の一部を抜き出したもの（段の順は実物どおり）。対話の中身は LLM が resources/setup/system-prompt.md の
+ * 初回フローに沿って話す例。パスは架空。
  */
 import Scrolly from '../motion/Scrolly.astro';
 import Step from '../motion/Step.astro';
@@ -21,14 +28,14 @@ import '../../styles/quickstart.css';
 	<TakoWindow
 		slot="stage"
 		tabs={[
-			{ label: '~', activeAt: '1' },
+			{ label: '1', activeAt: '1' },
 			{
 				label: 'setup',
 				at: '2+',
 				activeAt: '2+',
 				states: [
-					{ at: '2 4', state: 'running' },
-					{ at: '3', state: 'idle' },
+					{ at: '2 4 5', state: 'running' },
+					{ at: '3 6', state: 'idle' },
 				],
 			},
 		]}
@@ -36,27 +43,36 @@ import '../../styles/quickstart.css';
 		cwd="~"
 		class="tk-qs-setup"
 	>
-		<div slot="banner" data-at="1" data-fx="unfold">
-			<div><WelcomeBanner pressAt="1" /></div>
+		<div slot="banner">
+			<WelcomeBanner
+				stages={[
+					{ step: 'setup', at: '1', pressAt: '1' },
+					{ step: 'running', at: '2' },
+					{ step: 'login', at: '3', pressAt: '3' },
+					{ step: 'continue', at: '4', pressAt: '4' },
+					{ step: 'dialogue', at: '5' },
+					{ step: 'master', at: '6' },
+				]}
+			/>
 		</div>
 		<div class="tk-stack tk-fill" style="flex: 1">
 			<div data-at="1" data-fx="fade" class="tk-split">
-				<Pane n={1} title="~" state="idle" focus>
+				<Pane n={1} title="ターミナル" state="idle" focus>
 					<span class="tk-l"><span class="tk-p">~ ❯</span> <span class="tk-cur"></span></span>
 				</Pane>
 			</div>
 			<div data-at="2+" data-fx="fade" class="tk-split">
 				<Pane
 					n={1}
-					title="setup"
+					title="ターミナル"
 					state={[
-						{ at: '!3', state: 'running' },
-						{ at: '3', state: 'idle' },
+						{ at: '2 4 5', state: 'running' },
+						{ at: '3 6', state: 'idle' },
 					]}
 					focus
 				>
 					<div data-fx="log">
-						<span class="tk-l"><span class="tk-p">~ ❯</span> tako setup</span>
+						<span class="tk-l"><span class="tk-p">~ ❯</span> /Applications/tako.app/Contents/MacOS/tako setup</span>
 						<span class="tk-l tk-b">tako セットアップ</span>
 						<span class="tk-l tk-dim">═════════════════</span>
 						<span class="tk-l" data-at="2+" style="--d: .25s">  <span class="tk-ok">[OK]</span> tako CLI: どのターミナルからも使えます（/opt/homebrew/bin）</span>
@@ -73,36 +89,44 @@ import '../../styles/quickstart.css';
 						<span class="tk-l tk-qs-hl" data-at="3+" style="--d: 1.1s">     <span class="tk-acc">claude auth login</span></span>
 						<span class="tk-l tk-dim" data-at="3+" style="--d: 1.3s">済んだら tako setup をもう一度実行してください（残りはここから再開します）</span>
 						<span class="tk-l" data-at="3"><span class="tk-p">~ ❯</span> <span class="tk-cur"></span></span>
-						<span class="tk-l" data-at="4+"><span class="tk-p">~ ❯</span> tako setup</span>
+						<span class="tk-l" data-at="4+"><span class="tk-p">~ ❯</span> /Applications/tako.app/Contents/MacOS/tako setup</span>
 						<span class="tk-l tk-b" data-at="4+" style="--d: .2s">tako セットアップ</span>
 						<span class="tk-l tk-dim" data-at="4+" style="--d: .2s">═════════════════</span>
 						<span class="tk-l" data-at="4+" style="--d: .4s">  <span class="tk-ok">[OK]</span> tako CLI: どのターミナルからも使えます（/opt/homebrew/bin）</span>
-						<span class="tk-l" data-at="4+" style="--d: .55s">  <span class="tk-ok">[OK]</span> シェル統合: 環境変数の注入で有効です（zsh / bash / fish。設定ファイルは書き換えません）</span>
-						<span class="tk-l" data-at="4+" style="--d: .7s">    <span class="tk-acc">[検出]</span> claude: ~/.local/bin/claude（認証済み / pro）</span>
-						<span class="tk-l" data-at="4+" style="--d: .85s">  <span class="tk-ok">[OK]</span> tmux: /opt/homebrew/bin/tmux</span>
-						<span class="tk-l" data-at="4+" style="--d: 1s">  <span class="tk-ok">[OK]</span> Claude MCP: tako が登録済み</span>
-						<span class="tk-l tk-ok tk-b" data-at="4+" style="--d: 1.25s">セットアップが完了しました。</span>
-						<span class="tk-l" data-at="4+" style="--d: 1.5s">対話アシスタントを起動します。設定の変更・解説・次の一歩の相談ができます。</span>
+						<span class="tk-l" data-at="4+" style="--d: .55s">    <span class="tk-acc">[検出]</span> claude: ~/.local/bin/claude（認証済み / pro）</span>
+						<span class="tk-l" data-at="4+" style="--d: .7s">  <span class="tk-ok">[OK]</span> Claude MCP: tako が登録済み</span>
+						<span class="tk-l tk-ok tk-b" data-at="4+" style="--d: .95s">セットアップが完了しました。</span>
+						<span class="tk-l" data-at="4+" style="--d: 1.2s">対話アシスタントを起動します。設定の変更・解説・次の一歩の相談ができます。</span>
+						<span class="tk-l tk-tui-msg" data-at="5+">master と worker は claude、モデルは各 CLI の既定です。このまま使いますか？</span>
+						<span class="tk-l tk-tui-user" data-at="5+" style="--d: .6s">このままで</span>
+						<span class="tk-l tk-tui-msg" data-at="5+" style="--d: 1.1s">別の PC と設定を共有するなら、GitHub に private リポジトリを作ってつなげます。作りますか？</span>
+						<span class="tk-l" data-at="6"><span class="tk-p">~ ❯</span> <span class="tk-cur"></span></span>
 					</div>
 				</Pane>
 			</div>
 		</div>
-		<Pointer slot="overlay" path="1:83,28 2:-" click="1" />
+		<Pointer slot="overlay" path="1:88,32 2:- 3:92,32 4:87,32 5:-" click="1 3 4" />
 	</TakoWindow>
 
 	<Step title="バナーの「セットアップを実行」を押す">
-		<p>はじめて開くと、タブバーの下に「tako へようこそ」が出ます。<strong>「セットアップを実行」</strong>を押すだけです。ターミナルで打つなら 1 行です。</p>
+		<p>はじめて開くと、タブバーの下に「tako へようこそ」が出ます。起動しただけでは何も走りません。「次にやること」の<strong>「セットアップを実行」</strong>を押します。ターミナルで打つなら 1 行です。</p>
 		<Cmd>tako setup</Cmd>
 	</Step>
 	<Step title="新しいタブで、[OK] が積まれていく">
 		<p>「setup」というタブが開き、tako 自身がセットアップを進めます。<code>tako</code> コマンドの置き場所、AI エージェント（claude / codex / agy）の検出、tmux などの確認まで、揃っているものは <code>[OK]</code> で流れていきます。揃っていれば質問は出ません。</p>
+		<p class="tk-step-note">tmux などが足りないときだけ、何をどのコマンドで入れるかを見せて <code>[y/N]</code> を 1 回聞きます。Claude Code そのものが入っていなければ、入れてよいかもここで聞きます。</p>
 	</Step>
-	<Step title="人にしかできないことだけ「残り」に">
-		<p>途中で止まりません。ログインのように人の操作が要るものは脇に置いて、AI 連携の登録（MCP）まで先に済ませ、最後に<strong>「残り N 件」と、次に打つ 1 行</strong>を並べます。</p>
-		<p class="tk-step-note">tmux などが足りないときだけ、何をどのコマンドで入れるかを見せて <code>[y/N]</code> を 1 回聞きます。</p>
+	<Step title="ログインだけは「ログイン」で">
+		<p>途中で止まりません。ログインのように人の操作が要るものは脇に置いて、AI 連携の登録（MCP）まで先に済ませ、最後に<strong>「残り N 件」と、次に打つ 1 行</strong>を並べます。バナーも<strong>「ログイン」</strong>に変わり、押すと setup のタブでログインのコマンドが走ってブラウザが開きます。</p>
 	</Step>
-	<Step title="済ませたら、もう一度打つだけ">
-		<p>ログインしたら、もう一度 <code>tako setup</code>。済んだところは <code>[OK]</code> で素通りして、残りから再開します。何度打っても壊れません。変えるものが無ければ「変更なし」で終わります。</p>
+	<Step title="「セットアップを続ける」で、もう一度">
+		<p>ログインが済むと、バナーが<strong>「セットアップを続ける」</strong>に変わります。押すと同じタブで <code>tako setup</code> がもう一度走り、済んだところは <code>[OK]</code> で素通りして、残りから再開します。何度走らせても壊れません。</p>
+	</Step>
+	<Step title="最後は、対話で決める">
+		<p>setup の最後に対話のアシスタントが開き、master / worker の設定、プロジェクトの登録、GitHub を使った設定の共有などを、日本語で相談しながら決めます。対話が走っているあいだ、バナーのボタンは「タブを開く」です。</p>
+	</Step>
+	<Step title="閉じると「master を起動」">
+		<p>アシスタントを閉じると、バナーが<strong>「master を起動」</strong>に変わります。押せば司令塔の AI が起動し、あとは日本語で頼むだけです。</p>
 		<p class="tk-step-note">Windows でも同じバナー・同じ流れです。おもに違うのは、シェル統合を tako がペインの PowerShell を開くときに読み込ませること（<code>$PROFILE</code> は書き換えません）と、psmux などの導入に winget を使うこと（git は Windows の管理者の確認が出るので、同じ 1 回の確認に添えます）です。</p>
 	</Step>
 </Scrolly>
