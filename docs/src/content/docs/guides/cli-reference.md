@@ -306,7 +306,7 @@ tako setup-mcp --project         # 現在のディレクトリだけに登録（
 
 | エージェント | 書き込み先 | 手段 |
 |---|---|---|
-| claude | `~/.claude.json`（`--project` 時は `<cwd>/.mcp.json`） | `claude mcp add`（無ければ JSON を直接マージ） |
+| claude | `~/.claude.json`（`CLAUDE_CONFIG_DIR` を設定していれば `$CLAUDE_CONFIG_DIR/.claude.json`。`--project` 時は `<cwd>/.mcp.json`） | `claude mcp add`（無ければ JSON を直接マージ） |
 | codex | `~/.codex/config.toml`（`CODEX_HOME` を設定していれば `$CODEX_HOME/config.toml`）の `[mcp_servers.tako]` | `codex mcp add` + `env_vars` の追記 |
 | agy | `~/.gemini/config/mcp_config.json` の `mcpServers.tako` | `agy mcp add` |
 

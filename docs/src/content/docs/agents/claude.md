@@ -42,7 +42,7 @@ claude auth login
 tako setup-mcp
 ```
 
-書き込み先は `~/.claude.json` です。現在のディレクトリだけに入れたいときは `tako setup-mcp --project` で `<cwd>/.mcp.json` に書き込みます（`--project` に対応しているのは claude だけです）。
+書き込み先は `~/.claude.json` です（`CLAUDE_CONFIG_DIR` を設定していれば、claude と同じく `$CLAUDE_CONFIG_DIR/.claude.json`）。現在のディレクトリだけに入れたいときは `tako setup-mcp --project` で `<cwd>/.mcp.json` に書き込みます（`--project` に対応しているのは claude だけです）。
 
 一度登録すればどのプロジェクトでも有効です。`tako setup` を実行していれば登録は済んでいるので、通常このコマンドを打つ必要はありません。tako の MCP サーバーの中身は [内蔵 MCP サーバー](/features/mcp-server/) にあります。
 

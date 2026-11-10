@@ -500,8 +500,8 @@ pub fn is_claude_default_config_dir(path: &str) -> bool {
     normalize(Path::new(&expanded)) == normalize(&default)
 }
 
-/// claude の config ディレクトリを指す環境変数名
-pub const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
+/// claude の config ディレクトリを指す環境変数名（正本は `tako_core::claude_config`。#2906）
+pub const CLAUDE_CONFIG_DIR_ENV: &str = tako_core::claude_config::CONFIG_DIR_ENV;
 
 /// 起動コマンドへ注入する環境変数の計画（Issue #512）。
 ///

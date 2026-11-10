@@ -22,7 +22,7 @@ MCP は、AI エージェントが外部ツールを操作するための共通�
 
 | エージェント | 書き込み先 | 手段 | 環境変数の渡し方 |
 |---|---|---|---|
-| claude | `~/.claude.json` / `<cwd>/.mcp.json` | `claude mcp add` | そのまま継承する |
+| claude | `~/.claude.json`（`CLAUDE_CONFIG_DIR` を設定していれば `$CLAUDE_CONFIG_DIR/.claude.json`）/ `<cwd>/.mcp.json` | `claude mcp add` | そのまま継承する |
 | codex | `~/.codex/config.toml`（`CODEX_HOME` を設定していれば `$CODEX_HOME/config.toml`）の `[mcp_servers.tako]` | `codex mcp add` + `env_vars` の追記 | 転送する変数名を書いたものだけ |
 | agy | `~/.gemini/config/mcp_config.json` | `agy mcp add` | そのまま継承する |
 

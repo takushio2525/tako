@@ -422,7 +422,8 @@ enum Command {
     /// エージェント CLI に tako MCP サーバーの接続設定を追加する（アプリ未起動でも実行できる）
     ///
     /// 引数なしで claude + この環境に導入済みの codex / agy へまとめて登録する。
-    /// claude の書き先は ~/.claude.json（--project のときは <cwd>/.mcp.json）、
+    /// claude の書き先は ~/.claude.json（CLAUDE_CONFIG_DIR があれば $CLAUDE_CONFIG_DIR/.claude.json。
+    /// --project のときは <cwd>/.mcp.json）、
     /// codex / agy はそれぞれの CLI の mcp add に書かせる。
     SetupMcp(SetupMcpArgs),
     /// 動画操作（play / pause / seek。プレビューペインが動画モードの場合のみ有効）
@@ -5259,7 +5260,8 @@ fn events_follow(args: &EventsArgs) -> Result<(), String> {
 }
 
 /// MCP セットアップ（アプリ未起動でも動作）。書き先の正本は `dispatch::mcp_target_path`
-/// （claude = `~/.claude.json` / `--project` = `<cwd>/.mcp.json`。codex / agy は各 CLI の `mcp add`）
+/// （claude = `$CLAUDE_CONFIG_DIR/.claude.json`・未設定なら `~/.claude.json` / `--project` =
+/// `<cwd>/.mcp.json`。codex / agy は各 CLI の `mcp add`）
 fn setup_mcp_local(args: &SetupMcpArgs) -> Result<(), String> {
     // dispatch の `setup_mcp_agents` は理由の文を組んだ時点の表示言語で文字列にする（#2365）。
     // 呼ぶ前に決めておかないと、日本語表示の人へ理由の文だけ英語（静的既定）で出る
@@ -5334,35 +5336,15 @@ fn setup_mcp_report_lines(resp: &serde_json::Value, home: Option<&std::path::Pat
     lines
 }
 
-/// MCP 登録パスの存在を確認し、不在なら警告を出す（master/solo 起動前のガード）
+/// MCP 登録パスの存在を確認し、不在なら警告を出す（master/solo 起動前のガード）。
+/// 読む場所は `tako setup-mcp` の書き先と同じ 1 実装（`$CLAUDE_CONFIG_DIR/.claude.json`・
+/// 未設定なら `~/.claude.json`。#2906 の前は `~/.claude.json` 決め打ちだった）
 fn check_mcp_health_warning(lang: tako_core::i18n::Lang) {
-    let home = match tako_core::paths::home_dir() {
-        Some(h) => h,
-        None => return,
+    let Some(cmd) = tako_control::agent_mcp::claude_registered_command() else {
+        return;
     };
-    let claude_json = home.join(".claude.json");
-    let content = match std::fs::read_to_string(&claude_json) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let settings: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let cmd = match settings
-        .get("mcpServers")
-        .and_then(|s| s.get("tako"))
-        .and_then(|t| t.get("command"))
-        .and_then(|c| c.as_str())
-    {
-        Some(c) => c,
-        None => return,
-    };
-    if !std::path::Path::new(cmd).is_file() {
-        eprintln!(
-            "{}",
-            ReplyNote::McpPathMissing(cmd.to_string()).text_in(lang)
-        );
+    if !std::path::Path::new(&cmd).is_file() {
+        eprintln!("{}", ReplyNote::McpPathMissing(cmd).text_in(lang));
         eprintln!();
     }
 }
