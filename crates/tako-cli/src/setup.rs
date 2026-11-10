@@ -1402,12 +1402,15 @@ fn run_dependency_check(
         // 在るが動かない（tailscale の `--version` が固まる / 非 0 = #1797）。在るので入れ直させないが、
         // 動かないので `[OK]` とも言わない（#1816）。任意依存なので残り作業にも数えない（tako は動く =
         // FR-2.41 の「残り N 件は整わないと tako が動かない詰まりだけ」の線引き）
-        if let Some(text) = state.unrunnable_text() {
-            eprintln!("  [警告] {text}");
+        // 見つけたパスはホームを `~` に縮めて出す（ほかの行と同じ。#2892）
+        if let Some(path) = state.found.as_deref().filter(|_| state.unrunnable()) {
+            let path = display_home_relative(Path::new(path));
+            eprintln!("  [警告] {}", setup_deps::unrunnable_line(dep.bin, &path));
             eprintln!("      {}", tako_control::tailscale::UNRUNNABLE_HINT);
             continue;
         }
         if let Some(path) = &state.found {
+            let path = display_home_relative(Path::new(path));
             eprintln!("  [OK] {}: {path}", dep.bin);
             continue;
         }
@@ -1452,6 +1455,7 @@ fn run_dependency_check(
         .unwrap_or(setup_deps::DepOutcome::NotInstalled);
         match outcome {
             setup_deps::DepOutcome::Installed(path) => {
+                let path = display_home_relative(Path::new(&path));
                 eprintln!("  [OK] {}: {path}（インストール完了）", dep.bin);
                 installed_bins.push(dep.bin);
             }
@@ -1576,12 +1580,17 @@ fn print_deps_human(action: &str, value: &serde_json::Value) {
             }
             // 在るが動かない（#1816）。`[OK]` と言わず、入れ直しも勧めない（依存段と同じ文面）
             if let (Some(false), Some(path)) = (dep["runnable"].as_bool(), dep["found"].as_str()) {
-                eprintln!("  [警告] {}", setup_deps::unrunnable_line(bin, path));
+                let path = display_home_relative(Path::new(path));
+                eprintln!("  [警告] {}", setup_deps::unrunnable_line(bin, &path));
                 eprintln!("      {}", tako_control::tailscale::UNRUNNABLE_HINT);
                 continue;
             }
             match dep["found"].as_str() {
-                Some(path) => eprintln!("  [OK] {bin}: {path}"),
+                // JSON（`--json`）の found は絶対パスのまま。人向けの行だけ縮める（#2892）
+                Some(path) => {
+                    let path = display_home_relative(Path::new(path));
+                    eprintln!("  [OK] {bin}: {path}");
+                }
                 None => {
                     eprintln!("  [任意] {bin}: 見つかりません");
                     if let Some(purpose) = dep["purpose"].as_str() {
@@ -1933,26 +1942,50 @@ fn run_setup_mcp() -> Result<(), String> {
     let scope = tako_control::dispatch::McpScope::User;
     match tako_control::dispatch::setup_mcp(&tako_bin, &scope) {
         Ok(result) => {
-            if result.repaired {
-                let old = result.old_command.as_deref().unwrap_or("(不明)");
-                eprintln!("  [修復] MCP: 登録パスが消失していたため付け替えました");
-                eprintln!("         旧: {old}");
-                eprintln!("         新: {tako_bin}");
-            } else if result.already_existed {
-                eprintln!("  MCP: 既に設定されています");
-            } else {
-                eprintln!(
-                    "  MCP: 設定を追加しました（{}）",
-                    result.target_path.display()
-                );
-            }
-            if result.legacy_cleaned {
-                eprintln!("  [掃除] 旧 settings.json の無効な MCP 設定を除去しました");
+            let home = tako_core::paths::home_dir();
+            for line in claude_mcp_lines(&result, &tako_bin, home.as_deref()) {
+                eprintln!("{line}");
             }
             Ok(())
         }
         Err(e) => Err(format!("MCP 設定の追加に失敗: {e}")),
     }
+}
+
+/// Claude の MCP 登録の結果の行（`tako setup` の端末の出力）。
+///
+/// パスは**ほかの行と同じくホームを `~` に縮める**（#2892）。この行だけ
+/// `target_path.display()` のままで、初回起動の「セットアップを実行」の画面・録画に
+/// 実ユーザー名入りの `/Users/<名前>/.claude.json` が出ていた。縮めるのは表示だけで、
+/// 書き先（`dispatch::mcp_target_path`）と MCP / `--json` の応答の値は絶対パスのまま。
+/// ホームを引数で受けるのは、env を書き換えずにテストで行の字面を確かめるため
+fn claude_mcp_lines(
+    result: &tako_control::dispatch::SetupMcpResult,
+    tako_bin: &str,
+    home: Option<&Path>,
+) -> Vec<String> {
+    let short = |path: &str| tako_core::paths::shorten_home_with(path, home);
+    let mut lines = Vec::new();
+    if result.repaired {
+        let old = result
+            .old_command
+            .as_deref()
+            .map_or("(不明)".to_string(), short);
+        lines.push("  [修復] MCP: 登録パスが消失していたため付け替えました".to_string());
+        lines.push(format!("         旧: {old}"));
+        lines.push(format!("         新: {}", short(tako_bin)));
+    } else if result.already_existed {
+        lines.push("  MCP: 既に設定されています".to_string());
+    } else {
+        lines.push(format!(
+            "  MCP: 設定を追加しました（{}）",
+            short(&result.target_path.to_string_lossy())
+        ));
+    }
+    if result.legacy_cleaned {
+        lines.push("  [掃除] 旧 settings.json の無効な MCP 設定を除去しました".to_string());
+    }
+    lines
 }
 
 /// 検出済みの全エージェントへ tako MCP を登録する（#979）。
@@ -3169,6 +3202,8 @@ fn run_config_share_link(
                 .as_str()
                 .or_else(|| result["push"]["repo"].as_str())
                 .unwrap_or("?");
+            // 応答の repo は絶対パス。表示はほかの行と同じく `~` に縮める（#2892）
+            let repo_path = display_home_relative(Path::new(repo_path));
             eprintln!("  [OK] 設定共有を配線しました: {repo_path}");
             if action == "link" {
                 eprintln!("       `tako config pull` でこのデバイスへ取り込めます");
@@ -4080,6 +4115,120 @@ fn print_context_budget_status() {
 mod tests {
     use super::*;
     use tako_control::setup::SetupConfig;
+
+    /// #2892: `tako setup` の Claude の MCP の行と `tako setup-mcp` の要約は、ほかの行と同じく
+    /// ホームを `~` に縮めて出す（前はこの 2 つだけ `/Users/<名前>/.claude.json` の絶対パスで、
+    /// 初回起動の画面・録画に実ユーザー名が出ていた）。ホームの外・ホームが引けないときは縮めない
+    #[test]
+    fn issue2892_setupのmcpの行はホームをチルダに縮める() {
+        use tako_control::dispatch::SetupMcpResult;
+        let home = Path::new("/Users/testuser");
+        let result = |target: &str, old: Option<&str>| SetupMcpResult {
+            configured: true,
+            already_existed: old.is_some(),
+            repaired: old.is_some(),
+            old_command: old.map(str::to_string),
+            target_path: PathBuf::from(target),
+            legacy_cleaned: false,
+        };
+        let added = |target: &str| format!("  MCP: 設定を追加しました（{target}）");
+        let bin = "/Users/testuser/Applications/tako.app/Contents/MacOS/tako";
+
+        // 1) 新規に足した行（Issue の行そのもの）
+        assert_eq!(
+            claude_mcp_lines(
+                &result("/Users/testuser/.claude.json", None),
+                bin,
+                Some(home)
+            ),
+            vec![added("~/.claude.json")],
+            "#2892: tako setup の「MCP: 設定を追加しました」の行がホームを ~ に縮めていない"
+        );
+        // 2) ホームの下の別の置き場（CLAUDE_CONFIG_DIR を向けた先など）も同じ口で縮む
+        assert_eq!(
+            claude_mcp_lines(
+                &result("/Users/testuser/.claude-alt/.claude.json", None),
+                bin,
+                Some(home)
+            ),
+            vec![added("~/.claude-alt/.claude.json")]
+        );
+        // 3) 修復の旧 / 新のコマンドも縮める
+        assert_eq!(
+            claude_mcp_lines(
+                &result(
+                    "/Users/testuser/.claude.json",
+                    Some("/Users/testuser/dev/tako/target/debug/tako")
+                ),
+                bin,
+                Some(home)
+            ),
+            vec![
+                "  [修復] MCP: 登録パスが消失していたため付け替えました".to_string(),
+                "         旧: ~/dev/tako/target/debug/tako".to_string(),
+                "         新: ~/Applications/tako.app/Contents/MacOS/tako".to_string(),
+            ],
+            "#2892: MCP の修復の行の旧 / 新がホームの絶対パスのまま"
+        );
+        // 4) 境界: ホームの外・ホームと途中だけ一致するパス・ホームが引けないときは縮めない
+        for (target, home, want) in [
+            (
+                "/opt/claude/.claude.json",
+                Some(home),
+                "/opt/claude/.claude.json",
+            ),
+            (
+                "/Users/testuser2/.claude.json",
+                Some(home),
+                "/Users/testuser2/.claude.json",
+            ),
+            (
+                "/Users/testuser/.claude.json",
+                None,
+                "/Users/testuser/.claude.json",
+            ),
+        ] {
+            assert_eq!(
+                claude_mcp_lines(&result(target, None), bin, home),
+                vec![added(want)],
+                "{target} / ホーム {home:?}"
+            );
+        }
+        // 5) Windows のホーム（区切りは元の文字のまま）
+        assert_eq!(
+            claude_mcp_lines(
+                &result(r"C:\Users\winuser\.claude.json", None),
+                r"C:\Program Files\tako\tako.exe",
+                Some(Path::new(r"C:\Users\winuser"))
+            ),
+            vec![added(r"~\.claude.json")]
+        );
+
+        // 6) `tako setup-mcp` の要約（claude / codex / agy の書き先と、修復の旧 / 新）
+        let resp = serde_json::json!({
+            "agents": [
+                { "agent": "claude", "configured": true, "already_existed": false,
+                  "target_path": "/Users/testuser/.claude.json", "command": bin },
+                { "agent": "codex", "configured": false, "already_existed": true,
+                  "target_path": "/Users/testuser/.codex/config.toml", "command": bin },
+                { "agent": "agy", "configured": true, "already_existed": true, "repaired": true,
+                  "old_command": "/Users/testuser/old/tako",
+                  "target_path": "/Users/testuser/.gemini/config/mcp_config.json", "command": bin },
+            ]
+        });
+        assert_eq!(
+            crate::setup_mcp_report_lines(&resp, Some(home)),
+            vec![
+                "  [設定] claude: 追加しました（~/.claude.json）".to_string(),
+                "  [OK] codex: 既に設定されています（~/.codex/config.toml）".to_string(),
+                "  [修復] agy: 登録パスが消失していたため付け替えました（~/.gemini/config/mcp_config.json）"
+                    .to_string(),
+                "         旧: ~/old/tako".to_string(),
+                "         新: ~/Applications/tako.app/Contents/MacOS/tako".to_string(),
+            ],
+            "#2892: tako setup-mcp の要約の行がホームを ~ に縮めていない"
+        );
+    }
 
     /// #2798: codex の指示ファイルの書き先は、空・空白だけの `CODEX_HOME` でも `~/.codex/AGENTS.md`
     /// （前は空のパスへ join して**作業 dir の `AGENTS.md`** を指し、setup がそこへ書いていた）。
