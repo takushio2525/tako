@@ -19,7 +19,7 @@
 //! [`seal_inherited_fds`] は、自分の fd 3 以上のうち CLOEXEC が無いものへ
 //! `FD_CLOEXEC` を立てる。**子の中で**呼べば、exec を越えて残るのは 0 / 1 / 2 だけになる。
 //!
-//! - **daemon**: 既存の `pre_exec` の中から呼ぶ（`remote.rs` の `configure_daemon_child`）
+//! - **daemon**: 既存の `pre_exec` の中から呼ぶ（`tako_control::platform::process::configure_daemon_child`。#2860 で `remote.rs` から移した）
 //! - **PTY**: alacritty の `Command` には `pre_exec` を足す口が無いので、
 //!   [`spawn_sealed`] で `tty::new` を包む。包んでいるあいだだけ `pthread_atfork` の
 //!   子ハンドラが構え、**そのスレッドが起こした fork の子**で掃除を走らせる

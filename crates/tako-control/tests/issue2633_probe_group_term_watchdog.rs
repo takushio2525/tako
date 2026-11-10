@@ -12,15 +12,20 @@
 //! いまはグループへ **SIGTERM を 1 回だけ**送って呼び手へはその場で返し、刈り取り係
 //! （`probe::reap_group_in_background`）が猶予（`probe::GROUP_TERM_GRACE`）の間グループを見張って、
 //! 残っていれば SIGKILL で畳む。頭（直接の子）は判定が済むまで刈り取らない（グループの番号を使い回させない）。
+//! グループの判定・送り方・見張りの OS 差は境界 `tako_core::platform::process`（`signal_own_group` /
+//! `await_group_or_kill`。#2860）が持ち、probe はその口を呼ぶ（A/B のゲートと猶予の値は probe が渡す）。
 //!
 //! ## ここで止めるもの
 //!
-//! 1. [`打ち切りの畳み方はterm_猶予_killの形`] — `crates/tako-core/src/probe.rs` の形を file:line で拘束する:
-//!    `kill_on_timeout` は A/B の腕（`if issue2633_legacy() {`）の外でグループへ SIGTERM を送り SIGKILL を
-//!    送らない・刈り取り係は猶予の後にだけ SIGKILL を送り、それより前に頭を刈り取らない・待ちの 1 実装が
-//!    TERM を送ったグループを刈り取り係へ渡す・A/B のゲートは製品コードに 1 か所
+//! 1. [`打ち切りの畳み方はterm_猶予_killの形`] — `crates/tako-core/src/probe.rs` と境界
+//!    `crates/tako-core/src/platform/process.rs` の形を file:line で拘束する:
+//!    `kill_on_timeout` は A/B のゲートを境界の `signal_own_group` へ渡し、`signal_own_group` は A/B の腕
+//!    （`if issue2633_legacy() {`）の外でグループへ SIGTERM を送り SIGKILL を送らない・刈り取り係は境界の
+//!    `await_group_or_kill` へ猶予（`GROUP_TERM_GRACE`）を渡してから頭を刈り取り、`await_group_or_kill` は
+//!    猶予の後にだけ SIGKILL を送る・待ちの 1 実装が TERM を送ったグループを刈り取り係へ渡す・
+//!    A/B のゲートは製品コードに 1 か所
 //! 2. [`修正前の形の注入を名指す`] — 1 の検査が修正前の形（グループへの即 SIGKILL・猶予の前の刈り取り・
-//!    刈り取り係を通さない）の注入を file:line で名指すこと
+//!    刈り取り係を通さない・猶予を待たない SIGKILL・A/B のゲートを渡さない）の注入を file:line で名指すこと
 //! 3. 実プロセス（unix）: [`termで後片付けが走りロックが消える`] / [`termを無視する子は猶予の後に消える`] /
 //!    [`止まった子も猶予の後に消える`] / [`legacyではロックが残る`]（A/B の旧経路 = 修正前の再現）
 //!
@@ -42,6 +47,8 @@ mod production_range;
 mod call_graph;
 
 const PROBE: &str = "crates/tako-core/src/probe.rs";
+/// グループの判定・送り方・見張りの境界（B5。#2860）
+const PROCESS: &str = "crates/tako-core/src/platform/process.rs";
 
 /// 製品コードを持つ 4 クレート（A/B のゲートの数を数える範囲）
 const ROOTS: &[&str] = &[
@@ -64,14 +71,25 @@ fn product_text(raw: &str) -> String {
     production_range::scan(raw).text
 }
 
-fn probe_raw() -> String {
-    std::fs::read_to_string(workspace_root().join(PROBE)).expect("probe.rs が読める")
+fn read_rel(rel: &str) -> String {
+    std::fs::read_to_string(workspace_root().join(rel))
+        .unwrap_or_else(|e| panic!("{rel} が読める（消した / 改名したなら番犬も追うこと）: {e}"))
 }
 
-/// `fn <name>` の最初の定義（cfg で 2 つあるときは unix 版が先に並ぶ）の製品の経路の眺め
+fn probe_raw() -> String {
+    read_rel(PROBE)
+}
+
+fn process_raw() -> String {
+    read_rel(PROCESS)
+}
+
+/// `fn <name>` の最初の定義の製品の経路の眺め
 /// （A/B の旧経路の腕 `if …legacy() {` と入れ子の関数を除いた範囲）
 struct View<'g> {
     source: &'g call_graph::Source,
+    /// どのファイルの関数か（名指しの頭）
+    rel: &'static str,
     /// 製品の経路の範囲（原文のバイト位置・昇順）
     ranges: Vec<(usize, usize)>,
     /// 本文の全体（A/B の腕も含む）
@@ -81,17 +99,20 @@ struct View<'g> {
 }
 
 impl View<'_> {
-    fn new<'g>(graph: &'g call_graph::Graph, name: &str) -> Result<View<'g>, String> {
+    fn new<'g>(
+        graph: &'g call_graph::Graph,
+        rel: &'static str,
+        name: &str,
+    ) -> Result<View<'g>, String> {
         let f = graph
-            .find(PROBE, name)
+            .find(rel, name)
             .into_iter()
             .min_by_key(|&f| graph.fns[f].line)
-            .ok_or_else(|| {
-                format!("{PROBE} に `fn {name}` が無い（改名したなら番犬も追うこと）")
-            })?;
+            .ok_or_else(|| format!("{rel} に `fn {name}` が無い（改名したなら番犬も追うこと）"))?;
         let def = &graph.fns[f];
         Ok(View {
             source: &graph.sources[def.file],
+            rel,
             ranges: graph.product_ranges(f),
             body: (def.body.0, def.body.1 + 1),
             line: def.line,
@@ -113,60 +134,93 @@ impl View<'_> {
     fn line_of(&self, pos: usize) -> usize {
         self.source.line_of(pos)
     }
+
+    /// 製品の経路で最初に頭を刈り取る位置と字面（`try_wait` / `.wait()` / `waitpid`）
+    fn first_reap(&self) -> Option<(usize, &'static str)> {
+        ["try_wait", ".wait()", "waitpid"]
+            .iter()
+            .filter_map(|w| self.find(w).map(|i| (i, *w)))
+            .min()
+    }
 }
 
-/// 1 の本体: probe.rs の本文（注入で差し替えられる）から、修正前の形へ戻った箇所を file:line で並べる
-fn offenders(probe: &str) -> Vec<String> {
-    let text = product_text(probe);
-    let graph = call_graph::Graph::build(vec![call_graph::Source::new(PROBE, &text)]);
+/// 1 の本体: probe.rs と境界の本文（注入で差し替えられる）から、修正前の形へ戻った箇所を file:line で並べる
+fn offenders(probe: &str, process: &str) -> Vec<String> {
+    let probe_text = product_text(probe);
+    let process_text = product_text(process);
+    let graph = call_graph::Graph::build(vec![
+        call_graph::Source::new(PROBE, &probe_text),
+        call_graph::Source::new(PROCESS, &process_text),
+    ]);
     let mut out = Vec::new();
 
-    // kill_on_timeout: 腕の外はグループへ TERM だけ・腕はゲートの中
-    match View::new(&graph, "kill_on_timeout") {
+    // kill_on_timeout（probe）: A/B のゲートを境界へ渡す・自分では SIGKILL を送らない
+    match View::new(&graph, PROBE, "kill_on_timeout") {
         Err(e) => out.push(e),
         Ok(view) => {
-            if view.find("libc::kill(-pid, libc::SIGTERM)").is_none() {
+            if view
+                .find("crate::platform::process::signal_own_group(child, issue2633_legacy)")
+                .is_none()
+            {
                 out.push(format!(
-                    "{PROBE}:{}（fn kill_on_timeout）がグループへ SIGTERM を送っていない（#2633: 畳むときは TERM を 1 回 → 猶予の後に刈り取り係が SIGKILL）",
-                    view.line
+                    "{}:{}（fn kill_on_timeout）が境界の `signal_own_group` へ A/B のゲート `issue2633_legacy` を渡していない（#2633 / #2860: グループへの送り方は境界が持つ）",
+                    view.rel, view.line
                 ));
             }
             if let Some(at) = view.find("SIGKILL") {
                 out.push(format!(
-                    "{PROBE}:{}（fn kill_on_timeout）が A/B の腕（`if issue2633_legacy() {{`）の外で SIGKILL を送る = rc の EXIT の trap が走れない（#2633）",
+                    "{}:{}（fn kill_on_timeout）が SIGKILL を送る = rc の EXIT の trap が走れない（#2633）",
+                    view.rel,
                     view.line_of(at)
-                ));
-            }
-            if !view.body_has("issue2633_legacy()") {
-                out.push(format!(
-                    "{PROBE}:{}（fn kill_on_timeout）に A/B のゲート `issue2633_legacy()` が無い（修正前の形を同じバイナリで再現できない）",
-                    view.line
                 ));
             }
         }
     }
 
-    // reap_group_in_background: 猶予の後にだけ SIGKILL・それより前に頭を刈り取らない
-    match View::new(&graph, "reap_group_in_background") {
+    // signal_own_group（境界）: 腕の外はグループへ TERM だけ・腕はゲートの中
+    match View::new(&graph, PROCESS, "signal_own_group") {
         Err(e) => out.push(e),
         Ok(view) => {
-            let kill = view.find("libc::kill(-pgid, libc::SIGKILL)");
-            let grace = view.find("GROUP_TERM_GRACE");
-            match (kill, grace) {
-                (Some(k), Some(g)) if g < k => {}
-                _ => out.push(format!(
-                    "{PROBE}:{}（fn reap_group_in_background）に「猶予（GROUP_TERM_GRACE）を過ぎたら SIGKILL」の形が無い（#2633）",
-                    view.line
-                )),
+            if view.find("libc::kill(-pid, libc::SIGTERM)").is_none() {
+                out.push(format!(
+                    "{}:{}（fn signal_own_group）がグループへ SIGTERM を送っていない（#2633: 畳むときは TERM を 1 回 → 猶予の後に刈り取り係が SIGKILL）",
+                    view.rel, view.line
+                ));
             }
-            let reap = ["try_wait", ".wait()", "waitpid"]
-                .iter()
-                .filter_map(|w| view.find(w).map(|i| (i, *w)))
-                .min();
-            if let (Some((r, what)), Some(k)) = (reap, kill) {
-                if r < k {
+            if let Some(at) = view.find("SIGKILL") {
+                out.push(format!(
+                    "{}:{}（fn signal_own_group）が A/B の腕（`if issue2633_legacy() {{`）の外で SIGKILL を送る = rc の EXIT の trap が走れない（#2633）",
+                    view.rel,
+                    view.line_of(at)
+                ));
+            }
+            if !view.body_has("issue2633_legacy()") {
+                out.push(format!(
+                    "{}:{}（fn signal_own_group）に A/B のゲート `issue2633_legacy()` が無い（修正前の形を同じバイナリで再現できない）",
+                    view.rel, view.line
+                ));
+            }
+        }
+    }
+
+    // reap_group_in_background（probe）: 猶予を境界の見張りへ渡し、見張りが済んでから頭を刈り取る
+    match View::new(&graph, PROBE, "reap_group_in_background") {
+        Err(e) => out.push(e),
+        Ok(view) => {
+            let watch = view.find(
+                "crate::platform::process::await_group_or_kill(pgid, GROUP_TERM_GRACE, POLL)",
+            );
+            if watch.is_none() {
+                out.push(format!(
+                    "{}:{}（fn reap_group_in_background）が猶予（GROUP_TERM_GRACE）を境界の見張り `await_group_or_kill` へ渡していない（#2633）",
+                    view.rel, view.line
+                ));
+            }
+            if let (Some((r, what)), Some(w)) = (view.first_reap(), watch) {
+                if r < w {
                     out.push(format!(
-                        "{PROBE}:{}（fn reap_group_in_background）が SIGKILL の判定より前に頭を刈り取る（`{what}`）= グループの番号が空き、別のグループへ SIGKILL を送りうる（#2633）",
+                        "{}:{}（fn reap_group_in_background）が猶予の見張り（SIGKILL の判定）より前に頭を刈り取る（`{what}`）= グループの番号が空き、別のグループへ SIGKILL を送りうる（#2633）",
+                        view.rel,
                         view.line_of(r)
                     ));
                 }
@@ -174,8 +228,31 @@ fn offenders(probe: &str) -> Vec<String> {
         }
     }
 
+    // await_group_or_kill（境界）: 猶予の後にだけ SIGKILL・頭は刈り取らない（呼び手が後で刈り取る）
+    match View::new(&graph, PROCESS, "await_group_or_kill") {
+        Err(e) => out.push(e),
+        Ok(view) => {
+            let kill = view.find("libc::kill(-pgid, libc::SIGKILL)");
+            let grace = view.find("start.elapsed() >= grace");
+            match (kill, grace) {
+                (Some(k), Some(g)) if g < k => {}
+                _ => out.push(format!(
+                    "{}:{}（fn await_group_or_kill）に「猶予（grace）を過ぎたら SIGKILL」の形が無い（#2633）",
+                    view.rel, view.line
+                )),
+            }
+            if let Some((r, what)) = view.first_reap() {
+                out.push(format!(
+                    "{}:{}（fn await_group_or_kill）が頭を刈り取る（`{what}`）= 刈り取りは見張りが済んだ後の呼び手の仕事（#2633）",
+                    view.rel,
+                    view.line_of(r)
+                ));
+            }
+        }
+    }
+
     // 待ちの 1 実装: TERM を送ったグループは刈り取り係へ
-    match View::new(&graph, "wait_with_timeout") {
+    match View::new(&graph, PROBE, "wait_with_timeout") {
         Err(e) => out.push(e),
         Ok(view) => {
             for needle in [
@@ -184,8 +261,8 @@ fn offenders(probe: &str) -> Vec<String> {
             ] {
                 if view.find(needle).is_none() {
                     out.push(format!(
-                        "{PROBE}:{}（fn wait_with_timeout）に `{needle}` が無い（打ち切ったグループの猶予と SIGKILL を刈り取り係へ渡していない。#2633）",
-                        view.line
+                        "{}:{}（fn wait_with_timeout）に `{needle}` が無い（打ち切ったグループの猶予と SIGKILL を刈り取り係へ渡していない。#2633）",
+                        view.rel, view.line
                     ));
                 }
             }
@@ -194,10 +271,10 @@ fn offenders(probe: &str) -> Vec<String> {
     out
 }
 
-/// 1: 今の probe.rs は TERM → 猶予 → KILL の形
+/// 1: 今の probe.rs と境界は TERM → 猶予 → KILL の形
 #[test]
 fn 打ち切りの畳み方はterm_猶予_killの形() {
-    let hits = offenders(&probe_raw());
+    let hits = offenders(&probe_raw(), &process_raw());
     assert!(
         hits.is_empty(),
         "打ち切ったログインシェルのグループの畳み方が修正前の形へ戻っている（#2633）:\n  {}\n\n\
@@ -249,34 +326,56 @@ fn ab_のゲートは1か所() {
 /// 2: 修正前の形の注入を 1 の検査が file:line で名指す（同じテストの中の A/B）
 #[test]
 fn 修正前の形の注入を名指す() {
-    let raw = probe_raw();
-    let cases: [(&str, &str, &str); 3] = [
+    let probe = probe_raw();
+    let process = process_raw();
+    // (注入するファイル, 何を戻すか, 起点, 差し替え)
+    let cases: [(&str, &str, &str, &str); 5] = [
         (
-            "グループへの即 SIGKILL（修正前の kill_on_timeout）",
+            PROCESS,
+            "グループへの即 SIGKILL（修正前の kill_on_timeout の形）",
             "libc::kill(-pid, libc::SIGTERM);",
             "libc::kill(-pid, libc::SIGKILL);",
         ),
         (
+            PROBE,
             "猶予の判定より前の刈り取り",
-            "            if let Some(pgid) = pgid {\n                let start = Instant::now();",
-            "            let _ = child.wait();\n            if let Some(pgid) = pgid {\n                let start = Instant::now();",
+            "            crate::platform::process::await_group_or_kill(pgid, GROUP_TERM_GRACE, POLL);\n            let _ = child.wait();",
+            "            let _ = child.wait();\n            crate::platform::process::await_group_or_kill(pgid, GROUP_TERM_GRACE, POLL);",
         ),
         (
+            PROBE,
             "刈り取り係を通さない（修正前の待ちの 1 実装）",
             "                        reap_group_in_background(child);",
             "                        reap_in_background(child);",
         ),
+        (
+            PROCESS,
+            "猶予を待たずに SIGKILL（境界の見張りが猶予を見ない）",
+            "if start.elapsed() >= grace {",
+            "if start.elapsed() >= Duration::ZERO {",
+        ),
+        (
+            PROBE,
+            "A/B のゲートを境界へ渡さない（旧経路を同じバイナリで再現できない）",
+            "signal_own_group(child, issue2633_legacy)",
+            "signal_own_group(child, || false)",
+        ),
     ];
-    for (what, from, to) in cases {
+    for (target, what, from, to) in cases {
+        let (probe_in, process_in) = if target == PROBE {
+            (probe.replacen(from, to, 1), process.clone())
+        } else {
+            (probe.clone(), process.replacen(from, to, 1))
+        };
+        let raw = if target == PROBE { &probe } else { &process };
         assert!(
             raw.contains(from),
-            "注入の起点が probe.rs に無い（{what}。番犬も追うこと）: {from}"
+            "注入の起点が {target} に無い（{what}。番犬も追うこと）: {from}"
         );
-        let injected = raw.replacen(from, to, 1);
-        let hits = offenders(&injected);
+        let hits = offenders(&probe_in, &process_in);
         assert!(
-            hits.iter().any(|h| h.starts_with(&format!("{PROBE}:"))),
-            "注入（{what}）を file:line で名指せない: {hits:?}"
+            hits.iter().any(|h| h.starts_with(&format!("{target}:"))),
+            "注入（{what}）を {target} の file:line で名指せない: {hits:?}"
         );
     }
 }

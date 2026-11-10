@@ -153,12 +153,9 @@ impl ClientExit {
         if let Some(code) = status.code() {
             return ClientExit::Code(code);
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            if let Some(signal) = status.signal() {
-                return ClientExit::Signal(signal);
-            }
+        // シグナルの番号は unix でしか読めない（境界が unix 以外で `None` を返す。#2860）
+        if let Some(signal) = crate::platform::process::exit_signal(status) {
+            return ClientExit::Signal(signal);
         }
         ClientExit::Unknown
     }

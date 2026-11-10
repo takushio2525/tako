@@ -65,6 +65,8 @@ mod byte_window;
 
 const EXE: &str = "crates/tako-core/src/platform/exe.rs";
 const PROBE: &str = "crates/tako-core/src/probe.rs";
+/// プロセスグループの扱いの境界（B5。#2860）
+const PROCESS: &str = "crates/tako-core/src/platform/process.rs";
 const SETUP_BOOTSTRAP: &str = "crates/tako-control/src/setup_bootstrap.rs";
 const DISPATCH: &str = "crates/tako-control/src/dispatch.rs";
 const CONFIG_SHARE_ENV: &str = "crates/tako-control/src/config_share/env.rs";
@@ -363,19 +365,27 @@ fn 寄せ先の1実装を通る() {
         "ask_login_shell",
         &["crate::probe::group_output_with_timeout("],
     );
+    // グループの頭として起こす・グループへ送る・猶予の後に畳むの OS 差は境界
+    // `tako_core::platform::process` が持つ（#2860）。probe はその口を 1 本ずつ呼ぶ
     expect(
         PROBE,
         "group_output_with_timeout",
         &[
-            "process_group(0)",
+            "crate::platform::process::lead_own_group(command)",
             "wait_with_timeout(child, label, budget)",
         ],
     );
+    expect(PROCESS, "lead_own_group", &["process_group(0)"]);
     // 畳み方は #2633 で TERM → 猶予 → KILL（グループへ TERM を 1 回・残りは刈り取り係が猶予の後に
     // SIGKILL = rc の孫も残さない。形の拘束の本体は issue2633_probe_group_term_watchdog）
     expect(
         PROBE,
         "kill_on_timeout",
+        &["crate::platform::process::signal_own_group(child, issue2633_legacy)"],
+    );
+    expect(
+        PROCESS,
+        "signal_own_group",
         &[
             "libc::getpgid(pid) == pid",
             "libc::kill(-pid, libc::SIGTERM)",
@@ -384,6 +394,11 @@ fn 寄せ先の1実装を通る() {
     expect(
         PROBE,
         "reap_group_in_background",
+        &["crate::platform::process::await_group_or_kill(pgid, GROUP_TERM_GRACE, POLL)"],
+    );
+    expect(
+        PROCESS,
+        "await_group_or_kill",
         &["libc::kill(-pgid, libc::SIGKILL)"],
     );
     expect(

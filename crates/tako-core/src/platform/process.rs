@@ -21,8 +21,20 @@
 //! **出力をパイプ / 破棄して受け取るだけの子**に付ける。
 //! ペインの PTY 起動（ConPTY）は疑似コンソールへ接続するため対象外
 //! （そちらは alacritty_terminal 側が面倒を見る）。
+//!
+//! ## プロセスグループ・打ち切り・終了シグナル（#2860。#1538 の表の S5）
+//!
+//! tako-core の呼び手（`probe` / `backend_reattach` / `tmux_cleanup`）が使う OS 差もここに置く:
+//! 子を**自分のプロセスグループの頭として起こす**（[`lead_own_group`]）・**グループへ終了要求を送る**
+//! （[`signal_own_group`]）・**猶予の後に畳む**（[`await_group_or_kill`] / [`kill_group`]）・
+//! **終了シグナルを読む**（[`exit_signal`]）・**pid を名指しして強制終了する**（[`force_kill_pid`]）。
+//! 呼び手は OS を見ずに 1 本の経路で呼び、`cfg` はこの境界の中の実装の選択だけに置く。
+//! 中身は移す前の呼び手の `cfg` の塊をそのまま写したもので、unix 以外の腕（グループを分けない・
+//! `None`・`taskkill /T /F`）も移す前の挙動のまま（Job Object = B30 `platform::job` へ寄せるかは別 Issue）。
+//! pid を指定した終了要求（`terminate`）と制御側の停止は `tako-control::platform::process` が扱う。
 
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus};
+use std::time::Duration;
 
 /// 子プロセスにコンソールウィンドウを作らせない。
 ///
@@ -242,6 +254,160 @@ pub fn started_unless_exited(
 ) -> Option<u64> {
     let started = started?;
     (!exited(exit_code())).then_some(started)
+}
+
+/// 子を**自分のプロセスグループの頭として**起こすよう `command` を整える（#1532 / #1533）。
+///
+/// unix は `process_group(0)`（子の pid がそのままグループの番号になる）。上限で打ち切ったら
+/// [`signal_own_group`] → [`await_group_or_kill`] でグループごと畳めるので、rc が起こした孫
+/// （`sleep` / 入力を待つ `read` / パスフレーズを聞く `ssh-add`）もパイプの書き手として残らない。
+/// グループを分けた子が端末（`/dev/tty`）を読もうとすると、バックグラウンドの読み取りとして止められる（SIGTTIN）。
+///
+/// unix 以外はグループを分けない（何もしない = [`signal_own_group`] は常に `false`）
+pub fn lead_own_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = command;
+    }
+}
+
+/// 子が**自分のプロセスグループを率いている**（[`lead_own_group`] で起こした）なら、
+/// グループへ終了要求を送る（#2633）。
+///
+/// 既定はグループへ **SIGTERM を 1 回だけ**送って `true` を返す。直接の子にも SIGKILL は送らない =
+/// rc の途中の処理（`pyenv rehash` のロック）が EXIT の trap で後片付けを終えられる。残ったもの
+/// （TERM を無視する・止まっている）は呼び手が [`await_group_or_kill`] で猶予の後に畳む。
+/// `issue2633_legacy()` が真（A/B の旧経路。呼び手の `probe::issue2633_legacy` を渡す）なら、猶予を置かずに
+/// グループごと SIGKILL を送って `false`（呼び手は直接の子も kill する = 修正前の形）。
+/// `issue2633_legacy` を問うのは、子がグループを率いていると分かったときだけ。
+/// 率いていない子（親のグループに居る）には何も送らずに `false`（呼び手が直接の子だけを kill する）。
+///
+/// 子は `&Child` で受ける = 呼び手がまだ刈り取っていない（`try_wait` が `None` を返した直後）ので、
+/// 番号が別のグループへ使い回されていることは無い。unix 以外はグループを分けないので常に `false`
+pub fn signal_own_group(child: &Child, issue2633_legacy: impl FnOnce() -> bool) -> bool {
+    #[cfg(unix)]
+    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: プロセスの属性を読むだけでメモリには触れない
+        let leads_group = unsafe { libc::getpgid(pid) == pid };
+        if leads_group {
+            if issue2633_legacy() {
+                // SAFETY: 負の pid（= グループ宛て）へシグナルを送るだけでメモリには触れない
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            } else {
+                // SAFETY: 同上
+                unsafe {
+                    libc::kill(-pid, libc::SIGTERM);
+                }
+                return true;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (child, issue2633_legacy);
+    false
+}
+
+/// [`signal_own_group`] で SIGTERM を送ったグループ `pgid` を見張り、生きたメンバーが居なくなるか
+/// `grace` を過ぎるまで `poll` おきに待つ。過ぎてもまだ居れば SIGKILL で畳む（#2633）。
+///
+/// TERM を無視する・止まった（SIGTTIN）メンバーもここで消える。待つので、呼び手は別スレッド
+/// （`probe` の刈り取り係）から呼ぶ。**頭（直接の子）は呼び手がこの後で刈り取る**: 先に刈り取ると
+/// 頭の番号（= グループの番号）が空き、後から生まれた別のグループへ SIGKILL を送りうる。
+/// 生き死には `kill(-pgid, 0)` で見る（生きたメンバーが居る間だけ 0。macOS は刈り取り前の頭だけが
+/// 残ると EPERM、刈り取った後は ESRCH を返す = どちらも「居ない」）。
+/// unix 以外はグループを分けないので待たずに返る
+pub fn await_group_or_kill(pgid: u32, grace: Duration, poll: Duration) {
+    #[cfg(unix)]
+    if let Ok(pgid) = libc::pid_t::try_from(pgid) {
+        use std::time::Instant;
+        let start = Instant::now();
+        // SAFETY: グループ宛てに 0 番（居るかどうかの確かめ）を送るだけでメモリには触れない
+        while unsafe { libc::kill(-pgid, 0) } == 0 {
+            if start.elapsed() >= grace {
+                // SAFETY: 頭はまだ刈り取っていない = グループの番号は使い回されていない
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
+                break;
+            }
+            std::thread::sleep(poll);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (pgid, grace, poll);
+}
+
+/// グループ `pgid` へ SIGKILL を送る（#2633。刈り取り係のスレッドを作れなかった回に、猶予を諦めて
+/// その場で畳む）。頭をまだ刈り取っていない（= 番号が使い回されていない）間だけ呼ぶ。
+/// unix 以外はグループを分けないので何もしない
+pub fn kill_group(pgid: u32) {
+    #[cfg(unix)]
+    if let Ok(pgid) = libc::pid_t::try_from(pgid) {
+        // SAFETY: 負の pid（= グループ宛て）へシグナルを送るだけでメモリには触れない
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pgid;
+}
+
+/// 子を終わらせたシグナルの番号（「終了シグナルを読む」口。#2860）。
+///
+/// シグナルで終わった子は `ExitStatus::code()` が `None` になり、番号は unix の
+/// `ExitStatusExt::signal` でしか読めない。unix 以外はシグナルで終わることが無いので常に `None`
+/// （呼び手は `code()` も `None` のときの既定へ倒す = 移す前と同じ）
+pub fn exit_signal(status: ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
+}
+
+/// **pid を名指し**して強制終了する（`tmux_cleanup` の器の回収 = `tako tmux cleanup --servers`。#1282）。
+///
+/// 名前一致（`taskkill /IM` / `Stop-Process -Name`）は他インスタンスの器を巻き込むので絶対に使わない。
+/// Windows は `taskkill /PID <pid> /T /F`（`/T` で器の中の pwsh ごと落とす）、unix は直接の
+/// `kill(pid, SIGKILL)`（子孫は道連れにしない）。`0` と `pid_t` の範囲外は撃たない
+/// （`kill` は 0 を「自分のプロセスグループ」、負を「グループ / 全プロセス」と読む）
+pub fn force_kill_pid(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        let mut cmd = std::process::Command::new("taskkill");
+        crate::platform::process::no_console_window(&mut cmd);
+        let _ = cmd.args(["/PID", &pid.to_string(), "/T", "/F"]).output();
+    }
+    #[cfg(not(windows))]
+    {
+        // unix で tmux_cleanup がこの経路へ来るのは名前で列挙した器だけ（ソケットファイルがある
+        // 環境では生じない）。実装を空にすると「落としたつもり」になるので、
+        // 同じ意味の操作を置く。**子プロセスは起こさない**（`kill(1)` を spawn すると
+        // Windows のコンソール窓抑止の境界検査に引っかかるうえ、ここでは不要）
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return;
+        };
+        if pid > 0 {
+            // SAFETY: 正の pid（プロセスグループ / 全プロセスの特別値ではない）へ
+            // SIGKILL を送るだけ。引数は値渡しでポインタを触らない
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
 }
 
 #[cfg(not(windows))]

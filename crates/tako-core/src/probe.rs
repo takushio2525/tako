@@ -702,13 +702,10 @@ pub fn command_output_with_timeout(
 /// グループを分けるので、rc が端末（`/dev/tty`）を読もうとするとバックグラウンドの読み取りとして
 /// 止められる（SIGTTIN）。利用者の打鍵を横取りせず、止まったまま上限で打ち切られ、猶予の後に畳まれる。
 /// 普通に終わったときは何も畳まない（rc が意図して残す常駐 = `ssh-agent` 等は従来どおり残る）。
-/// Windows はグループを分けない（ログインシェルを起こさない）= [`command_output_with_timeout`] と同じ
+/// Windows はグループを分けない（ログインシェルを起こさない）= [`command_output_with_timeout`] と同じ。
+/// グループの扱いの OS 差は境界（[`crate::platform::process::lead_own_group`]。#2860）が持つ
 pub fn group_output_with_timeout(command: &mut Command, label: &str, budget: Duration) -> Outcome {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+    crate::platform::process::lead_own_group(command);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -735,26 +732,11 @@ pub fn group_output_with_timeout(command: &mut Command, label: &str, budget: Dur
 /// 止める（#2462）。
 ///
 /// グループへ送るのは子がまだ刈り取られていないとき（`try_wait` が `None` を返した直後）だけなので、
-/// 番号が別のグループへ使い回されていることは無い
+/// 番号が別のグループへ使い回されていることは無い。グループの判定と送り方（OS 差）は境界
+/// （[`crate::platform::process::signal_own_group`]。#2860）が持ち、A/B のゲートはここから渡す
 fn kill_on_timeout(child: &mut Child) -> bool {
-    #[cfg(unix)]
-    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
-        // SAFETY: プロセスの属性を読むだけでメモリには触れない
-        let leads_group = unsafe { libc::getpgid(pid) == pid };
-        if leads_group {
-            if issue2633_legacy() {
-                // SAFETY: 負の pid（= グループ宛て）へシグナルを送るだけでメモリには触れない
-                unsafe {
-                    libc::kill(-pid, libc::SIGKILL);
-                }
-            } else {
-                // SAFETY: 同上
-                unsafe {
-                    libc::kill(-pid, libc::SIGTERM);
-                }
-                return true;
-            }
-        }
+    if crate::platform::process::signal_own_group(child, issue2633_legacy) {
+        return true;
     }
     let _ = child.kill();
     false
@@ -930,44 +912,23 @@ fn reap_in_background(mut child: Child) {
 /// （SIGTTIN）メンバーもここで消える。
 ///
 /// **頭は判定が済むまで刈り取らない**: 刈り取ると頭の番号（= グループの番号）が空き、後から生まれた
-/// 別のグループへ SIGKILL を送りうる。生き死には `kill(-pgid, 0)` で見る（生きたメンバーが居る間だけ
-/// 0。macOS は刈り取り前の頭だけが残ると EPERM、刈り取った後は ESRCH を返す = どちらも「居ない」）
-#[cfg(unix)]
+/// 別のグループへ SIGKILL を送りうる。見張りと SIGKILL（OS 差）は境界
+/// （[`crate::platform::process::await_group_or_kill`] / [`crate::platform::process::kill_group`]。#2860）が持つ。
+/// unix 以外はグループを分けない（[`kill_on_timeout`] が `true` を返さない）ので、ここへは来ない
+/// （来ても境界は待たずに返る = [`reap_in_background`] と同じ刈り取りになる）
 fn reap_group_in_background(mut child: Child) {
-    let pgid = libc::pid_t::try_from(child.id()).ok();
+    let pgid = child.id();
     let spawned = std::thread::Builder::new()
         .name("tako-probe-reap".into())
         .spawn(move || {
-            if let Some(pgid) = pgid {
-                let start = Instant::now();
-                // SAFETY: グループ宛てに 0 番（居るかどうかの確かめ）を送るだけでメモリには触れない
-                while unsafe { libc::kill(-pgid, 0) } == 0 {
-                    if start.elapsed() >= GROUP_TERM_GRACE {
-                        // SAFETY: 頭はまだ刈り取っていない = グループの番号は使い回されていない
-                        unsafe {
-                            libc::kill(-pgid, libc::SIGKILL);
-                        }
-                        break;
-                    }
-                    std::thread::sleep(POLL);
-                }
-            }
+            crate::platform::process::await_group_or_kill(pgid, GROUP_TERM_GRACE, POLL);
             let _ = child.wait();
         });
     // スレッドを作れない（資源切れ）ときは猶予を諦めてその場で畳む。子は刈り取られずにゾンビとして
     // 残る（= 番号は使い回されない。[`reap_in_background`] と同じくゾンビ 1 つを残すほうを選ぶ）
-    if let (Err(_), Some(pgid)) = (spawned, pgid) {
-        // SAFETY: 負の pid（= グループ宛て）へシグナルを送るだけでメモリには触れない
-        unsafe {
-            libc::kill(-pgid, libc::SIGKILL);
-        }
+    if spawned.is_err() {
+        crate::platform::process::kill_group(pgid);
     }
-}
-
-/// unix 以外はグループを分けない（[`kill_on_timeout`] が `true` を返さない）ので、ここへは来ない
-#[cfg(not(unix))]
-fn reap_group_in_background(child: Child) {
-    reap_in_background(child);
 }
 
 /// パイプを吸い出す係。**join しない**のが要点（孫が書き手として残っていると
