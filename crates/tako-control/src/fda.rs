@@ -5,54 +5,9 @@
 //! 必要がある。このモジュールは FDA の付与状態をベストエフォートで検出し、
 //! 設定画面を開く機能を提供する。
 
-// FDA は macOS の TCC 固有の概念（抽象境界 B15）。プローブパス解決も macOS でのみ使う
-#[cfg(target_os = "macos")]
-use std::path::PathBuf;
-
-/// FDA が付与されているかをベストエフォートで検出する。
-/// macOS に直接の API は無いため、FDA 保護下のパスへの read_dir 試行で判定する。
-/// - true: FDA 付与済み（保護パスを読めた）
-/// - false: 未付与（Permission denied）
-/// - macOS 以外では常に true を返す（TCC が無いため判定不要）
-pub fn is_granted() -> bool {
-    #[cfg(not(target_os = "macos"))]
-    {
-        true
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // ~/Library/Mail は kTCCServiceSystemPolicyAllFiles で保護されている。
-        // FDA が無いと read_dir で Permission denied になる（ディレクトリが存在する場合）。
-        // 存在しない場合は別のプローブパスを試す
-        let probes = fda_probe_paths();
-        for path in &probes {
-            if !path.exists() {
-                continue;
-            }
-            match std::fs::read_dir(path) {
-                Ok(_) => return true,
-                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return false,
-                Err(_) => continue, // 他のエラー（破損等）はスキップ
-            }
-        }
-        // プローブパスがすべて存在しない場合は判定不能 → 付与済みと仮定
-        // （ダイアログが出ていないなら問題ない）
-        true
-    }
-}
-
-/// FDA のプローブに使うパス群。存在する順に試行する
-#[cfg(target_os = "macos")]
-fn fda_probe_paths() -> Vec<PathBuf> {
-    // FDA は macOS 専用だが、ホーム解決は他と同じ正本を通す（#893）
-    let home = tako_core::paths::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-    vec![
-        home.join("Library/Mail"),
-        home.join("Library/Safari"),
-        home.join("Library/Messages"),
-        home.join("Library/Cookies"),
-    ]
-}
+// OS ごとの腕（対象の OS か・付与の判定・設定画面を開く）は境界 B15 `crate::platform::fda` が持つ
+// （#2859）。このモジュールは OS を意識しない層 = 日本語の口と CLI / MCP 向けの状態の組み立てだけを持つ
+pub use crate::platform::fda::{is_granted, open_settings_typed};
 
 /// macOS のシステム設定を開いてフルディスクアクセスのパネルを表示する。
 /// 成功したら Ok(())、開けなかったらエラーメッセージ（日本語）を返す
@@ -60,33 +15,11 @@ pub fn open_settings() -> Result<(), String> {
     open_settings_typed().map_err(crate::OsRefusal::into_ja)
 }
 
-/// [`open_settings`] の型の口（断りを表示言語で返す dispatch が使う。#2365）
-pub fn open_settings_typed() -> Result<(), crate::OsRefusal> {
-    #[cfg(target_os = "macos")]
-    {
-        // macOS 13+ のシステム設定 URL スキーム
-        let urls = [
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles",
-            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles",
-        ];
-        for url in &urls {
-            if crate::platform::os_integration::open_url_wait(url).is_ok() {
-                return Ok(());
-            }
-        }
-        Err(crate::OsRefusal::FdaPanelUnopenable)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Err(crate::OsRefusal::FdaMacOnly)
-    }
-}
-
 /// FDA のステータス情報（CLI / MCP 向け）
 pub fn status_info() -> FdaStatus {
     FdaStatus {
         granted: is_granted(),
-        platform_supported: cfg!(target_os = "macos"),
+        platform_supported: crate::platform::fda::supported(),
     }
 }
 

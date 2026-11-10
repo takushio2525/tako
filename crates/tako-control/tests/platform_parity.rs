@@ -2144,3 +2144,183 @@ fn sleep_guard_rsの本番コードにosのcfgが戻っていない() {
     );
     check_sleep_guard_has_no_os_cfg(&read_rel(SLEEP_GUARD_RS), SLEEP_GUARD_RS);
 }
+
+/// **#2859 の番犬**: フルディスクアクセスの案内（境界 B15）の OS の腕は `tako_control::platform::fda` の
+/// 内側だけに置き、呼び手（`fda.rs` の OS を意識しない層・診断の `fda` 項目・`tako setup` の FDA の段）は
+/// 境界の答え `platform::fda::supported` を見る 1 本の経路にする。
+///
+/// ## なぜ止めるのか
+///
+/// #2859 まで `fda.rs` に 7 塊、`diagnostics.rs`（`fda_item` の対と `lines_of`）に 3 塊、
+/// `tako-cli/src/setup.rs`（`run_fda_check` の定義と呼び出し）に 2 塊の OS の `cfg` があり（#1538 の集計）、
+/// 「Windows に TCC 相当は無い = 対象外」の判断が 3 ファイルに散っていた。macOS の CI では Windows の腕が
+/// 型検査されない（逆も同じ）ので、片方を直しても他方が壊れていることに気付けない。戻る形は 3 ファイルの
+/// 本番コードに OS の `cfg`（`#[cfg]` / `cfg!` / `cfg_attr`）を足すことで、両 OS のビルドとテストは緑のまま通る。
+///
+/// 見るのは 3 つ（本番コードだけ。テスト領域・コメント・文字列の中は数えない = #2856 の番犬と同じ眺め）:
+/// 1. 3 ファイルに OS の `cfg` が無い
+/// 2. 境界の口（`supported` / `is_granted` / `open_settings_typed`）を境界の外で定義していない
+///    （2 つ目の定義は「片方の OS の経路だけ直る」分岐の芽）。境界の中には在る（改名で空振りしない）
+/// 3. 診断の `fda_item` と setup の `run_fda_check` が境界の答え `platform::fda::supported()` を見ている。
+///    外すと Windows では `is_granted` が常に true なので「付与済み」の行が出る（#2859 の前は出さなかった）
+const FDA_RS: &str = "crates/tako-control/src/fda.rs";
+const FDA_BOUNDARY_RS: &str = "crates/tako-control/src/platform/fda.rs";
+/// 境界の答えを見る呼び手（ファイル, 関数名）
+const FDA_CALLERS: [(&str, &str); 2] = [
+    ("crates/tako-control/src/diagnostics.rs", "fda_item"),
+    ("crates/tako-cli/src/setup.rs", "run_fda_check"),
+];
+/// 境界の口（定義は境界のファイルだけ）
+const FDA_BOUNDARY_FNS: [&str; 3] = ["supported", "is_granted", "open_settings_typed"];
+
+/// コードの眺めの行が `fn 名前(` を定義しているか（`my_fn 名前` などの部分一致は除く）
+fn fda_defines_fn(line: &str, name: &str) -> bool {
+    let pat = format!("fn {name}(");
+    line.match_indices(pat.as_str()).any(|(i, _)| {
+        i == 0 || {
+            let b = line.as_bytes()[i - 1];
+            !(b.is_ascii_alphanumeric() || b == b'_')
+        }
+    })
+}
+
+/// コードの眺めの中の `fn 名前(` の本体（波括弧の内側）。見つからなければ `None`
+fn fda_fn_body<'a>(view: &'a str, name: &str) -> Option<&'a str> {
+    let bytes = view.as_bytes();
+    let start = view
+        .match_indices(&format!("fn {name}("))
+        .map(|(i, _)| i)
+        .find(|&i| i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))?;
+    let open = start + view[start..].find('{')?;
+    let mut depth = 0usize;
+    for (k, &c) in bytes.iter().enumerate().skip(open) {
+        match c {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&view[open + 1..k]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 1 ファイル分の違反（1・2 と、呼び手なら 3）を `file:line` つきで返す。
+/// `answer_in` = 境界の答えを見ているはずの関数名
+fn fda_violations(src: &str, rel: &str, answer_in: Option<&str>) -> Vec<String> {
+    let view = production_code_view(src);
+    let mut violations: Vec<String> = os_cfg_sites(&view)
+        .iter()
+        .map(|(line, head)| format!("{rel}:{line} `{head}…` — OS の cfg（1）"))
+        .collect();
+    for (idx, line) in view.lines().enumerate() {
+        for name in FDA_BOUNDARY_FNS {
+            if fda_defines_fn(line, name) {
+                violations.push(format!(
+                    "{rel}:{} `fn {name}` を境界の外で定義している（2）",
+                    idx + 1
+                ));
+            }
+        }
+    }
+    if let Some(func) = answer_in {
+        match fda_fn_body(&view, func) {
+            None => violations.push(format!(
+                "{rel}: `fn {func}(` が見つからない（改名したならこの番犬の FDA_CALLERS も直す。3）"
+            )),
+            Some(body) if !body.contains("platform::fda::supported()") => violations.push(format!(
+                "{rel}: `{func}` が境界の答え `platform::fda::supported()` を見ていない（3）"
+            )),
+            Some(_) => {}
+        }
+    }
+    violations
+}
+
+#[test]
+fn fdaの案内のos差が境界の外に戻っていない() {
+    // 検出力: 戻した形の断片は名指される（リポジトリのファイルは触らない）
+    for (legacy, answer_in) in [
+        // #2859 より前の診断の対（cfg の対・境界の答えを見ない）
+        (
+            "#[cfg(target_os = \"macos\")]\nfn fda_item(lang: Lang) -> Vec<Item> {\n    \
+             if crate::fda::is_granted() { return Vec::new(); }\n    Vec::new()\n}\n\
+             #[cfg(not(target_os = \"macos\"))]\nfn fda_item(_lang: Lang) -> Vec<Item> {\n    Vec::new()\n}\n",
+            Some("fda_item"),
+        ),
+        // #2859 より前の setup の呼び出し（関数の中の塊）
+        (
+            "fn run_dependency_check(mode: DepCheckMode) {\n    #[cfg(target_os = \"macos\")]\n    {\n        \
+             run_fda_check(mode.review_settings);\n    }\n}\n\
+             fn run_fda_check(interactive: bool) {\n    if !tako_control::platform::fda::supported() {\n        \
+             return;\n    }\n}\n",
+            Some("run_fda_check"),
+        ),
+        // 値の分岐・属性の出し分け
+        (
+            "pub fn status_info() -> FdaStatus {\n    FdaStatus { granted: is_granted(), \
+             platform_supported: cfg!(target_os = \"macos\") }\n}\n",
+            None,
+        ),
+        (
+            "#[cfg_attr(windows, allow(dead_code))]\nfn lines_of(self, text: &str) -> Self { self }\n",
+            None,
+        ),
+        // cfg を使わずに境界の外へ 2 つ目の定義を置く
+        ("pub fn is_granted() -> bool {\n    true\n}\n", None),
+        // ガードを落とした呼び手（Windows で「付与済み」の行が出る）
+        (
+            "fn run_fda_check(interactive: bool) {\n    if tako_control::fda::is_granted() {\n        \
+             eprintln!(\"[OK]\");\n    }\n}\n",
+            Some("run_fda_check"),
+        ),
+        // 呼び手の関数が無い（改名で空振りしない）
+        ("fn other() {}\n", Some("fda_item")),
+    ] {
+        assert!(
+            !fda_violations(legacy, "注入", answer_in).is_empty(),
+            "#2859 の番犬が戻した形を見逃した: {legacy}"
+        );
+    }
+    // 当たってはいけない形は通る（OS でない cfg・コメント・文字列・テスト領域・境界の答えを見る呼び手）
+    let clean = fda_violations(
+        "pub use crate::platform::fda::{is_granted, open_settings_typed};\n\
+         #[cfg(feature = \"x\")]\nfn f() {}\n\
+         // #[cfg(target_os = \"macos\")] は説明。fn is_granted() も説明\n\
+         const S: &str = \"cfg!(windows) fn supported() {}\";\n\
+         fn fda_item(lang: Lang) -> Vec<Item> {\n    if !crate::platform::fda::supported() {\n        \
+         return Vec::new();\n    }\n    if crate::fda::is_granted() { return Vec::new(); }\n    Vec::new()\n}\n\
+         #[cfg(test)]\nmod tests {\n    #[cfg(target_os = \"macos\")]\n    #[test]\n    fn is_granted() {}\n}\n",
+        "注入",
+        Some("fda_item"),
+    );
+    assert!(
+        clean.is_empty(),
+        "当たってはいけない形を名指した: {clean:?}"
+    );
+
+    // 本物のファイル（3 ファイル分をまとめて名指す）
+    let mut violations = fda_violations(&read_rel(FDA_RS), FDA_RS, None);
+    for (rel, func) in FDA_CALLERS {
+        violations.extend(fda_violations(&read_rel(rel), rel, Some(func)));
+    }
+    let boundary = production_code_view(&read_rel(FDA_BOUNDARY_RS));
+    for name in FDA_BOUNDARY_FNS {
+        if !boundary.lines().any(|l| fda_defines_fn(l, name)) {
+            violations.push(format!(
+                "{FDA_BOUNDARY_RS}: `fn {name}` の定義が無い（改名・削除したならこの番犬の FDA_BOUNDARY_FNS も直す。2）"
+            ));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "フルディスクアクセスの案内の OS 差が境界 B15 の外にある（#2859）:\n  {}\n\
+         → OS ごとの実装は `{FDA_BOUNDARY_RS}`（`tako_control::platform::fda`）の内側へ置き、\
+         呼び手は `platform::fda::supported()` の答えを見て対象外なら項目を出さない 1 本の経路で組む。\
+         `cfg` を書いてよいのは境界の中の実装選択だけ（設計 §2.1）",
+        violations.join("\n  ")
+    );
+}

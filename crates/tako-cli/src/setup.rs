@@ -1479,11 +1479,8 @@ fn run_dependency_check(
                 state
             }
         });
-    // FDA チェック（macOS のみ。任意だが強く推奨）
-    #[cfg(target_os = "macos")]
-    {
-        run_fda_check(mode.review_settings);
-    }
+    // FDA チェック（対象は macOS のみ = 境界 B15 の答え。任意だが強く推奨）
+    run_fda_check(mode.review_settings);
     // スリープ防止の設定案内
     run_sleep_guard_check(mode.review_settings, sleep_guard_answer);
     DepCheckOutcome {
@@ -1881,8 +1878,12 @@ fn run_sleep_guard_check(interactive: bool, answered: Option<SleepGuardValues>) 
 /// FDA（フルディスクアクセス）の案内ステップ。
 /// macOS の TCC（Transparency, Consent, and Control）による「ほかのアプリからの
 /// データへのアクセス権を求められています」ダイアログを一括で消す方法を案内する。
-#[cfg(target_os = "macos")]
+/// 対象外の OS（TCC 相当が無い）では何も出さない。その判断は境界 B15 の答え
+/// `platform::fda::supported` の 1 か所が持つ（#2859。以前は呼び出しと定義が `cfg` で包まれていた）
 fn run_fda_check(interactive: bool) {
+    if !tako_control::platform::fda::supported() {
+        return;
+    }
     if tako_control::fda::is_granted() {
         eprintln!("  [OK] フルディスクアクセス: 付与済み（許可ダイアログは表示されません）");
         return;

@@ -9706,8 +9706,9 @@ const RESUME_LAUNCH_SRC: &str = include_str!("../src/resume_launch.rs");
 const RESUME_LAUNCH_PATH: &str = "crates/tako-control/src/resume_launch.rs";
 const WORKER_MCP_SRC: &str = include_str!("../src/worker_mcp.rs");
 const WORKER_MCP_PATH: &str = "crates/tako-control/src/worker_mcp.rs";
-const FDA_SRC: &str = include_str!("../src/fda.rs");
-const FDA_PATH: &str = "crates/tako-control/src/fda.rs";
+// フルディスクアクセスの型の口 `open_settings_typed` は #2859 で境界 B15 へ移した（`fda.rs` は re-export）
+const FDA_SRC: &str = include_str!("../src/platform/fda.rs");
+const FDA_PATH: &str = "crates/tako-control/src/platform/fda.rs";
 const SLEEP_GUARD_SRC: &str = include_str!("../src/sleep_guard.rs");
 const SLEEP_GUARD_PATH: &str = "crates/tako-control/src/sleep_guard.rs";
 const SHELL_INTEGRATION_SRC: &str = include_str!("../src/shell_integration.rs");

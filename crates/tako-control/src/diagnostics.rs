@@ -196,8 +196,7 @@ impl Item {
         self
     }
 
-    /// 改行で区切った複数の続きの行を足す（呼び手は macOS の `fda_item` だけ。#1537）
-    #[cfg(target_os = "macos")]
+    /// 改行で区切った複数の続きの行を足す（呼び手は `fda_item` だけ。#1537）
     fn lines_of(mut self, text: &str) -> Self {
         self.lines.extend(text.lines().map(str::to_string));
         self
@@ -1014,10 +1013,14 @@ fn dep_guide_lines(state: &crate::setup_deps::DepStatus, lang: Lang) -> Vec<Stri
         .collect()
 }
 
-// --- フルディスクアクセス（macOS） ------------------------------------------
+// --- フルディスクアクセス（境界 B15。対象は macOS だけ） ----------------------
 
-#[cfg(target_os = "macos")]
+/// 対象外の OS（TCC 相当が無い）では項目を出さない。その判断は境界 B15 の答え
+/// `platform::fda::supported` の 1 か所が持つ（#2859。以前はこの関数が `cfg` の対だった）
 fn fda_item(lang: Lang) -> Vec<Item> {
+    if !crate::platform::fda::supported() {
+        return Vec::new();
+    }
     if crate::fda::is_granted() {
         return vec![Item::new(
             "fda",
@@ -1033,11 +1036,6 @@ fn fda_item(lang: Lang) -> Vec<Item> {
         lang,
     )
     .lines_of(&HealthText::FdaNotGrantedDetail.text_in(lang))]
-}
-
-#[cfg(not(target_os = "macos"))]
-fn fda_item(_lang: Lang) -> Vec<Item> {
-    Vec::new()
 }
 
 // --- WebView2 ランタイム（Windows の Web ビュー。#2431） ------------------------
