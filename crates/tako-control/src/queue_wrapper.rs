@@ -54,9 +54,8 @@ use serde_json::Value;
 use tako_core::i18n::Lang;
 use tako_core::queue::{self as q, CallerRole, JobKind, JobWire, Priority, PriorityHint};
 
-// 子とその子孫を止める（取り消し）・シグナルの受け取りと転送（unix。Windows は何もしない =
-// Ctrl+C はコンソールの全員に届く）。OS 差は境界 B5 の制御側（#2860）
-use crate::platform::process::child_tree as tree;
+// シグナルの受け取りと転送（unix。Windows は何もしない = Ctrl+C はコンソールの全員に届く）。
+// OS 差は境界 B5 の制御側（#2860。子とその子孫を止める取り消しは `platform::process::terminate_child_tree`）
 use crate::platform::process::signal_relay as signals;
 use crate::protocol::Request;
 use crate::queue::{unix_ms, ENV_JOB};
@@ -730,14 +729,18 @@ fn run_with(
                 adopt_job_priority(&mut wire, &v);
                 if v["cancel"] == true && cancel_at.is_none() {
                     note(&ReplyNote::QueueStoppingCancelled(KILL_GRACE.as_secs()).text_in(lang));
-                    tree::terminate(&mut child, &mut descendants, false);
+                    crate::platform::process::terminate_child_tree(
+                        &mut child,
+                        &mut descendants,
+                        false,
+                    );
                     cancel_at = Some(Instant::now());
                 }
             }
         }
         if let Some(at) = cancel_at {
             if !killed && at.elapsed() >= KILL_GRACE {
-                tree::terminate(&mut child, &mut descendants, true);
+                crate::platform::process::terminate_child_tree(&mut child, &mut descendants, true);
                 killed = true;
             }
         }

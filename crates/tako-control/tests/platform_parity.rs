@@ -2345,7 +2345,7 @@ fn fdaの案内のos差が境界の外に戻っていない() {
 /// （#1538 / #1374 の実害の形）。#2860 で `tako_core::platform::process`（`lead_own_group` /
 /// `signal_own_group` / `await_group_or_kill` / `kill_group` / `exit_signal` / `force_kill_pid`）と
 /// `tako_control::platform::process`（`watch_shutdown_signals` / `configure_daemon_child` /
-/// `signal_relay` / `child_tree`）へ寄せ、呼び手は境界の口を 1 本呼ぶだけになった。
+/// `signal_relay` / `terminate_child_tree`）へ寄せ、呼び手は境界の口を 1 本呼ぶだけになった。
 ///
 /// ## なぜ「件数」で見るのか
 ///
@@ -2484,7 +2484,7 @@ fn プロセスグループと終了シグナルの直呼びが境界の外に�
          想定と違う（#2860）:\n  {}\n\
          → `tako_core::platform::process`（lead_own_group / signal_own_group / await_group_or_kill / \
          kill_group / exit_signal / force_kill_pid）か `tako_control::platform::process`\
-         （watch_shutdown_signals / configure_daemon_child / signal_relay / child_tree）の口を呼んでください。\
+         （watch_shutdown_signals / configure_daemon_child / signal_relay / terminate_child_tree）の口を呼んでください。\
          `cfg` を書いてよいのは境界の中の実装選択だけ（設計 §2.1）",
         diffs.join("\n  ")
     );

@@ -9,9 +9,11 @@
 //! （何もしない / 入れ物ごと止める）も移す前の挙動のまま。プロセスグループの扱いと終了シグナルの読み取りは
 //! `tako-core` の呼び手も使うので `tako_core::platform::process` にある。
 
-use std::process::Command;
+use std::process::{Child, Command};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+
+use tako_core::platform::job::KillScope;
 
 /// 指定 PID の終了を要求する。
 ///
@@ -350,51 +352,48 @@ pub mod signal_relay {
     pub use imp::{forward, install, take};
 }
 
-/// 起こした子とその子孫を止める（`tako queue` の取り消し。#1994 / #2462 / #2860）
-pub mod child_tree {
-    use std::process::Child;
-
-    use tako_core::platform::job::KillScope;
-
-    /// unix: 子とその子孫（libproc の親子表）へ SIGTERM（`force` なら SIGKILL）。
-    /// 親子表が採れなければ子だけ。入れ物（`KillScope`）は unix では空なので見ない
-    #[cfg(unix)]
-    pub fn terminate(child: &mut Child, _descendants: &mut KillScope, force: bool) {
-        let root = child.id();
-        let sig = if force { libc::SIGKILL } else { libc::SIGTERM };
-        let mut targets = vec![root];
-        if let Some(procs) = tako_core::platform::resources::processes() {
-            let mut frontier = vec![root];
-            while let Some(p) = frontier.pop() {
-                for r in procs.iter().filter(|r| r.ppid == p && r.pid != p) {
-                    if !targets.contains(&r.pid) {
-                        targets.push(r.pid);
-                        frontier.push(r.pid);
-                    }
-                }
-            }
-        }
-        for pid in targets {
-            if let Ok(pid) = libc::pid_t::try_from(pid) {
-                if pid > 0 {
-                    // SAFETY: 自分が起こした子とその子孫へ送るだけ
-                    unsafe {
-                        libc::kill(pid, sig);
-                    }
+/// 起こした子とその子孫を止める（`tako queue` の取り消し。#1994 / #2462 / #2860）。
+/// 名前は pid を指定する [`terminate`] と分けてある（呼び出しの番犬 `issue1984_ui_thread_offload_watchdog` は
+/// 関数を名前で引くので、同じファイルに同名があると取り違える）。
+///
+/// unix: 子とその子孫（libproc の親子表）へ SIGTERM（`force` なら SIGKILL）。
+/// 親子表が採れなければ子だけ。入れ物（`KillScope`）は unix では空なので見ない
+#[cfg(unix)]
+pub fn terminate_child_tree(child: &mut Child, _descendants: &mut KillScope, force: bool) {
+    let root = child.id();
+    let sig = if force { libc::SIGKILL } else { libc::SIGTERM };
+    let mut targets = vec![root];
+    if let Some(procs) = tako_core::platform::resources::processes() {
+        let mut frontier = vec![root];
+        while let Some(p) = frontier.pop() {
+            for r in procs.iter().filter(|r| r.ppid == p && r.pid != p) {
+                if !targets.contains(&r.pid) {
+                    targets.push(r.pid);
+                    frontier.push(r.pid);
                 }
             }
         }
     }
-
-    /// Windows: 子とその子孫を入れ物（Job Object。境界 B30。#2462）ごと止める。寿命はペインを
-    /// 閉じるのと同じ（コンソールのプロセスは止め、GUI のアプリとその子孫は残す）。穏当な終了要求は
-    /// 無いので `force` は見ない（1 回目で止まる。2 回目の入れ物は空）。入れ物が無い回
-    /// （入れられなかった・A/B の `TAKO_2454_LEGACY=1`）は子だけ（孫は残る = #2462 の前）
-    #[cfg(not(unix))]
-    pub fn terminate(child: &mut Child, descendants: &mut KillScope, _force: bool) {
-        descendants.stop();
-        let _ = child.kill();
+    for pid in targets {
+        if let Ok(pid) = libc::pid_t::try_from(pid) {
+            if pid > 0 {
+                // SAFETY: 自分が起こした子とその子孫へ送るだけ
+                unsafe {
+                    libc::kill(pid, sig);
+                }
+            }
+        }
     }
+}
+
+/// Windows: 子とその子孫を入れ物（Job Object。境界 B30。#2462）ごと止める。寿命はペインを
+/// 閉じるのと同じ（コンソールのプロセスは止め、GUI のアプリとその子孫は残す）。穏当な終了要求は
+/// 無いので `force` は見ない（1 回目で止まる。2 回目の入れ物は空）。入れ物が無い回
+/// （入れられなかった・A/B の `TAKO_2454_LEGACY=1`）は子だけ（孫は残る = #2462 の前）
+#[cfg(not(unix))]
+pub fn terminate_child_tree(child: &mut Child, descendants: &mut KillScope, _force: bool) {
+    descendants.stop();
+    let _ = child.kill();
 }
 
 #[cfg(unix)]
