@@ -1,0 +1,59 @@
+{
+  "title": "担当: api",
+  "footer": "demo · 担当の台本",
+  "promptLines": 1,
+  "turns": [
+    [
+      {
+        "busy": "作業中"
+      },
+      {
+        "wait": 800,
+        "say": "方針: 間隔を倍に・最大 3 回",
+        "color": "text"
+      },
+      {
+        "wait": 1100,
+        "tool": "Read",
+        "arg": "api/payments.ts"
+      },
+      {
+        "wait": 1000,
+        "tool": "Read",
+        "arg": "lib/http.ts"
+      },
+      {
+        "wait": 1500,
+        "tool": "Edit",
+        "arg": "lib/retry.ts +42"
+      },
+      {
+        "wait": 1400,
+        "tool": "Edit",
+        "arg": "api/payments.ts +18"
+      },
+      {
+        "wait": 1300,
+        "tool": "Edit",
+        "arg": "test/retry.test.ts"
+      },
+      {
+        "wait": 1200,
+        "tool": "Run",
+        "arg": "npm test payments"
+      },
+      {
+        "wait": 2000,
+        "say": "12 passed (1.8s)",
+        "color": "ok",
+        "indent": 6
+      },
+      {
+        "wait": 700,
+        "say": "完了: 4 files · 12 tests",
+        "color": "ok",
+        "beat": "done"
+      }
+    ]
+  ]
+}
