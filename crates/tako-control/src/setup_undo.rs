@@ -273,21 +273,23 @@ impl Targets {
 }
 
 /// claude の設定 dir から `.claude.json` の置き場を引く（実測 2026-11-08・claude 2.1.301:
-/// `CLAUDE_CONFIG_DIR=X` なら `X/.claude.json`、既定（`~/.claude`）なら `~/.claude.json`）
+/// `CLAUDE_CONFIG_DIR=X` なら `X/.claude.json`、既定（`~/.claude`）なら `~/.claude.json`）。
+///
+/// 規則は `tako_core::claude_config::global_json` の 1 実装（MCP の登録の書き先と同じ = #2906）。
+/// 既定の dir は「未設定」（= そのホーム直下）と「既定を明示」（= dir の中）の両方を見る
 pub fn claude_json_paths(dirs: &[Target]) -> Vec<PathBuf> {
+    use tako_core::claude_config::global_json;
     let mut out: Vec<PathBuf> = Vec::new();
-    let mut push = |p: PathBuf| {
-        if !out.contains(&p) {
+    let mut push = |p: Option<PathBuf>| {
+        if let Some(p) = p.filter(|p| !out.contains(p)) {
             out.push(p);
         }
     };
     for t in dirs {
         if t.sources.contains(&Source::Default) {
-            if let Some(parent) = t.dir.parent() {
-                push(parent.join(".claude.json"));
-            }
+            push(global_json(None, t.dir.parent()));
         }
-        push(t.dir.join(".claude.json"));
+        push(global_json(Some(&t.dir), None));
     }
     out
 }

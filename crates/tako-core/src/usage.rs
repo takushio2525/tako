@@ -188,12 +188,9 @@ pub fn normalize_config_dir(raw: Option<&str>, home: Option<&Path>) -> Option<Pa
 /// 資格情報のファイル（§3.2）: `CLAUDE_CONFIG_DIR` があれば `<それ>/.claude.json`、
 /// 無ければ `<ホーム>/.claude.json`。**既定の設定 dir（`~/.claude`）の transcript には 2 通りが混ざる**
 /// （`CLAUDE_CONFIG_DIR` 無し = `~/.claude.json` / `=~/.claude` = `~/.claude/.claude.json`）ので、
-/// 置き場ではなく報告の `config_dir` で決める
+/// 置き場ではなく報告の `config_dir` で決める。置き場の規則は `claude_config::global_json`（#2906）
 pub fn credentials_file(config_dir: Option<&str>, home: Option<&Path>) -> Option<PathBuf> {
-    match normalize_config_dir(config_dir, home) {
-        Some(dir) => Some(dir.join(".claude.json")),
-        None => home.map(|h| h.join(".claude.json")),
-    }
+    crate::claude_config::global_json(normalize_config_dir(config_dir, home).as_deref(), home)
 }
 
 /// 資格情報を読めないときに鍵へ使う設定 dir（`CLAUDE_CONFIG_DIR`、無ければ `<ホーム>/.claude`）

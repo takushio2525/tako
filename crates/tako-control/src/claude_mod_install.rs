@@ -118,8 +118,11 @@ pub fn collect_targets(inputs: &TargetInputs) -> Vec<Target> {
                     (None, None) => {}
                 }
             }
-            if let Some(env) = inputs.process_env.as_deref().filter(|v| !v.is_empty()) {
-                push(&mut out, PathBuf::from(env), Source::Env);
+            // 空は未設定と同じ（読み方の正本は `claude_config`。MCP の書き先と同じ 1 実装 = #2906）
+            if let Some(env) =
+                tako_core::claude_config::explicit_config_dir(inputs.process_env.as_deref())
+            {
+                push(&mut out, env, Source::Env);
             }
         }
     }

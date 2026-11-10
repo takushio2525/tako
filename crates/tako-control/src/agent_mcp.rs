@@ -1,6 +1,7 @@
 //! agent_mcp — claude 以外のエージェント CLI（codex / agy）へ tako MCP サーバーを登録する（Issue #979）
 //!
-//! claude 向けの登録は `dispatch::setup_mcp`（`~/.claude.json` / `.mcp.json`）にある。
+//! claude 向けの登録は `dispatch::setup_mcp`（`$CLAUDE_CONFIG_DIR/.claude.json`・未設定なら
+//! `~/.claude.json` = [`claude_user_config_json`] / `.mcp.json`）にある。
 //! ここは **codex / agy** の分で、書き込みは各 CLI の公式サブコマンド
 //! （`codex mcp add` / `agy mcp add`）に任せる。
 //!
@@ -293,6 +294,7 @@ pub fn list_args(agent: WorkerAgent) -> Vec<String> {
 /// - codex: `$CODEX_HOME/config.toml`（未設定・空・空白だけなら `~/.codex/config.toml`）
 /// - agy: `~/.gemini/config/mcp_config.json`（実測: `agy mcp add` が実際に書いた先。
 ///   `HOME` を差し替えるとそちらへ付いてくる = テストで隔離できる）
+/// - claude: [`claude_user_config_json`]（`$CLAUDE_CONFIG_DIR/.claude.json`・未設定なら `~/.claude.json`）
 pub fn config_path(agent: WorkerAgent) -> Option<PathBuf> {
     let home = tako_core::paths::home_dir;
     match agent {
@@ -303,7 +305,9 @@ pub fn config_path(agent: WorkerAgent) -> Option<PathBuf> {
         WorkerAgent::Agy => {
             home().map(|h| h.join(".gemini").join("config").join("mcp_config.json"))
         }
-        WorkerAgent::Claude => home().map(|h| h.join(".claude.json")),
+        // MCP の登録の書き先と同じ 1 実装（`$CLAUDE_CONFIG_DIR/.claude.json`・未設定なら
+        // `~/.claude.json`。#2906）
+        WorkerAgent::Claude => claude_user_config_json(),
     }
 }
 
@@ -985,17 +989,51 @@ pub fn claude_listing_has_tako(stdout: &str) -> bool {
     })
 }
 
-/// `~/.claude.json` から tako MCP 登録の command パスを読み取る
+/// claude の MCP 登録（user スコープ）から tako の command パスを読み取る。
+///
+/// 読む場所は登録の書き先と同じ 1 実装（[`claude_user_config_json`] → `dispatch::mcp_target_path`）。
+/// #2906 の前は `~/.claude.json` 決め打ちで、`CLAUDE_CONFIG_DIR` を向けた環境では
+/// `$CLAUDE_CONFIG_DIR/.claude.json` の登録を読めず、健全性が「読めない = 楽観判定」になっていた
 pub fn claude_registered_command() -> Option<String> {
-    let home = tako_core::paths::home_dir().filter(|p| p.is_absolute())?;
-    let content = std::fs::read_to_string(home.join(".claude.json")).ok()?;
-    let settings: serde_json::Value = serde_json::from_str(&content).ok()?;
-    settings
-        .get("mcpServers")?
-        .get("tako")?
-        .get("command")?
-        .as_str()
-        .map(String::from)
+    crate::dispatch::read_mcp_registration(&crate::dispatch::McpScope::User)
+}
+
+/// claude の MCP の user スコープの書き先（**このプロセスが起こす claude が実際に書く場所**。#2906）。
+///
+/// `claude mcp add --scope user` は子の env の `CLAUDE_CONFIG_DIR` に従って
+/// `$CLAUDE_CONFIG_DIR/.claude.json`（未設定・空なら `~/.claude.json`）へ書く。子はこのプロセスの
+/// env を継ぐので、見るのは**このプロセスの** env（CLI の `tako setup` / `tako setup-mcp` は
+/// 打ったシェルの値、MCP の `tako_setup_mcp`・設定画面の登録は GUI の値）。
+/// 規則そのものは `tako_core::claude_config`（`setup_undo::claude_json_paths` と同じ 1 実装）。
+///
+/// 登録の書き先・登録済みの判定・健全性の判定・直書き・表示はすべてここを通る
+/// （`dispatch::mcp_target_path(McpScope::User)`。自分で `.claude.json` を join しない）
+pub fn claude_user_config_json() -> Option<std::path::PathBuf> {
+    claude_user_config_json_with(
+        std::env::var(crate::orchestrator::CLAUDE_CONFIG_DIR_ENV)
+            .ok()
+            .as_deref(),
+        tako_core::paths::home_dir()
+            .filter(|p| p.is_absolute())
+            .as_deref(),
+        tako_core::paths::is_verification_process(),
+    )
+}
+
+/// [`claude_user_config_json`] の判定（env とホームを引数で受ける = テストで env を書き換えない）。
+///
+/// **検証プロセスは一時 dir の外を指す `CLAUDE_CONFIG_DIR` を見ない**: 検証（`cargo test`・
+/// 隔離 GUI・作業シェルから叩く CLI）の env は利用者の生きた設定 dir を継いでいることがあり、
+/// 直書き（claude CLI が無いとき）がそこへ書いてしまう。その場合は修正前と同じホーム直下へ倒す
+/// （判定は tako mod の書き込みの番人 `claude_mod_install::write_guard` と同じ 1 実装）
+pub fn claude_user_config_json_with(
+    config_dir_env: Option<&str>,
+    home: Option<&std::path::Path>,
+    verification: bool,
+) -> Option<std::path::PathBuf> {
+    let dir = tako_core::claude_config::explicit_config_dir(config_dir_env)
+        .filter(|dir| tako_core::claude_mod_install::write_guard(dir, verification).is_ok());
+    tako_core::claude_config::global_json(dir.as_deref(), home)
 }
 
 /// いまの登録状態を読む（CLI を 1 回だけ起こす）
@@ -1022,6 +1060,59 @@ pub fn state(agent: WorkerAgent) -> McpState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2906: claude の MCP の書き先は `CLAUDE_CONFIG_DIR` に従う（空は未設定と同じ）
+    #[test]
+    fn claudeのmcpの書き先はclaude_config_dirに従う() {
+        let home = std::path::Path::new("/home/testuser");
+        let at = |env: Option<&str>| claude_user_config_json_with(env, Some(home), false);
+        assert_eq!(at(None), Some(home.join(".claude.json")));
+        assert_eq!(at(Some("")), Some(home.join(".claude.json")));
+        assert_eq!(
+            at(Some("/home/testuser/.claude-alt")),
+            Some(std::path::PathBuf::from(
+                "/home/testuser/.claude-alt/.claude.json"
+            ))
+        );
+        // ホームが引けなくても、明示された設定 dir があればそこ
+        assert_eq!(
+            claude_user_config_json_with(Some("/x/.claude-b"), None, false),
+            Some(std::path::PathBuf::from("/x/.claude-b/.claude.json"))
+        );
+        assert_eq!(claude_user_config_json_with(None, None, false), None);
+    }
+
+    /// #2906: 検証プロセスは一時 dir の外を指す `CLAUDE_CONFIG_DIR`（作業シェルが継いだ利用者の
+    /// 生きた設定 dir）を見ず、修正前と同じホーム直下へ倒す。一時 dir の中なら見る
+    #[test]
+    fn 検証プロセスは一時dirの外のclaude_config_dirを見ない() {
+        let home = std::path::Path::new("/home/testuser");
+        // 製品の経路なら見る
+        assert_eq!(
+            claude_user_config_json_with(Some("/opt/testuser/.claude-alt"), Some(home), false),
+            Some(std::path::PathBuf::from(
+                "/opt/testuser/.claude-alt/.claude.json"
+            ))
+        );
+        // 検証プロセスでは見ない（`..` で一時 dir から抜ける形も）
+        assert_eq!(
+            claude_user_config_json_with(Some("/opt/testuser/.claude-alt"), Some(home), true),
+            Some(home.join(".claude.json"))
+        );
+        // 固定名安全: 作らない・消さないパス（`..` で一時 dir から抜ける形の判定だけを見る）
+        let escape = std::env::temp_dir().join("..").join("..").join(".claude-x");
+        assert_eq!(
+            claude_user_config_json_with(escape.to_str(), Some(home), true),
+            Some(home.join(".claude.json"))
+        );
+        // 一時 dir の中なら検証プロセスでも見る
+        let scratch = tako_core::test_residue::ScratchDir::new("i2906-guard");
+        let inside = scratch.join(".claude-alt");
+        assert_eq!(
+            claude_user_config_json_with(inside.to_str(), Some(home), true),
+            Some(inside.join(".claude.json"))
+        );
+    }
 
     #[test]
     fn add_argsはcodexとagyで実測どおりの書式になる() {

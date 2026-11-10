@@ -17,6 +17,7 @@ pub mod backend_reattach;
 pub mod background_groups;
 pub mod bin_resolve;
 pub mod byte_lru;
+pub mod claude_config;
 pub mod claude_mod;
 pub mod claude_mod_install;
 pub mod claude_mod_ui;

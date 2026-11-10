@@ -23487,7 +23487,7 @@ pub struct SetupMcpResult {
 
 /// MCP 設定のスコープ
 pub enum McpScope {
-    /// ユーザーグローバル（~/.claude.json 相当）
+    /// ユーザーグローバル（`$CLAUDE_CONFIG_DIR/.claude.json`・未設定なら `~/.claude.json`。#2906）
     User,
     /// プロジェクト単位（cwd/.mcp.json）
     Project(std::path::PathBuf),
@@ -23496,8 +23496,12 @@ pub enum McpScope {
 /// Claude Code に tako MCP サーバーの接続設定を登録する。
 ///
 /// 1. `claude` CLI があれば `claude mcp add` を使う（公式経路）
-/// 2. なければ設定ファイルを直接マージ編集（user → ~/.claude.json、project → cwd/.mcp.json）
+/// 2. なければ設定ファイルを直接マージ編集（user → [`mcp_target_path`] = claude CLI が書くのと
+///    同じ `$CLAUDE_CONFIG_DIR/.claude.json`・未設定なら `~/.claude.json`、project → cwd/.mcp.json）
 /// 3. 旧バージョンが残した ~/.claude/settings.json の mcpServers.tako を検出・掃除
+///
+/// 登録済みの判定（`read_mcp_registration`）も同じ書き先を読む（#2906。修正前は `~/.claude.json`
+/// 決め打ちで、`CLAUDE_CONFIG_DIR` を向けた環境では毎回 remove → add の「追加しました」になっていた）
 ///
 /// 断りの文は**日本語のまま**（呼び手は CLI の `tako setup` = 枠が日本語の手元の処理）。
 /// 断りを表示言語で返す dispatch は [`setup_mcp_typed`] を通す（#2365）
@@ -23670,24 +23674,30 @@ pub fn setup_mcp_agents(
 /// **`~/.claude/settings.json` は旧経路**（`clean_legacy_settings_json` が掃除する側）。
 /// CLI の `--help` / 案内文はこの定数から文言を組むので、書き先を変えたら help も一緒に動く
 /// （#1248: 実装が `.claude.json` へ移ったあとも help だけ `settings.json` と言い続けていた）。
-pub const MCP_TARGET_FILE_USER: &str = ".claude.json";
+/// 置く dir の規則は `tako_core::claude_config`（#2906）
+pub const MCP_TARGET_FILE_USER: &str = tako_core::claude_config::GLOBAL_JSON;
 
 /// claude の MCP 設定の書き先ファイル名（project スコープ = `<cwd>/.mcp.json`）
 pub const MCP_TARGET_FILE_PROJECT: &str = ".mcp.json";
 
-/// claude の MCP 設定の書き先（**文言の正本**。`MCP_TARGET_FILE_*` と対で 1 実装）
+/// claude の MCP 設定の書き先（**文言の正本**。`MCP_TARGET_FILE_*` と対で 1 実装）。
+///
+/// user スコープは claude CLI が実際に書く場所（`agent_mcp::claude_user_config_json` =
+/// `$CLAUDE_CONFIG_DIR/.claude.json`・未設定なら `~/.claude.json`。#2906）。登録・登録済みの判定・
+/// 健全性の判定・直書き・表示はすべてここを読む
 pub fn mcp_target_path(scope: &McpScope) -> std::path::PathBuf {
     match scope {
         // ホームが引けないときの表示用フォールバック。`~` を join で繋ぐのは
         // `format!("~/{…}")` が `~` 短縮の番犬（#893）に引っかかるため
-        McpScope::User => home_dir()
-            .map(|h| h.join(MCP_TARGET_FILE_USER))
+        McpScope::User => crate::agent_mcp::claude_user_config_json()
             .unwrap_or_else(|| std::path::PathBuf::from("~").join(MCP_TARGET_FILE_USER)),
         McpScope::Project(cwd) => cwd.join(MCP_TARGET_FILE_PROJECT),
     }
 }
 
-fn read_mcp_registration(scope: &McpScope) -> Option<String> {
+/// 登録済みの tako の command（[`mcp_target_path`] の `mcpServers.tako.command`）。
+/// 読めない・無いときは `None`（`agent_mcp::claude_registered_command` もここを通る）
+pub(crate) fn read_mcp_registration(scope: &McpScope) -> Option<String> {
     let path = mcp_target_path(scope);
     let content = std::fs::read_to_string(&path).ok()?;
     let data: serde_json::Value = serde_json::from_str(&content).ok()?;
@@ -52028,6 +52038,43 @@ tako | pane 2 [ compact ]       [-]
         let content: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
         assert_eq!(content["mcpServers"]["tako"]["command"], "/new/stable/tako");
+    }
+
+    /// #2906: user スコープの直書き（claude CLI が無いとき）は claude CLI と同じく
+    /// `$CLAUDE_CONFIG_DIR/.claude.json` へ書き、ホーム直下（その claude は読まない）を触らない。
+    /// OS を問わずここで見る（結合テストの番犬の直書きの節はログインシェルを外せる unix だけ）
+    #[test]
+    fn setup_mcp_direct_userはclaude_config_dirへ書く() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(setup_mcp_direct_userはclaude_config_dirへ書く) {
+            return;
+        }
+        // 置き場は `ScratchDir`（`mcp_test_dir` の呼び手の数は #2561 の番犬が数えているので増やさない）
+        let dir = tako_core::test_residue::ScratchDir::new("mcp-test-direct-config-dir");
+        let home = dir.join("home");
+        let alt = home.join(".claude-alt");
+        std::fs::create_dir_all(&alt).unwrap();
+        std::env::set_var("HOME", &home);
+        std::env::set_var("USERPROFILE", &home);
+        std::env::set_var("CLAUDE_CONFIG_DIR", &alt);
+        let target = alt.join(".claude.json");
+        assert_eq!(mcp_target_path(&McpScope::User), target);
+        setup_mcp_direct("/usr/local/bin/tako", &McpScope::User).unwrap();
+        let content: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(
+            content["mcpServers"]["tako"]["command"],
+            "/usr/local/bin/tako"
+        );
+        assert_eq!(
+            read_mcp_registration(&McpScope::User).as_deref(),
+            Some("/usr/local/bin/tako"),
+            "登録済みの判定が書いた場所を読む"
+        );
+        assert!(
+            !home.join(".claude.json").exists(),
+            "ホーム直下へ書いた（CLAUDE_CONFIG_DIR を向けた claude からは見えない）"
+        );
     }
 
     #[test]
