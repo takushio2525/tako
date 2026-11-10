@@ -411,8 +411,13 @@ enum Command {
     /// MCP 連携（serve = stdio ブリッジ。エージェントの MCP クライアントが起動する）
     #[command(subcommand)]
     Mcp(McpCommand),
-    /// 質問ゼロの自動セットアップ。claude / codex / agy を検出して環境を最適化する。
-    /// アプリ未起動でも実行できる
+    /// AI 連携の自動セットアップ。claude / codex / agy を検出して設定を書き、端末でログイン済みなら最後に対話のアシスタントを開く（揃っていれば質問なし。アプリ未起動でも実行できる）
+    ///
+    /// 通常の実行で聞くのは足りないものを入れてよいかだけ（使えるエージェント CLI が 1 つも無いときの導入の確認と、見つからない依存の [y/N]）。
+    /// 対話のアシスタントは、端末で実行し、選んだエージェント CLI がログイン済みのときだけ開く。
+    /// --yes / --answers を付けたとき・端末が無いとき・まだログインしていないときは開かず、次の一歩の案内で終わる
+    // 1 段落目は `tako --help` の一覧と `-h` に出るので 1 行で書く（clap は段落の中の改行を空白でつなぐ）。
+    // 文面は docs の「3. `tako setup`」節と揃える（#2897）
     Setup(SetupArgs),
     /// エージェント CLI に tako MCP サーバーの接続設定を追加する（アプリ未起動でも実行できる）
     ///
@@ -4475,10 +4480,10 @@ struct SetupArgs {
     /// --changes の出力を JSON にする（MCP tako_setup_changes と同一ペイロード）
     #[arg(long, requires = "changes")]
     json: bool,
-    /// 検出値・前回値・既定値を使い、標準入力を読まずにセットアップする
+    /// 検出値・前回値・既定値を使い、標準入力を読まずにセットアップする（足りないものは確認なしで入れ、最後の対話のアシスタントも開かない）
     #[arg(long, conflicts_with_all = ["check", "changes", "review"])]
     yes: bool,
-    /// 全回答を JSON、@ファイル、または -（標準入力）で与える（指定時は非対話）
+    /// 全回答を JSON、@ファイル、または -（標準入力）で与える（指定時は --yes と同じく非対話で、最後の対話のアシスタントも開かない）
     #[arg(long, value_name = "JSON|@FILE|-", conflicts_with_all = ["check", "changes", "review"])]
     answers: Option<String>,
     /// 前回設定を setup agent と個別に見直す
@@ -4486,6 +4491,14 @@ struct SetupArgs {
     review: bool,
     #[command(subcommand)]
     command: Option<SetupCommand>,
+}
+
+impl SetupArgs {
+    /// 標準入力を読まない実行か。`--answers` は `--yes` と同じ扱い
+    /// （`--help` の説明が突き合わせる口 = `help_text_parity`。#2897）
+    fn assume_yes(&self) -> bool {
+        self.yes || self.answers.is_some()
+    }
 }
 
 /// `tako setup` のサブコマンド。**素の `tako setup` の意味は変えない**（#322）。
@@ -4875,14 +4888,12 @@ fn cli_main() -> ExitCode {
                 setup::run_changes(args.json)
             } else if args.reset {
                 setup::load_answers(args.answers.as_deref()).and_then(|answers| {
-                    setup::run_reset().and_then(|()| {
-                        setup::run_setup(args.yes || args.answers.is_some(), args.review, &answers)
-                    })
+                    setup::run_reset()
+                        .and_then(|()| setup::run_setup(args.assume_yes(), args.review, &answers))
                 })
             } else {
-                setup::load_answers(args.answers.as_deref()).and_then(|answers| {
-                    setup::run_setup(args.yes || args.answers.is_some(), args.review, &answers)
-                })
+                setup::load_answers(args.answers.as_deref())
+                    .and_then(|answers| setup::run_setup(args.assume_yes(), args.review, &answers))
             }
         }
         Command::SetupMcp(ref args) => setup_mcp_local(args),
@@ -18834,6 +18845,120 @@ mod help_text_parity {
             assert!(
                 matches!(args.command, Some(SetupCommand::Undo { .. })),
                 "{argv:?} が setup undo にならない"
+            );
+        }
+    }
+
+    /// #2897: `tako setup --help` が今の契約を述べる。端末の標準実行は足りないものを聞き
+    /// （依存の [y/N] = #1499）、ログイン済みなら最後に対話のアシスタントを開く。
+    /// `--yes` / `--answers` はどちらも聞かずに入れ、対話も開かない。
+    ///
+    /// 説明文どうしは比べず、挙動を決めている側（`setup_deps::offer_for` /
+    /// `setup::opens_dialogue` / `SetupArgs::assume_yes`）の答えを前提として確かめてから見る
+    #[test]
+    fn setupのhelpが質問と対話のアシスタントの契約と一致する() {
+        use tako_control::setup_deps::{offer_for, DepOffer, DepOfferContext};
+
+        let cmd = subcommand(&["setup"]);
+        // `tako --help` の一覧と `-h` に出る 1 段落目
+        let about = cmd.get_about().map(|t| t.to_string()).unwrap_or_default();
+        let long = cmd.clone().render_long_help().to_string();
+        let arg_help = |id: &str| {
+            cmd.get_arguments()
+                .find(|a| a.get_id() == id)
+                .and_then(|a| a.get_help())
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| panic!("setup に --{id} の説明が無い"))
+        };
+        let (yes, answers) = (arg_help("yes"), arg_help("answers"));
+
+        // 端末の標準実行は未検出の依存を聞く → 「質問ゼロ」と言い切らない
+        let tty = DepOfferContext {
+            stage_installs: true,
+            review: false,
+            assume_yes: false,
+            stdin_is_terminal: true,
+            legacy: false,
+        };
+        assert_eq!(
+            offer_for(true, tty),
+            DepOffer::Ask,
+            "この検査は「端末の標準実行は依存を聞く」を前提にしている（#1499）"
+        );
+        for (place, text) in [("1 段落目", &about), ("--help", &long)] {
+            assert!(
+                !text.contains("質問ゼロ"),
+                "setup の{place}が「質問ゼロ」と言い切っている（端末なら依存を [y/N] で聞く）:\n{text}"
+            );
+        }
+        assert!(
+            long.contains("[y/N]"),
+            "setup --help が依存の [y/N] に触れていない:\n{long}"
+        );
+
+        // --yes は聞かずに入れる
+        assert_eq!(
+            offer_for(
+                true,
+                DepOfferContext {
+                    assume_yes: true,
+                    ..tty
+                }
+            ),
+            DepOffer::AutoInstall
+        );
+        assert!(
+            yes.contains("確認なしで入れ"),
+            "--yes の説明が「確認なしで入れる」に触れていない: {yes}"
+        );
+
+        // --answers は --yes と同じ扱い
+        let cli = Cli::try_parse_from(["tako", "setup", "--answers", "{}"])
+            .unwrap_or_else(|e| panic!("setup --answers が通らない: {e}"));
+        let Command::Setup(args) = cli.command else {
+            panic!("setup --answers が setup にならない");
+        };
+        assert!(
+            args.assume_yes(),
+            "--answers が --yes と同じ扱いになっていない"
+        );
+        assert!(
+            answers.contains("--yes と同じ"),
+            "--answers の説明が --yes と同じ扱いに触れていない: {answers}"
+        );
+
+        // 端末でログイン済みなら開き、--yes / --answers・端末なし・未ログインでは開かない
+        let open = setup::DialogueContext {
+            usable_agent: true,
+            assume_yes: false,
+            stdin_is_terminal: true,
+            launch_none: false,
+        };
+        assert!(setup::opens_dialogue(open));
+        for closed in [
+            setup::DialogueContext {
+                assume_yes: true,
+                ..open
+            },
+            setup::DialogueContext {
+                stdin_is_terminal: false,
+                ..open
+            },
+            setup::DialogueContext {
+                usable_agent: false,
+                ..open
+            },
+        ] {
+            assert!(!setup::opens_dialogue(closed), "{closed:?} で開いている");
+        }
+        assert!(
+            about.contains("対話のアシスタント") && about.contains("ログイン済み"),
+            "setup の 1 段落目が最後の対話のアシスタントとその条件に触れていない: {about}"
+        );
+        for (place, text) in [("--yes", &yes), ("--answers", &answers)] {
+            assert!(
+                text.contains("対話のアシスタントも開かない"),
+                "{place} の説明が対話のアシスタントを開かないことに触れていない: {text}"
             );
         }
     }
