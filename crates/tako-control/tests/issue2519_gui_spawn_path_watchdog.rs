@@ -67,14 +67,15 @@ const PERIODIC: &[(&str, &str, &str, &str)] = &[
         "lsof",
         "GUI の会話 ID の走査（30 秒ごと × agy のペイン）",
     ),
+    // スリープ防止の macOS の手段（#2857 で `sleep_guard.rs` から境界 B9 へ移した）
     (
-        "crates/tako-control/src/sleep_guard.rs",
+        "crates/tako-control/src/platform/lid/pmset.rs",
         "set_disablesleep",
         "sudo",
         "スリープ防止の周期（状態の変わり目ごと）",
     ),
     (
-        "crates/tako-control/src/sleep_guard.rs",
+        "crates/tako-control/src/platform/power/iokit.rs",
         "force_display_sleep",
         "pmset",
         "スリープ防止の周期（蓋を閉じるたび）",

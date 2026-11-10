@@ -1837,7 +1837,7 @@ lid-guard.json が使う）:
   着地（`land_offload`）が答えの不足を見たらもう一巡 background へ出す（`OffloadLanding::Again`。
   最大 3 巡。受け口と GUI のボタンは `drive_offload` の 1 実装でこれを回す）。GUI の再起動のボタン 2 つ
   （会話を引き継いだ再起動・stale の張り直し）も `dispatch_off_ui` で同じ経路を通る。
-  `sleep_guard::check_qos` の `ps` は `probe::output_with_timeout`（5 秒）へ（呼び出し元は自分のテストだけで
+  `sleep_guard::check_qos`（本体は #2857 から境界の `platform::power::check_qos`）の `ps` は `probe::output_with_timeout`（5 秒）へ（呼び出し元は自分のテストだけで
   UI スレッドからは届かないが、上限なしの型を残さない）。番犬
   `crates/tako-control/tests/issue1984_ui_thread_offload_watchdog.rs`（注入 10 通りを file:line で名指し）、
   A/B は同一バイナリの `TAKO_1984_LEGACY=1`（全部を UI スレッドの同期の dispatch へ戻す）。

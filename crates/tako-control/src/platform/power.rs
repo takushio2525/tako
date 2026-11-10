@@ -1,9 +1,17 @@
-//! スリープ防止（抽象境界 B9）のうち **macOS 以外**の実装。#524
+//! スリープ防止（抽象境界 B9）のうちアイドルスリープの防止と電源の状態。#524 / #2857
 //!
-//! macOS は IOKit 電源アサーション実装が `sleep_guard::iokit` にあり、そちらが正
-//! （#173 / #218 / #311 / #212 の積み重ねがあるので、Windows 実装を入れるために
-//! 移設して壊すことはしない）。このモジュールは `sleep_guard` の非 macOS 経路が
-//! 呼ぶ差し込み口で、`cfg` はこのファイルの内側に閉じている。
+//! OS の差はこのモジュールの内側（`imp` の選択と各関数の `cfg`）に閉じている。呼び手の
+//! `sleep_guard` は「いつ握る・いつ外す・記録」だけを持ち、OS を意識しない（#2857 で
+//! macOS の腕を `sleep_guard.rs` からここへ移した。中身は移設の前後でトークン列が一致）。
+//!
+//! | OS | 電源要求 | AC 判定 | 残量・thermal |
+//! |---|---|---|---|
+//! | macOS | IOKit の `PreventUserIdleSystemSleep`（`iokit`。#173） | `IOPSGetTimeRemainingEstimate`（#212） | IOPowerSources（#1473）・`NSProcessInfo.thermalState`（#218） |
+//! | Windows | `PowerCreateRequest` + `PowerSetRequest`（下の節） | `GetSystemPowerStatus` | 取らない（`None` / nominal） |
+//! | その他 | 持たない（[`supported`] が false） | false | 取らない |
+//!
+//! 蓋を閉じたまま走らせ続ける制御（蓋の開閉・`pmset disablesleep`・電源プランの lid action）は
+//! [`crate::platform::lid`] が持つ。
 //!
 //! ## なぜ `SetThreadExecutionState` を使わないか
 //!
@@ -31,6 +39,58 @@
 //! sudoers 連携は macOS が管理者権限を要するための手段であって、
 //! Windows では権限そのものが不要なので「落ちている」わけではない。
 
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+/// Thermal 状態（NSProcessInfo.thermalState の Rust 表現）
+///
+/// #2857 で `sleep_guard.rs` から移した（境界の [`thermal_state`] が返す型を境界に置き、
+/// 境界から `sleep_guard` を参照しないため。`sleep_guard::ThermalState` は re-export）
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ThermalState {
+    #[default]
+    Nominal,
+    Fair,
+    Serious,
+    Critical,
+}
+
+impl ThermalState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Nominal => "nominal",
+            Self::Fair => "fair",
+            Self::Serious => "serious",
+            Self::Critical => "critical",
+        }
+    }
+
+    pub fn is_warning(self) -> bool {
+        matches!(self, Self::Serious | Self::Critical)
+    }
+
+    /// `as_str` の逆（#372。`to_json` を読み戻すために使う）
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s {
+            "nominal" => Some(Self::Nominal),
+            "fair" => Some(Self::Fair),
+            "serious" => Some(Self::Serious),
+            "critical" => Some(Self::Critical),
+            _ => None,
+        }
+    }
+
+    /// バッテリー駆動で蓋を閉じ続けるには温度が高すぎるか（#1473）。
+    ///
+    /// AC 接続時の [`Self::is_warning`] より**厳しい**（`fair` でも解除する）。
+    /// 蓋を閉じたバッテリー駆動は鞄の中である可能性が高く、放熱が閉じた状態から
+    /// さらに悪化しても誰も気づけないため、悪化の兆し（fair）で降りる
+    pub fn blocks_battery_lid(self) -> bool {
+        self != Self::Nominal
+    }
+}
+
 /// この環境でスリープ防止（アイドルスリープの抑止）が使えるか
 pub fn supported() -> bool {
     imp::SUPPORTED
@@ -38,7 +98,8 @@ pub fn supported() -> bool {
 
 /// アイドルスリープ防止を保持 / 解除する。同じ状態への再要求は何もしない。
 ///
-/// `reason` は診断ツール（`powercfg /requests`）に出る文字列
+/// `reason` は診断ツール（Windows = `powercfg /requests` / macOS = `pmset -g assertions`）に出る文字列。
+/// 非 ASCII を書いてよいかは [`reason_accepts_non_ascii`]
 pub fn set_hold(hold: bool, reason: &str) {
     imp::set_hold(hold, reason);
 }
@@ -53,6 +114,105 @@ pub fn is_held() -> bool {
 /// スリープ防止が一切効かなくなる。デスクトップ機がこれに当たる）
 pub fn on_ac_power() -> bool {
     imp::on_ac_power()
+}
+
+/// 電源要求の理由（[`set_hold`] の `reason`）に非 ASCII を書いてよいか（#524 / #2857）。
+///
+/// macOS は `pmset -g assertions` に UTF-8 のまま出る（#173 から日本語の文）。Windows は
+/// `powercfg /requests` のコンソール出力で化けるので ASCII に固定する。文そのものは呼び手
+/// （`sleep_guard::assertion_reason`）が持つ
+pub fn reason_accepts_non_ascii() -> bool {
+    cfg!(target_os = "macos")
+}
+
+/// いまのバッテリー残量（%）を OS から読む（#1473）。
+///
+/// デスクトップ機・バッテリーを持たない環境・読めない OS は `None`。
+/// 検証用の注入は呼び手（`sleep_guard::battery_percent`）が先に通す。
+/// **UI スレッドから 2 秒ごとに呼ばれる**のでサブプロセスは使わない（#212）
+pub fn battery_percent() -> Option<u8> {
+    #[cfg(target_os = "macos")]
+    {
+        iokit::battery_percent()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Windows の残量取得は #1473 の対象外。読めない = バッテリー駆動では
+        // 安全弁が働いて蓋閉じ継続に入らない（理由は status に出る）
+        None
+    }
+}
+
+/// いまの thermal 状態を OS から読む（#218 / #1473）。
+///
+/// 検証用の注入は呼び手（`sleep_guard::current_thermal`）が先に通す
+pub fn thermal_state() -> ThermalState {
+    #[cfg(target_os = "macos")]
+    {
+        iokit::thermal_state()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Windows は NSProcessInfo 相当を持たない（#218 からの既知の制約）
+        ThermalState::Nominal
+    }
+}
+
+/// tako の終了時に電源要求を外す（正常終了フック。#524）。
+///
+/// Windows の電源要求はプロセス終了で OS が回収するが、明示的に解除しておく
+/// （`powercfg /requests` に残らないことを終了直後に確認できる）。macOS のアサーションは
+/// #2857 より前と同じく触らない（プロセスの終了で OS が回収する）
+pub fn release_on_exit() {
+    #[cfg(not(target_os = "macos"))]
+    {
+        crate::platform::power::set_hold(false, "");
+    }
+}
+
+/// バッテリーの設定画面を開く URL（蓋閉じ継続の案内のフォールバック）。開けない OS は `None`
+pub fn battery_settings_url() -> Option<&'static str> {
+    #[cfg(target_os = "macos")]
+    {
+        Some("x-apple.systempreferences:com.apple.preference.battery")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// [`check_qos`] の `ps` 1 回の上限（#1984）。自プロセス 1 行を引くだけなので桁で足りる
+#[cfg(target_os = "macos")]
+const QOS_PS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// プロセスの QoS を確認する（macOS のみ、診断用）。
+///
+/// `ps` は**上限つきで**待つ（#1984。`Command::output()` は子が終わらない・パイプの書き手が
+/// 長生きのプロセスへ漏れると永久に返らない = #1979 の本番ハングと同じ型）
+pub fn check_qos() -> Value {
+    #[cfg(target_os = "macos")]
+    {
+        let pid = std::process::id().to_string();
+        match tako_core::probe::output_with_timeout(
+            "ps",
+            &["-p", &pid, "-o", "pri,nice"],
+            QOS_PS_TIMEOUT,
+        ) {
+            tako_core::probe::Outcome::Done { stdout, .. } => {
+                let stdout = String::from_utf8_lossy(&stdout);
+                json!({ "qos_info": stdout.trim() })
+            }
+            tako_core::probe::Outcome::TimedOut { label, waited, .. } => {
+                json!({ "error": format!("{label} が {} 秒で返らなかった", waited.as_secs()) })
+            }
+            tako_core::probe::Outcome::Failed { reason, .. } => json!({ "error": reason }),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        json!({ "qos_info": "macOS 以外では非対応" })
+    }
 }
 
 /// `SYSTEM_POWER_STATUS` の 2 フィールドから AC 接続を判定する純粋関数。
@@ -70,6 +230,37 @@ fn on_ac_from_status(ac_line: u8, battery_flag: u8) -> bool {
         return true; // バッテリーが無い機械は常に AC
     }
     ac_line != AC_OFFLINE // 1 = AC、255 = 不明はどちらも AC 扱い
+}
+
+/// macOS の FFI（#2857 で `sleep_guard.rs` の `mod iokit` を移した）。
+/// 蓋の側（clamshell・`disablesleep`・ディスプレイ消灯）は `platform::lid` の macOS の腕が使う
+#[cfg(target_os = "macos")]
+pub(super) mod iokit;
+
+/// macOS の腕（IOKit の電源アサーション。#173）。
+/// 握る / 外すの形は #2857 より前の `sleep_guard::update` の macOS の経路のまま
+#[cfg(target_os = "macos")]
+mod imp {
+    use super::iokit;
+
+    pub(super) const SUPPORTED: bool = true;
+
+    pub(super) fn is_held() -> bool {
+        iokit::is_held()
+    }
+
+    pub(super) fn set_hold(hold: bool, reason: &str) {
+        if hold && !iokit::is_held() {
+            iokit::create_assertion(reason);
+        } else if !hold && iokit::is_held() {
+            iokit::release_assertion();
+        }
+    }
+
+    /// UI スレッドから 2 秒毎に呼ばれるので IOKit の FFI で読む（サブプロセスは使わない。#212）
+    pub(super) fn on_ac_power() -> bool {
+        iokit::on_ac_power()
+    }
 }
 
 #[cfg(windows)]
@@ -200,9 +391,8 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 mod imp {
-    /// macOS は `sleep_guard::iokit` が担当するのでここへは来ない。
     /// Linux 等は防止手段を持たない（従来どおり `platform_supported: false`）
     pub(super) const SUPPORTED: bool = false;
 
@@ -240,7 +430,8 @@ mod tests {
         assert!(on_ac_from_status(255, 255));
     }
 
-    /// 実機での取得・解除。Windows 以外では素通りする（`supported()` が false）
+    /// 実機での取得・解除。Windows と macOS は実際に握って外す（どちらもプロセスに結びついた要求で、
+    /// 電源設定は書かない。#2857 から macOS も腕を通る）。その他の OS は素通りする（`supported()` が false）
     #[test]
     fn 保持と解除で状態が戻る() {
         let _serial = crate::platform::testing::machine_state_lock();

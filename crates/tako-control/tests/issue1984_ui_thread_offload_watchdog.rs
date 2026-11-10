@@ -14,7 +14,7 @@
 //! - セッション再起動の計画（`SessionRestart` / `StaleBinary restart`）: `claude agents --json` +
 //!   器の pid 祖先辿り + 親子表
 //! - tmux 一覧（IPC の `TmuxList` と右パネルの切替時の取り直し）: `tmux list-sessions` ほか数本
-//! - `sleep_guard::check_qos` の `ps`（上限なしの `Command::output()`）
+//! - `platform::power::check_qos` の `ps`（上限なしの `Command::output()`。#2857 で `sleep_guard` から境界 B9 へ移した）
 //!
 //! # 何を縛るか
 //!
@@ -108,6 +108,8 @@ mod call_graph;
 const DISPATCH: &str = "crates/tako-control/src/dispatch.rs";
 const MAIN: &str = "crates/tako-app/src/main.rs";
 const SLEEP_GUARD: &str = "crates/tako-control/src/sleep_guard.rs";
+/// `check_qos` の本体の置き場（#2857 で `sleep_guard.rs` から境界 B9 の `platform::power` へ移した）
+const POWER: &str = "crates/tako-control/src/platform/power.rs";
 const AGENT_CLI: &str = "crates/tako-control/src/orchestrator/agent_cli.rs";
 const RIGHT_PANEL: &str = "crates/tako-app/src/right_panel.rs";
 const TASKS_PANEL: &str = "crates/tako-app/src/tasks_panel.rs";
@@ -729,11 +731,11 @@ fn scan_main(main: &str) -> Vec<Offender> {
 }
 
 /// 6. `check_qos` の `ps` が上限つき
-fn scan_sleep_guard(src: &str) -> Vec<Offender> {
+fn scan_check_qos(src: &str) -> Vec<Offender> {
     let mut out = Vec::new();
     match fn_window(src, "pub fn check_qos(") {
         None => out.push(Offender {
-            file: SLEEP_GUARD,
+            file: POWER,
             line: 0,
             why: "`check_qos` が見つからない（走査が空振り）".into(),
         }),
@@ -741,7 +743,7 @@ fn scan_sleep_guard(src: &str) -> Vec<Offender> {
             for needle in [".output()", "Command::new("] {
                 for i in code_lines_with(&window, needle) {
                     out.push(Offender {
-                        file: SLEEP_GUARD,
+                        file: POWER,
                         line: at + i,
                         why: format!(
                             "`check_qos` が `{needle}` を使っている（`ps` を上限なしで待つ = #1979 の本番ハングと \
@@ -752,7 +754,7 @@ fn scan_sleep_guard(src: &str) -> Vec<Offender> {
             }
             if code_lines_with(&window, "output_with_timeout(").is_empty() {
                 out.push(Offender {
-                    file: SLEEP_GUARD,
+                    file: POWER,
                     line: at,
                     why:
                         "`check_qos` の `ps` が上限つきの待ち（`probe::output_with_timeout`）でない"
@@ -2809,6 +2811,7 @@ struct Sources {
     dispatch: String,
     main: String,
     sleep_guard: String,
+    power: String,
     agent_cli: String,
     right_panel: String,
     tmux_backend: String,
@@ -2825,6 +2828,7 @@ impl Sources {
             dispatch: read(&root, DISPATCH),
             main: read(&root, MAIN),
             sleep_guard: read(&root, SLEEP_GUARD),
+            power: read(&root, POWER),
             agent_cli: read(&root, AGENT_CLI),
             right_panel: read(&root, RIGHT_PANEL),
             tmux_backend: read(&root, TMUX_BACKEND),
@@ -2862,7 +2866,7 @@ impl Sources {
         v.extend(scan_prepare(&self.dispatch));
         v.extend(scan_background(&self.dispatch));
         v.extend(scan_main(&self.main));
-        v.extend(scan_sleep_guard(&self.sleep_guard));
+        v.extend(scan_check_qos(&self.power));
         v.extend(scan_tmux_open_arm(&self.dispatch));
         v.extend(scan_locate(&self.agent_cli));
         v.extend(scan_gui_1989(&self.main, &self.right_panel));
@@ -2951,7 +2955,7 @@ fn 走査が空振りしていない() {
         (&s.dispatch, "pub fn land_offload(", "probe_needs("),
         (&s.main, "fn spawn_tmux_refresh(", "fetch_tmux_sessions("),
         (&s.main, "fn dispatch_off_ui(", "prepare_offload("),
-        (&s.sleep_guard, "pub fn check_qos(", "output_with_timeout("),
+        (&s.power, "pub fn check_qos(", "output_with_timeout("),
         (
             &s.dispatch,
             "fn dispatch_git_resolve_agent(",
@@ -4194,15 +4198,15 @@ fn 逆戻りを名指しできる() {
 
     // ⑩ check_qos を修正前の上限なしの ps へ戻す
     let g = inject(
-        &s.sleep_guard,
+        &s.power,
         "        match tako_core::probe::output_with_timeout(",
         "        let _ = std::process::Command::new(\"ps\").output();\n        match tako_core::probe::output_with_timeout(",
         "⑩",
     );
     expect_named(
         "check_qos の ps を上限なしへ",
-        scan_sleep_guard(&g),
-        SLEEP_GUARD,
+        scan_check_qos(&g),
+        POWER,
         "check_qos",
     );
 }

@@ -951,10 +951,22 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
              製品コードの起動ではないので Windows の GUI からは到達しない",
         ),
         (
+            "crates/tako-control/src/platform/lid/pmset.rs",
+            1,
+            "境界 B9 の蓋ぶんの macOS の手段 `sudo -n pmset -a disablesleep`（#2857 で `sleep_guard.rs` から移した。\
+             起こすのは macOS の腕だけ）",
+        ),
+        (
             "crates/tako-control/src/platform/os_integration.rs",
             7,
             "境界 B8 の macOS / Linux 実装（open / osascript / xdg-open）+ テストの osascript 1 件。\
              Windows 側（explorer / cmd start）は #617 で適用済みなので数に入らない",
+        ),
+        (
+            "crates/tako-control/src/platform/power/iokit.rs",
+            1,
+            "境界 B9 の macOS の腕のディスプレイ消灯 `pmset displaysleepnow`（#311。#2857 で `sleep_guard.rs` から移した。\
+             `cfg(target_os = \"macos\")` のモジュール）",
         ),
         (
             "crates/tako-control/src/queue.rs",
@@ -979,8 +991,9 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
         ),
         (
             "crates/tako-control/src/sleep_guard.rs",
-            4,
-            "macOS 限定（pmset / osascript / sudo。#1926 で defaults を、#1984 で ps を消した）",
+            2,
+            "macOS 限定の sudoers の登録・削除（osascript。#1926 で defaults を、#1984 で ps を消し、\
+             #2857 で pmset / sudo を境界 B9 の `platform/power/iokit.rs` / `platform/lid/pmset.rs` へ移した）",
         ),
         (
             "crates/tako-control/src/test_write_isolation.rs",

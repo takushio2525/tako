@@ -1,7 +1,17 @@
-//! 蓋を閉じたまま走らせ続ける制御（抽象境界 B9 のうち蓋ぶん）の **macOS 以外**の実装。#697
+//! 蓋を閉じたまま走らせ続ける制御（抽象境界 B9 のうち蓋ぶん）。#697 / #2857
 //!
-//! macOS は clamshell 検知 + sudoers + `pmset disablesleep` を `sleep_guard` が持っていて
-//! そちらが正。このモジュールは非 macOS 経路の差し込み口で、`cfg` はこのファイルの内側に閉じている。
+//! 手段は OS で違う。呼び手の `sleep_guard` は下の「OS をまたぐ口」（[`control_supported`] /
+//! [`apply_override`] / [`override_active`] ほか）だけを呼び、OS を意識しない。`cfg` はこのファイル
+//! （と [`pmset`]）の内側に閉じている。
+//!
+//! | OS | 手段 | 権限 | 倒した記録 |
+//! |---|---|---|---|
+//! | macOS | clamshell 検知 + sudoers + `pmset disablesleep`（[`pmset`]。#218。#2857 で `sleep_guard.rs` から移した） | 初回に管理者パスワード | 持たない（いまの値を IORegistry から読む） |
+//! | Windows | 電源プランの lid action（このファイルの本体 = 電源プランの腕。#697） | 不要 | 所有者つきで持つ（#1373） |
+//! | その他 | 持たない | — | — |
+//!
+//! 以下の節は電源プランの腕（Windows）の説明。[`supported`] / [`is_active`] / [`set_stay_awake`] /
+//! [`clear_residual`] はこの腕の口で、macOS では使わない（[`supported`] が false）。
 //!
 //! ## 何を倒すのか
 //!
@@ -615,7 +625,9 @@ fn invalidate_cache() {
     *lock_cache() = None;
 }
 
-/// この OS で蓋閉じ継続を制御できるか
+/// 電源プランの腕（Windows）で蓋閉じ継続を制御できるか。
+///
+/// macOS の `pmset` の手段を含めて「この OS で制御できるか」を問うのは [`control_supported`]
 pub fn supported() -> bool {
     imp::SUPPORTED
 }
@@ -775,6 +787,205 @@ fn restore(saved: &SavedLidState) -> Result<(), LidError> {
     imp::apply(&scheme)?;
     clear_saved();
     Ok(())
+}
+
+// --- OS をまたぐ口（#2857） ---
+//
+// 呼び手（`sleep_guard`）はこの節の口だけを呼ぶ。macOS の腕は #2857 より前に
+// `sleep_guard.rs` の `#[cfg(target_os = "macos")]` の塊に並んでいたもの、macOS 以外の腕は
+// 電源プランの腕（上の節）へそのまま渡す。判定（いつ倒す・いつ戻す）と記録（persist.log /
+// stderr）は呼び手が持つ。
+
+/// macOS の手段（sudoers の限定登録 + `pmset disablesleep`。#218）
+pub mod pmset;
+
+#[cfg(target_os = "macos")]
+use super::power::iokit;
+#[cfg(target_os = "macos")]
+use pmset::{is_sudoers_installed, set_disablesleep};
+
+/// 蓋を閉じたまま走らせ続ける制御をこの OS が持つか（#524 / #697）。
+/// 表の正本と経緯は `sleep_guard::lid_control_supported`
+pub fn control_supported() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        crate::platform::lid::supported()
+    }
+}
+
+/// 蓋の開閉（[`is_closed`]）をこの OS で観測できるか（#697。`sleep_guard::lid_state_detectable`）
+pub fn state_detectable() -> bool {
+    cfg!(target_os = "macos")
+}
+
+/// この OS の蓋閉じ継続が、管理者権限を伴う初回登録（macOS = sudoers）を要する仕組みか
+/// （#697。`sleep_guard::lid_requires_privileged_setup`）。
+///
+/// 呼び手はこれを「sudoers の手段（[`pmset`]）を使う OS か」の能力として読む（呼び手に
+/// `cfg` を戻さない = #2857）
+pub fn requires_privileged_setup() -> bool {
+    cfg!(target_os = "macos")
+}
+
+/// 蓋が閉じているか（macOS = IORegistry の `AppleClamshellState`。root 不要。#218）。
+/// 観測できない OS は false（「開いている」と「分からない」の区別は [`state_detectable`]）
+pub fn is_closed() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        iokit::clamshell_closed()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// いま蓋閉じ継続の上書きが効いているか。
+///
+/// macOS = `pmset disablesleep` の現在値（IORegistry の `SleepDisabled`。root 不要。#218）、
+/// Windows = 倒した記録が残っているか（[`is_active`]）
+pub fn override_active() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        iokit::sleep_disabled()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        is_active()
+    }
+}
+
+/// 蓋閉じ継続の設定が off の間も、呼び手の周期（`sleep_guard::update`）で上書きを戻しに行くか（#2857）。
+///
+/// Windows（電源プランの腕）は倒した記録に所有者を持ち、設定が off なら自分の上書きだけを戻す
+/// （#697 / #1373）。macOS の腕は設定が off の間は `pmset` に触らない（#218 からの挙動。#2857 の
+/// 移設では変えない）。off にした後の macOS の戻しは `tako sleep-guard remove-lid-sleep`・
+/// 終了時の [`restore_on_exit`]・次の起動の [`clear_startup_residual`] が受け持つ
+pub fn restores_while_mode_off() -> bool {
+    !cfg!(target_os = "macos")
+}
+
+/// 蓋閉じ継続を倒す / 戻す。倒した・戻したら `Ok(true)`、同じ状態なら何もせず `Ok(false)`
+/// （毎 tick 呼ばれる前提）。倒すべきかの判定は呼び手（`sleep_guard::lid_decision`）が持つ。
+///
+/// `include_battery` はバッテリー側も倒すか。電源プランは AC / DC を別々に持つので倒すレールを
+/// 選ぶ（#1473）。macOS の `pmset -a` は電源を問わず効くので使わない
+pub fn apply_override(enable: bool, include_battery: bool) -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = include_battery;
+        let current_disabled = iokit::sleep_disabled();
+        if enable && !current_disabled {
+            set_disablesleep(true).map(|()| true)
+        } else if !enable && current_disabled {
+            set_disablesleep(false).map(|()| true)
+        } else {
+            Ok(false)
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        set_stay_awake(enable, include_battery)
+    }
+}
+
+/// 蓋閉じ中のディスプレイ消灯（#311）。
+///
+/// macOS の `disablesleep=1` は蓋閉じスリープだけでなくディスプレイの消灯も止めるので、
+/// 蓋閉じ + 倒している組み合わせでディスプレイだけを明示的に消す（蓋が閉じている間は入力が
+/// 無いので 1 回送れば消灯が続く）。電源プランの lid action はディスプレイの消灯を妨げないので、
+/// macOS 以外では何もしない
+pub fn sync_display_sleep(lid_closed: bool, lid_sleep_disabled: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        if lid_closed && lid_sleep_disabled {
+            iokit::force_display_sleep();
+        }
+        if !lid_closed || !lid_sleep_disabled {
+            iokit::reset_display_sleep_sent();
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (lid_closed, lid_sleep_disabled);
+    }
+}
+
+/// 蓋閉じ中にディスプレイの消灯を送ったか（#311）
+pub fn display_sleep_forced() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        iokit::display_sleep_sent()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// 起動時の残留の後始末（[`clear_startup_residual`]）の結果（#449 / #697 / #2857）。
+///
+/// stderr の文と persist.log への記録は呼び手（`sleep_guard::check_disablesleep_residual`）が組む。
+/// 文が手段ごとに違う（#2857 より前のまま）ので、手段の名前で分けて返す
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupResidual {
+    /// macOS: 戻さなかった（理由は [`pmset::should_clear_residual`] の文）
+    PmsetSkipped(&'static str),
+    /// macOS: `pmset disablesleep 0` で戻した
+    PmsetCleared,
+    /// macOS: 戻そうとして失敗した
+    PmsetFailed(String),
+    /// 電源プランの腕（Windows）: [`clear_residual`] の結果そのまま
+    /// （`Ok(Some(説明))` = 戻した / `Ok(None)` = 触らない / `Err` = 失敗）
+    PowerPlan(Result<Option<String>, String>),
+}
+
+/// 起動時の残留チェック: 前回のクラッシュ・異常終了で倒したまま残った上書きを元へ戻す（#449 / #697）。
+///
+/// 隔離（`is_isolated`）と他の tako の稼働（`other_instance_running`）の門は両方の腕が通る
+pub fn clear_startup_residual(is_isolated: bool, other_instance_running: bool) -> StartupResidual {
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(reason) = pmset::should_clear_residual(
+            is_isolated,
+            other_instance_running,
+            is_sudoers_installed(),
+            iokit::sleep_disabled(),
+        ) {
+            return StartupResidual::PmsetSkipped(reason);
+        }
+        match set_disablesleep(false) {
+            Err(e) => StartupResidual::PmsetFailed(e),
+            Ok(()) => StartupResidual::PmsetCleared,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        StartupResidual::PowerPlan(clear_residual(is_isolated, other_instance_running))
+    }
+}
+
+/// tako の正常終了で蓋閉じ継続の上書きを戻す（#218 / #697）。
+///
+/// **蓋の設定は OS が回収してくれない**（倒したまま終了すると、次に tako を起動するまで蓋を
+/// 閉じてもスリープしない）。起動時の残留復元（[`clear_startup_residual`]）は最後の砦であって、
+/// 正常終了ではここで戻す。macOS の腕の失敗は #2857 より前と同じく黙って捨てる（`Ok` を返す）
+pub fn restore_on_exit() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        if is_sudoers_installed() && iokit::sleep_disabled() {
+            let _ = set_disablesleep(false);
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        set_stay_awake(false, false).map(|_| ())
+    }
 }
 
 #[cfg(windows)]
@@ -953,8 +1164,8 @@ mod imp {
 mod imp {
     use super::{LidError, Rail};
 
-    /// macOS は `sleep_guard` の clamshell + pmset 実装が担当するのでここへは来ない。
-    /// Linux 等は蓋の動作を触る共通の仕組みが無い
+    /// macOS は OS をまたぐ口の macOS の腕（clamshell + [`super::pmset`]）が担当するので
+    /// 電源プランの腕は使わない。Linux 等は蓋の動作を触る共通の仕組みが無い
     pub(super) const SUPPORTED: bool = false;
 
     /// 非 Windows では GUID を扱わないので、型だけ合わせた空実装。

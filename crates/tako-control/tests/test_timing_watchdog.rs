@@ -144,7 +144,8 @@ const ABSOLUTE_BUDGET_ALLOWLIST: &[(&str, &str, &str)] = &[
         "予算 200ms（と下限 400ms）/ 正常は数 ms・直列化したら遅い側の 500ms 待ち",
     ),
     (
-        "crates/tako-control/src/sleep_guard.rs",
+        // #2857 で `sleep_guard.rs` から FFI ごと境界 B9 へ移した
+        "crates/tako-control/src/platform/power/iokit.rs",
         "iokit_ffi_calls_are_fast",
         "予算 1 秒 / 正常は FFI ×400 で数百 µs・回帰はサブプロセス ×400 で数十秒",
     ),

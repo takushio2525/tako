@@ -28,13 +28,28 @@
 //! 電源条件:
 //! - ac-only: AC 接続時のみ（既定）
 //! - always: バッテリー時も
+//!
+//! OS の差（IOKit・`pmset`・sudoers・電源プラン・QoS の確認）は境界 B9 の
+//! `platform::power`（電源要求・電源の状態）と `platform::lid`（蓋閉じ継続）の内側に閉じていて、
+//! このモジュールは OS を意識しない判断（いつ握る・いつ外す・いつ倒す・いつ戻す）と記録だけを持つ
+//! （#2857。番犬 `platform_parity.rs` がこのファイルの本番コードの OS の `cfg` を落とす）。
+//! OS ごとに手段が違うところ（sudoers の登録の要否など）は境界の能力
+//! （[`lid_requires_privileged_setup`] ほか）で分ける
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::platform::lid::pmset::{SUDOERS_CONTENT, SUDOERS_FILE};
+use crate::platform::lid::{self, StartupResidual};
+use crate::platform::power;
 use crate::OsRefusal;
+
+/// sudoers.d/tako-sleep-guard が登録済みか（**macOS 固有の手段**。#2857 で `platform::lid::pmset` へ移した）
+pub use crate::platform::lid::pmset::is_sudoers_installed;
+/// Thermal 状態（#2857 で境界 `platform::power` へ移した。呼び手の綴りはそのまま）
+pub use crate::platform::power::ThermalState;
 
 /// update() で計算された busy_agents の最新値。status() が読み取る（#372）
 static BUSY_AGENTS: AtomicUsize = AtomicUsize::new(0);
@@ -181,52 +196,6 @@ pub fn parse_battery_floor_typed(percent: i64) -> Result<u8, OsRefusal> {
         Ok(percent as u8)
     } else {
         Err(OsRefusal::BatteryFloorOutOfRange(percent))
-    }
-}
-
-/// Thermal 状態（NSProcessInfo.thermalState の Rust 表現）
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ThermalState {
-    #[default]
-    Nominal,
-    Fair,
-    Serious,
-    Critical,
-}
-
-impl ThermalState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Nominal => "nominal",
-            Self::Fair => "fair",
-            Self::Serious => "serious",
-            Self::Critical => "critical",
-        }
-    }
-
-    pub fn is_warning(self) -> bool {
-        matches!(self, Self::Serious | Self::Critical)
-    }
-
-    /// `as_str` の逆（#372。`to_json` を読み戻すために使う）
-    pub fn from_str_opt(s: &str) -> Option<Self> {
-        match s {
-            "nominal" => Some(Self::Nominal),
-            "fair" => Some(Self::Fair),
-            "serious" => Some(Self::Serious),
-            "critical" => Some(Self::Critical),
-            _ => None,
-        }
-    }
-
-    /// バッテリー駆動で蓋を閉じ続けるには温度が高すぎるか（#1473）。
-    ///
-    /// AC 接続時の [`Self::is_warning`] より**厳しい**（`fair` でも解除する）。
-    /// 蓋を閉じたバッテリー駆動は鞄の中である可能性が高く、放熱が閉じた状態から
-    /// さらに悪化しても誰も気づけないため、悪化の兆し（fair）で降りる
-    pub fn blocks_battery_lid(self) -> bool {
-        self != Self::Nominal
     }
 }
 
@@ -611,321 +580,7 @@ impl SleepGuardState {
     }
 }
 
-// --- IOKit FFI（macOS 専用） ---
-
-#[cfg(target_os = "macos")]
-mod iokit {
-    use std::ffi::c_void;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    type IOPMAssertionID = u32;
-    type CFStringRef = *const c_void;
-    type CFStringEncoding = u32;
-    type CFBooleanRef = *const c_void;
-
-    const K_CFSTRING_ENCODING_UTF8: CFStringEncoding = 0x08000100;
-    const K_IOPM_ASSERTION_LEVEL_ON: u32 = 255;
-
-    /// `CFNumberGetValue` の型指定（kCFNumberSInt32Type）
-    const K_CFNUMBER_SINT32_TYPE: i32 = 3;
-
-    #[link(name = "CoreFoundation", kind = "framework")]
-    extern "C" {
-        fn CFStringCreateWithCString(
-            alloc: *const c_void,
-            c_str: *const u8,
-            encoding: CFStringEncoding,
-        ) -> CFStringRef;
-        fn CFRelease(cf: *const c_void);
-        fn CFBooleanGetValue(boolean: CFBooleanRef) -> bool;
-        // バッテリー残量の読み取り（#1473）
-        fn CFArrayGetCount(array: *const c_void) -> isize;
-        fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
-        fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
-        fn CFNumberGetValue(number: *const c_void, the_type: i32, value: *mut c_void) -> bool;
-    }
-
-    /// AC 接続時の IOPSGetTimeRemainingEstimate 戻り値（kIOPSTimeRemainingUnlimited）
-    const K_IOPS_TIME_REMAINING_UNLIMITED: f64 = -2.0;
-
-    type IOReturn = i32;
-    type MachPort = u32;
-
-    #[link(name = "IOKit", kind = "framework")]
-    extern "C" {
-        fn IOPMAssertionCreateWithName(
-            assertion_type: CFStringRef,
-            assertion_level: u32,
-            reason_for_activity: CFStringRef,
-            assertion_id: *mut IOPMAssertionID,
-        ) -> IOReturn;
-        fn IOPMAssertionRelease(assertion_id: IOPMAssertionID) -> IOReturn;
-        fn IOPSGetTimeRemainingEstimate() -> f64;
-        // バッテリー残量の読み取り（#1473）。Copy で返るものは CFRelease が要る
-        fn IOPSCopyPowerSourcesInfo() -> *const c_void;
-        fn IOPSCopyPowerSourcesList(blob: *const c_void) -> *const c_void;
-        fn IOPSGetPowerSourceDescription(blob: *const c_void, ps: *const c_void) -> *const c_void;
-
-        fn IOServiceGetMatchingService(main_port: MachPort, matching: *const c_void) -> u32;
-        fn IOServiceMatching(name: *const u8) -> *mut c_void;
-        fn IORegistryEntryCreateCFProperty(
-            entry: u32,
-            key: CFStringRef,
-            allocator: *const c_void,
-            options: u32,
-        ) -> *const c_void;
-        fn IOObjectRelease(object: u32) -> IOReturn;
-    }
-
-    static ASSERTION_ID: AtomicU32 = AtomicU32::new(0);
-    static ASSERTION_HELD: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-    // #311: 蓋閉じ中にディスプレイ消灯コマンドを送信済みか
-    static DISPLAY_SLEEP_SENT: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-
-    fn cf_string(s: &str) -> CFStringRef {
-        let c_str = std::ffi::CString::new(s).unwrap_or_default();
-        unsafe {
-            CFStringCreateWithCString(
-                std::ptr::null(),
-                c_str.as_ptr() as *const u8,
-                K_CFSTRING_ENCODING_UTF8,
-            )
-        }
-    }
-
-    /// IOKit 電源アサーションを取得する。既に保持中の場合は何もしない
-    pub fn create_assertion(reason: &str) -> bool {
-        if ASSERTION_HELD.load(std::sync::atomic::Ordering::Relaxed) {
-            return true;
-        }
-        let assertion_type = cf_string("PreventUserIdleSystemSleep");
-        let reason_str = cf_string(reason);
-        let mut assertion_id: IOPMAssertionID = 0;
-        let result = unsafe {
-            IOPMAssertionCreateWithName(
-                assertion_type,
-                K_IOPM_ASSERTION_LEVEL_ON,
-                reason_str,
-                &mut assertion_id,
-            )
-        };
-        unsafe {
-            CFRelease(assertion_type);
-            CFRelease(reason_str);
-        }
-        if result == 0 {
-            ASSERTION_ID.store(assertion_id, Ordering::Relaxed);
-            ASSERTION_HELD.store(true, std::sync::atomic::Ordering::Relaxed);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// IOKit 電源アサーションを解放する。保持していない場合は何もしない
-    pub fn release_assertion() {
-        if !ASSERTION_HELD.load(std::sync::atomic::Ordering::Relaxed) {
-            return;
-        }
-        let id = ASSERTION_ID.load(Ordering::Relaxed);
-        unsafe {
-            IOPMAssertionRelease(id);
-        }
-        ASSERTION_HELD.store(false, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn is_held() -> bool {
-        ASSERTION_HELD.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// AC 電源に接続されているか（IOKit IOPSGetTimeRemainingEstimate 経由）。
-    /// UI スレッドから 2 秒毎に呼ばれるため、サブプロセス（pmset）は使えない
-    /// （fork+exec は 1 回 20〜30ms、CPU 飽和時は秒級までブロックする。#212）
-    pub fn on_ac_power() -> bool {
-        unsafe { IOPSGetTimeRemainingEstimate() == K_IOPS_TIME_REMAINING_UNLIMITED }
-    }
-
-    /// CFNumber を i32 として読む（#1473）
-    fn cf_number_i32(value: *const c_void) -> Option<i32> {
-        if value.is_null() {
-            return None;
-        }
-        let mut out: i32 = 0;
-        let ok = unsafe {
-            CFNumberGetValue(
-                value,
-                K_CFNUMBER_SINT32_TYPE,
-                std::ptr::addr_of_mut!(out) as *mut c_void,
-            )
-        };
-        ok.then_some(out)
-    }
-
-    /// バッテリー残量（%。IOPowerSources。root 不要、#1473）。
-    ///
-    /// デスクトップ機・電源が 1 つも列挙されない環境は `None`。
-    /// `on_ac_power` と同じく **UI スレッドから 2 秒毎に呼ばれる**ので
-    /// サブプロセス（`pmset -g batt`）は使わない（#212）
-    pub fn battery_percent() -> Option<u8> {
-        unsafe {
-            let blob = IOPSCopyPowerSourcesInfo();
-            if blob.is_null() {
-                return None;
-            }
-            let list = IOPSCopyPowerSourcesList(blob);
-            if list.is_null() {
-                CFRelease(blob);
-                return None;
-            }
-            let mut result = None;
-            for i in 0..CFArrayGetCount(list) {
-                let source = CFArrayGetValueAtIndex(list, i);
-                if source.is_null() {
-                    continue;
-                }
-                // Get = 所有権は blob 側（CFRelease しない）
-                let desc = IOPSGetPowerSourceDescription(blob, source);
-                if desc.is_null() {
-                    continue;
-                }
-                let current_key = cf_string("Current Capacity");
-                let max_key = cf_string("Max Capacity");
-                let current = cf_number_i32(CFDictionaryGetValue(desc, current_key));
-                let max = cf_number_i32(CFDictionaryGetValue(desc, max_key));
-                CFRelease(current_key);
-                CFRelease(max_key);
-                if let (Some(current), Some(max)) = (current, max) {
-                    if max > 0 {
-                        let ratio = f64::from(current) / f64::from(max) * 100.0;
-                        result = Some(ratio.round().clamp(0.0, 100.0) as u8);
-                        break;
-                    }
-                }
-            }
-            CFRelease(list);
-            CFRelease(blob);
-            result
-        }
-    }
-
-    /// 蓋が閉じているか（IORegistry AppleClamshellState。root 不要、#218）。
-    /// IOKit FFI なのでサブプロセスを使わず UI スレッドで安全に呼べる
-    pub fn clamshell_closed() -> bool {
-        unsafe {
-            let name = b"IOPMrootDomain\0";
-            let matching = IOServiceMatching(name.as_ptr());
-            if matching.is_null() {
-                return false;
-            }
-            let service = IOServiceGetMatchingService(0, matching);
-            // IOServiceMatching の戻り値は IOServiceGetMatchingService が消費する（CFRelease 不要）
-            if service == 0 {
-                return false;
-            }
-            let key = cf_string("AppleClamshellState");
-            let value = IORegistryEntryCreateCFProperty(service, key, std::ptr::null(), 0);
-            CFRelease(key);
-            IOObjectRelease(service);
-            if value.is_null() {
-                return false;
-            }
-            let result = CFBooleanGetValue(value as CFBooleanRef);
-            CFRelease(value);
-            result
-        }
-    }
-
-    /// pmset disablesleep の現在値を IORegistry から読む（root 不要、#218）
-    pub fn sleep_disabled() -> bool {
-        unsafe {
-            let name = b"IOPMrootDomain\0";
-            let matching = IOServiceMatching(name.as_ptr());
-            if matching.is_null() {
-                return false;
-            }
-            let service = IOServiceGetMatchingService(0, matching);
-            if service == 0 {
-                return false;
-            }
-            let key = cf_string("SleepDisabled");
-            let value = IORegistryEntryCreateCFProperty(service, key, std::ptr::null(), 0);
-            CFRelease(key);
-            IOObjectRelease(service);
-            if value.is_null() {
-                return false;
-            }
-            let result = CFBooleanGetValue(value as CFBooleanRef);
-            CFRelease(value);
-            result
-        }
-    }
-
-    /// NSProcessInfo.thermalState を取得（ObjC runtime 経由、#218）
-    pub fn thermal_state() -> super::ThermalState {
-        #[link(name = "objc", kind = "dylib")]
-        extern "C" {
-            fn objc_getClass(name: *const u8) -> *const c_void;
-            fn sel_registerName(name: *const u8) -> *const c_void;
-            fn objc_msgSend(receiver: *const c_void, sel: *const c_void, ...) -> *const c_void;
-        }
-
-        unsafe {
-            let cls = objc_getClass(c"NSProcessInfo".as_ptr() as *const u8);
-            if cls.is_null() {
-                return super::ThermalState::Nominal;
-            }
-            let sel_pi = sel_registerName(c"processInfo".as_ptr() as *const u8);
-            let pi = objc_msgSend(cls, sel_pi);
-            if pi.is_null() {
-                return super::ThermalState::Nominal;
-            }
-            let sel_ts = sel_registerName(c"thermalState".as_ptr() as *const u8);
-            let state = objc_msgSend(pi, sel_ts);
-            match state as isize {
-                0 => super::ThermalState::Nominal,
-                1 => super::ThermalState::Fair,
-                2 => super::ThermalState::Serious,
-                3 => super::ThermalState::Critical,
-                _ => super::ThermalState::Nominal,
-            }
-        }
-    }
-
-    /// ディスプレイだけをスリープさせる（#311）。
-    /// disablesleep=1 の蓋閉じ時に呼ぶ。root 不要。蓋閉じ中はユーザー入力が
-    /// ないため、一度送ればディスプレイは消灯を維持する。
-    /// 蓋閉じ→蓋開け 1 サイクルにつき 1 回だけ呼ぶ（DISPLAY_SLEEP_SENT で制御）
-    pub fn force_display_sleep() {
-        if DISPLAY_SLEEP_SENT.load(std::sync::atomic::Ordering::Relaxed) {
-            return;
-        }
-        // GUI のスリープ防止の周期から起こすので PATH で引いた絶対パスで起こす（#2519）
-        let _ = std::process::Command::new(tako_core::platform::exe::resolve_for_spawn("pmset"))
-            .arg("displaysleepnow")
-            .output();
-        DISPLAY_SLEEP_SENT.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn display_sleep_sent() -> bool {
-        DISPLAY_SLEEP_SENT.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    pub fn reset_display_sleep_sent() {
-        DISPLAY_SLEEP_SENT.store(false, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
 // --- 蓋閉じ防止の sudoers 登録・pmset 制御（#218） ---
-
-const SUDOERS_FILE: &str = "/etc/sudoers.d/tako-sleep-guard";
-const SUDOERS_CONTENT: &str = "\
-# tako sleep guard: pmset disablesleep のみ NOPASSWD (#218)
-# アンインストール: sudo rm /etc/sudoers.d/tako-sleep-guard
-%admin ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0
-%admin ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1
-";
 
 /// 蓋を閉じたまま走らせ続ける制御をこの OS が持つか（#524 / #697）。
 ///
@@ -942,21 +597,11 @@ const SUDOERS_CONTENT: &str = "\
 /// #524 の時点では Windows を「相当する API が無い」として落としていたが、
 /// これは誤りだった（#697 で実測して訂正）。設定は `powercfg /q` の一覧に出ない
 /// （定義側の `Attributes = 1` で UI から hidden）だけで、GUID を明示すれば
-/// 非管理者のまま読み書きできる
+/// 非管理者のまま読み書きできる。
+///
+/// 手段の選択は境界 `platform::lid` の内側（#2857）
 pub fn lid_control_supported() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        true
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        crate::platform::lid::supported()
-    }
-}
-
-/// sudoers.d/tako-sleep-guard が登録済みか（**macOS 固有の手段**）
-pub fn is_sudoers_installed() -> bool {
-    std::path::Path::new(SUDOERS_FILE).exists()
+    lid::control_supported()
 }
 
 /// 蓋の開閉状態（`lid_closed`）をこの OS で観測できるか（#697）。
@@ -966,15 +611,17 @@ pub fn is_sudoers_installed() -> bool {
 /// 持つには重いので**観測しない**。`lid_closed` が常に false になるので、
 /// 表示側はこの関数で「開いている」と「分からない」を区別する
 pub fn lid_state_detectable() -> bool {
-    cfg!(target_os = "macos")
+    lid::state_detectable()
 }
 
 /// この OS の蓋閉じ継続が、管理者権限を伴う初回登録を要する仕組みか（#697）。
 ///
 /// **OS ごとに固定**で、登録が済んだかどうかでは変わらない（そこは `lid_setup_pending`）。
-/// 設定画面の説明文のように「この OS ではどういう仕組みか」を書く場所で使う
+/// 設定画面の説明文のように「この OS ではどういう仕組みか」を書く場所で使う。
+/// このモジュールの中では「sudoers の手段（`platform::lid::pmset`）を使う OS か」の
+/// 能力として読む（登録・解除・状態の `sudoers_installed` の出し分け。#2857）
 pub fn lid_requires_privileged_setup() -> bool {
-    cfg!(target_os = "macos")
+    lid::requires_privileged_setup()
 }
 
 /// 蓋閉じ継続を使うのに、この機械でまだ初回セットアップが要るか（#697）。
@@ -986,14 +633,7 @@ pub fn lid_setup_pending() -> bool {
     if !lid_control_supported() {
         return false; // 使えない OS では「セットアップ待ち」ですらない
     }
-    #[cfg(target_os = "macos")]
-    {
-        !is_sudoers_installed()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        false
-    }
+    lid_requires_privileged_setup() && !is_sudoers_installed()
 }
 
 /// 蓋閉じ継続を使える状態にする（#697）。
@@ -1015,12 +655,9 @@ pub fn prepare_lid_control_done() -> Result<LidControlDone, OsRefusal> {
     if !lid_control_supported() {
         return Err(OsRefusal::LidUnsupported);
     }
-    #[cfg(target_os = "macos")]
-    {
+    if lid_requires_privileged_setup() {
         install_sudoers_typed().map(LidControlDone::SudoersInstalled)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
+    } else {
         Ok(LidControlDone::NoSetupNeeded)
     }
 }
@@ -1040,12 +677,9 @@ pub fn teardown_lid_control_typed() -> Result<String, OsRefusal> {
 
 /// [`teardown_lid_control`] の結果を型で返す口（#2365。`tako sleep-guard remove-lid-sleep` の行）
 pub fn teardown_lid_control_done() -> Result<LidControlDone, OsRefusal> {
-    #[cfg(target_os = "macos")]
-    {
+    if lid_requires_privileged_setup() {
         remove_sudoers_done()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
+    } else {
         // tako が動いていない状態で叩かれても、その場で元へ戻せるようにする
         crate::platform::lid::set_stay_awake_typed(false, false)
             .map(|changed| {
@@ -1220,26 +854,6 @@ echo 'OK: sudoers 削除完了・disablesleep 解除'
         } else {
             stderr
         }))
-    }
-}
-
-/// sudo pmset -a disablesleep 0/1 を実行する（sudoers 登録済み前提、NOPASSWD）
-pub fn set_disablesleep(enable: bool) -> Result<(), String> {
-    if !is_sudoers_installed() {
-        return Err("sudoers 未登録（tako setup --lid-sleep で登録してください）".to_string());
-    }
-    let val = if enable { "1" } else { "0" };
-    // GUI のスリープ防止の周期が状態の変わり目ごとに起こすので PATH で引いた絶対パスで起こす（#2519）
-    let output = std::process::Command::new(tako_core::platform::exe::resolve_for_spawn("sudo"))
-        .args(["-n", "/usr/bin/pmset", "-a", "disablesleep", val])
-        .output()
-        .map_err(|e| format!("pmset の実行に失敗: {e}"))?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("pmset disablesleep {val} に失敗: {stderr}"))
     }
 }
 
@@ -1451,16 +1065,7 @@ pub fn battery_percent() -> Option<u8> {
     if let Some(p) = injected_battery_percent() {
         return Some(p);
     }
-    #[cfg(target_os = "macos")]
-    {
-        iokit::battery_percent()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        // Windows の残量取得は #1473 の対象外。読めない = バッテリー駆動では
-        // 安全弁が働いて蓋閉じ継続に入らない（理由は status に出る）
-        None
-    }
+    power::battery_percent()
 }
 
 /// いまの thermal 状態（#1473。注入を通す 1 実装）
@@ -1468,24 +1073,27 @@ fn current_thermal() -> ThermalState {
     if let Some(t) = injected_thermal() {
         return t;
     }
-    #[cfg(target_os = "macos")]
-    {
-        iokit::thermal_state()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        // Windows は NSProcessInfo 相当を持たない（#218 からの既知の制約）
-        ThermalState::Nominal
-    }
+    power::thermal_state()
 }
 
 /// 電源要求に添える理由文字列（#524）。
 ///
 /// Windows では `powercfg /requests` にそのまま出る。診断ツールのコンソール出力で
 /// 文字化けさせないため **ASCII に固定**する（UI へは出ないので日英化の対象外。
-/// UI 文言は `tako-app::ui_text::sleep_guard` が持つ）
-#[cfg(not(target_os = "macos"))]
+/// UI 文言は `tako-app::ui_text::sleep_guard` が持つ）。macOS は `pmset -g assertions` に
+/// UTF-8 のまま出るので #173 からの日本語の文を使う（どちらを使うかは境界の能力
+/// `power::reason_accepts_non_ascii`。#2857）
 fn assertion_reason(mode: SleepGuardMode, busy_agents: usize) -> String {
+    if power::reason_accepts_non_ascii() {
+        match mode {
+            SleepGuardMode::On => return "tako: スリープ防止（常時モード）".to_string(),
+            SleepGuardMode::WhileAgentsRunning => {
+                return format!("tako: エージェント稼働中（{busy_agents} 体）")
+            }
+            // Off で保持することは無い（下の無害な既定値へ落ちる）
+            SleepGuardMode::Off => {}
+        }
+    }
     match mode {
         SleepGuardMode::On => "tako: sleep guard (always on)".to_string(),
         SleepGuardMode::WhileAgentsRunning => {
@@ -1494,31 +1102,6 @@ fn assertion_reason(mode: SleepGuardMode, busy_agents: usize) -> String {
         // Off で保持することは無い（呼ばれても無害な既定値を返す）
         SleepGuardMode::Off => "tako: sleep guard".to_string(),
     }
-}
-
-/// 残留解除を行うべきかを判定する（#449: テスト可能な純粋関数）。
-/// Ok(()) なら解除すべき、Err(理由) ならスキップ。呼び手は macOS の残留解除とテストだけ
-/// （Windows は `platform::lid::should_clear_residual`。#1537）
-#[cfg(any(target_os = "macos", test))]
-fn should_clear_residual(
-    is_isolated: bool,
-    other_instance_running: bool,
-    sudoers_installed: bool,
-    sleep_disabled: bool,
-) -> Result<(), &'static str> {
-    if is_isolated {
-        return Err("隔離モード（TAKO_ISOLATED）のためスキップ");
-    }
-    if other_instance_running {
-        return Err("他の tako プロセスが動作中のためスキップ");
-    }
-    if !sudoers_installed {
-        return Err("sudoers 未登録");
-    }
-    if !sleep_disabled {
-        return Err("disablesleep=0（残留なし）");
-    }
-    Ok(())
 }
 
 /// 蓋制御のエラーを出しすぎないための直近の文言（#697）。
@@ -1573,44 +1156,29 @@ fn log_lid_change(enabled: bool, reason: Option<LidSkipReason>, battery: Option<
 /// セカンダリモードでは呼び出し側でスキップすること（#449）
 ///
 /// macOS は `pmset disablesleep=1`、Windows は電源プランの lid action が対象。
-/// **呼び出し側は OS を意識しない**（#697 で Windows 経路を足しても main.rs は無変更）
+/// **呼び出し側は OS を意識しない**（#697 で Windows 経路を足しても main.rs は無変更）。
+/// 判定と戻すことは境界（`platform::lid::clear_startup_residual`）、診断の文と記録はここ（#2857）
 pub fn check_disablesleep_residual() {
-    #[cfg(not(target_os = "macos"))]
-    {
-        let is_isolated = matches!(
-            std::env::var("TAKO_ISOLATED").ok().as_deref(),
-            Some("1" | "true" | "on")
-        );
-        match crate::platform::lid::clear_residual(
-            is_isolated,
-            tako_core::ports::other_tako_running(),
-        ) {
-            Ok(Some(msg)) => {
-                eprintln!("[sleep-guard] {msg}");
-                crate::diag::persist_log("lid-sleep residual cleared on startup");
-            }
-            Ok(None) => {}
-            Err(e) => eprintln!("[sleep-guard] 蓋閉じ継続の残留解除に失敗: {e}"),
+    let is_isolated = matches!(
+        std::env::var("TAKO_ISOLATED").ok().as_deref(),
+        Some("1" | "true" | "on")
+    );
+    match lid::clear_startup_residual(is_isolated, tako_core::ports::other_tako_running()) {
+        StartupResidual::PowerPlan(Ok(Some(msg))) => {
+            eprintln!("[sleep-guard] {msg}");
+            crate::diag::persist_log("lid-sleep residual cleared on startup");
         }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let is_isolated = matches!(
-            std::env::var("TAKO_ISOLATED").ok().as_deref(),
-            Some("1" | "true" | "on")
-        );
-        if let Err(reason) = should_clear_residual(
-            is_isolated,
-            tako_core::ports::other_tako_running(),
-            is_sudoers_installed(),
-            iokit::sleep_disabled(),
-        ) {
+        StartupResidual::PowerPlan(Ok(None)) => {}
+        StartupResidual::PowerPlan(Err(e)) => {
+            eprintln!("[sleep-guard] 蓋閉じ継続の残留解除に失敗: {e}")
+        }
+        StartupResidual::PmsetSkipped(reason) => {
             eprintln!("[sleep-guard] disablesleep 残留チェック: {reason}");
-            return;
         }
-        if let Err(e) = set_disablesleep(false) {
+        StartupResidual::PmsetFailed(e) => {
             eprintln!("[sleep-guard] disablesleep 残留の自動解除に失敗: {e}");
-        } else {
+        }
+        StartupResidual::PmsetCleared => {
             eprintln!("[sleep-guard] disablesleep 残留を自動解除しました（前回のクラッシュまたは異常終了）");
             crate::diag::persist_log("lid-sleep residual cleared on startup");
         }
@@ -1625,22 +1193,21 @@ pub fn open_battery_settings() -> Result<(), String> {
 /// [`open_battery_settings`] の型の口（#2365。枠と中身 = `os_integration::open_url` の断りを
 /// 同じ言語で組む）
 pub fn open_battery_settings_typed() -> Result<(), OsRefusal> {
-    #[cfg(target_os = "macos")]
-    {
-        crate::platform::os_integration::open_url_typed(
-            "x-apple.systempreferences:com.apple.preference.battery",
-        )
+    // 開く先（macOS の「バッテリー」設定）が無い OS は断る（#2857 で URL を境界へ）
+    let Some(url) = power::battery_settings_url() else {
+        return Err(OsRefusal::BatterySettingsMacOnly);
+    };
+    crate::platform::os_integration::open_url_typed(url)
         .map_err(OsRefusal::BatterySettingsUnopenable)?;
-        Ok(())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Err(OsRefusal::BatterySettingsMacOnly)
-    }
+    Ok(())
 }
 
 /// スリープ防止の状態を更新する。busy_agents は現在 busy なエージェントの数。
-/// 設定に基づいてアサーションの取得・解放を行い、現在の状態を返す
+/// 設定に基づいてアサーションの取得・解放を行い、現在の状態を返す。
+///
+/// OS の差（IOKit / 電源要求・`pmset` / 電源プラン）は境界 `platform::power` / `platform::lid` の
+/// 内側にあり、ここは OS を問わない 1 本の経路で「いつ握る・いつ外す・いつ倒す・いつ戻す」を
+/// 決めて記録する（#524 / #697 / #2857）
 pub fn update(config: SleepGuardConfig, busy_agents: usize) -> SleepGuardState {
     BUSY_AGENTS.store(busy_agents, Ordering::Relaxed);
     let SleepGuardConfig {
@@ -1653,164 +1220,85 @@ pub fn update(config: SleepGuardConfig, busy_agents: usize) -> SleepGuardState {
     // 材料の取得は OS ごとの実装に閉じつつ、**判定は 1 実装**（#1473）
     let battery = battery_percent();
     let thermal = current_thermal();
-    #[cfg(not(target_os = "macos"))]
+    let on_ac = power::on_ac_power();
+    // 蓋の開閉を観測できない OS は false（Windows の蓋の開閉は `RegisterPowerSettingNotification` に
+    // ウィンドウハンドルが要り、ここからは取れない。蓋閉じ継続そのものは電源プランの lid action = #697）
+    let lid_closed = lid::is_closed();
+    // 初回セットアップ（macOS = sudoers 登録）が済んでいるか。sudoers の手段を使わない OS
+    // （Windows は電源プランを非管理者で書ける）は登録が要らない = 常に済み
+    let sudoers = lid_requires_privileged_setup() && is_sudoers_installed();
+    let setup_done = !lid_requires_privileged_setup() || sudoers;
+
+    // --- アイドルスリープ防止（判定は #524 で共通化） ---
+    let should_hold = should_hold_assertion(mode, power_condition, on_ac, busy_agents);
+    power::set_hold(should_hold, &assertion_reason(mode, busy_agents));
+
+    // --- 蓋閉じ継続（#218 / #697。判定は #1473 で安全弁つきの 1 実装） ---
+    let lid_supported = lid_control_supported();
+    // 設定が off の間も戻しに行くかは手段による（Windows は自分の記録だけを戻す・macOS は
+    // off の間は `pmset` に触らない = #218 からの挙動。`lid::restores_while_mode_off`）
+    if lid_supported
+        && setup_done
+        && (lid_sleep_mode == LidSleepMode::WhileAgentsRunning || lid::restores_while_mode_off())
     {
-        // 蓋の開閉検知は macOS 固有のまま
-        // （Windows の蓋の開閉は `RegisterPowerSettingNotification` にウィンドウハンドルが
-        // 要り、ここからは取れない）。蓋閉じ継続そのものは電源プランの lid action で行う（#697）
-        let on_ac = crate::platform::power::on_ac_power();
-        let should_hold = should_hold_assertion(mode, power_condition, on_ac, busy_agents);
-        crate::platform::power::set_hold(should_hold, &assertion_reason(mode, busy_agents));
-
-        // --- 蓋閉じ継続（#697: 電源プランの lid action を倒す） ---
-        let lid_supported = lid_control_supported();
-        if lid_supported {
-            // Windows は初回セットアップが要らないので setup_done = true。
-            // 判定関数と安全弁は macOS と同一（#1473）
-            let decision = lid_decision(&LidGuardInput {
-                lid_sleep_mode,
-                setup_done: true,
-                busy_agents,
-                on_ac,
-                thermal,
-                lid_power_condition,
-                battery_percent: battery,
-                battery_floor: lid_battery_floor,
-            });
-            let should_disable = decision.is_ok();
-            // 倒すレールは電源条件に合わせる（#1473）。`ac-only`（既定）では
-            // AC レールだけ = 従来どおりで、バッテリー側を触らないことが残留時の
-            // 安全弁にもなる。`always` を選んだときだけバッテリーレールも倒す
-            let include_battery = lid_power_condition == PowerCondition::Always;
-            match crate::platform::lid::set_stay_awake(should_disable, include_battery) {
-                Ok(true) => {
-                    log_lid_change(should_disable, decision.err(), battery);
-                    clear_lid_error();
-                }
-                Ok(false) => {}
-                Err(e) => report_lid_error(&e),
-            }
-        }
-
-        SleepGuardState {
-            assertion_held: crate::platform::power::is_held(),
-            mode,
-            power_condition,
-            on_ac_power: on_ac,
-            busy_agents,
-            platform_supported: crate::platform::power::supported(),
-            lid_closed: false,
-            lid_sleep_disabled: crate::platform::lid::is_active(),
-            // 制御できない OS（Linux 等）で設定値をそのまま返すと
-            // 「設定してあるのに効かない」と読めてしまうので Off を返す
-            lid_sleep_mode: if lid_supported {
-                lid_sleep_mode
-            } else {
-                LidSleepMode::Off
-            },
-            sudoers_installed: false,
-            lid_setup_required: false,
-            thermal_state: thermal,
-            display_sleep_forced: false,
-            lid_power_condition,
-            lid_battery_floor,
-            battery_percent: battery,
-            lid_skip_reason: None,
-        }
-        .with_decision()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let on_ac = iokit::on_ac_power();
-        let lid_closed = iokit::clamshell_closed();
-        let sudoers = is_sudoers_installed();
-
-        // --- アイドルスリープ防止（既存ロジック。判定は #524 で共通化） ---
-        let should_hold = should_hold_assertion(mode, power_condition, on_ac, busy_agents);
-
-        if should_hold && !iokit::is_held() {
-            let reason = match mode {
-                SleepGuardMode::On => "tako: スリープ防止（常時モード）".to_string(),
-                SleepGuardMode::WhileAgentsRunning => {
-                    format!("tako: エージェント稼働中（{busy_agents} 体）")
-                }
-                SleepGuardMode::Off => unreachable!(),
-            };
-            iokit::create_assertion(&reason);
-        } else if !should_hold && iokit::is_held() {
-            iokit::release_assertion();
-        }
-
-        // --- 蓋閉じ防止（#218: pmset disablesleep） ---
-        // 判定は #697 で Windows と共通化し、#1473 で安全弁つきの 1 実装になった
-        let current_disabled = iokit::sleep_disabled();
-        if lid_sleep_mode == LidSleepMode::WhileAgentsRunning && sudoers {
-            let decision = lid_decision(&LidGuardInput {
-                lid_sleep_mode,
-                setup_done: sudoers,
-                busy_agents,
-                on_ac,
-                thermal,
-                lid_power_condition,
-                battery_percent: battery,
-                battery_floor: lid_battery_floor,
-            });
-            let should_disable = decision.is_ok();
-            // 倒した・戻したは診断へ残す（#1473。旧実装は結果を捨てていたので、
-            // 安全弁が働いて解除されても記録が何も残らなかった）
-            if should_disable && !current_disabled {
-                match set_disablesleep(true) {
-                    Ok(()) => {
-                        log_lid_change(true, None, battery);
-                        clear_lid_error();
-                    }
-                    Err(e) => report_lid_error(&e),
-                }
-            } else if !should_disable && current_disabled {
-                match set_disablesleep(false) {
-                    Ok(()) => {
-                        log_lid_change(false, decision.err(), battery);
-                        clear_lid_error();
-                    }
-                    Err(e) => report_lid_error(&e),
-                }
-            }
-        }
-
-        let lid_sleep_disabled = iokit::sleep_disabled();
-
-        // --- ディスプレイ消灯（#311） ---
-        // disablesleep=1 は蓋閉じ時のディスプレイ消灯も阻害するため、
-        // 蓋閉じ + disablesleep 有効の組み合わせで明示的にディスプレイだけ消す
-        if lid_closed && lid_sleep_disabled {
-            iokit::force_display_sleep();
-        }
-        if !lid_closed || !lid_sleep_disabled {
-            iokit::reset_display_sleep_sent();
-        }
-
-        SleepGuardState {
-            assertion_held: iokit::is_held(),
-            mode,
-            power_condition,
-            on_ac_power: on_ac,
-            busy_agents,
-            platform_supported: true,
-            lid_closed,
-            lid_sleep_disabled,
+        let decision = lid_decision(&LidGuardInput {
             lid_sleep_mode,
-            sudoers_installed: sudoers,
-            // macOS は sudoers 登録が初回セットアップ
-            lid_setup_required: !sudoers,
-            thermal_state: thermal,
-            display_sleep_forced: iokit::display_sleep_sent(),
+            setup_done,
+            busy_agents,
+            on_ac,
+            thermal,
             lid_power_condition,
-            lid_battery_floor,
             battery_percent: battery,
-            lid_skip_reason: None,
+            battery_floor: lid_battery_floor,
+        });
+        let should_disable = decision.is_ok();
+        // 倒すレールは電源条件に合わせる（#1473）。`ac-only`（既定）では
+        // AC レールだけ = 従来どおりで、バッテリー側を触らないことが残留時の
+        // 安全弁にもなる。`always` を選んだときだけバッテリーレールも倒す
+        let include_battery = lid_power_condition == PowerCondition::Always;
+        // 倒した・戻したは診断へ残す（#1473。旧実装は結果を捨てていたので、
+        // 安全弁が働いて解除されても記録が何も残らなかった）
+        match lid::apply_override(should_disable, include_battery) {
+            Ok(true) => {
+                log_lid_change(should_disable, decision.err(), battery);
+                clear_lid_error();
+            }
+            Ok(false) => {}
+            Err(e) => report_lid_error(&e),
         }
-        .with_decision()
     }
+    let lid_sleep_disabled = lid::override_active();
+
+    // --- ディスプレイ消灯（#311。要るのは macOS の `disablesleep` だけ = 境界の内側で決まる） ---
+    lid::sync_display_sleep(lid_closed, lid_sleep_disabled);
+
+    SleepGuardState {
+        assertion_held: power::is_held(),
+        mode,
+        power_condition,
+        on_ac_power: on_ac,
+        busy_agents,
+        platform_supported: power::supported(),
+        lid_closed,
+        lid_sleep_disabled,
+        // 制御できない OS（Linux 等）で設定値をそのまま返すと
+        // 「設定してあるのに効かない」と読めてしまうので Off を返す
+        lid_sleep_mode: if lid_supported {
+            lid_sleep_mode
+        } else {
+            LidSleepMode::Off
+        },
+        sudoers_installed: sudoers,
+        // macOS は sudoers 登録が初回セットアップ
+        lid_setup_required: !setup_done,
+        thermal_state: thermal,
+        display_sleep_forced: lid::display_sleep_forced(),
+        lid_power_condition,
+        lid_battery_floor,
+        battery_percent: battery,
+        lid_skip_reason: None,
+    }
+    .with_decision()
 }
 
 /// 現在の状態を取得する（副作用なし）
@@ -1825,113 +1313,53 @@ pub fn status(config: SleepGuardConfig) -> SleepGuardState {
     } = config;
     let battery = battery_percent();
     let thermal = current_thermal();
-    #[cfg(not(target_os = "macos"))]
-    {
-        // 副作用なし: 取得・解放は行わず、いまの保持状態と電源だけを読む
-        let lid_supported = lid_control_supported();
-        SleepGuardState {
-            assertion_held: crate::platform::power::is_held(),
-            mode,
-            power_condition,
-            on_ac_power: crate::platform::power::on_ac_power(),
-            busy_agents,
-            platform_supported: crate::platform::power::supported(),
-            lid_closed: false,
-            lid_sleep_disabled: crate::platform::lid::is_active(),
-            lid_sleep_mode: if lid_supported {
-                lid_sleep_mode
-            } else {
-                LidSleepMode::Off
-            },
-            sudoers_installed: false,
-            lid_setup_required: false,
-            thermal_state: thermal,
-            display_sleep_forced: false,
-            lid_power_condition,
-            lid_battery_floor,
-            battery_percent: battery,
-            lid_skip_reason: None,
-        }
-        .with_decision()
+    // 副作用なし: 取得・解放は行わず、いまの保持状態と電源・蓋だけを読む（OS の差は境界の内側）
+    let lid_supported = lid_control_supported();
+    let sudoers = lid_requires_privileged_setup() && is_sudoers_installed();
+    SleepGuardState {
+        assertion_held: power::is_held(),
+        mode,
+        power_condition,
+        on_ac_power: power::on_ac_power(),
+        busy_agents,
+        platform_supported: power::supported(),
+        lid_closed: lid::is_closed(),
+        lid_sleep_disabled: lid::override_active(),
+        lid_sleep_mode: if lid_supported {
+            lid_sleep_mode
+        } else {
+            LidSleepMode::Off
+        },
+        sudoers_installed: sudoers,
+        lid_setup_required: lid_requires_privileged_setup() && !sudoers,
+        thermal_state: thermal,
+        display_sleep_forced: lid::display_sleep_forced(),
+        lid_power_condition,
+        lid_battery_floor,
+        battery_percent: battery,
+        lid_skip_reason: None,
     }
-    #[cfg(target_os = "macos")]
-    {
-        SleepGuardState {
-            assertion_held: iokit::is_held(),
-            mode,
-            power_condition,
-            on_ac_power: iokit::on_ac_power(),
-            busy_agents,
-            platform_supported: true,
-            lid_closed: iokit::clamshell_closed(),
-            lid_sleep_disabled: iokit::sleep_disabled(),
-            lid_sleep_mode,
-            sudoers_installed: is_sudoers_installed(),
-            lid_setup_required: !is_sudoers_installed(),
-            thermal_state: thermal,
-            display_sleep_forced: iokit::display_sleep_sent(),
-            lid_power_condition,
-            lid_battery_floor,
-            battery_percent: battery,
-            lid_skip_reason: None,
-        }
-        .with_decision()
-    }
+    .with_decision()
 }
 
-/// [`check_qos`] の `ps` 1 回の上限（#1984）。自プロセス 1 行を引くだけなので桁で足りる
-#[cfg(target_os = "macos")]
-const QOS_PS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// プロセスの QoS を確認する（macOS のみ、診断用）。
-///
-/// `ps` は**上限つきで**待つ（#1984。`Command::output()` は子が終わらない・パイプの書き手が
-/// 長生きのプロセスへ漏れると永久に返らない = #1979 の本番ハングと同じ型）
+/// プロセスの QoS を確認する（macOS のみ、診断用。本体と `ps` の上限は境界の
+/// `platform::power::check_qos` = #1984 / #2857）
 pub fn check_qos() -> Value {
-    #[cfg(target_os = "macos")]
-    {
-        let pid = std::process::id().to_string();
-        match tako_core::probe::output_with_timeout(
-            "ps",
-            &["-p", &pid, "-o", "pri,nice"],
-            QOS_PS_TIMEOUT,
-        ) {
-            tako_core::probe::Outcome::Done { stdout, .. } => {
-                let stdout = String::from_utf8_lossy(&stdout);
-                json!({ "qos_info": stdout.trim() })
-            }
-            tako_core::probe::Outcome::TimedOut { label, waited, .. } => {
-                json!({ "error": format!("{label} が {} 秒で返らなかった", waited.as_secs()) })
-            }
-            tako_core::probe::Outcome::Failed { reason, .. } => json!({ "error": reason }),
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        json!({ "qos_info": "macOS 以外では非対応" })
-    }
+    power::check_qos()
 }
 
 /// tako 終了時に残ったスリープ防止を解除する（正常終了フック）
 pub fn cleanup_on_exit() {
-    #[cfg(target_os = "macos")]
-    {
-        if is_sudoers_installed() && iokit::sleep_disabled() {
-            let _ = set_disablesleep(false);
-        }
-    }
     // Windows の電源要求はプロセス終了で OS が回収するが、明示的に解除しておく
-    // （`powercfg /requests` に残らないことを終了直後に確認できる）
-    #[cfg(not(target_os = "macos"))]
-    {
-        crate::platform::power::set_hold(false, "");
-        // **蓋の設定は OS が回収してくれない**（電源プランに書かれた永続設定なので、
-        // 倒したまま終了すると次に tako を起動するまで蓋を閉じてもスリープしない）。
-        // 起動時の残留復元（#697）は最後の砦であって、正常終了ではここで必ず戻す
-        if let Err(e) = crate::platform::lid::set_stay_awake(false, false) {
-            eprintln!("[sleep-guard] 終了時の蓋設定の復元に失敗: {e}");
-            crate::diag::persist_log(&format!("lid-sleep cleanup on exit failed: {e}"));
-        }
+    // （`powercfg /requests` に残らないことを終了直後に確認できる。macOS は触らない = 境界の内側）
+    power::release_on_exit();
+    // **蓋の設定は OS が回収してくれない**（電源プランに書かれた永続設定なので、
+    // 倒したまま終了すると次に tako を起動するまで蓋を閉じてもスリープしない）。
+    // 起動時の残留復元（#697）は最後の砦であって、正常終了ではここで必ず戻す
+    // （macOS の腕は失敗を黙って捨てる = #2857 より前のまま）
+    if let Err(e) = lid::restore_on_exit() {
+        eprintln!("[sleep-guard] 終了時の蓋設定の復元に失敗: {e}");
+        crate::diag::persist_log(&format!("lid-sleep cleanup on exit failed: {e}"));
     }
 }
 
@@ -2577,95 +2005,10 @@ mod tests {
         assert!(state.description().contains("ディスプレイ消灯済み"));
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn on_ac_power_does_not_panic() {
-        let _ = iokit::on_ac_power();
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn clamshell_closed_does_not_panic() {
-        let _ = iokit::clamshell_closed();
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn sleep_disabled_does_not_panic() {
-        let _ = iokit::sleep_disabled();
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn thermal_state_does_not_panic() {
-        let _ = iokit::thermal_state();
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn iokit_ffi_calls_are_fast() {
-        // #212: UI スレッドから 2 秒毎に呼ばれるため、サブプロセス実装への回帰を検出する
-        let t0 = std::time::Instant::now();
-        for _ in 0..100 {
-            let _ = iokit::on_ac_power();
-            let _ = iokit::clamshell_closed();
-            let _ = iokit::sleep_disabled();
-            let _ = iokit::thermal_state();
-        }
-        assert!(
-            t0.elapsed() < std::time::Duration::from_secs(1),
-            "IOKit FFI ×100 が {:?} かかった（サブプロセス実装への回帰の疑い）",
-            t0.elapsed()
-        );
-    }
-
     #[test]
     fn check_qos_returns_json() {
         let qos = check_qos();
         assert!(qos.is_object());
-    }
-
-    // --- #449: should_clear_residual のガード条件テスト ---
-
-    #[test]
-    fn residual_skip_when_isolated() {
-        let r = should_clear_residual(true, false, true, true);
-        assert!(r.is_err());
-        assert!(r.unwrap_err().contains("隔離モード"));
-    }
-
-    #[test]
-    fn residual_skip_when_other_instance_running() {
-        let r = should_clear_residual(false, true, true, true);
-        assert!(r.is_err());
-        assert!(r.unwrap_err().contains("他の tako"));
-    }
-
-    #[test]
-    fn residual_skip_when_no_sudoers() {
-        let r = should_clear_residual(false, false, false, true);
-        assert!(r.is_err());
-        assert!(r.unwrap_err().contains("sudoers"));
-    }
-
-    #[test]
-    fn residual_skip_when_not_disabled() {
-        let r = should_clear_residual(false, false, true, false);
-        assert!(r.is_err());
-        assert!(r.unwrap_err().contains("残留なし"));
-    }
-
-    #[test]
-    fn residual_clear_when_solo_and_disabled() {
-        let r = should_clear_residual(false, false, true, true);
-        assert!(r.is_ok());
-    }
-
-    #[test]
-    fn residual_isolated_takes_priority_over_other_checks() {
-        let r = should_clear_residual(true, true, true, true);
-        assert!(r.is_err());
-        assert!(r.unwrap_err().contains("隔離モード"));
     }
 
     // --- #1473: バッテリー駆動でも蓋閉じ継続を続ける（opt-in + 安全弁） ---
