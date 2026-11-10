@@ -781,10 +781,29 @@ pub trait DetachedAccess: DetachedCapture {
 /// **修飾付き Enter（`S-Enter` 等）は `None`**: その形は送り先のペインの器で変わる（#729）ので、
 /// 器を知らない呼び手には推測で出さない。ペインが分かる呼び手は [`key_name_bytes_in`] を使う
 pub fn key_name_bytes(key: &str) -> Option<Vec<u8>> {
-    if modified_enter_mods(key).is_some() {
+    // shift+Tab（#2841）も修飾付き Enter と同じく、形が送り先のペインの器で変わる
+    if modified_enter_mods(key).is_some() || key == BACK_TAB {
         return None;
     }
     key_name_bytes_in(key, true)
+}
+
+/// shift+Tab のキー名（#2841。tmux の `send-keys` と同じ綴り）
+pub const BACK_TAB: &str = "BTab";
+
+/// shift+Tab を端末へ書くバイト列（#2841。形の選び方は修飾付き Enter = [`modified_enter_bytes`] と同じ）。
+///
+/// - CSI u が届くペイン（器なし・tmux の器・Windows の ConPTY の直接ペイン）: `ESC [ 9 ; 2 u`。
+///   GUI の打鍵（tako-app の `keystroke_to_bytes`）が送るのと同じ形。claude 2.1.322 は tako の
+///   器なしのペインで `ESC [ Z` を shift+Tab と読まず（auto mode の確認が残った）、この形で読んだ（実測）
+/// - 届かない器（psmux）: xterm の CBT `ESC [ Z`（CSI u は器が内側へ通さない。tmux の器で
+///   `extended-keys` が効かないときも tmux はこの形で内側へ渡し、claude はそれを読む = 実測）
+pub fn back_tab_bytes(extended_keys: bool) -> Vec<u8> {
+    if extended_keys {
+        b"\x1b[9;2u".to_vec()
+    } else {
+        b"\x1b[Z".to_vec()
+    }
 }
 
 /// [`key_name_bytes`] の語彙の正本。`extended_keys` は送り先のペインへ CSI u が届くか
@@ -792,6 +811,11 @@ pub fn key_name_bytes(key: &str) -> Option<Vec<u8>> {
 pub fn key_name_bytes_in(key: &str, extended_keys: bool) -> Option<Vec<u8>> {
     if let Some(mods) = modified_enter_mods(key) {
         return Some(modified_enter_bytes(mods, extended_keys));
+    }
+    // shift+Tab（#2841。claude の auto mode の確認の `shift+Tab to leave for accept edits mode` へ
+    // 答える口）。形はペインの器で変わる
+    if key == BACK_TAB {
+        return Some(back_tab_bytes(extended_keys));
     }
     // 端末の Enter は CR（LF は「改行挿入」と解釈され送信にならない。#95）
     let seq: &[u8] = match key {
@@ -901,8 +925,9 @@ fn issue729_inject_no_extended_keys() -> bool {
 }
 
 /// [`key_name_bytes_in`] が受ける名前の一覧（知らない名前を断るときに添える。ASCII だけ）
-pub const KEY_NAMES: &str = "Enter, S-Enter / C-Enter / M-Enter (newline), Escape, Tab, Space, \
-     Up, Down, Left, Right, C-<a-z> (C-c ...), 1 ASCII char";
+pub const KEY_NAMES: &str =
+    "Enter, S-Enter / C-Enter / M-Enter (newline), Escape, Tab, BTab (shift+Tab), \
+     Space, Up, Down, Left, Right, C-<a-z> (C-c ...), 1 ASCII char";
 
 /// 知らないキー名を断る理由（#2743。`tako_send_input` の `keys` / `tako send --key`）。
 /// 表示（`Display`）は表示言語に従う（#2365）
@@ -2458,6 +2483,22 @@ mod tests {
         for pwa in ["Escape", "Tab", "C-c", "Up", "Down"] {
             assert!(super::key_name_bytes(pwa).is_some(), "{pwa}");
         }
+        // #2841: shift+Tab は修飾付き Enter と同じく器で形が変わる（CSI u が届くなら GUI の打鍵と同じ
+        // `ESC [ 9 ; 2 u`・届かない器 = psmux は xterm の CBT）。器を知らない口は推測で出さない
+        assert_eq!(super::key_name_bytes("BTab"), None);
+        assert_eq!(
+            super::key_name_bytes_in("BTab", true).as_deref(),
+            Some(&b"\x1b[9;2u"[..])
+        );
+        assert_eq!(
+            super::key_name_bytes_in("BTab", false).as_deref(),
+            Some(&b"\x1b[Z"[..])
+        );
+        assert_eq!(
+            super::keys_to_bytes(&["BTab".to_string()], true),
+            Ok(vec![b"\x1b[9;2u".to_vec()])
+        );
+        assert!(super::KEY_NAMES.contains("BTab"));
         let keys = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(
             super::keys_to_bytes(&keys(&["Escape", "Enter"]), true),

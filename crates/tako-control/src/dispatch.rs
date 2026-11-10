@@ -662,6 +662,9 @@ pub enum Reason {
     DialogVanishedWhileMoving,
     /// `選択肢「<label>」へカーソルを移動できなかったため応答を中止した（Enter は送っていません）`
     CursorNotLanded(String),
+    /// `選択肢「<label>」の確定キーを画面の案内から送れるキー名へ読めないため応答を中止した…`（#2841。キーの
+    /// 案内で答えるダイアログで、案内の綴りが `key_name_bytes` の語彙に無い選択肢を選ばれた。何も送らない）
+    ChoiceKeyUnreadable(String),
     /// ラベルで当たった選択肢のラベルが切り詰められている（#1143 / #2302）。`position` は 1 始まり
     ChoiceLabelTruncated {
         position: usize,
@@ -2208,6 +2211,15 @@ impl Reason {
             (Self::CursorNotLanded(label), En) => format!(
                 "could not move the cursor to the choice \"{label}\", so the answer was \
                  cancelled (Enter was not sent)"
+            ),
+            (Self::ChoiceKeyUnreadable(label), Ja) => format!(
+                "選択肢「{label}」の確定キーを画面の案内から送れるキー名へ読めないため応答を中止した\
+                 （キーは送っていません。手動で応答してください）"
+            ),
+            (Self::ChoiceKeyUnreadable(label), En) => format!(
+                "the key that confirms the choice \"{label}\" cannot be read from the hint on the \
+                 screen as a key tako can send, so the answer was cancelled (no key was sent; \
+                 answer it by hand)"
             ),
             (
                 Self::ChoiceLabelTruncated {
@@ -22897,7 +22909,29 @@ pub fn respond_via(
             .operation()
         })
     };
-    if dialog.numbered {
+    if let Some(keys) = dialog.answer_keys.as_ref() {
+        // #2841: キーの案内で答えるダイアログ（auto mode の確認）。選択肢ごとに決まったキーを
+        // 1 つだけ送る（番号キーは無反応・カーソルも無いので矢印での着地の検証はできない）。
+        // 案内の綴りを語彙へ落とせない選択肢は推測で送らない
+        let key = keys
+            .get(index)
+            .cloned()
+            .flatten()
+            .ok_or_else(|| Reason::ChoiceKeyUnreadable(chosen.label.clone()).operation())?;
+        // claude 2.1.322 はこの確認を描いた直後に届いた Enter / shift+Tab を捨てる（実測: 検出の直後に送ると
+        // 確認が残り、0.5 秒置けば通る。Esc だけは直後でも効く）。いつ描かれたかは 1 回の採取では分からないので、
+        // 最初の採取から [`KEY_DIALOG_SETTLE`] 置き、同じ確認がまだ出ていることを確かめてから送る
+        // （送り直しはしない: 遅れて効いたキーと重なると次の画面 = 操作ごとの承認へ Enter が抜けて No になる）
+        std::thread::sleep(KEY_DIALOG_SETTLE);
+        let still = crate::claude_tui::detect_choice_dialog(&capture()?)
+            .is_some_and(|now| now.kind == dialog.kind && now.labels() == dialog.labels());
+        if !still {
+            return Err(Reason::NoChoiceDialog.operation());
+        }
+        send(&key)?;
+        keys_sent.push(key);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    } else if dialog.numbered {
         let number = chosen.number.unwrap_or((index + 1) as u32).to_string();
         send(&number)?;
         keys_sent.push(number);
@@ -22999,6 +23033,11 @@ pub fn respond_via(
 
 /// 番号なしダイアログでカーソル移動を試みる回数（キーを飲まれたときの再試行込み）
 const NAV_ATTEMPTS: u32 = 3;
+
+/// キーの案内で答えるダイアログ（#2841）へキーを送る前に置く時間。claude 2.1.322 は確認を描いた直後の
+/// キーを捨てる（隔離 GUI の実測: 検出の直後 = 0 秒は Enter も shift+Tab も残り、0.5 秒・1 秒は通る。
+/// Claude Code のクリックの mount 後 300 ms の捨て方と同じ型）。0.5 秒の実測に余裕を取る
+const KEY_DIALOG_SETTLE: std::time::Duration = std::time::Duration::from_millis(800);
 
 /// `choice` 文字列を選択肢の添字（0-based）へ解決する（#748）。
 ///
@@ -46899,6 +46938,62 @@ tako | pane 2 [ compact ]       [-]
         );
     }
 
+    /// #2841: auto mode の確認の画面（claude 2.1.322 の実採取を縮めたもの。罫線の直下の見出しと下端のキー案内）
+    const AUTO_MODE_2841: &str = "\
+────────────────────────────────────────\n\
+  Auto mode can't check actions in this session\n\
+\n\
+  Auto mode's safety check runs on the server.\n\
+\n\
+  Enter to stay in auto mode · shift+Tab to leave for accept edits mode and stop · Esc to cancel";
+
+    /// #2841: respond が auto mode の確認の「leave」で実 PTY の子へ書く shift+Tab の形は、そのペインの器で
+    /// 決まる（修飾付き Enter = #729 と同じ判定）。器なしのペインは GUI の打鍵と同じ CSI u（claude 2.1.322 は
+    /// 器なしのペインで `ESC [ Z` を読まなかった = 実測）、CSI u を運べない器（psmux）のペインは `ESC [ Z`。
+    /// Windows CI では ConPTY の子（VT 入力 = claude が読む形）で同じ本体が回る
+    #[test]
+    fn issue2841_respondのshift_tabはそのペインの器で形が決まり実ptyの子へ届く() {
+        let tmp = tako_core::test_residue::ScratchDir::new("i2841-btab");
+        let respond = |pane: u64, choice: &str| Request::OrchestratorRespond {
+            pane_id: pane,
+            choice: Some(choice.into()),
+            caller_role: Some("test-2841".into()),
+        };
+
+        let direct = tmp.path().join("direct");
+        let mut host = MockHost::new();
+        host.backend_caps = Some(i729_psmux_caps());
+        let pane = i2743_recorder(&mut host, AUTO_MODE_2841, &direct, 6, None);
+        let reply =
+            dispatch(&mut host, respond(pane, "leave"), PaneOrigin::Cli).expect("答えられる");
+        assert_eq!(reply["kind"], "auto_mode_unchecked", "{reply}");
+        assert_eq!(reply["keys_sent"], json!(["BTab"]), "{reply}");
+        assert_eq!(
+            i2743_received(&direct, 6),
+            b"\x1b[9;2u",
+            "器なしのペインは CSI u の shift+Tab"
+        );
+
+        let wrapped = tmp.path().join("wrapped");
+        let mut host = MockHost::new();
+        host.backend_caps = Some(i729_psmux_caps());
+        let pane = i2743_recorder(&mut host, AUTO_MODE_2841, &wrapped, 3, None);
+        host.backend_sessions.insert(pane, "tako-2841".into());
+        dispatch(&mut host, respond(pane, "2"), PaneOrigin::Cli).expect("答えられる");
+        assert_eq!(
+            i2743_received(&wrapped, 3),
+            b"\x1b[Z",
+            "psmux の器のペインは xterm の CBT"
+        );
+
+        // 既定の答え（stay = Enter）は器に依らず CR
+        let stay = tmp.path().join("stay");
+        let mut host = MockHost::new();
+        let pane = i2743_recorder(&mut host, AUTO_MODE_2841, &stay, 1, None);
+        dispatch(&mut host, respond(pane, "stay"), PaneOrigin::Cli).expect("答えられる");
+        assert_eq!(i2743_received(&stay, 1), b"\r");
+    }
+
     /// 受け入れ条件 3: 添付は置き場へ写り、送った本文にそのパスが入る。同期の腕と、IPC / MCP の
     /// 受け口と同じ offload の 3 段（準備 → 写す = background → 送る = 着地）の両方を通す
     #[test]
@@ -47075,6 +47170,8 @@ tako | pane 2 [ compact ]       [-]
             "Left",
             "Right",
             "Tab",
+            // #2841: shift+Tab（auto mode の確認の `shift+Tab to leave …` へ答える口。器なしは CSI u）
+            "BTab",
             "Space",
             "C-a",
             "C-c",

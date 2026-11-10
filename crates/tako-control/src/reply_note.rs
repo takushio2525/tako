@@ -619,6 +619,13 @@ pub enum ReplyNote {
     WatchAgentDeadDetail,
     /// `tako orchestrator watch`: session ID が無く resume のコマンドを組めない（`resume: ` の後ろ）
     WatchResumeUnbuildable,
+    /// `tako orchestrator watch`: キーの案内で答えるダイアログ（#2841。`note: ` の後ろ）
+    WatchNoteKeyDialog,
+    /// `tako orchestrator watch`: キーの案内が画面外で選択肢は実測の並び（#2841。同上）
+    WatchNoteKeyHintOffscreen,
+    /// 選択肢ダイアログの案内（#2841。`choice_dialog.note` と watch の `note: ` の後ろ）: claude の auto mode の
+    /// 安全確認がこのセッションで使えないときの確認の原因と答え方
+    DialogAutoModeUnchecked,
     // ---- CLI の人向けの表示: tako queue（状況・cancel / start / priority / limits）----
     // 調停役（GUI）が組む文（待つ理由・見込み・札を配らない理由）は応答の値のまま変えず、日本語は
     // その文をそのまま、英語は同じ応答の構造の欄（`reason` / `code` / `eta` / `start_s`）から組む
@@ -2676,6 +2683,46 @@ impl ReplyNote {
             }
             (Self::WatchResumeUnbuildable, En) => {
                 "(no session ID recorded, so the resume command cannot be built)".into()
+            }
+            (Self::WatchNoteKeyDialog, Ja) => {
+                "番号もカーソルも無くキーの案内で答えるダイアログ（tako が選んだ選択肢のキーを 1 つ送る）".into()
+            }
+            (Self::WatchNoteKeyDialog, En) => {
+                "a dialog without numbers or a cursor that is answered by the keys in its hint line \
+                 (tako sends the key of the choice you pick)"
+                    .into()
+            }
+            (Self::WatchNoteKeyHintOffscreen, Ja) => {
+                "ダイアログがペインより高くキーの案内が画面外（選択肢は実測の既定の並び。番号で応答する）".into()
+            }
+            (Self::WatchNoteKeyHintOffscreen, En) => {
+                "the dialog is taller than the pane and its key hint is off the screen (the choices \
+                 are the measured default ones; answer by number)"
+                    .into()
+            }
+            (Self::DialogAutoModeUnchecked, Ja) => {
+                "worker の claude は auto mode だが、その安全確認（サーバー側）がこのセッションでは使えない\
+                 （原因は title。ANTHROPIC_BASE_URL のゲートウェイ経由・実験的 beta の無効化・組織の方針など）。\
+                 「stay in auto mode」（Enter）= auto mode のまま進める。以後は確認が要る操作ごとに承認\
+                 ダイアログ（WORKER_PERMISSION。既定は No）が出るので 1 件ずつ respond する。\
+                 「leave for accept edits mode and stop」（shift+Tab）= accept edits mode へ移ってこの\
+                 ターンを止める（安全確認なしで編集や作業フォルダ内の rm / mv が通る。許可モードが変わるので\
+                 利用者に確かめる）。「cancel」（Esc）= このターンを止める（auto mode のまま。次に確認が要る\
+                 操作でまた同じ確認が出る）。worker を止めずに進めるなら stay in auto mode"
+                    .into()
+            }
+            (Self::DialogAutoModeUnchecked, En) => {
+                "the worker's claude is in auto mode, but its safety check (server side) is not \
+                 available in this session (the cause is in title: requests through a gateway via \
+                 ANTHROPIC_BASE_URL, experimental betas turned off, an organization policy, ...). \
+                 \"stay in auto mode\" (Enter) = keep going in auto mode; from then on every action that \
+                 needs the check opens a permission dialog (WORKER_PERMISSION, default No) to answer \
+                 one by one with respond. \"leave for accept edits mode and stop\" (shift+Tab) = switch \
+                 to accept edits mode and stop this turn (edits and rm / mv in the working folders then \
+                 run without the check; it changes the permission mode, so ask the user). \"cancel\" \
+                 (Esc) = stop this turn (it stays in auto mode, and the next action that needs the \
+                 check shows this dialog again). To keep the worker going, pick stay in auto mode"
+                    .into()
             }
             (Self::QueueOfflineNote, Ja) => "順番待ちは無効（tako が起動していない）".into(),
             (Self::QueueOfflineNote, En) => "the queue is off (tako is not running)".into(),
