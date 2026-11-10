@@ -1,0 +1,44 @@
+{
+  "title": "担当: docs",
+  "footer": "demo · 担当の台本",
+  "promptLines": 1,
+  "turns": [
+    [
+      {
+        "busy": "作業中"
+      },
+      {
+        "wait": 800,
+        "say": "方針: 使い方に例を足す",
+        "color": "text"
+      },
+      {
+        "wait": 1200,
+        "tool": "Read",
+        "arg": "README.md"
+      },
+      {
+        "wait": 1700,
+        "tool": "Edit",
+        "arg": "README.md +36 -3"
+      },
+      {
+        "wait": 1300,
+        "tool": "Run",
+        "arg": "npm run docs:check"
+      },
+      {
+        "wait": 1900,
+        "say": "links ok · examples ok",
+        "color": "ok",
+        "indent": 6
+      },
+      {
+        "wait": 700,
+        "say": "完了: README.md を更新",
+        "color": "ok",
+        "beat": "done"
+      }
+    ]
+  ]
+}

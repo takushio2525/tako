@@ -1,0 +1,697 @@
+/* tako プロモ動画（リメイク版）の合成。1920x1080 の 1 枚を、時刻から決定的に描く。
+   動きは CSS の transition / animation を使わず、comp.js が毎フレーム値を書く。 */
+
+:root {
+	--paper: #f4f0e8;
+	--paper-2: #ebe5d9;
+	--ink: #15171c;
+	--ink-2: #4c5260;
+	--ink-3: #8a8f9b;
+	--accent: #e8467c; /* アプリのアイコンのタコの色に寄せたコーラル */
+	--accent-soft: #fbd9e3;
+	--ok: #1f9d63;
+	--win: #171a24;
+	--win-2: #222736;
+	--line: rgba(21, 23, 28, 0.12);
+	--sans: system-ui, -apple-system, 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', sans-serif;
+	--mono: ui-monospace, 'SF Mono', Menlo, monospace;
+}
+
+* {
+	box-sizing: border-box;
+	margin: 0;
+	padding: 0;
+}
+
+html,
+body {
+	width: 1920px;
+	height: 1080px;
+	overflow: hidden;
+	background: var(--paper);
+}
+
+#stage {
+	position: relative;
+	width: 1920px;
+	height: 1080px;
+	overflow: hidden;
+	background: radial-gradient(1400px 900px at 78% 8%, #fbf8f2 0%, var(--paper) 55%, var(--paper-2) 100%);
+	color: var(--ink);
+	font-family: var(--sans);
+	font-feature-settings: 'palt';
+	-webkit-font-smoothing: antialiased;
+}
+
+.scene {
+	position: absolute;
+	inset: 0;
+	display: none;
+}
+
+[data-a] {
+	opacity: 0;
+	transform: translateY(var(--ay, 0px)) scale(var(--as, 1));
+	will-change: transform, opacity;
+}
+
+em {
+	font-style: normal;
+	color: var(--accent);
+}
+
+.h1 {
+	font-size: 86px;
+	font-weight: 700;
+	line-height: 1.32;
+	letter-spacing: 0.01em;
+}
+
+.h2 {
+	font-size: 68px;
+	font-weight: 700;
+	line-height: 1.35;
+}
+
+.body {
+	font-size: 38px;
+	font-weight: 400;
+	line-height: 1.6;
+	color: var(--ink-2);
+}
+
+.chip {
+	display: inline-block;
+	padding: 8px 22px 9px;
+	border-radius: 999px;
+	background: var(--ink);
+	color: var(--paper);
+	font-size: 26px;
+	font-weight: 600;
+	letter-spacing: 0.06em;
+}
+
+/* ---- 0–20 秒: 課題 → 答え ---- */
+
+.a1-text {
+	position: absolute;
+	left: 132px;
+}
+
+.a1-hook {
+	top: 108px;
+}
+
+.a1-problem {
+	top: 880px;
+	left: 0;
+	width: 1920px;
+	text-align: center;
+	z-index: 4;
+}
+
+#tiles {
+	position: absolute;
+	inset: 0;
+	z-index: 2;
+}
+
+.tile {
+	position: absolute;
+	left: 0;
+	top: 0;
+	width: 330px;
+	height: 212px;
+	border-radius: 14px;
+	background: var(--win);
+	box-shadow: 0 24px 50px rgba(21, 23, 28, 0.26), 0 4px 10px rgba(21, 23, 28, 0.18);
+	overflow: hidden;
+	transform-origin: 50% 50%;
+	opacity: 0;
+}
+
+.tile .bar {
+	height: 34px;
+	background: var(--win-2);
+	display: flex;
+	align-items: center;
+	gap: 7px;
+	padding-left: 14px;
+}
+
+.tile .bar i,
+.onetab-bar i {
+	width: 11px;
+	height: 11px;
+	border-radius: 50%;
+	background: #4a5063;
+}
+
+.tile .bar span {
+	margin-left: 10px;
+	color: #c9cedb;
+	font-size: 17px;
+	font-weight: 600;
+	white-space: nowrap;
+}
+
+.tile .rows {
+	padding: 16px 16px 0;
+}
+
+.tile .rows u {
+	display: block;
+	height: 9px;
+	border-radius: 5px;
+	background: #3a4052;
+	margin-bottom: 12px;
+	text-decoration: none;
+}
+
+.tile .rows u.hot {
+	background: var(--accent);
+}
+
+.tile .rows u.ok {
+	background: #3fbf8a;
+}
+
+.tile .state {
+	position: absolute;
+	right: 12px;
+	bottom: 10px;
+	font-size: 15px;
+	font-weight: 600;
+	color: #8f96a8;
+}
+
+.bubble {
+	position: absolute;
+	padding: 14px 28px 16px;
+	border-radius: 18px;
+	background: #fff;
+	box-shadow: 0 14px 34px rgba(21, 23, 28, 0.16);
+	font-size: 40px;
+	font-weight: 700;
+	transform-origin: 20% 100%;
+	z-index: 3;
+}
+
+#q1 {
+	left: 148px;
+	top: 250px;
+}
+
+#q2 {
+	left: 1180px;
+	top: 420px;
+}
+
+#q3 {
+	left: 560px;
+	top: 690px;
+}
+
+#onetab {
+	position: absolute;
+	border-radius: 18px;
+	background: #10131b;
+	box-shadow: 0 40px 90px rgba(21, 23, 28, 0.3), 0 8px 22px rgba(21, 23, 28, 0.2);
+	opacity: 0;
+}
+
+.onetab-bar {
+	height: 46px;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding-left: 18px;
+}
+
+.onetab-tab {
+	margin-left: 18px;
+	padding: 5px 18px 6px;
+	border-radius: 9px;
+	background: var(--win-2);
+	color: #dfe3ee;
+	font-size: 19px;
+	font-weight: 600;
+}
+
+.a1-title {
+	position: absolute;
+	left: 132px;
+	top: 250px;
+	width: 800px;
+}
+
+.brand {
+	display: flex;
+	align-items: center;
+	gap: 26px;
+}
+
+.brand-icon {
+	width: 116px;
+	height: 116px;
+	border-radius: 26px;
+	box-shadow: 0 14px 30px rgba(21, 23, 28, 0.25);
+}
+
+.brand-name {
+	font-size: 132px;
+	font-weight: 800;
+	letter-spacing: -0.02em;
+	line-height: 1;
+}
+
+.tagline {
+	margin-top: 46px;
+	font-size: 70px;
+	font-weight: 700;
+	line-height: 1.34;
+}
+
+.tagsub {
+	margin-top: 34px;
+	font-size: 31px;
+	color: var(--ink-2);
+}
+
+/* ---- 実画面の場面 ---- */
+
+.footage .cap {
+	position: absolute;
+	left: 120px;
+	top: 46px;
+	right: 120px;
+	height: 150px;
+}
+
+.footage .cap .chip {
+	position: absolute;
+	left: 0;
+	top: 6px;
+	background: var(--accent);
+	color: #fff;
+}
+
+.footage .cap .head {
+	position: absolute;
+	left: 0;
+	top: 62px;
+	font-size: 58px;
+	font-weight: 700;
+	line-height: 1.2;
+	white-space: nowrap;
+}
+
+.footage .cap .sub {
+	position: absolute;
+	right: 0;
+	bottom: 12px;
+	max-width: 1060px;
+	text-align: right;
+	white-space: nowrap;
+	font-size: 33px;
+	font-weight: 600;
+	line-height: 1.45;
+	color: var(--ink-2);
+	opacity: 0;
+}
+
+.footage .cap .sub code,
+.cmp code {
+	font-family: var(--mono);
+	font-size: 0.9em;
+	padding: 2px 10px 3px;
+	border-radius: 8px;
+	background: rgba(21, 23, 28, 0.08);
+	color: var(--ink);
+}
+
+.viewport {
+	position: absolute;
+	left: 208px;
+	top: 212px;
+	width: 1504px;
+	height: 846px;
+	border-radius: 16px;
+	overflow: hidden;
+	background: #10131b;
+	box-shadow: 0 46px 100px rgba(21, 23, 28, 0.34), 0 10px 26px rgba(21, 23, 28, 0.22), 0 0 0 1px rgba(21, 23, 28, 0.5);
+}
+
+.viewport .content {
+	position: absolute;
+	left: 0;
+	top: 0;
+	width: 1504px;
+	height: 846px;
+	transform-origin: 0 0;
+}
+
+.viewport img.frame {
+	position: absolute;
+	left: 0;
+	top: 0;
+	width: 1504px;
+	height: 846px;
+	display: block;
+}
+
+/* 読み戻した絵には OS が描く信号機ボタンが無いので、同じ位置に描き足す */
+.viewport .lights {
+	position: absolute;
+	left: 15px;
+	top: 14px;
+	display: flex;
+	gap: 9.4px;
+}
+
+.viewport .lights i {
+	width: 14px;
+	height: 14px;
+	border-radius: 50%;
+}
+
+.viewport .lights i:nth-child(1) {
+	background: #fe5f57;
+}
+
+.viewport .lights i:nth-child(2) {
+	background: #febc2e;
+}
+
+.viewport .lights i:nth-child(3) {
+	background: #28c840;
+}
+
+.callout {
+	position: absolute;
+	transform-origin: 0 0;
+	opacity: 0;
+	white-space: nowrap;
+}
+
+.callout span {
+	display: inline-block;
+	padding: 9px 20px 11px;
+	border-radius: 12px;
+	background: var(--accent);
+	color: #fff;
+	font-size: 28px;
+	font-weight: 700;
+	box-shadow: 0 10px 24px rgba(21, 23, 28, 0.35);
+}
+
+.callout.box {
+	border: 4px solid var(--accent);
+	border-radius: 14px;
+	box-shadow: 0 0 0 9999px rgba(10, 12, 18, 0.34);
+}
+
+.footage .gap {
+	position: absolute;
+	left: 208px;
+	top: 212px;
+	width: 1504px;
+	height: 846px;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	gap: 26px;
+	opacity: 0;
+}
+
+.footage .gap p {
+	font-size: 54px;
+	font-weight: 700;
+}
+
+.footage .gap small {
+	font-size: 32px;
+	color: var(--ink-2);
+}
+
+.footage .gap .dots {
+	display: flex;
+	gap: 16px;
+}
+
+.footage .gap .dots i {
+	width: 16px;
+	height: 16px;
+	border-radius: 50%;
+	background: var(--accent);
+}
+
+.footage .demo-note {
+	position: absolute;
+	right: 120px;
+	top: 20px;
+	font-size: 19px;
+	color: var(--ink-3);
+}
+
+/* ---- くらべると ---- */
+
+#compare .chip {
+	position: absolute;
+	left: 150px;
+	top: 96px;
+}
+
+.cmp {
+	position: absolute;
+	left: 150px;
+	top: 190px;
+	width: 1620px;
+}
+
+.cmp-head,
+.cmp-row {
+	display: grid;
+	grid-template-columns: 730px 110px 780px;
+	align-items: center;
+}
+
+.cmp-head {
+	font-size: 30px;
+	font-weight: 600;
+	color: var(--ink-3);
+	padding-bottom: 22px;
+	border-bottom: 2px solid var(--line);
+}
+
+.cmp-head .cmp-tako {
+	color: var(--accent);
+	font-weight: 800;
+	font-size: 40px;
+}
+
+.cmp-row {
+	height: 158px;
+	border-bottom: 2px solid var(--line);
+	font-size: 43px;
+	font-weight: 600;
+}
+
+.cmp-row span:first-child {
+	color: var(--ink-3);
+	font-weight: 400;
+	font-size: 39px;
+}
+
+.cmp-row span:last-child {
+	font-weight: 700;
+}
+
+.cmp-row b {
+	width: 58px;
+	height: 3px;
+	background: var(--accent);
+	position: relative;
+}
+
+.cmp-row b::after {
+	content: '';
+	position: absolute;
+	right: -1px;
+	top: -8px;
+	width: 16px;
+	height: 16px;
+	border-top: 3px solid var(--accent);
+	border-right: 3px solid var(--accent);
+	transform: rotate(45deg);
+}
+
+.cmp-note {
+	position: absolute;
+	left: 150px;
+	top: 960px;
+	font-size: 24px;
+	color: var(--ink-3);
+}
+
+/* ---- 立ち位置 ---- */
+
+.st-left {
+	position: absolute;
+	left: 132px;
+	top: 150px;
+	width: 900px;
+}
+
+.st-left .h2 {
+	margin-top: 34px;
+}
+
+.st-left .body {
+	margin-top: 34px;
+}
+
+.tags {
+	margin-top: 56px;
+	display: flex;
+	flex-wrap: wrap;
+	gap: 16px;
+}
+
+.tags span {
+	padding: 12px 26px 14px;
+	border-radius: 999px;
+	border: 2px solid var(--ink);
+	font-size: 27px;
+	font-weight: 600;
+}
+
+.st-cards {
+	position: absolute;
+	inset: 0;
+}
+
+.card {
+	position: absolute;
+	width: 520px;
+	border-radius: 16px;
+	background: #10131b;
+	overflow: hidden;
+	box-shadow: 0 30px 70px rgba(21, 23, 28, 0.32), 0 6px 16px rgba(21, 23, 28, 0.2);
+}
+
+.card .shot {
+	position: relative;
+	width: 520px;
+	height: 292px;
+	overflow: hidden;
+}
+
+.card .shot img {
+	position: absolute;
+	display: block;
+}
+
+.card figcaption {
+	padding: 12px 22px 14px;
+	background: #fff;
+	font-size: 25px;
+	font-weight: 700;
+}
+
+#card-git {
+	left: 1060px;
+	top: 40px;
+	rotate: -2deg;
+}
+
+#card-code {
+	left: 1320px;
+	top: 330px;
+	rotate: 1.5deg;
+}
+
+#card-starter {
+	left: 1100px;
+	top: 686px;
+	rotate: -1deg;
+}
+
+/* ---- 入手方法 ---- */
+
+#cta {
+	text-align: center;
+}
+
+#cta .brand.big {
+	position: absolute;
+	left: 0;
+	right: 0;
+	top: 150px;
+	justify-content: center;
+}
+
+.tagline.center {
+	position: absolute;
+	left: 0;
+	right: 0;
+	top: 300px;
+	font-size: 56px;
+}
+
+.cmd {
+	position: absolute;
+	left: 50%;
+	top: 500px;
+	translate: -50% 0;
+	padding: 26px 48px 28px;
+	border-radius: 20px;
+	background: var(--win);
+	color: #f1f3f8;
+	font-family: var(--mono);
+	font-size: 44px;
+	white-space: nowrap;
+	box-shadow: 0 24px 54px rgba(21, 23, 28, 0.28);
+}
+
+.cmd span {
+	color: var(--accent);
+	margin-right: 18px;
+}
+
+.links {
+	position: absolute;
+	left: 0;
+	right: 0;
+	top: 668px;
+	font-size: 40px;
+	font-weight: 700;
+}
+
+.links i {
+	display: inline-block;
+	width: 10px;
+	height: 10px;
+	margin: 0 30px 9px;
+	border-radius: 50%;
+	background: var(--accent);
+}
+
+.note {
+	position: absolute;
+	left: 0;
+	right: 0;
+	top: 790px;
+	font-size: 30px;
+	color: var(--ink-2);
+}
+
+.fine {
+	position: absolute;
+	left: 0;
+	right: 0;
+	top: 960px;
+	font-size: 22px;
+	color: var(--ink-3);
+}

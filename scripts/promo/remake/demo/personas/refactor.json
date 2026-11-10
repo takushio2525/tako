@@ -1,0 +1,85 @@
+{
+  "title": "エージェント",
+  "footer": "demo · 台本（LLM は呼んでいません）",
+  "promptLines": 2,
+  "turns": [
+    [
+      {
+        "busy": "作業中"
+      },
+      {
+        "wait": 600
+      },
+      {
+        "say": "12 ファイルを順に直します。",
+        "beat": "start"
+      },
+      {
+        "wait": 2500,
+        "tool": "Edit",
+        "arg": "1/12  src/api/products.ts"
+      },
+      {
+        "wait": 2500,
+        "tool": "Edit",
+        "arg": "2/12  src/api/orders.ts"
+      },
+      {
+        "wait": 2500,
+        "tool": "Edit",
+        "arg": "3/12  src/api/payments.ts"
+      },
+      {
+        "wait": 2500,
+        "tool": "Edit",
+        "arg": "4/12  src/api/search.ts"
+      },
+      {
+        "wait": 2500,
+        "tool": "Edit",
+        "arg": "5/12  src/lib/http.ts"
+      },
+      {
+        "wait": 2500,
+        "tool": "Edit",
+        "arg": "6/12  src/lib/retry.ts"
+      },
+      {
+        "wait": 2500,
+        "tool": "Edit",
+        "arg": "7/12  src/lib/db.ts"
+      },
+      {
+        "wait": 2500,
+        "tool": "Edit",
+        "arg": "8/12  src/cart/cart.ts"
+      },
+      {
+        "wait": 2500,
+        "tool": "Edit",
+        "arg": "9/12  src/cart/price.ts"
+      },
+      {
+        "wait": 2500,
+        "tool": "Edit",
+        "arg": "10/12 src/auth/session.ts"
+      },
+      {
+        "wait": 2500,
+        "tool": "Edit",
+        "arg": "11/12 src/auth/token.ts"
+      },
+      {
+        "wait": 2500,
+        "tool": "Edit",
+        "arg": "12/12 src/index.ts"
+      },
+      {
+        "wait": 1500,
+        "say": "完了: 12 files · テスト 21 件 緑",
+        "color": "ok",
+        "beat": "done"
+      }
+    ]
+  ]
+}

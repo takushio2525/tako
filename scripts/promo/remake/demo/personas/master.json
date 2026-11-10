@@ -1,0 +1,128 @@
+{
+  "title": "司令塔（master）",
+  "footer": "demo · 司令塔の台本（LLM は呼んでいません）",
+  "promptLines": 2,
+  "turns": [
+    [
+      {
+        "busy": "分解中"
+      },
+      {
+        "wait": 1000,
+        "say": "成果物ごとに 3 つへ分けて、担当を立てます。",
+        "color": "text",
+        "beat": "plan"
+      },
+      {
+        "wait": 800,
+        "tool": "spawn",
+        "arg": "api    決済 API にリトライ"
+      },
+      {
+        "exec": "tako orchestrator spawn --project shop-app --label api --prompt '決済 API にリトライを入れる（最大 3 回・テスト緑まで）'",
+        "capture": "api",
+        "field": "pane_id",
+        "beat": "spawn_api"
+      },
+      {
+        "wait": 800,
+        "tool": "spawn",
+        "arg": "search 商品検索を実装"
+      },
+      {
+        "exec": "tako orchestrator spawn --project shop-app --label search --prompt '商品検索を実装する（部分一致・ページング）'",
+        "capture": "search",
+        "field": "pane_id",
+        "beat": "spawn_search"
+      },
+      {
+        "wait": 800,
+        "tool": "spawn",
+        "arg": "docs   README を更新"
+      },
+      {
+        "exec": "tako orchestrator spawn --project shop-app --label docs --prompt 'README に使い方を追記する（例が動くこと）'",
+        "capture": "docs",
+        "field": "pane_id",
+        "beat": "spawn_docs"
+      },
+      {
+        "wait": 700,
+        "say": "右パネルに全体を出します。",
+        "color": "text"
+      },
+      {
+        "exec": "tako panel --show --view orch --width 300",
+        "beat": "panel"
+      },
+      {
+        "busy": "3 体を監視中"
+      },
+      {
+        "waitBeat": "docs:prompt1"
+      },
+      {
+        "wait": 500
+      },
+      {
+        "until": "tako orchestrator status --pane ${docs}",
+        "field": "status",
+        "equals": "idle"
+      },
+      {
+        "say": "docs   完了を検知 → 例とリンクを確認",
+        "color": "ok",
+        "indent": 2,
+        "beat": "done_docs"
+      },
+      {
+        "waitBeat": "api:prompt1"
+      },
+      {
+        "wait": 500
+      },
+      {
+        "until": "tako orchestrator status --pane ${api}",
+        "field": "status",
+        "equals": "idle"
+      },
+      {
+        "say": "api    完了を検知 → テスト 12 件 緑",
+        "color": "ok",
+        "indent": 2,
+        "beat": "done_api"
+      },
+      {
+        "waitBeat": "search:prompt1"
+      },
+      {
+        "wait": 500
+      },
+      {
+        "until": "tako orchestrator status --pane ${search}",
+        "field": "status",
+        "equals": "idle"
+      },
+      {
+        "say": "search 完了を検知 → テスト 9 件 緑",
+        "color": "ok",
+        "indent": 2,
+        "beat": "done_search"
+      },
+      {
+        "wait": 900,
+        "say": ""
+      },
+      {
+        "say": "検収しました。3 件とも受け入れ条件を満たしています。",
+        "color": "text",
+        "beat": "report"
+      },
+      {
+        "say": "変更 10 ファイル · テスト 21 件 緑 · README 更新済み",
+        "color": "dim",
+        "indent": 2
+      }
+    ]
+  ]
+}

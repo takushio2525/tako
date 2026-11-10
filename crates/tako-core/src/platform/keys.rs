@@ -117,6 +117,120 @@ pub fn close_pane(platform: Platform) -> &'static str {
     }
 }
 
+/// プレビューのファイル内検索の欄を開く / 閉じる打鍵（FindPreview。Issue #2854）。
+///
+/// Windows は `Ctrl+Shift+F`（`Ctrl+F` は readline の 1 字進むなので shift 段へ逃がした = #585。
+/// 理由の全文は tako-app の `keybindings::find_in_files_bindings`）。CLI `tako edit search` の
+/// ヘルプが `⌘F` と直書きしていた（Windows では Win+F を案内していた）のを、ここから引く形へ移した
+pub fn find_preview(platform: Platform) -> &'static str {
+    match platform {
+        Platform::MacOs => "\u{2318}F",
+        Platform::Windows => "Ctrl+Shift+F",
+    }
+}
+
+/// 「shift 付きの打鍵」の shift の表記（macOS = `⇧` / Windows = `Shift`。Issue #2854）。
+///
+/// 記号と語の書き分けは tako-app のバインド表の表記（`format_keystroke_for`）と同じ
+/// （tako-app のテストが突き合わせる）
+pub fn shift(platform: Platform) -> &'static str {
+    match platform {
+        Platform::MacOs => "\u{21e7}",
+        Platform::Windows => "Shift",
+    }
+}
+
+/// macOS だけの打鍵記号（⌘ ⌥ ⌃ ⇧ ⌫ ⌦）。**Windows の案内に 1 つも出てはいけない**ものの一覧
+/// （Issue #2854）。
+///
+/// 組み上がった案内（CLI のヘルプ全体など）を Windows の構成で検査する側が引く。記号の正本は
+/// このファイルだけが持つ（番犬 `ui_key_notation` の規則 A が他の場所への直書きを名指すので、
+/// 検査する側も字面ではなくここを引く）
+pub const MACOS_KEY_SYMBOLS: [char; 6] = [
+    '\u{2318}', '\u{2325}', '\u{2303}', '\u{21e7}', '\u{232B}', '\u{2326}',
+];
+
+/// コード編集の打鍵表（[`super::editor_keys::TABLE`]）の 1 操作を、案内文へ載せる表記にする
+/// （Issue #2854）。
+///
+/// その OS の列の**先頭の打鍵**を返す（同じ操作に打鍵が複数あっても案内は 1 本 = #322 の
+/// 「最も簡単な形」）。列が空（その OS に打鍵が無い = Windows の行頭までの削除など）は `None`。
+/// 正本は編集の打鍵表で、GUI の入口も同じ表を引くので、案内と実際に効く打鍵はずれない
+/// （キーバインドに奪われないことは tako-app の `エディタの打鍵表はキーバインドと衝突しない`）
+pub fn editor_key(platform: Platform, action: super::editor_keys::Action) -> Option<String> {
+    let entry = super::editor_keys::TABLE
+        .iter()
+        .find(|entry| entry.action == action)?;
+    let chord = entry.chords(platform).first()?;
+    Some(chord_label(platform, chord))
+}
+
+/// 編集の打鍵 1 つの表記（macOS はメニューの記号順 ⌃⌥⌘ を詰めて書く / Windows は `+` で繋ぐ）
+fn chord_label(platform: Platform, chord: &super::editor_keys::Chord) -> String {
+    let key = editor_key_name(platform, chord.key);
+    match platform {
+        Platform::MacOs => {
+            let mut s = String::new();
+            if chord.control {
+                s.push('\u{2303}');
+            }
+            if chord.alt {
+                s.push('\u{2325}');
+            }
+            if chord.platform {
+                s.push('\u{2318}');
+            }
+            s + &key
+        }
+        Platform::Windows => {
+            let mut parts: Vec<&str> = Vec::new();
+            if chord.control {
+                parts.push("Ctrl");
+            }
+            if chord.alt {
+                parts.push("Alt");
+            }
+            // Windows の列に Win キーは置かない（editor_keys の「案内できない打鍵は受理もしない」）。
+            // 置かれたら `Win` の表記で出し、`windowsの案内にcmd表記が出ない` の単体が落とす
+            if chord.platform {
+                parts.push("Win");
+            }
+            parts.push(&key);
+            parts.join("+")
+        }
+    }
+}
+
+/// 編集の打鍵表のキー名（GPUI の `Keystroke::key` の綴り）の表記
+fn editor_key_name(platform: Platform, key: &str) -> String {
+    let mac = platform == Platform::MacOs;
+    match key {
+        "left" => "\u{2190}".into(),
+        "right" => "\u{2192}".into(),
+        "up" => "\u{2191}".into(),
+        "down" => "\u{2193}".into(),
+        "home" => "Home".into(),
+        "end" => "End".into(),
+        "pageup" => "Page Up".into(),
+        "pagedown" => "Page Down".into(),
+        "backspace" if mac => "\u{232B}".into(),
+        "backspace" => "Backspace".into(),
+        "delete" if mac => "\u{2326}".into(),
+        "delete" => "Delete".into(),
+        "enter" => "Enter".into(),
+        "tab" => "Tab".into(),
+        "escape" => "Escape".into(),
+        _ if key.chars().count() == 1 => key.to_uppercase(),
+        _ => {
+            let mut c = key.chars();
+            match c.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        }
+    }
+}
+
 /// 「修飾 + クリック / Enter」の主修飾キーの表記（macOS = command / Windows = Ctrl）。
 ///
 /// キーバインド表に載っていない「修飾 + クリック」「修飾 + Enter」の操作
@@ -559,6 +673,85 @@ mod tests {
         assert_eq!(quit(Platform::Windows), "Ctrl+Shift+Q");
         assert_eq!(close_pane(Platform::MacOs), "\u{2318}W");
         assert_eq!(close_pane(Platform::Windows), "Ctrl+Shift+W");
+        assert_eq!(find_preview(Platform::MacOs), "\u{2318}F");
+        assert_eq!(find_preview(Platform::Windows), "Ctrl+Shift+F");
+        assert_eq!(shift(Platform::MacOs), "\u{21e7}");
+        assert_eq!(shift(Platform::Windows), "Shift");
+    }
+
+    /// #2854: CLI `tako edit` のヘルプが引く編集の打鍵。macOS は修正前のヘルプの直書き
+    /// （`⌥← / Home / Page Down`・`⌥⌫ / ⌘⌫`）と 1 文字も変わらず、Windows は編集の打鍵表の
+    /// Windows の列（語 = Ctrl・行頭までの削除は打鍵が無い）を出す
+    #[test]
+    fn 編集の打鍵の案内は打鍵表の先頭の打鍵を出す() {
+        use super::super::editor_keys::Action;
+        use crate::text_edit::{CursorMovement as M, DeleteMotion as D};
+        let key = |platform, action| editor_key(platform, action);
+        // macOS: 修正前のヘルプの直書きと同じ表記
+        assert_eq!(
+            key(Platform::MacOs, Action::Move(M::WordLeft)).as_deref(),
+            Some("\u{2325}\u{2190}")
+        );
+        assert_eq!(
+            key(Platform::MacOs, Action::Move(M::SmartLineStart)).as_deref(),
+            Some("Home")
+        );
+        assert_eq!(
+            key(Platform::MacOs, Action::Move(M::PageDown)).as_deref(),
+            Some("Page Down")
+        );
+        assert_eq!(
+            key(Platform::MacOs, Action::Delete(D::WordBackward)).as_deref(),
+            Some("\u{2325}\u{232B}")
+        );
+        assert_eq!(
+            key(Platform::MacOs, Action::Delete(D::ToLineStart)).as_deref(),
+            Some("\u{2318}\u{232B}")
+        );
+        // Windows: 語の移動・削除は Ctrl、Home / Page Down は同じ、行頭までの削除は打鍵が無い
+        assert_eq!(
+            key(Platform::Windows, Action::Move(M::WordLeft)).as_deref(),
+            Some("Ctrl+\u{2190}")
+        );
+        assert_eq!(
+            key(Platform::Windows, Action::Move(M::SmartLineStart)).as_deref(),
+            Some("Home")
+        );
+        assert_eq!(
+            key(Platform::Windows, Action::Move(M::PageDown)).as_deref(),
+            Some("Page Down")
+        );
+        assert_eq!(
+            key(Platform::Windows, Action::Delete(D::WordBackward)).as_deref(),
+            Some("Ctrl+Backspace")
+        );
+        assert_eq!(key(Platform::Windows, Action::Delete(D::ToLineStart)), None);
+        // 表記は表の先頭の打鍵から作っている（表を直せば案内も変わる）。両 OS の全行で、
+        // 先頭の打鍵を resolve へ通すと同じ操作へ解ける
+        for platform in [Platform::MacOs, Platform::Windows] {
+            for entry in super::super::editor_keys::TABLE {
+                let Some(chord) = entry.chords(platform).first() else {
+                    assert_eq!(key(platform, entry.action), None, "{platform:?}");
+                    continue;
+                };
+                assert!(
+                    key(platform, entry.action).is_some(),
+                    "{platform:?} {:?}",
+                    entry.action
+                );
+                let mods = super::super::editor_keys::KeyMods {
+                    shift: false,
+                    alt: chord.alt,
+                    control: chord.control,
+                    platform: chord.platform,
+                };
+                assert!(
+                    super::super::editor_keys::resolve(platform, chord.key, mods).is_some(),
+                    "{platform:?}: 案内に出す {} が表で解けない",
+                    chord.gpui_spec()
+                );
+            }
+        }
     }
 
     /// Windows の案内に macOS の記号 / 語が混ざらない（#1203 の症状そのもの）
@@ -569,10 +762,42 @@ mod tests {
             save_preview(Platform::Windows),
             quit(Platform::Windows),
             close_pane(Platform::Windows),
+            find_preview(Platform::Windows),
+            shift(Platform::Windows),
         ] {
             assert!(!s.contains('\u{2318}'), "{s:?} に ⌘ が残っている");
             assert!(!s.contains("Cmd"), "{s:?} に Cmd が残っている");
             assert!(!s.contains("Win"), "{s:?} に Win が残っている");
+        }
+        // #2854: 編集の打鍵表の Windows の列は全行が macOS の記号 / Win キーを含まない
+        for entry in super::super::editor_keys::TABLE {
+            let Some(s) = editor_key(Platform::Windows, entry.action) else {
+                continue;
+            };
+            for mac in MACOS_KEY_SYMBOLS {
+                assert!(!s.contains(mac), "{s:?} に macOS の記号 {mac} が残っている");
+            }
+            assert!(!s.contains("Win"), "{s:?} に Win が残っている");
+        }
+        // 一覧そのもの: macOS の案内が使う記号はすべて載っている（載せ漏れると Windows の検査が
+        // その記号を見逃す）
+        for s in [
+            command_palette(Platform::MacOs).to_string(),
+            jump_forward(Platform::MacOs).to_string(),
+            shift(Platform::MacOs).to_string(),
+            tree_clip_hint(Platform::MacOs, TreeClipKey::PasteMove),
+            editor_key(
+                Platform::MacOs,
+                super::super::editor_keys::Action::Delete(
+                    crate::text_edit::DeleteMotion::ToLineEnd,
+                ),
+            )
+            .unwrap_or_default(),
+        ] {
+            assert!(
+                s.chars().any(|c| MACOS_KEY_SYMBOLS.contains(&c)),
+                "{s:?} の記号が MACOS_KEY_SYMBOLS に無い"
+            );
         }
         // #1601: 「修飾 + クリック / Enter」の修飾も Windows は Ctrl（Win キーは押せない）
         let m = platform_modifier(Platform::Windows);

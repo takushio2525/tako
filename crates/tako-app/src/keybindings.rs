@@ -2317,6 +2317,11 @@ mod tests {
                     "tako::ClosePane",
                     tako_core::platform::keys::close_pane(platform),
                 ),
+                // #2854: CLI `tako edit search` のヘルプが引く
+                (
+                    "tako::FindPreview",
+                    tako_core::platform::keys::find_preview(platform),
+                ),
             ] {
                 let from_bindings = shortcut_hint_for(action, platform).unwrap_or_else(|| {
                     panic!("{platform:?}: {action} に届くバインドが 1 本も無い")
@@ -2741,5 +2746,113 @@ mod tests {
             skipped_shift, 6,
             "shift 付きを見なかった打鍵の数が想定と違う"
         );
+    }
+
+    /// #2854: CLI `tako edit` のヘルプが案内する編集の打鍵（`keys::editor_key`）が、**両 OS で**
+    /// 実際に編集の入口へ届いてその操作になること。
+    ///
+    /// 案内の表記から打鍵を GPUI の綴りへ戻し、(1) その OS のキーバインドが握っていない
+    /// （GPUI はバインドを入口より先に発火して伝播を止める）、(2) 編集の打鍵表で案内どおりの
+    /// 操作へ解ける、(3) `--select` が案内する shift 付きは選択を伸ばす、を見る。
+    /// Windows の行頭までの削除は打鍵が無いので、ヘルプにも出ない（`None`）ことを固定する
+    #[test]
+    fn cliのヘルプが案内する編集の打鍵は実際に届く() {
+        use tako_core::platform::editor_keys::{self, Action, EditorCommand, KeyMods};
+        use tako_core::platform::keys;
+        use tako_core::text_edit::{CursorMovement as M, DeleteMotion as D};
+        // CLI のヘルプが並べる操作（tako-cli の `help_keys`）
+        let helped = [
+            Action::Move(M::WordLeft),
+            Action::Move(M::SmartLineStart),
+            Action::Move(M::PageDown),
+            Action::Delete(D::WordBackward),
+            Action::Delete(D::ToLineStart),
+        ];
+        let mut checked = 0usize;
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let bound: Vec<(String, Keystroke)> = bindings_for(platform)
+                .iter()
+                .filter(|b| b.keystrokes().len() == 1)
+                .map(|b| {
+                    (
+                        b.action().name().to_string(),
+                        b.keystrokes()[0].inner().clone(),
+                    )
+                })
+                .collect();
+            for action in helped {
+                let Some(hint) = keys::editor_key(platform, action) else {
+                    assert!(
+                        platform == Platform::Windows && action == Action::Delete(D::ToLineStart),
+                        "{platform:?}: {action:?} の案内が無い"
+                    );
+                    continue;
+                };
+                // 案内の表記を出した打鍵（表の先頭）を GPUI の綴りへ戻す
+                let chord = editor_keys::TABLE
+                    .iter()
+                    .find(|e| e.action == action)
+                    .and_then(|e| e.chords(platform).first())
+                    .expect("案内があるなら表に打鍵がある");
+                for shift in [false, true] {
+                    let spec = if shift {
+                        format!("shift-{}", chord.gpui_spec())
+                    } else {
+                        chord.gpui_spec()
+                    };
+                    let ks = Keystroke::parse(&spec).expect("表の綴りは GPUI が読める");
+                    for (name, got) in &bound {
+                        assert!(
+                            !(got.key == ks.key && got.modifiers == ks.modifiers),
+                            "{platform:?}: ヘルプが案内する {hint}（{spec}）を {name} が握っている"
+                        );
+                    }
+                    let resolved = editor_keys::resolve(
+                        platform,
+                        &ks.key,
+                        KeyMods {
+                            shift: ks.modifiers.shift,
+                            alt: ks.modifiers.alt,
+                            control: ks.modifiers.control,
+                            platform: ks.modifiers.platform,
+                        },
+                    );
+                    let want = match action {
+                        Action::Move(movement) => Some(EditorCommand::Move {
+                            movement,
+                            extend: shift,
+                        }),
+                        Action::Delete(motion) => Some(EditorCommand::Delete(motion)),
+                        _ => unreachable!("ヘルプは移動と削除だけを案内する"),
+                    };
+                    assert_eq!(
+                        resolved, want,
+                        "{platform:?}: ヘルプの {hint}（{spec}）が案内どおりの操作にならない"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        // 両 OS × 5 操作 × shift の有無 − Windows の行頭までの削除（打鍵なし）の 2
+        assert_eq!(checked, 18, "見た打鍵の数が想定と違う");
+    }
+
+    /// #2854: `keys::shift`（CLI `tako edit move --select` のヘルプ）は、バインド表の表記
+    /// （`format_keystroke_for`）が shift を書く綴りと同じ（macOS = `⇧` / Windows = `Shift`）
+    #[test]
+    fn shiftの案内はバインド表の表記と同じ綴り() {
+        use tako_core::platform::keys;
+        for (platform, spec) in [
+            (Platform::MacOs, "cmd-shift-f"),
+            (Platform::Windows, "ctrl-shift-f"),
+        ] {
+            let ks = Keystroke::parse(spec).expect(spec);
+            let label = format_keystroke_for(&ks, platform);
+            assert!(
+                label.contains(keys::shift(platform)),
+                "{platform:?}: バインド表は {label:?} と書くのに shift の案内は {:?}",
+                keys::shift(platform)
+            );
+        }
     }
 }
