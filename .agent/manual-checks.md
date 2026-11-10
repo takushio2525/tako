@@ -613,7 +613,21 @@ unit test + 実 claude e2e（`claude_tui_e2e`）で機械検証済み。GUI 側�
       入力欄が隠れない**。バナーを閉じると TUI が新しい行数へ描き直される
 - [ ] バナー表示中にペイン内の文字をドラッグ選択して、掴んだ位置と選択範囲が一致する
 
-## 初回起動の導線（#1510、2026-10-28）
+## 初回起動の導線: ボタン → setup → 対話（#2879、2026-11-10）
+
+段の判定・ボタンの中身・遷移・起動時に何も走らせないことは単体テスト（`welcome` / `setup` の `issue2879_*`）と
+番犬 `issue2879_no_setup_on_launch_watchdog`、`scripts/test-first-run-2879.sh`（隔離 GUI・偽の claude と curl）で機械検証済み。
+**Windows 実機の通し**と**本物の claude での対話の中身**（初回フローの Step 1〜4 を辿るか）は次で確認する。
+本物の HOME で試すと本当に setup が走るので、新しいユーザーアカウントか、`TAKO_FIRST_RUN=1` + 一時の HOME の隔離 GUI で行う。
+
+- [ ] 初回起動で「次にやること: 初期設定をします…」と「セットアップを実行」が出て、**押すまで** HOME（`~/.claude/CLAUDE.md`・`~/.claude.json`・PATH の設定ファイル）も data dir の `setup/`・`orchestrator/` も増えない
+- [ ] 「セットアップを実行」で `setup` タブが開き `tako setup` が走る。そのあいだバナーは「setup のタブでセットアップを進めています」+「タブを開く」
+- [ ] claude がログイン済み: setup の最後に対話アシスタントが開き、バナーは「対話のセットアップ中です」。対話が初回フロー（Step 1 グローバル指示ファイル → Step 2 オーケストレーション設定 → Step 3 プロジェクト登録 → Step 3.5 設定共有 = GitHub）で進む。閉じると「master を起動」
+- [ ] claude が無い: setup が導入の `[Y/n]` を聞き、入った後は「ログイン」→ 済むと「セットアップを続ける」→ 同じタブで `tako setup` → 対話 → 「master を起動」
+- [ ] 「あとで」で閉じても次の起動でまた出る。「今後表示しない」なら出ない。「master を起動」の後の起動では出ない。settings.json がある既存の利用者には出ない
+- [ ] Windows: ボタンの行が PowerShell で実行される形になり、setup → ログイン → 続ける → 対話 → master まで通る
+
+## 初回起動の導線（#1510、2026-10-28。#2879 からは A/B `TAKO_2879_LEGACY=1` の形）
 
 自動の段・段の判定・ボタンの中身・遷移は単体テスト（`welcome` / tako-cli の `issue1510_*`）と
 `scripts/test-first-run-1510.sh`（隔離 GUI の実経路。偽のインストーラ・偽の claude）で機械検証済み。

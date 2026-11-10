@@ -265,6 +265,7 @@ pub const CATALOG: &[Entry] = &[
         local_fields: &[
             "welcome_dismissed",
             "welcome_onboarding",
+            "welcome_guided",
             "update_card_dismissed",
         ],
         needs_local_unless: &[],
@@ -276,7 +277,12 @@ pub const CATALOG: &[Entry] = &[
         note: notes::DECLARATIVE,
         // setup をいつ・どの版で走らせたかはデバイスごとの記録。
         // 共有すると push のたびに無意味な差分が出る
-        local_fields: &["setup.completed_at", "setup.applied_version"],
+        // 対話のセットアップを済ませたか（#2879）もその端末の記録（共有すると新しい端末で対話が始まらない）
+        local_fields: &[
+            "setup.completed_at",
+            "setup.applied_version",
+            "setup.dialogue_done",
+        ],
         needs_local_unless: &[],
     },
     Entry {

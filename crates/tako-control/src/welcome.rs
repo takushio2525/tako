@@ -34,6 +34,22 @@
 //!
 //! 状態と操作は dispatch `Welcome`（CLI `tako welcome` / MCP `tako_welcome`）の 1 実装で、
 //! GUI のボタンも同じ要求を投げる（UI に閉じたロジックを作らない）
+//!
+//! ## ボタン → setup → 対話（#2879。いまの既定 = [`Flow::Guided`]）
+//!
+//! 11/10 の利用者の指示で、#1510 の自動の段をやめた。master / worker の設定や GitHub との連携
+//! （設定共有）は `tako setup` の最後に開く**対話アシスタント**でしか決められないのに、自動の段は
+//! `launch_agent: none` で対話を通らず「master を起動」へ進んでいた。いまは次の形:
+//!
+//! - 初回起動では**何も走らせない**（[`startup_action`] は確かめるだけ。ファイルも書かない）
+//! - 最初の段は「セットアップを実行」（[`NextStep::Setup`]）= setup のタブで端末の `tako setup`。
+//!   エージェント CLI が無ければ setup 自身が導入の同意（`[Y/n]`）を聞き、ログインはバナーの
+//!   「ログイン」、済んだら「セットアップを続ける」（[`NextStep::Continue`]）でもう一度 `tako setup` →
+//!   最後に対話アシスタント。対話が済んだら（`config.yaml` の `setup.dialogue_done`）「master を起動」
+//! - setup・対話が走っているあいだ（[`crate::setup::running_phase`]）は [`NextStep::Running`] で、
+//!   ボタンはタブを見せるだけ（走っている setup の入力へコマンド行を打たない）
+//!
+//! A/B は `TAKO_2879_LEGACY=1`（#1510 の自動の段の形 = [`Flow::Auto`]）
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -55,16 +71,25 @@ pub fn should_show(settings_path: &Path, settings: &Settings) -> bool {
     !settings_path.exists() && !settings.welcome_dismissed
 }
 
-/// [`should_show`] に #1510 の「導線が続いているあいだは毎回出す」を足したもの（純関数）。
+/// [`should_show`] に「導線が続いているあいだは毎回出す」を足したもの（純関数）。
 ///
-/// `onboarding` = 導線を動かすか（[`onboarding_enabled`]）。偽なら [`should_show`] と同じ
-/// （= #549 の初回だけ）。**既存ユーザーには出さない**: `welcome_onboarding` は初回起動で
-/// 導線を始めたときだけ立つので、#1510 より前から使っている人のファイルには無い
-pub fn should_show_with(settings_path: &Path, settings: &Settings, onboarding: bool) -> bool {
+/// `flow` = 導線の形（[`flow`]）。[`Flow::Banner`] なら [`should_show`] と同じ（= #549 の初回だけ）。
+/// 続いている印は形ごとに別: #1510 の形は `welcome_onboarding`、#2879 の形は `welcome_guided`。
+/// **既存の利用者には出さない**: どちらの印も初回起動で導線を始めたときだけ立つので、それより前から
+/// 使っている人のファイルには無い。#1510 の印が立ったままの人（自動の段の後に master を押していない人）にも、
+/// #2879 の形は出さない（初回起動を済ませた人へ対話を促し直さない = 11/10 の判断）
+pub fn should_show_with(settings_path: &Path, settings: &Settings, flow: Flow) -> bool {
     if settings.welcome_dismissed {
         return false;
     }
-    !settings_path.exists() || (onboarding && settings.welcome_onboarding)
+    if !settings_path.exists() {
+        return true;
+    }
+    match flow {
+        Flow::Banner => false,
+        Flow::Auto => settings.welcome_onboarding,
+        Flow::Guided => settings.welcome_guided,
+    }
 }
 
 /// 起動時にバナーを出すか（実パス版）。
@@ -73,7 +98,7 @@ pub fn should_show_with(settings_path: &Path, settings: &Settings, onboarding: b
 /// 「閉じても毎回出る」になるため、出さない側へ倒す）。
 pub fn should_show_on_launch() -> bool {
     match crate::settings::settings_path() {
-        Some(path) => should_show_with(&path, &crate::settings::load(), onboarding_enabled()),
+        Some(path) => should_show_with(&path, &crate::settings::load(), flow()),
         None => false,
     }
 }
@@ -85,9 +110,30 @@ pub fn is_first_launch() -> bool {
 
 /// 「以後出さない」を永続化する
 pub fn mark_dismissed() -> io::Result<PathBuf> {
+    crate::settings::set_carry_welcome_guided(false);
     let mut settings = crate::settings::load();
     settings.welcome_dismissed = true;
     crate::settings::save(&settings)
+}
+
+/// 初回起動（settings.json がまだ無い）の GUI で、ほかの設定の保存にも導線の印を載せる（#2879）。
+/// **ここでは書かない**（起動しただけではファイルを増やさない = 何も自動で走らせない約束の一部）。
+/// 理由は `settings::CARRY_WELCOME_GUIDED`
+pub fn carry_guided_on_first_launch() {
+    if is_first_launch() {
+        crate::settings::set_carry_welcome_guided(true);
+    }
+}
+
+/// 導線を始めた印を書く（#2879。最初のボタンを押したとき）。既に立っていれば書かない。
+/// setup の CLI が後から settings.json を書いても、読んでから書くので印は残る
+pub fn mark_guided() -> io::Result<()> {
+    let mut settings = crate::settings::load();
+    if settings.welcome_guided {
+        return Ok(());
+    }
+    settings.welcome_guided = true;
+    crate::settings::save(&settings).map(|_| ())
 }
 
 /// 導線を始めた印を残す（初回起動。#1510）。**settings.json はここで初めてできる**
@@ -98,15 +144,28 @@ pub fn begin_onboarding() -> io::Result<PathBuf> {
     crate::settings::save(&settings)
 }
 
-/// 導線を終える（master を起動した。#1510）。以後の起動ではバナーを出さない
+/// 導線を終える（master を起動した。#1510 / #2879）。以後の起動ではバナーを出さない
 pub fn finish_onboarding() -> io::Result<PathBuf> {
-    let mut settings = crate::settings::load();
-    if !settings.welcome_onboarding {
-        return crate::settings::settings_path()
-            .ok_or_else(|| io::Error::other("設定の置き場が決まらない"));
+    crate::settings::set_carry_welcome_guided(false);
+    let path = crate::settings::settings_path()
+        .ok_or_else(|| io::Error::other("設定の置き場が決まらない"))?;
+    match finished_settings(&crate::settings::load(), path.exists()) {
+        Some(settings) => crate::settings::save(&settings),
+        None => Ok(path),
     }
-    settings.welcome_onboarding = false;
-    crate::settings::save(&settings)
+}
+
+/// 導線を終えた settings（**純関数**。書く必要が無ければ None）。どちらの形の印も倒す。
+/// settings.json がまだ無い（初回起動のまま master を押した）なら書いて初回を終える
+/// （書かないと次の起動も「初回」と読んでバナーが出る）
+pub fn finished_settings(settings: &Settings, file_exists: bool) -> Option<Settings> {
+    if file_exists && !settings.welcome_onboarding && !settings.welcome_guided {
+        return None;
+    }
+    let mut done = settings.clone();
+    done.welcome_onboarding = false;
+    done.welcome_guided = false;
+    Some(done)
 }
 
 /// 案内するコマンド（#322「最も簡単なコマンドを提案する」原則。
@@ -200,6 +259,83 @@ pub fn onboarding_enabled() -> bool {
 /// [`onboarding_enabled`] の判断（純関数）
 pub fn onboarding_enabled_in(legacy: bool, verification: bool, opted_in: bool) -> bool {
     !legacy && (!verification || opted_in)
+}
+
+/// A/B（`TAKO_2879_LEGACY=1`）: #2879 より前 = #1510 の自動の段の形（[`Flow::Auto`]）へ戻す
+pub const LEGACY_2879_ENV: &str = "TAKO_2879_LEGACY";
+
+/// [`LEGACY_2879_ENV`] が立っているか
+pub fn legacy_2879() -> bool {
+    std::env::var_os(LEGACY_2879_ENV).is_some()
+}
+
+/// 初回起動の導線の形
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Flow {
+    /// #549 のバナー（2 行を並べるだけ。押すと以後出さない）。`TAKO_1510_LEGACY=1` と、
+    /// 検証プロセスの既定（`TAKO_FIRST_RUN` を明示しない隔離 GUI・テスト）
+    Banner,
+    /// #1510 の形: 初回起動で副作用の小さい setup の段を自動で走らせる（`TAKO_2879_LEGACY=1`）。
+    /// `Onboarding::default()` の既定（#1510 の単体テストがこの形を縛る）
+    #[default]
+    Auto,
+    /// #2879 の形（製品の既定）: 何も自動で走らせず、ボタン → setup → 対話 → master
+    Guided,
+}
+
+impl Flow {
+    /// 機械が読む名前（CLI / MCP の `onboarding.flow`）
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Banner => "banner",
+            Self::Auto => "auto",
+            Self::Guided => "guided",
+        }
+    }
+}
+
+/// いまの導線の形
+pub fn flow() -> Flow {
+    flow_in(
+        legacy(),
+        legacy_2879(),
+        tako_core::paths::is_verification_process(),
+        matches!(
+            std::env::var(FIRST_RUN_ENV).ok().as_deref(),
+            Some("1" | "true" | "on")
+        ),
+    )
+}
+
+/// [`flow`] の判断（純関数）
+pub fn flow_in(legacy_1510: bool, legacy_2879: bool, verification: bool, opted_in: bool) -> Flow {
+    if !onboarding_enabled_in(legacy_1510, verification, opted_in) {
+        Flow::Banner
+    } else if legacy_2879 {
+        Flow::Auto
+    } else {
+        Flow::Guided
+    }
+}
+
+/// 起動時に導線が何をするか（#2879）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Startup {
+    /// 「次にやること」を確かめるだけ（何も走らせない）
+    Probe,
+    /// #1510 の自動の段を走らせる（[`Flow::Auto`] で setup がまだ一度も最後まで走っていないとき）
+    Auto,
+}
+
+/// 起動時の入口の判断（**純関数**。GUI の `start_welcome_onboarding` はこれに従うだけ）。
+///
+/// **[`Flow::Guided`] では何があっても [`Startup::Auto`] を返さない**（11/10 の指示: 初回起動で
+/// 何も自動で走らせない）。番犬: `issue2879_no_setup_on_launch_watchdog`
+pub fn startup_action(flow: Flow, setup_completed: bool) -> Startup {
+    match flow {
+        Flow::Auto if !setup_completed => Startup::Auto,
+        _ => Startup::Probe,
+    }
 }
 
 /// 初回起動の自動の段に渡す answers（#1510）。
@@ -363,6 +499,13 @@ pub enum NextStep {
     Master { agent: AgentKind },
     /// 導入状況を確かめられない（ログインシェルが応答しない等）
     Unknown { reason: String },
+    /// まだ一度も setup が最後まで走っていない → 「セットアップを実行」（#2879。導入状況は見ない）
+    Setup,
+    /// 使える系統はあるが、この端末で対話のセットアップをまだ済ませていない →
+    /// 「セットアップを続ける」= もう一度 `tako setup`（最後に対話アシスタント。#2879）
+    Continue { agent: AgentKind },
+    /// 端末の `tako setup`（またはその対話アシスタント）が走っている（#2879）。ボタンはタブを見せるだけ
+    Running { phase: crate::setup::RunningPhase },
 }
 
 impl NextStep {
@@ -375,6 +518,9 @@ impl NextStep {
             Self::Login { .. } => "login",
             Self::Master { .. } => "master",
             Self::Unknown { .. } => "unknown",
+            Self::Setup => "setup",
+            Self::Continue { .. } => "continue",
+            Self::Running { .. } => "running",
         }
     }
 
@@ -384,8 +530,9 @@ impl NextStep {
             | Self::Path { agent }
             | Self::PathByHand { agent, .. }
             | Self::Login { agent, .. }
-            | Self::Master { agent } => Some(*agent),
-            Self::Unknown { .. } => None,
+            | Self::Master { agent }
+            | Self::Continue { agent } => Some(*agent),
+            Self::Unknown { .. } | Self::Setup | Self::Running { .. } => None,
         }
     }
 
@@ -403,7 +550,9 @@ impl NextStep {
                     .to_string()
             }
             Self::Master { .. } => MASTER_COMMAND.to_string(),
-            Self::Unknown { .. } => SETUP_COMMAND.to_string(),
+            Self::Unknown { .. } | Self::Setup | Self::Continue { .. } => SETUP_COMMAND.to_string(),
+            // 走っているあいだは打つものが無い（同じ setup をもう 1 本起こさない）
+            Self::Running { .. } => return None,
         })
     }
 
@@ -440,6 +589,7 @@ impl NextStep {
                 }
             }
             Self::Unknown { reason } => out["reason"] = json!(reason),
+            Self::Running { phase } => out["phase"] = json!(phase.as_str()),
             _ => {}
         }
         out
@@ -535,6 +685,69 @@ pub fn probe() -> NextStep {
     ))
 }
 
+/// 対話のセットアップの進み具合（#2879。`config.yaml` の `setup` と、走っている印）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SetupProgress {
+    /// setup が一度でも最後まで走ったか（`setup.completed`）
+    pub completed: bool,
+    /// この端末で対話のセットアップを済ませたか（`setup.dialogue_done == Some(true)`）
+    pub dialogue_done: bool,
+    /// いま端末の `tako setup` が走っているなら、その段（[`crate::setup::running_phase`]）
+    pub running: Option<crate::setup::RunningPhase>,
+}
+
+impl SetupProgress {
+    /// いまの進み具合を読む（ファイルを読むだけ。ログインシェルは起こさない）
+    pub fn read() -> Result<Self, String> {
+        let config = crate::setup::load_config()?;
+        Ok(Self {
+            completed: config.setup.completed,
+            dialogue_done: config.setup.dialogue_done == Some(true),
+            running: crate::setup::running_phase(),
+        })
+    }
+}
+
+/// #2879 の「次にやること」（**純関数**）。
+///
+/// 走っていれば [`NextStep::Running`]、一度も最後まで走っていなければ [`NextStep::Setup`]
+/// （**この 2 つは導入状況を確かめない** = `states` を呼ばない。起動直後の確かめでログインシェルを起こさない）。
+/// それ以外は導入状況から [`next_step`] と同じ段を出し、master を起こせる段でも対話を済ませていなければ
+/// [`NextStep::Continue`]（対話を通らずに「master を起動」へ進まない）
+pub fn next_step_guided(
+    progress: &SetupProgress,
+    states: impl FnOnce() -> Vec<(AgentKind, Result<BootstrapState, String>)>,
+) -> NextStep {
+    if let Some(phase) = progress.running {
+        return NextStep::Running { phase };
+    }
+    if !progress.completed {
+        return NextStep::Setup;
+    }
+    match next_step(&states()) {
+        NextStep::Master { agent } if !progress.dialogue_done => NextStep::Continue { agent },
+        other => other,
+    }
+}
+
+/// #2879 の「次にやること」を確かめる（**待つことがある** = UI スレッドでは呼ばない）
+pub fn probe_guided() -> NextStep {
+    match SetupProgress::read() {
+        Ok(progress) => next_step_guided(&progress, || {
+            crate::setup_bootstrap::status_all_within(tako_core::probe::auth_probe_timeout())
+        }),
+        Err(reason) => NextStep::Unknown { reason },
+    }
+}
+
+/// 導線の形に合った確かめ（dispatch の offload が background で呼ぶ）
+pub fn probe_in(flow: Flow) -> NextStep {
+    match flow {
+        Flow::Guided => probe_guided(),
+        Flow::Banner | Flow::Auto => probe(),
+    }
+}
+
 /// 「次にやること」のボタンが何をするか（#1510）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Launch {
@@ -546,38 +759,69 @@ pub enum Launch {
     },
     /// master を起動する（新しいタブ。#549 の「master を起動」と同じ）
     Master,
-    /// 自動の段をもう一度走らせる（PATH は自動の段が受け持つ）
+    /// 自動の段をもう一度走らせる（PATH は自動の段が受け持つ。#1510 の形だけ）
     Auto,
+    /// 導線のタブを見せるだけ（setup・対話が走っている。#2879）
+    Focus,
+    /// 確かめ直すだけ（自分で PATH を足し終えた。#2879 の形の [`NextStep::PathByHand`]）
+    Recheck,
 }
 
-/// ボタンの中身（**純関数**。方言を引数で受けるので macOS 上から PowerShell の形も検査できる）
+/// ボタンの中身（#1510 の形 = [`Flow::Auto`]。**純関数**。方言を引数で受けるので macOS 上から
+/// PowerShell の形も検査できる）。導線の形を選ぶのは [`launch_for_flow`]
 pub fn launch_for(step: &NextStep, dialect: ShellDialect) -> Launch {
-    match step {
-        NextStep::Install { agent, .. } => Launch::Pane {
-            title: "setup",
-            line: launch_command_line_in(
-                dialect,
-                &format!(
-                    "setup bootstrap install{}",
-                    crate::setup_bootstrap::agent_flag(*agent)
-                ),
-            ),
+    launch_for_flow(step, dialect, Flow::Auto)
+}
+
+/// ボタンの中身（**純関数**）。[`Flow::Guided`] では [`Launch::Auto`] を返さない（自動の段を走らせない）
+pub fn launch_for_flow(step: &NextStep, dialect: ShellDialect, flow: Flow) -> Launch {
+    let guided = flow == Flow::Guided;
+    // #2879: ボタン起点の形の setup の段は **GUI と同じ版の CLI**（実行ファイルの隣を先に = 自動の段と同じ
+    // [`auto_setup_binary`]）を打つ。導線は CLI が書く走っている印・対話が済んだ印で進むので、`/Applications` や
+    // PATH の先の古い版を打つと段が「セットアップを続ける」から先へ進まない。#1510 の形（A/B）は従来の解決のまま
+    let setup_tab = |sub: &str| Launch::Pane {
+        title: "setup",
+        line: if guided {
+            format!("{} {sub}", dialect.command_word(&auto_setup_binary()))
+        } else {
+            launch_command_line_in(dialect, sub)
         },
+    };
+    match step {
+        NextStep::Install { agent, .. } => setup_tab(&format!(
+            "setup bootstrap install{}",
+            crate::setup_bootstrap::agent_flag(*agent)
+        )),
+        // #2879: 自動の段が無いので、PATH を通すコマンドをタブで打つ
+        NextStep::Path { agent } if guided => setup_tab(&format!(
+            "setup bootstrap path{}",
+            crate::setup_bootstrap::agent_flag(*agent)
+        )),
         NextStep::Path { .. } => Launch::Auto,
         // #2576: 自動の段もそのシェルの設定ファイルは書けないが、走らせ直すと足し終えたかを確かめ直し
         // （足し終えていれば tako CLI の段は already_on_path）、続きの段（MCP 登録など）も当て直して次の段へ進む。
-        // 同じ断りで止まるコマンドをタブへ打たない
+        // 同じ断りで止まるコマンドをタブへ打たない。#2879 の形は確かめ直すだけ（続きは「セットアップを続ける」）
+        NextStep::PathByHand { .. } if guided => Launch::Recheck,
         NextStep::PathByHand { .. } => Launch::Auto,
         NextStep::Login { agent, binary } => Launch::Pane {
             title: "login",
             line: login_line(dialect, *agent, binary.as_deref()),
         },
         NextStep::Master { .. } => Launch::Master,
-        NextStep::Unknown { .. } => Launch::Pane {
-            title: "setup",
-            line: launch_command_line_in(dialect, "setup"),
-        },
+        NextStep::Unknown { .. } | NextStep::Setup | NextStep::Continue { .. } => {
+            setup_tab("setup")
+        }
+        NextStep::Running { .. } => Launch::Focus,
     }
+}
+
+/// 同じ段のボタンをもう一度押したとき、導線のタブへコマンド行を打ち直すか（#2879）。
+///
+/// 「セットアップを実行 / 続ける」は、走っているあいだは [`NextStep::Running`] になるので、この段が
+/// 出ている = 前の `tako setup` は終わっている（途中で止めた）= 打ち直してよい。導入・ログインは
+/// 走っているかを知る印が無いので、従来どおり打ち直さずにタブを見せる
+pub fn retypes_on_repress(step: &NextStep) -> bool {
+    matches!(step, NextStep::Setup | NextStep::Continue { .. })
 }
 
 /// ログインのコマンド行。コマンドの正本は `agent_cli::auth_command`（3 系統とも実物で確認済み）で、
@@ -614,6 +858,8 @@ pub enum AutoState {
 /// 導線の状態（GUI が持つ。CLI / MCP は dispatch `Welcome` の status で読む）
 #[derive(Debug, Clone, Default)]
 pub struct Onboarding {
+    /// 導線の形（GUI が起動時に [`flow`] で決める。既定は #1510 の形）
+    pub flow: Flow,
     pub auto: AutoState,
     /// 最後に確かめた「次にやること」（まだ確かめていなければ None）
     pub step: Option<NextStep>,
@@ -635,6 +881,14 @@ pub struct Effects {
 }
 
 impl Onboarding {
+    /// 形を決めて作る
+    pub fn new(flow: Flow) -> Self {
+        Self {
+            flow,
+            ..Self::default()
+        }
+    }
+
     pub fn auto_running(&self) -> bool {
         self.auto == AutoState::Running
     }
@@ -651,6 +905,9 @@ impl Onboarding {
 
     /// 確かめた「次にやること」を受け取り、次にすることを決める（**純関数**。時刻は引数）
     pub fn apply_step(&mut self, next: NextStep, now: Instant) -> Effects {
+        if self.flow == Flow::Guided {
+            return self.apply_step_guided(next, now);
+        }
         let previous = self.step.as_ref().map(NextStep::kind);
         let after_auto = std::mem::take(&mut self.after_auto);
         // 人の操作（ボタンで開いたペイン・外のターミナル）で段が進んだ
@@ -676,6 +933,25 @@ impl Onboarding {
         effects
     }
 
+    /// #2879 の形の [`Self::apply_step`]。**自動の段は一切頼まない**（`run_auto` は常に偽）。
+    /// setup・対話が走っているあいだ（[`NextStep::Running`]）は見張りを延ばし続け、終わって段が
+    /// 変わったら見張りを止める（次のボタンは人が押す）
+    fn apply_step_guided(&mut self, next: NextStep, now: Instant) -> Effects {
+        let previous = self.step.as_ref().map(NextStep::kind);
+        self.after_auto = false;
+        if matches!(next, NextStep::Running { .. }) {
+            self.start_watch(now);
+        } else if previous.is_some_and(|kind| kind != next.kind()) || !self.watching(now) {
+            self.watch_until = None;
+        }
+        let effects = Effects {
+            run_auto: false,
+            watch: self.watching(now),
+        };
+        self.step = Some(next);
+        effects
+    }
+
     /// 自動の段が終わった
     pub fn finish_auto(&mut self, outcome: AutoOutcome) {
         self.auto = AutoState::Done(outcome);
@@ -693,6 +969,7 @@ impl Onboarding {
             }
         };
         json!({
+            "flow": self.flow.as_str(),
             "auto": auto,
             "step": self.step.as_ref().map(NextStep::to_json),
             "watching": self.watching(now),
@@ -908,21 +1185,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("settings.json");
         // 初回（ファイルが無い）は導線の有無にかかわらず出す（#549 のまま）
-        assert!(should_show_with(&path, &Settings::default(), true));
-        assert!(should_show_with(&path, &Settings::default(), false));
+        for flow in [Flow::Auto, Flow::Banner, Flow::Guided] {
+            assert!(should_show_with(&path, &Settings::default(), flow));
+        }
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&path, "{}").unwrap();
         let active = Settings {
             welcome_onboarding: true,
             ..Settings::default()
         };
-        assert!(should_show_with(&path, &active, true), "導線の途中");
+        assert!(should_show_with(&path, &active, Flow::Auto), "導線の途中");
         assert!(
-            !should_show_with(&path, &active, false),
+            !should_show_with(&path, &active, Flow::Banner),
             "導線を動かさない起動"
         );
         assert!(
-            !should_show_with(&path, &Settings::default(), true),
+            !should_show_with(&path, &Settings::default(), Flow::Auto),
             "#1510 より前から使っている人（welcome_onboarding が無い）"
         );
         let dismissed = Settings {
@@ -930,7 +1208,10 @@ mod tests {
             welcome_dismissed: true,
             ..Settings::default()
         };
-        assert!(!should_show_with(&path, &dismissed, true), "今後表示しない");
+        assert!(
+            !should_show_with(&path, &dismissed, Flow::Auto),
+            "今後表示しない"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1281,5 +1562,300 @@ mod tests {
         assert_eq!(value["step"]["command"], "tako setup bootstrap install");
         assert!(value["step"]["install_plan"]["official_command"].is_string());
         assert_eq!(value["watching"], false);
+    }
+
+    // --- #2879: ボタン → setup → 対話 ---------------------------------------
+
+    use crate::setup::RunningPhase;
+
+    #[test]
+    fn issue2879_導線の形は既定がボタン起点で旧挙動はabで戻る() {
+        assert_eq!(
+            flow_in(false, false, false, false),
+            Flow::Guided,
+            "製品の既定"
+        );
+        assert_eq!(
+            flow_in(false, true, false, false),
+            Flow::Auto,
+            "TAKO_2879_LEGACY=1 = #1510 の自動の段"
+        );
+        assert_eq!(
+            flow_in(true, false, false, false),
+            Flow::Banner,
+            "TAKO_1510_LEGACY=1 = #549"
+        );
+        assert_eq!(
+            flow_in(false, false, true, false),
+            Flow::Banner,
+            "検証プロセスの既定"
+        );
+        assert_eq!(
+            flow_in(false, false, true, true),
+            Flow::Guided,
+            "TAKO_FIRST_RUN=1"
+        );
+    }
+
+    /// **要件 1 の判断の口**: ボタン起点の形では、起動時に何があっても自動の段を走らせない
+    #[test]
+    fn issue2879_起動時はsetupを走らせない() {
+        for completed in [false, true] {
+            assert_eq!(startup_action(Flow::Guided, completed), Startup::Probe);
+            assert_eq!(startup_action(Flow::Banner, completed), Startup::Probe);
+        }
+        // A/B（#1510 の形）は従来どおり、一度も最後まで走っていなければ自動の段
+        assert_eq!(startup_action(Flow::Auto, false), Startup::Auto);
+        assert_eq!(startup_action(Flow::Auto, true), Startup::Probe);
+    }
+
+    /// 段の判定: 走っていれば running / 未実施なら setup（どちらも導入状況を確かめない）/
+    /// 使える系統があっても対話がまだなら continue / 対話が済んでいれば master
+    #[test]
+    fn issue2879_次にやることはsetupから対話を経てmasterへ() {
+        use AgentKind::*;
+        let never = |_: ()| -> Vec<(AgentKind, Result<BootstrapState, String>)> {
+            panic!("この段は導入状況を確かめない（ログインシェルを起こさない）")
+        };
+        let fresh = SetupProgress::default();
+        assert_eq!(next_step_guided(&fresh, || never(())), NextStep::Setup);
+        for phase in [RunningPhase::Setup, RunningPhase::Dialogue] {
+            let running = SetupProgress {
+                running: Some(phase),
+                ..fresh
+            };
+            assert_eq!(
+                next_step_guided(&running, || never(())),
+                NextStep::Running { phase }
+            );
+        }
+        let done_once = SetupProgress {
+            completed: true,
+            ..fresh
+        };
+        assert_eq!(
+            next_step_guided(&done_once, || states(&[(Claude, Step::Ready)])),
+            NextStep::Continue { agent: Claude },
+            "対話を通らずに master へ進まない"
+        );
+        // 導入・ログインが残っていれば従来の段（ボタン 1 つの同意）
+        assert_eq!(
+            next_step_guided(&done_once, || states(&[(Claude, Step::Auth)])).kind(),
+            "login"
+        );
+        assert_eq!(
+            next_step_guided(&done_once, || states(&[(Claude, Step::Install)])).kind(),
+            "install"
+        );
+        let talked = SetupProgress {
+            completed: true,
+            dialogue_done: true,
+            running: None,
+        };
+        assert_eq!(
+            next_step_guided(&talked, || states(&[(Claude, Step::Ready)])),
+            NextStep::Master { agent: Claude }
+        );
+    }
+
+    /// CLI / MCP の `tako welcome` が同じ段を同じ名前と最簡コマンドで返す（要件 5）
+    #[test]
+    fn issue2879_段の名前と最簡コマンド() {
+        use tako_core::i18n::Lang;
+        let cases = [
+            (NextStep::Setup, "setup", Some("tako setup")),
+            (
+                NextStep::Continue {
+                    agent: AgentKind::Claude,
+                },
+                "continue",
+                Some("tako setup"),
+            ),
+            (
+                NextStep::Running {
+                    phase: RunningPhase::Dialogue,
+                },
+                "running",
+                None,
+            ),
+        ];
+        for (step, kind, command) in cases {
+            assert_eq!(step.kind(), kind);
+            assert_eq!(step.command().as_deref(), command);
+            let value = step.to_json_in(Lang::En);
+            assert_eq!(value["kind"], kind);
+            assert_eq!(value["command"].as_str(), command);
+        }
+        assert_eq!(
+            NextStep::Running {
+                phase: RunningPhase::Setup
+            }
+            .to_json_in(Lang::Ja)["phase"],
+            "setup"
+        );
+    }
+
+    /// ボタンの中身: setup / continue は setup のタブで `tako setup`（方言どおり）、走っているあいだは
+    /// タブを見せるだけ、PATH は `tako setup bootstrap path` を打つ。**自動の段（Launch::Auto）を返さない**
+    #[test]
+    fn issue2879_ボタンの中身は自動の段を使わない() {
+        use tako_core::platform::shell_dialect::ShellDialect::{Posix, PowerShell};
+        use AgentKind::*;
+        let by_hand = NextStep::PathByHand {
+            agent: Claude,
+            shell: "/bin/tcsh".into(),
+            dirs: vec!["$HOME/.local/bin".into()],
+        };
+        let all = [
+            NextStep::Setup,
+            NextStep::Continue { agent: Claude },
+            NextStep::Running {
+                phase: RunningPhase::Dialogue,
+            },
+            next_step(&states(&[(Claude, Step::Install)])),
+            NextStep::Path { agent: Claude },
+            by_hand.clone(),
+            NextStep::Login {
+                agent: Claude,
+                binary: None,
+            },
+            NextStep::Master { agent: Claude },
+            NextStep::Unknown { reason: "x".into() },
+        ];
+        for dialect in [Posix, PowerShell] {
+            for step in &all {
+                assert_ne!(
+                    launch_for_flow(step, dialect, Flow::Guided),
+                    Launch::Auto,
+                    "{step:?}"
+                );
+            }
+            for step in [NextStep::Setup, NextStep::Continue { agent: Claude }] {
+                match launch_for_flow(&step, dialect, Flow::Guided) {
+                    Launch::Pane { title, line } => {
+                        assert_eq!(title, "setup");
+                        assert!(line.ends_with(" setup"), "{dialect:?}: {line}");
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            assert!(matches!(
+                launch_for_flow(&NextStep::Path { agent: Codex }, dialect, Flow::Guided),
+                Launch::Pane { line, .. } if line.ends_with(" setup bootstrap path --agent codex")
+            ));
+        }
+        assert_eq!(launch_for_flow(&all[2], Posix, Flow::Guided), Launch::Focus);
+        assert_eq!(
+            launch_for_flow(&by_hand, Posix, Flow::Guided),
+            Launch::Recheck
+        );
+        // #1510 の形（A/B）は従来どおり
+        assert_eq!(
+            launch_for(&NextStep::Path { agent: Claude }, Posix),
+            Launch::Auto
+        );
+        // 同じ段を押し直したら打ち直すのは setup / continue だけ（走っている setup には打たない）
+        assert!(retypes_on_repress(&NextStep::Setup));
+        assert!(retypes_on_repress(&all[1]));
+        assert!(!retypes_on_repress(&all[2]));
+        assert!(!retypes_on_repress(&all[3]));
+    }
+
+    /// 遷移: 自動の段は一切頼まない。走っているあいだは見張りを延ばし、終わって段が変わったら止める
+    #[test]
+    fn issue2879_遷移は自動の段を頼まず走っているあいだ見張る() {
+        use AgentKind::*;
+        let t0 = Instant::now();
+        let mut o = Onboarding::new(Flow::Guided);
+        assert_eq!(o.apply_step(NextStep::Setup, t0), Effects::default());
+        o.start_watch(t0);
+        let running = NextStep::Running {
+            phase: RunningPhase::Dialogue,
+        };
+        // 対話が見張りの期限（20 分）より長く続いても見張りを延ばし続ける
+        let late = t0 + WATCH_FOR + WATCH_FOR;
+        assert_eq!(
+            o.apply_step(running.clone(), late),
+            Effects {
+                run_auto: false,
+                watch: true
+            }
+        );
+        let fx = o.apply_step(NextStep::Master { agent: Claude }, late + WATCH_INTERVAL);
+        assert_eq!(fx, Effects::default(), "段が変わったら見張りを止める");
+        // PATH の段・人の手で進んだ段でも自動の段を頼まない（#1510 の形との違い）
+        let mut o = Onboarding::new(Flow::Guided);
+        assert!(!o.apply_step(NextStep::Path { agent: Claude }, t0).run_auto);
+        o.start_watch(t0);
+        assert!(
+            !o.apply_step(NextStep::Continue { agent: Claude }, t0)
+                .run_auto
+        );
+        assert_eq!(o.to_json(t0)["flow"], "guided");
+    }
+
+    /// 既存の利用者（settings.json がある）には出さない。#1510 の印が立ったままの人にも出さない（要件 3）
+    #[test]
+    fn issue2879_初回起動を済ませた人には出さない() {
+        let dir = tako_core::test_residue::ScratchDir::new("welcome-2879-show");
+        let path = dir.path().join("settings.json");
+        assert!(
+            should_show_with(&path, &Settings::default(), Flow::Guided),
+            "初回"
+        );
+        std::fs::write(&path, "{}").unwrap();
+        assert!(!should_show_with(&path, &Settings::default(), Flow::Guided));
+        let mid_1510 = Settings {
+            welcome_onboarding: true,
+            ..Settings::default()
+        };
+        assert!(
+            !should_show_with(&path, &mid_1510, Flow::Guided),
+            "#1510 の導線の途中の人に対話を促し直さない"
+        );
+        let guided = Settings {
+            welcome_guided: true,
+            ..Settings::default()
+        };
+        assert!(
+            should_show_with(&path, &guided, Flow::Guided),
+            "ボタンを押した後は出し続ける"
+        );
+        let dismissed = Settings {
+            welcome_guided: true,
+            welcome_dismissed: true,
+            ..Settings::default()
+        };
+        assert!(!should_show_with(&path, &dismissed, Flow::Guided));
+        // 印は serde の default で false（旧ファイルを読める）
+        let old: Settings = serde_json::from_str(r#"{"welcome_onboarding":true}"#).unwrap();
+        assert!(!old.welcome_guided);
+    }
+
+    /// 「master を起動」で導線を終える: どちらの形の印も倒し、初回起動のまま押したら書いて初回を終える
+    #[test]
+    fn issue2879_masterで導線を終える() {
+        let guided = Settings {
+            welcome_guided: true,
+            ..Settings::default()
+        };
+        let done = finished_settings(&guided, true).expect("印を倒して書く");
+        assert!(!done.welcome_guided && !done.welcome_onboarding);
+        let both = Settings {
+            welcome_guided: true,
+            welcome_onboarding: true,
+            ..Settings::default()
+        };
+        let done = finished_settings(&both, true).unwrap();
+        assert!(!done.welcome_guided && !done.welcome_onboarding);
+        assert!(
+            finished_settings(&Settings::default(), false).is_some(),
+            "settings.json が無ければ書く（次の起動を初回と読ませない）"
+        );
+        assert_eq!(
+            finished_settings(&Settings::default(), true),
+            None,
+            "印も無くファイルも在れば書かない"
+        );
     }
 }

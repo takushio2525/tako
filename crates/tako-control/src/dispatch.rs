@@ -8368,10 +8368,13 @@ impl OffloadJob {
                 )))
             }
             // #1510: 確かめ（待つ）は background、GUI へ渡す・押すのは UI スレッドへ戻す
+            // #2879: 導線の形（ボタン起点 / #1510 の自動の段）で確かめ方とボタンの中身が変わる
             OffloadJob::Welcome(probe_for) => {
-                let step = crate::welcome::probe();
-                let launch = (probe_for == WelcomeProbeFor::Next)
-                    .then(|| crate::welcome::launch_for(&step, crate::welcome::default_dialect()));
+                let flow = crate::welcome::flow();
+                let step = crate::welcome::probe_in(flow);
+                let launch = (probe_for == WelcomeProbeFor::Next).then(|| {
+                    crate::welcome::launch_for_flow(&step, crate::welcome::default_dialect(), flow)
+                });
                 OffloadOutcome::OnUi(OffloadContinuation::Welcome(Box::new(WelcomeLanding {
                     probe_for,
                     step,
@@ -15272,9 +15275,13 @@ fn dispatch_inner(
                 // #1510: 「次にやること」を押す。IPC / GUI のボタンは offload が確かめてから
                 // [`welcome_land`] へ来る。ここは直の呼び手（同じスレッドで確かめる）
                 "next" => {
-                    let step = crate::welcome::probe();
-                    let launch =
-                        crate::welcome::launch_for(&step, crate::welcome::default_dialect());
+                    let flow = crate::welcome::flow();
+                    let step = crate::welcome::probe_in(flow);
+                    let launch = crate::welcome::launch_for_flow(
+                        &step,
+                        crate::welcome::default_dialect(),
+                        flow,
+                    );
                     return welcome_next(host, step, launch);
                 }
                 // #1510: 自動の段（ネットワークの導入を含まない setup）をもう一度走らせる。
@@ -15316,16 +15323,22 @@ fn dispatch_inner(
 /// コマンドは #322 の最簡形で返す（AI がユーザーへそのまま提示できる）
 fn welcome_status(host: &dyn ControlHost) -> Value {
     let settings = crate::settings::load();
+    let flow = crate::welcome::flow();
     json!({
         "visible": host.welcome_banner_visible(),
         "dismissed": settings.welcome_dismissed,
         "first_launch": crate::welcome::is_first_launch(),
         "setup_command": crate::welcome::SETUP_COMMAND,
         "master_command": crate::welcome::MASTER_COMMAND,
-        // #1510: 導線（初回起動の自動の段・「次にやること」）。`enabled` が偽なら #549 の形のまま
+        // #1510 / #2879: 導線（「次にやること」）。`enabled` が偽なら #549 の形のまま。`flow` は形の名前
+        // （guided = ボタン → setup → 対話 / auto = #1510 の自動の段）、`active` はその形の続いている印
         "onboarding": {
             "enabled": crate::welcome::onboarding_enabled(),
-            "active": settings.welcome_onboarding,
+            "flow": flow.as_str(),
+            "active": match flow {
+                crate::welcome::Flow::Guided => settings.welcome_guided,
+                _ => settings.welcome_onboarding,
+            },
             "state": host
                 .welcome_onboarding()
                 .map(|o| o.to_json(std::time::Instant::now())),

@@ -520,6 +520,154 @@ pub struct SetupState {
     /// キーは claude / gpt / google。token やアカウント識別子は保存しない。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub provider_plans: BTreeMap<String, String>,
+    /// この端末で対話のセットアップ（setup の最後に開く対話アシスタント）を済ませたか（#2879）。
+    ///
+    /// - `None` = 記録なし（#2879 より前の版で setup した人・まだ setup していない人）。**旧ファイルには
+    ///   無い = serde の default で None** なので、移行の段は要らない。既存の利用者の扱いは変えない
+    /// - `Some(false)` = setup を最後まで走らせたが、対話はまだ（ログイン待ちで起こせなかった・
+    ///   `--yes` / MCP で走らせた）。次の対話は初回の流れ（[`assistant_greeting`] の `first_dialogue`）
+    /// - `Some(true)` = 対話を 1 回済ませた。初回起動のバナーはここで「master を起動」へ進む
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialogue_done: Option<bool>,
+}
+
+// --- 対話のセットアップ（#2879）---------------------------------------------------
+
+/// 対話アシスタントの最初のメッセージ（[`assistant_greeting`]）のうち、初回フローへ入る合図。
+/// `resources/setup/system-prompt.md` の「フロー判定」が同じ語で初回フローへ割り当てる
+/// （番犬: このモジュールの `issue2879_*` テストが両側を突き合わせる）
+pub const FIRST_FLOW_TRIGGER: &str = "初回フローを始めます";
+
+/// 対話アシスタントへ渡す最初のメッセージ（**純関数**。#2879 で tako-cli から移した）。
+///
+/// `first_dialogue` = この端末で対話をまだ済ませていない（初めての setup、または
+/// [`SetupState::dialogue_done`] が `Some(false)`）。#2879 より前は「setup が初めて最後まで走ったか」
+/// だけで決めていたので、ログイン待ちで 1 回目に対話を起こせなかった人の 2 回目は 2 回目以降の形
+/// （メニュー）になった。さらに初回の文もフロー判定の初回フローの合図を含まず、字面では 2 回目以降へ落ちた
+pub fn assistant_greeting(review: bool, has_pending: bool, first_dialogue: bool) -> &'static str {
+    if review {
+        if has_pending {
+            "最初に setup-instructions.md と pending-changes.md を読んでください。アップデート変更と前回設定の個別見直しを始めます。"
+        } else {
+            "最初に setup-instructions.md を読んでください。前回設定の個別見直しを始めます。変更したい項目だけ確認してください。"
+        }
+    } else if first_dialogue {
+        "最初に setup-instructions.md を読んでください。セットアップの検出と既定値の適用が済みました。初回フローを始めます。"
+    } else if has_pending {
+        "最初に setup-instructions.md と pending-changes.md を読んでください。アップデート変更があります。確認と設定の調整ができます。何でも聞いてください。"
+    } else {
+        "最初に setup-instructions.md を読んでください。設定の確認・変更、コマンドの使い方、次に何をすればよいかなど、何でも聞いてください。"
+    }
+}
+
+/// 対話アシスタントが「済んだ」と言えるか（**純関数**。#2879）。
+///
+/// 0 で終わったか、[`DIALOGUE_MIN_SECS`] 以上続いたなら済んだとみなす。起動してすぐ 0 以外で
+/// 落ちた（認証切れ・起動の失敗）ときは、初回起動のバナーを「master を起動」へ進めない
+pub fn dialogue_finished(success: bool, elapsed: std::time::Duration) -> bool {
+    success || elapsed >= std::time::Duration::from_secs(DIALOGUE_MIN_SECS)
+}
+
+/// [`dialogue_finished`] の下限（秒）
+pub const DIALOGUE_MIN_SECS: u64 = 30;
+
+/// 端末の `tako setup` が走っている段（#2879。走っている印 `<data_dir>/setup/running.json`）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunningPhase {
+    /// 検出・導入の確認・設定の書き出しの途中（導入の `[Y/n]` を含む）
+    Setup,
+    /// 対話アシスタントが開いている
+    Dialogue,
+}
+
+impl RunningPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Setup => "setup",
+            Self::Dialogue => "dialogue",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "setup" => Some(Self::Setup),
+            "dialogue" => Some(Self::Dialogue),
+            _ => None,
+        }
+    }
+}
+
+/// 走っている印の置き場（`<data_dir>/setup/running.json`）。**永続の設定ではない**（走っている
+/// あいだだけ在る実行時の印。書いたプロセスが死んでいれば読み手は無視する = 残っても害が無い）
+pub fn running_marker_path() -> Option<PathBuf> {
+    setup_dir().ok().map(|dir| dir.join("running.json"))
+}
+
+/// 端末の `tako setup` が走っている印（#2879）。初回起動のバナーは、これが生きているあいだ
+/// 「セットアップを実行 / 続ける」を出さない（走っている setup の入力へコマンド行を打ち込まない）。
+/// 落とす（Drop）と、自分が書いた印だけを消す
+pub struct RunningMarker {
+    path: PathBuf,
+    pid: u32,
+}
+
+impl RunningMarker {
+    /// 印を立てる。置き場が決まらない・書けないときは None（印が無くても setup は止めない）
+    pub fn begin(phase: RunningPhase) -> Option<Self> {
+        Self::begin_at(running_marker_path()?, phase)
+    }
+
+    /// [`Self::begin`] の置き場を指定する版（テスト用に公開）
+    pub fn begin_at(path: PathBuf, phase: RunningPhase) -> Option<Self> {
+        let marker = Self {
+            path,
+            pid: std::process::id(),
+        };
+        marker.write(phase).ok()?;
+        Some(marker)
+    }
+
+    /// 段を進める（対話アシスタントを開く直前に `Dialogue`）
+    pub fn set_phase(&self, phase: RunningPhase) {
+        let _ = self.write(phase);
+    }
+
+    fn write(&self, phase: RunningPhase) -> Result<(), String> {
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        let body = json!({ "pid": self.pid, "phase": phase.as_str() });
+        crate::config_io::atomic_write(&self.path, &body.to_string())
+    }
+}
+
+impl Drop for RunningMarker {
+    fn drop(&mut self) {
+        // 別の setup が後から書き直していたら消さない（自分の印だけ）
+        if read_marker_at(&self.path).is_some_and(|(pid, _)| pid == self.pid) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn read_marker_at(path: &Path) -> Option<(u32, RunningPhase)> {
+    let value: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let pid = u32::try_from(value["pid"].as_u64()?).ok()?;
+    Some((pid, RunningPhase::parse(value["phase"].as_str()?)?))
+}
+
+/// いま端末の `tako setup` が走っているなら、その段（書いたプロセスが生きているときだけ）
+pub fn running_phase() -> Option<RunningPhase> {
+    running_phase_at(
+        &running_marker_path()?,
+        &tako_core::platform::process::pid_alive,
+    )
+}
+
+/// [`running_phase`] の本体（生死の判定を差し替えられる）
+pub fn running_phase_at(path: &Path, alive: &dyn Fn(u32) -> bool) -> Option<RunningPhase> {
+    let (pid, phase) = read_marker_at(path)?;
+    alive(pid).then_some(phase)
 }
 
 fn default_true() -> bool {
@@ -1275,6 +1423,105 @@ pub fn render_pending_markdown(pending: &[SetupChange], applied_revision: u32) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- 対話のセットアップ（#2879） -----------------------------------------
+
+    /// フロー判定の食い違いを直した形を固定する: 初回の最初のメッセージは初回フローの合図を含み、
+    /// system prompt のフロー判定が同じ合図を初回フローへ割り当てる。2 回目以降の形は合図を含まない
+    #[test]
+    fn issue2879_初回の最初のメッセージは初回フローへ入る() {
+        let rule = format!("「{FIRST_FLOW_TRIGGER}」→ 初回フロー");
+        assert!(
+            SYSTEM_PROMPT.contains(&rule),
+            "resources/setup/system-prompt.md のフロー判定に {rule} が無い（初回の文が 2 回目以降へ落ちる）"
+        );
+        for pending in [false, true] {
+            let first = assistant_greeting(false, pending, true);
+            assert!(first.contains(FIRST_FLOW_TRIGGER), "{first}");
+            let again = assistant_greeting(false, pending, false);
+            assert!(!again.contains(FIRST_FLOW_TRIGGER), "{again}");
+        }
+        // --review は従来どおり（前回設定の個別見直しの合図。フロー判定がそれぞれを割り当てる）
+        let review = assistant_greeting(true, false, true);
+        assert!(
+            review.contains("前回設定の個別見直しを始めます"),
+            "{review}"
+        );
+        assert!(SYSTEM_PROMPT.contains("「前回設定の個別見直しを始めます」→ 初回フロー"));
+        let update = assistant_greeting(true, true, false);
+        assert!(update.contains("アップデート変更と前回設定の個別見直しを始めます"));
+        assert!(SYSTEM_PROMPT.contains(
+            "「アップデート変更と前回設定の個別見直しを始めます」→ アップデート追従フロー"
+        ));
+    }
+
+    #[test]
+    fn issue2879_対話が済んだかは0で終わったか一定時間続いたか() {
+        use std::time::Duration;
+        assert!(dialogue_finished(true, Duration::from_secs(1)));
+        assert!(dialogue_finished(
+            false,
+            Duration::from_secs(DIALOGUE_MIN_SECS)
+        ));
+        assert!(
+            !dialogue_finished(false, Duration::from_secs(2)),
+            "起動してすぐ 0 以外で落ちたら済んだ扱いにしない"
+        );
+    }
+
+    /// 対話が済んだ印は旧ファイル（項目が無い）を None で読み、書くときは値があるときだけ出す
+    #[test]
+    fn issue2879_対話が済んだ印はserdeの既定で旧ファイルを読める() {
+        let old = "setup:\n  completed: true\n  applied_revision: 20\n";
+        let config: SetupConfig = serde_yaml::from_str(old).expect("旧ファイルを読める");
+        assert!(config.setup.completed);
+        assert_eq!(config.setup.dialogue_done, None);
+        assert!(!serde_yaml::to_string(&config)
+            .unwrap()
+            .contains("dialogue_done"));
+        let mut done = config.clone();
+        done.setup.dialogue_done = Some(true);
+        let text = serde_yaml::to_string(&done).unwrap();
+        assert!(text.contains("dialogue_done: true"), "{text}");
+        let back: SetupConfig = serde_yaml::from_str(&text).unwrap();
+        assert_eq!(back.setup.dialogue_done, Some(true));
+    }
+
+    /// 走っている印: 書いたプロセスが生きているあいだだけ段を返し、落とすと自分の印だけ消す
+    #[test]
+    fn issue2879_走っている印は生きている書き手のときだけ効く() {
+        let dir = tako_core::test_residue::ScratchDir::new("setup-running-2879");
+        let path = dir.path().join("setup").join("running.json");
+        assert_eq!(running_phase_at(&path, &|_| true), None, "印が無い");
+        let marker = RunningMarker::begin_at(path.clone(), RunningPhase::Setup).expect("書ける");
+        assert_eq!(
+            running_phase_at(&path, &|pid| pid == std::process::id()),
+            Some(RunningPhase::Setup)
+        );
+        marker.set_phase(RunningPhase::Dialogue);
+        assert_eq!(
+            running_phase_at(&path, &|_| true),
+            Some(RunningPhase::Dialogue)
+        );
+        assert_eq!(
+            running_phase_at(&path, &|_| false),
+            None,
+            "書き手が死んでいれば残っていても無視する"
+        );
+        drop(marker);
+        assert!(!path.exists(), "落とすと消える");
+        // 別の setup が書き直した印は消さない
+        let marker = RunningMarker::begin_at(path.clone(), RunningPhase::Setup).unwrap();
+        std::fs::write(&path, r#"{"pid":1,"phase":"setup"}"#).unwrap();
+        drop(marker);
+        assert!(path.exists(), "他人の印は消さない");
+        std::fs::write(&path, "壊れた").unwrap();
+        assert_eq!(
+            running_phase_at(&path, &|_| true),
+            None,
+            "読めなければ無い扱い"
+        );
+    }
 
     // --- setup ディレクトリの置き場（Issue #1019） ---------------------------
 

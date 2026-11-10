@@ -20,6 +20,9 @@
 # 窓は tako-vd へ出す（#1141）。蓋閉じ・画面ロック中はフレームが組まれないが、IPC と導線は動く。
 # 落とすのは自分で起こしたプロセスだけ。
 #
+# #2879 からはこの形（自動の段）は A/B `TAKO_2879_LEGACY=1` でだけ動くので、砂場の env に立てて走らせる
+# （いまの既定 = ボタン → setup → 対話 は scripts/test-first-run-2879.sh）。
+#
 # 使い方: bash scripts/test-first-run-1510.sh   （LOG_DIR=<dir> で各状態の JSON を残す）
 set -uo pipefail
 
@@ -147,7 +150,7 @@ sandbox_env() {
   echo "HOME=$TMP/home" "SHELL=$STUBS/isosh" "CODEX_HOME=$TMP/home/.codex" \
     "PATH=$TMP/home/.local/bin:$STUBS:/usr/bin:/bin:/usr/sbin:/sbin" "TAKO_ISOLATED=1" \
     "TAKO_TMUX_BIN=$STUBS/tmux" "TAKO_TAILSCALE_BIN=$STUBS/tailscale" "TAKO_TAILSCALE_SOCKET=" \
-    "TAKO_LANG=ja" "TERM=dumb"
+    "TAKO_LANG=ja" "TERM=dumb" "TAKO_2879_LEGACY=1"
 }
 tk() {
   # shellcheck disable=SC2046

@@ -219,6 +219,13 @@ fn 未知のシェルのwelcomeは同じ断りで止まるコマンドを示さ�
                 Launch::Auto => {}
                 other => problems.push(format!("ボタンが確かめ直し（自動の段）でない: {other:?}")),
             }
+            // #2879: ボタン起点の形（自動の段が無い）では確かめ直すだけ（同じ断りで止まるコマンドを打たない）
+            match welcome::launch_for_flow(&step, ShellDialect::Posix, welcome::Flow::Guided) {
+                Launch::Recheck => {}
+                other => problems.push(format!(
+                    "ボタン起点の形のボタンが確かめ直しでない: {other:?}"
+                )),
+            }
             if problems.is_empty() {
                 closed += 1;
             } else {
