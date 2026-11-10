@@ -12,14 +12,15 @@ pub mod facts;
 pub mod file_clipboard;
 #[cfg(target_os = "macos")]
 pub mod finder_reveal;
-/// 蓋を閉じたまま実行を継続する制御（境界 B9 の蓋ぶん。#697）
+/// 蓋を閉じたまま実行を継続する制御（境界 B9 の蓋ぶん。macOS = clamshell + sudoers + `pmset`、
+/// Windows = 電源プランの lid action。#697 / #2857）
 pub mod lid;
 pub mod local_endpoint;
 /// Layer 1 IPC の Windows トランスポート（named pipe。境界 B3）
 #[cfg(windows)]
 pub mod named_pipe;
 pub mod os_integration;
-/// アイドルスリープ防止（境界 B9。macOS 以外。#524）
+/// アイドルスリープ防止と電源の状態（境界 B9。macOS = IOKit、Windows = 電源要求。#524 / #2857）
 pub mod power;
 pub mod process;
 /// マシンの混み具合（境界 B25。診断専用。#1073）
