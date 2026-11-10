@@ -4177,10 +4177,11 @@ mod tests {
                 Some(home),
                 "/opt/claude/.claude.json",
             ),
+            // 前方一致の対照はプレースホルダの組 alice / alice2（#927 の番犬の許可リスト）
             (
-                "/Users/testuser2/.claude.json",
-                Some(home),
-                "/Users/testuser2/.claude.json",
+                "/Users/alice2/.claude.json",
+                Some(Path::new("/Users/alice")),
+                "/Users/alice2/.claude.json",
             ),
             (
                 "/Users/testuser/.claude.json",
