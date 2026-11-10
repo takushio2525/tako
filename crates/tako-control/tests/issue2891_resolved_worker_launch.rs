@@ -573,13 +573,19 @@ fn fn_lines<'a>(src: &'a str, signature: &str) -> Vec<(usize, &'a str)> {
         .collect()
 }
 
+/// ソースの形の規則: (関数の頭, 通るべき入口, 置いてはいけない形と理由)
+type SourceRule = (
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+);
+
 #[test]
 fn resolvedとspawnは同じ解決の1実装を通る() {
     let path = "crates/tako-control/src/dispatch.rs";
     let src = std::fs::read_to_string(crate_file("src/dispatch.rs")).expect("dispatch.rs を読む");
     let mut failures = Vec::new();
-    // (関数, 通るべき入口, 置いてはいけない形と理由)
-    let rules: [(&str, &str, &[(&str, &str)]); 2] = [
+    let rules: [SourceRule; 2] = [
         (
             "fn profile_to_json(",
             "plan_worker_launch_typed",

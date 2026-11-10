@@ -270,11 +270,11 @@ effort / account を省いて立てたときの値、`resolved_workers.<系統>`
 効いていても古い値を「resolved」と名乗っていた（欄の名前と型はそのまま・値の意味を spawn の実値へ直した。
 名指しで読むのは master / setup の対話の LLM だけで、どちらも実値として読んでいた）。
 
-**効かない `worker_model` / `worker_effort` は master のプロファイルの応答の `warnings` に注記**
+**使われない `worker_model` / `worker_effort` は master のプロファイルの応答の `warnings` に注記**
 （`ReplyNote::WorkerSettingUnused`・日英は表示言語）。理由は 3 つ: ポリシーが inherit / delegate（使うのは
 fixed だけ）・既定の worker が codex / agy（claude の語彙を渡さない = #1013 のマトリクス）・上の段（アカウントの
 既定 / `worker_agents.<系統>`）が先に決める。`tako setup` が作るプロファイル（inherit +
-`worker_agents.claude.effort`）では `--worker-effort` はポリシーでも上の段でも効かないので、注記は
+`worker_agents.claude.effort`）では `--worker-effort` はポリシーでも上の段でも使われないので、注記は
 `--agent <系統> --agent-<欄> <値>` を案内する（アカウントの既定が決めているときは案内しない）。solo は worker を
 spawn しないので出さない。番犬は `tests/issue2891_resolved_worker_launch.rs`（MCP の tools/call → dispatch で
 show の resolved と spawn の応答・起動コマンドの `--model` / `--effort` を突き合わせる + ソースの形）。
