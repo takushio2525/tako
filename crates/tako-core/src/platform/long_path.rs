@@ -6,10 +6,12 @@
 //! 利用者名に空白・日本語・9 文字以上を含む PC では `TEMP` が `C:\Users\<利用者名の頭>~1\AppData\Local\Temp`
 //! のような短い形になり、そこから作ったパスや、利用者が短い形で書いたパスが作業 dir として tako に届く。
 //!
-//! claude は `.claude.json` の `projects` の鍵を**長い形**の作業 dir で引く（#2843 の Windows CI の実測。
-//! 短い形の cwd から起こしても、信頼の確認を通したときに claude が書く鍵は長い形）。tako が短い形のまま
-//! 事前信頼の鍵を書くと信頼済みと読まれず、信頼の確認が出て、確認が通るまで tako mod も読まれない。
-//! だから鍵を作る前にここで長い形へ戻す（呼び手は `tako-control::claude_tui::claude_project_key`）。
+//! claude は `.claude.json` の `projects` の鍵を**自分のプロセスの作業 dir の形**で引き、正規化しない
+//! （#2843 の Windows CI の実測）。ペインの PowerShell は位置を長い形にするので、シェルへ起動コマンドを打つ
+//! tako の worker の起動（既定のシェル）では claude の鍵は長い形になり、tako が短い形のまま事前信頼の鍵を書くと
+//! 信頼済みと読まれず、信頼の確認が出て、確認が通るまで tako mod も読まれない。だから鍵を作る前にここで
+//! 長い形へ戻す。位置を正規化しない起こし方（ConPTY からの直起動・cmd.exe）では渡した形のままなので、
+//! 呼び手（`tako-control::claude_tui::claude_project_keys`）は長い形の鍵に加えて渡された形の鍵も書く。
 //!
 //! ## 戻さない場合（入力をそのまま返す）
 //!

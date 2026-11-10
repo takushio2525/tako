@@ -2,17 +2,20 @@
 //!
 //! 2 本ある:
 //!
-//! - `issue2843_短い形の作業dirの鍵は長い形の鍵と同じ`（常設・Windows の全数で走る）: 実在する短い形・`/` 区切り・
-//!   verbatim の短い形から作った鍵が長い形の鍵（#1886 の答え）と同じになること、製品の事前信頼
-//!   （`claude_tui::ensure_trusted_in`）が短い形の cwd を受けても長い形の鍵で書くこと、戻せないパス
-//!   （存在しない・`~` が長い名前の一部・空白と日本語を含む長い形）は従来の答えのままであること。
+//! - `issue2843_短い形の作業dirの鍵は長い形の鍵と渡された形の鍵`（常設・Windows の全数で走る）: 実在する短い形・
+//!   `/` 区切り・verbatim の短い形から作った鍵の組が「長い形の鍵（#1886 の答え）・渡された形の鍵」になること、
+//!   製品の事前信頼（`claude_tui::ensure_trusted_in`）が短い形の cwd を受けて両方を書くこと。
+//!   `issue2843_戻せないパスは従来の答えのまま` は、戻せないパス（存在しない・`~` が長い名前の一部・空白と日本語を
+//!   含む長い形・8.3 の名前が作られない別のボリューム）が #1886 の答えの 1 本のままであること。
 //! - `issue2843_windows_claude_trusts_short_cwd`（`#[ignore]`・**本物の claude を起こす**）:
 //!   `scripts/windows/test-claude-mod-1886.ps1` が砂場へ claude を入れ偽の Messages API を立ててから名指しで回す
 //!   （`agent_install` の門の中。#1886 / #2842 と同じ導入）。短い形の cwd の ConPTY のペインから claude を
-//!   直起動 / ペインの PowerShell 5.1 から打つ形の両方で起こして、次の 3 つを見る:
-//!   1. 信頼の確認を通したときに claude が自分で書く鍵（= claude が引く鍵）が長い形か短い形か
-//!   2. 製品の事前信頼（短い形の cwd を渡す）を書いた設定 dir では確認が出ないこと
-//!   3. 修正前の答え（短い形をそのまま鍵にした形）だけを書いた設定 dir では確認が出ること（2 の検出力）
+//!   直起動 / ペインの PowerShell 5.1 から打つ形（worker の起動と同じくシェルへ起動コマンドを打つ）の両方で起こして、
+//!   次の 3 つを見る:
+//!   1. 信頼の確認を通したときに claude が自分で書く鍵（= claude が引く鍵）の形。claude は正規化せず自分の
+//!      プロセスの作業 dir の形で引く（直起動は渡した短い形・PowerShell は位置を長い形にするので長い形）
+//!   2. 製品の事前信頼（短い形の cwd を渡す）を書いた設定 dir では、どちらの起こし方でも確認が出ないこと
+//!   3. 片方の鍵だけ（修正前 = 短い形だけ・長い形だけ）では、もう片方の起こし方で確認が出ること（2 の検出力）
 //!
 //! 結果は `TAKO2843_*` の行で CI のログへ残す（パスは `<scratch>` / `<scratch~>` に置き換える）。
 
@@ -22,7 +25,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use tako_control::claude_tui::{claude_project_key, claude_project_key_in, ensure_trusted_in};
+use tako_control::claude_tui::{
+    claude_project_key, claude_project_key_in, claude_project_keys, ensure_trusted_in,
+};
 use tako_core::terminal::{SessionNotice, SpawnCommand, SpawnOptions, TerminalSession};
 use tako_core::test_residue::ScratchDir;
 
@@ -147,7 +152,7 @@ impl Dirs {
 // --- 常設（claude を起こさない） -------------------------------------------------
 
 #[test]
-fn issue2843_短い形の作業dirの鍵は長い形の鍵と同じ() {
+fn issue2843_短い形の作業dirの鍵は長い形の鍵と渡された形の鍵() {
     let dirs = Dirs::new();
     println!(
         "TAKO2843_PATHS short_differs={} short_root_differs={} long=[{}] short=[{}]",
@@ -157,38 +162,47 @@ fn issue2843_短い形の作業dirの鍵は長い形の鍵と同じ() {
         dirs.mask(&dirs.short_work)
     );
     let long_key = dirs.long_key();
-    // 長い形は #1886 の答えのまま
+    // 長い形は #1886 の答えの 1 本のまま
     assert_eq!(claude_project_key(&dirs.long_work), long_key);
+    assert_eq!(claude_project_keys(&dirs.long_work), vec![long_key.clone()]);
     if !dirs.has_short() {
         // 8.3 の名前が作られない環境では短い形の入力を作れない（戻す対象が無い = 何も変わらない）
         println!("TAKO2843_SKIP 短い形を作れない（このボリュームで 8.3 の名前が作られない）");
         return;
     }
-    // 短い形・`/` 区切りの短い形・verbatim の短い形のどれも長い形の鍵になる
+    let want = vec![long_key.clone(), dirs.short_key()];
+    let masked = |keys: &[String]| keys.iter().map(|k| dirs.mask(k)).collect::<Vec<_>>();
+    // 短い形・`/` 区切りの短い形・verbatim の短い形のどれも「長い形の鍵・渡された形の鍵」
     for (label, cwd) in [
         ("short", dirs.short_work.clone()),
         ("short-slash", dirs.short_work.replace('\\', "/")),
         ("short-verbatim", format!(r"\\?\{}", dirs.short_work)),
     ] {
+        let got = claude_project_keys(&cwd);
         assert_eq!(
-            claude_project_key(&cwd),
-            long_key,
-            "[#2843 {label}] 短い形の作業 dir {} の鍵が長い形の鍵 {} と違う（短い形を長い形へ戻す段 = 境界 B34 が効いていない）",
+            got,
+            want,
+            "[#2843 {label}] 短い形の作業 dir {} の鍵の組が {:?} でなく {:?}（長い形の鍵が無い = 短い形を長い形へ戻す段 = 境界 B34 が効いていない）",
             dirs.mask(&cwd),
-            dirs.mask(&long_key)
+            masked(&want),
+            masked(&got)
         );
+        assert_eq!(claude_project_key(&cwd), long_key, "[#2843 {label}]");
     }
-    // 製品の事前信頼（短い形の cwd を渡す）が長い形の鍵で書く
+    // 製品の事前信頼（短い形の cwd を渡す）が両方の鍵を書く
     let cfg = Path::new(&dirs.long_root).join("cfg");
     std::fs::create_dir_all(&cfg).unwrap();
     ensure_trusted_in(Some(&cfg.display().to_string()), &dirs.short_work)
         .expect("事前信頼を書けること");
-    let keys = trusted_keys(&cfg);
+    let mut keys = trusted_keys(&cfg);
+    keys.sort();
+    let mut sorted_want = want.clone();
+    sorted_want.sort();
     assert_eq!(
         keys,
-        vec![long_key.clone()],
-        "[#2843 ensure_trusted_in] 短い形の cwd を渡した事前信頼の鍵が長い形でない: {:?}",
-        keys.iter().map(|k| dirs.mask(k)).collect::<Vec<_>>()
+        sorted_want,
+        "[#2843 ensure_trusted_in] 短い形の cwd を渡した事前信頼の鍵が長い形と渡された形の 2 本でない: {:?}",
+        masked(&keys)
     );
 }
 
@@ -198,19 +212,21 @@ fn issue2843_戻せないパスは従来の答えのまま() {
     // 存在しない（GetLongPathNameW が答えない）
     let missing = format!(r"{}\NOEXIS~1\work", dirs.long_root);
     assert_eq!(
-        claude_project_key(&missing),
-        claude_project_key_in(&missing, true, false)
+        claude_project_keys(&missing),
+        vec![claude_project_key_in(&missing, true, false)],
+        "[#2843 missing] 存在しないパスは #1886 の答えの 1 本"
     );
     // `~` が長い名前の一部（8.3 の名前が無いボリュームと同じく OS が同じ形を返す）
     let literal = Path::new(&dirs.long_root).join("a~1 データ");
     std::fs::create_dir_all(&literal).unwrap();
     let literal = literal.display().to_string();
     assert_eq!(
-        claude_project_key(&literal),
-        claude_project_key_in(&literal, true, false)
+        claude_project_keys(&literal),
+        vec![claude_project_key_in(&literal, true, false)],
+        "[#2843 literal] `~` が長い名前の一部なら #1886 の答えの 1 本"
     );
     // 空白と日本語を含む長い形
-    assert_eq!(claude_project_key(&dirs.long_work), dirs.long_key());
+    assert_eq!(claude_project_keys(&dirs.long_work), vec![dirs.long_key()]);
     // 別のボリューム（スクリプトが渡したときだけ。8.3 の名前が作られないなら短い形 = 長い形）
     if let Some(other) = std::env::var_os(OTHER_VOLUME_ENV) {
         let other = PathBuf::from(other);
@@ -226,14 +242,13 @@ fn issue2843_戻せないパスは従来の答えのまま() {
             long.chars().take(2).collect::<String>(),
             short != long
         );
-        assert_eq!(
-            claude_project_key(&short),
-            claude_project_key_in(&long, true, false)
-        );
-        assert_eq!(
-            claude_project_key(&long),
-            claude_project_key_in(&long, true, false)
-        );
+        let long_key = claude_project_key_in(&long, true, false);
+        let mut want = vec![long_key.clone()];
+        if short != long {
+            want.push(claude_project_key_in(&short, true, false));
+        }
+        assert_eq!(claude_project_keys(&short), want);
+        assert_eq!(claude_project_keys(&long), vec![long_key]);
     }
 }
 
@@ -620,8 +635,9 @@ fn issue2843_windows_claude_trusts_short_cwd() {
     );
     let mut failures = Vec::new();
     let mut verdict = Vec::new();
+    let product_keys = claude_project_keys(&dirs.short_work);
 
-    // 1. claude が引く鍵（直起動とシェル経由）
+    // 1. claude が引く鍵（直起動とシェル経由）。製品の事前信頼が書く鍵の組に入っていること
     for launch in [Launch::Direct, Launch::ViaShell] {
         match claude_own_key(&given, &dirs, launch) {
             Ok((key, pwd)) => {
@@ -639,9 +655,10 @@ fn issue2843_windows_claude_trusts_short_cwd() {
                 }
                 let form = dirs.form_of(&key);
                 verdict.push(format!("claude_key_{launch:?}={form}").to_lowercase());
-                if form != "long" {
+                if !product_keys.contains(&key) {
                     failures.push(format!(
-                        "[#2843 own-{launch:?}] 短い形の cwd から起こした claude が書いた鍵が長い形でない（form={form}）= tako の鍵を長い形へ寄せる前提が崩れている"
+                        "[#2843 own-{launch:?}] 短い形の cwd から起こした claude が引く鍵（form={form}）が、製品の事前信頼が書く鍵の組 {:?} に無い",
+                        product_keys.iter().map(|k| dirs.form_of(k)).collect::<Vec<_>>()
                     ));
                 }
             }
@@ -649,9 +666,9 @@ fn issue2843_windows_claude_trusts_short_cwd() {
         }
     }
 
-    // 2. 製品の事前信頼（短い形の cwd を渡す = spawn の cwd が短い形のとき）
+    // 2. 製品の事前信頼（短い形の cwd を渡す = spawn の cwd が短い形のとき）。どちらの起こし方でも確認が出ない
     for launch in [Launch::Direct, Launch::ViaShell] {
-        let label = format!("fixed-{launch:?}").to_lowercase();
+        let label = format!("product-{launch:?}").to_lowercase();
         let cfg = fresh_config(&dirs, &label);
         ensure_trusted_in(Some(&cfg.display().to_string()), &dirs.short_work)
             .expect("製品の事前信頼を書けること");
@@ -661,39 +678,52 @@ fn issue2843_windows_claude_trusts_short_cwd() {
             written.iter().map(|k| dirs.form_of(k)).collect::<Vec<_>>()
         );
         let seen = dialog_with(&given, &dirs, &label, &cfg, launch);
-        verdict
-            .push(format!("fixed_dialog_{launch:?}={}", seen == Seen::TrustDialog).to_lowercase());
+        verdict.push(
+            format!("product_dialog_{launch:?}={}", seen == Seen::TrustDialog).to_lowercase(),
+        );
         if seen != Seen::Input {
             failures.push(format!(
-                "[#2843 {label}] 短い形の cwd を渡して事前信頼を書いたのに入力欄まで来ない（seen={seen:?}。TrustDialog なら鍵が claude の引く形とずれている = 短い形を長い形へ戻す段が効いていない）"
+                "[#2843 {label}] 短い形の cwd を渡して事前信頼を書いたのに入力欄まで来ない（seen={seen:?}。TrustDialog なら書いた鍵 {:?} に claude の引く形が無い）",
+                written.iter().map(|k| dirs.form_of(k)).collect::<Vec<_>>()
             ));
         }
     }
 
-    // 3. 修正前の答え（短い形をそのまま鍵にした形）だけでは確認が出る = 2 に検出力がある
-    for launch in [Launch::Direct, Launch::ViaShell] {
-        let label = format!("legacy-{launch:?}").to_lowercase();
+    // 3. 片方の鍵だけでは、もう片方の起こし方で確認が出る = 2 に検出力がある（両方の鍵が要る）。
+    //    short-only = 修正前（#2843 より前）の答え、long-only = 長い形へ戻すだけで渡された形を書かない答え。
+    //    残りの 2 つの組（short-only の直起動・long-only のシェル経由）は確認が出ない側として記録だけする
+    let arms = [
+        ("short-only", dirs.short_key(), Launch::ViaShell, true),
+        ("long-only", dirs.long_key(), Launch::Direct, true),
+        ("short-only", dirs.short_key(), Launch::Direct, false),
+        ("long-only", dirs.long_key(), Launch::ViaShell, false),
+    ];
+    for (name, key, launch, must_show) in arms {
+        let label = format!("{name}-{launch:?}").to_lowercase();
         let cfg = fresh_config(&dirs, &label);
         let mut config = onboarded_config();
-        config["projects"] = json!({ dirs.short_key(): { "hasTrustDialogAccepted": true } });
+        config["projects"] = json!({ key: { "hasTrustDialogAccepted": true } });
         std::fs::write(
             cfg.join(".claude.json"),
             serde_json::to_string_pretty(&config).unwrap(),
         )
         .unwrap();
         let seen = dialog_with(&given, &dirs, &label, &cfg, launch);
-        verdict
-            .push(format!("legacy_dialog_{launch:?}={}", seen == Seen::TrustDialog).to_lowercase());
-        if seen != Seen::TrustDialog {
+        verdict.push(
+            format!("{name}_dialog_{launch:?}={}", seen == Seen::TrustDialog)
+                .replace('-', "_")
+                .to_lowercase(),
+        );
+        if must_show && seen != Seen::TrustDialog {
             failures.push(format!(
-                "[#2843 {label}] 修正前の答え（短い形の鍵）だけでも確認が出ない（seen={seen:?}）= 2 の検出力が無い"
+                "[#2843 {label}] {name} の鍵だけでも確認が出ない（seen={seen:?}）= 2 の検出力が無い"
             ));
         }
     }
 
-    // 長い形の鍵は #1886 の答えのまま
-    if claude_project_key(&dirs.long_work) != dirs.long_key() {
-        failures.push("[#2843 long] 長い形の作業 dir の鍵が #1886 の答えと違う".into());
+    // 長い形の鍵は #1886 の答えの 1 本のまま
+    if claude_project_keys(&dirs.long_work) != vec![dirs.long_key()] {
+        failures.push("[#2843 long] 長い形の作業 dir の鍵が #1886 の答えの 1 本でない".into());
     }
 
     println!("TAKO2843_VERDICT {}", verdict.join(" "));
