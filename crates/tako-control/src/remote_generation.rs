@@ -12,7 +12,7 @@
 //! 1. **記録** — daemon が起動時に自分の実行ファイルの識別（[`ExeStamp`]）を PID ファイルの
 //!    4 行目へ残す（[`encode`] / [`decode`]）
 //! 2. **判定** — 記録した識別と、いまそのパスに在るファイルの識別を比べる（[`judge`]）。
-//!    比べるのは**ファイルの識別**（unix は dev + inode、加えて更新時刻とサイズ）で、
+//!    比べるのは**ファイルの識別**（unix は dev + inode・Windows はボリュームのシリアル + ファイル ID、加えて更新時刻とサイズ）で、
 //!    パスの文字列ではない
 //!
 //! 判定を読む面はどれも [`judge`] の 1 実装を通る（`remote::daemon_generation`）:
@@ -48,9 +48,10 @@ pub fn legacy_mode() -> bool {
 /// 替わったことを言うための材料だけを持つ
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExeStamp {
-    /// ボリューム（unix の `st_dev`。unix 以外は 0）
+    /// ボリューム（unix の `st_dev` / Windows のボリュームのシリアル。取れなければ 0）
     pub dev: u64,
-    /// inode（unix の `st_ino`。unix 以外は 0）。contents-swap では新しいファイルなので必ず変わる
+    /// inode（unix の `st_ino` / Windows のファイル ID。取れなければ 0）。contents-swap では
+    /// 新しいファイルなので必ず変わる
     pub ino: u64,
     /// 更新時刻（unix epoch からのナノ秒。取れなければ 0）
     pub mtime_ns: u128,
@@ -96,7 +97,7 @@ pub fn decode(line: &str) -> Option<ExeStamp> {
 pub struct Observed {
     /// ファイルの識別（無い・読めない = `None`）
     pub stamp: Option<ExeStamp>,
-    /// 状態変更時刻（unix epoch 秒。unix 以外・取れない = `None`）
+    /// 状態変更時刻（unix epoch 秒。Windows は ChangeTime = #2921。取れない = `None`）
     pub ctime_secs: Option<i64>,
 }
 
@@ -112,11 +113,11 @@ pub fn observe(path: &Path) -> Observed {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    // 境界 B37。Windows は同一性も状態変更時刻も `None` = 識別の欄は 0（[`ExeStamp`] の doc）・
-    // ctime は記録なし
+    // 境界 B37（Windows はボリュームのシリアル + ファイル ID と ChangeTime = #2921）。
+    // 取れない（`None`）なら識別の欄は 0（[`ExeStamp`] の doc）・ctime は記録なし
     let (dev, ino) =
-        tako_core::platform::fs_meta::identity(&meta).map_or((0, 0), |id| (id.dev, id.ino));
-    let ctime_secs = tako_core::platform::fs_meta::change_time_secs(&meta);
+        tako_core::platform::fs_meta::identity(path, &meta).map_or((0, 0), |id| (id.dev, id.ino));
+    let ctime_secs = tako_core::platform::fs_meta::change_time_secs(path, &meta);
     Observed {
         stamp: Some(ExeStamp {
             dev,
@@ -513,14 +514,13 @@ mod tests {
         std::fs::rename(&staged, &exe).unwrap();
         let after = observe(&exe);
         let _ = std::fs::remove_dir_all(&dir);
-        if cfg!(unix) {
-            assert_eq!(
-                judge(Some(&recorded), None, &after),
-                Generation::Replaced(Basis::Stamp),
-                "同じパス・同じ中身でも別のファイル（inode）なら旧版: {recorded:?} → {:?}",
-                after.stamp
-            );
-        }
+        // unix は inode、Windows はファイル ID（#2921）で見分ける
+        assert_eq!(
+            judge(Some(&recorded), None, &after),
+            Generation::Replaced(Basis::Stamp),
+            "同じパス・同じ中身でも別のファイル（inode / ファイル ID）なら旧版: {recorded:?} → {:?}",
+            after.stamp
+        );
         assert_eq!(
             judge(Some(&recorded), None, &observe(&dir.join("tako"))),
             Generation::Missing
