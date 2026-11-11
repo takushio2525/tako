@@ -3194,7 +3194,7 @@ pub fn one_m_model_note(model: &str, source: &str, clear: OneMClear) -> Option<c
         .then(|| crate::ReplyNote::OneMModelWarning {
             source: source.to_string(),
             model: model.to_string(),
-            clear,
+            clear: Box::new(clear),
         })
 }
 

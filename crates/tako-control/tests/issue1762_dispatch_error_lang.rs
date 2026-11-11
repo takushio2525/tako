@@ -7465,8 +7465,8 @@ fn dispatch_の個別の断りの値で分かれる腕の境界() {
 // (3) dispatch の対象の関数が日本語の口を呼んで断りに載せていないことを `file:line` で名指す
 
 use tako_control::orchestrator::{
-    CallerLaunch, ConfigError, ConfigFile, ProfileFallback, ProfileKind, Quarantine,
-    UnreadableCause, UnreadableProfile, WorkerAgent,
+    AccountKeep, CallerLaunch, ConfigError, ConfigFile, OneMClear, ProfileFallback, ProfileKind,
+    Quarantine, UnreadableCause, UnreadableProfile, WorkerAgent,
 };
 
 const ORCH_MOD_SRC: &str = include_str!("../src/orchestrator/mod.rs");
@@ -19041,13 +19041,90 @@ fn reply_note_table() -> Vec<(ReplyNote, String)> {
              tako MCP なしで起動します。tako setup-mcp で修復してください。"
                 .into(),
         ),
+        // #2918: 解除の案内はモデルを決めた段から組む（旧文は `<プロファイル名> --clear-model` 固定）。
+        // 値はどの方言でも引用の要らない語にする（Windows の CI でも同じ文になる）
         (
             ReplyNote::OneMModelWarning {
                 source: "master".into(),
                 model: "claude-opus-4-6[1m]".into(),
+                clear: Box::new(OneMClear::Model {
+                    profile: "p1".into(),
+                    kind: ProfileKind::Master,
+                }),
             },
             "[警告] master のモデル 'claude-opus-4-6[1m]' は 1M コンテキスト版のため、Pro プランでは起動できない可能性があります（Max / API プラン向け）。\n  \
-             起動に失敗する場合は `tako orchestrator profiles set <プロファイル名> --clear-model` で解除してください"
+             起動に失敗する場合は `tako orchestrator profiles set p1 --clear-model` で解除してください"
+                .into(),
+        ),
+        (
+            ReplyNote::OneMModelWarning {
+                source: "solo".into(),
+                model: "claude-opus-4-6[1m]".into(),
+                clear: Box::new(OneMClear::Model {
+                    profile: "p1".into(),
+                    kind: ProfileKind::Solo,
+                }),
+            },
+            "[警告] solo のモデル 'claude-opus-4-6[1m]' は 1M コンテキスト版のため、Pro プランでは起動できない可能性があります（Max / API プラン向け）。\n  \
+             起動に失敗する場合は `tako orchestrator profiles set p1 --solo --clear-model` で解除してください"
+                .into(),
+        ),
+        (
+            ReplyNote::OneMModelWarning {
+                source: "worker".into(),
+                model: "claude-w[1m]".into(),
+                clear: Box::new(OneMClear::WorkerModel {
+                    profile: "p1".into(),
+                }),
+            },
+            "[警告] worker のモデル 'claude-w[1m]' は 1M コンテキスト版のため、Pro プランでは起動できない可能性があります（Max / API プラン向け）。\n  \
+             起動に失敗する場合は `tako orchestrator profiles set p1 --clear-worker-model` で解除してください"
+                .into(),
+        ),
+        (
+            ReplyNote::OneMModelWarning {
+                source: "worker".into(),
+                model: "claude-w[1m]".into(),
+                clear: Box::new(OneMClear::AgentModel {
+                    profile: "p1".into(),
+                    agent: WorkerAgent::Claude,
+                }),
+            },
+            "[警告] worker のモデル 'claude-w[1m]' は 1M コンテキスト版のため、Pro プランでは起動できない可能性があります（Max / API プラン向け）。\n  \
+             起動に失敗する場合は `tako orchestrator profiles set p1 --agent claude --clear-agent-model` で解除してください"
+                .into(),
+        ),
+        (
+            ReplyNote::OneMModelWarning {
+                source: "worker".into(),
+                model: "claude-w[1m]".into(),
+                clear: Box::new(OneMClear::AccountModel {
+                    account: "acct".into(),
+                    keep: Some(AccountKeep {
+                        config_dir: None,
+                        inherit: true,
+                        description: None,
+                        default_effort: Some("low".into()),
+                    }),
+                }),
+            },
+            "[警告] worker のモデル 'claude-w[1m]' は 1M コンテキスト版のため、Pro プランでは起動できない可能性があります（Max / API プラン向け）。\n  \
+             このモデルはアカウント 'acct' の default_model から来ています。起動に失敗する場合は \
+             `tako orchestrator accounts add acct --inherit --default-effort low` で default_model を外してください（このアカウントを使う他のプロファイルにも効きます）"
+                .into(),
+        ),
+        (
+            ReplyNote::OneMModelWarning {
+                source: "worker".into(),
+                model: "claude-w[1m]".into(),
+                clear: Box::new(OneMClear::AccountModel {
+                    account: "acct".into(),
+                    keep: None,
+                }),
+            },
+            "[警告] worker のモデル 'claude-w[1m]' は 1M コンテキスト版のため、Pro プランでは起動できない可能性があります（Max / API プラン向け）。\n  \
+             このモデルはアカウント 'acct' の default_model から来ています。起動に失敗する場合は \
+             アカウントの default_model を外してください（今の設定は `tako orchestrator accounts show acct`）"
                 .into(),
         ),
         (

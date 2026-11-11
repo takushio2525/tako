@@ -245,11 +245,12 @@ pub enum ReplyNote {
     /// MCP の登録パス（`~/.claude.json` の `mcpServers.tako.command`）が消えている（2 行）
     McpPathMissing(String),
     /// `[警告] <source> のモデル '<model>' は 1M コンテキスト版のため…`（2 行。`profile_warnings` と共有）。
-    /// 2 行目の解除の案内は `clear`（モデルを決めた段）から組む（#2918）
+    /// 2 行目の解除の案内は `clear`（モデルを決めた段）から組む（#2918。`Box` は `ReplyNote` を
+    /// `Err` に載せる関数の大きさ = clippy の result_large_err を抑えるため）
     OneMModelWarning {
         source: String,
         model: String,
-        clear: crate::orchestrator::OneMClear,
+        clear: Box<crate::orchestrator::OneMClear>,
     },
     /// `master を起動しました: <場所>`（場所は `LaunchTab*` / `LaunchInline` の文）
     MasterLaunched(String),
