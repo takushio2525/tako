@@ -422,26 +422,16 @@ fn stamp_of(path: &Path) -> Stamp {
     Some((m.len(), m.modified().unwrap_or(UNIX_EPOCH), ino_of(&m)))
 }
 
-#[cfg(unix)]
+/// inode（境界 B37 の同一性）。**同一性を持たない OS（Windows = `None`）は 0** で埋める =
+/// 比べると常に等しい = 比較に使わない（大きさ・更新時刻・読んだ位置だけで見る）。
+/// 0 で埋めるのは索引の欄（`dev` / `ino`）が `u64` で永続されるため
 fn ino_of(m: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt as _;
-    m.ino()
+    tako_core::platform::fs_meta::identity(m).map_or(0, |id| id.ino)
 }
 
-#[cfg(not(unix))]
-fn ino_of(_: &std::fs::Metadata) -> u64 {
-    0
-}
-
-#[cfg(unix)]
+/// ボリューム（境界 B37 の同一性）。Windows = `None` は 0（[`ino_of`] と同じ理由）
 fn dev_of(m: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt as _;
-    m.dev()
-}
-
-#[cfg(not(unix))]
-fn dev_of(_: &std::fs::Metadata) -> u64 {
-    0
+    tako_core::platform::fs_meta::identity(m).map_or(0, |id| id.dev)
 }
 
 /// `dir` の下（深さ `max_depth` まで）の `*.jsonl` を `visit` へ渡す

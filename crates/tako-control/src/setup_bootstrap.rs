@@ -577,16 +577,8 @@ pub fn installed_launcher_for(agent: AgentKind) -> Option<String> {
     is_executable(&launcher).then(|| launcher.display().to_string())
 }
 
-#[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(not(unix))]
-fn is_executable(path: &Path) -> bool {
-    path.is_file()
-}
+/// 置いたランチャを実行できるか（境界 B37。unix は実行ビット・Windows は通常ファイルかだけ）
+use tako_core::platform::fs_meta::is_executable;
 
 /// 認証を確かめるために叩く引数（**3 系統の正本はここ 1 箇所**。#989）。
 ///

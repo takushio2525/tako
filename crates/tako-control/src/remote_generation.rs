@@ -112,13 +112,11 @@ pub fn observe(path: &Path) -> Observed {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    #[cfg(unix)]
-    let (dev, ino, ctime_secs) = {
-        use std::os::unix::fs::MetadataExt;
-        (meta.dev(), meta.ino(), Some(meta.ctime()))
-    };
-    #[cfg(not(unix))]
-    let (dev, ino, ctime_secs) = (0u64, 0u64, None);
+    // 境界 B37。Windows は同一性も状態変更時刻も `None` = 識別の欄は 0（[`ExeStamp`] の doc）・
+    // ctime は記録なし
+    let (dev, ino) =
+        tako_core::platform::fs_meta::identity(&meta).map_or((0, 0), |id| (id.dev, id.ino));
+    let ctime_secs = tako_core::platform::fs_meta::change_time_secs(&meta);
     Observed {
         stamp: Some(ExeStamp {
             dev,

@@ -19,7 +19,6 @@
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
-use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3463,49 +3462,9 @@ fn normalize_line_endings(text: &str, ending: LineEnding) -> Cow<'_, str> {
     }
 }
 
-#[cfg(unix)]
-pub(crate) fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let temp = parent.join(format!(".{name}.tako-save-{}-{nonce}", std::process::id()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    let mut file = options.open(&temp)?;
-    let result = (|| {
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        match std::fs::metadata(path) {
-            Ok(metadata) => std::fs::set_permissions(&temp, metadata.permissions())?,
-            // 外で消されたファイルを上書き保存で作り直す（#1659）。引き継ぐ権限が無いので
-            // 一時ファイルの既定（新規ファイルと同じ）のまま置く
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-        std::fs::rename(&temp, path)?;
-        std::fs::File::open(parent)?.sync_all()
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
-    result
-}
-
-#[cfg(not(unix))]
-pub(crate) fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    // `create`: 外で消されたファイルを上書き保存で作り直す（#1659）。
-    // 消えたファイルへの通常の保存は `save_inner` が書く前に断る
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()
-}
+/// 置き換えて保存する（境界 B37。unix = 一時ファイル + 権限の引き継ぎ + rename・Windows = その場で上書き）。
+/// エディタの保存と `workspace_replace` がこの名前で呼ぶ
+pub(crate) use crate::platform::fs_meta::save_replacing as write_file;
 
 #[cfg(test)]
 mod tests {

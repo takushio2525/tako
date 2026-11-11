@@ -289,20 +289,19 @@ fn create_parent(link: &Path) -> Result<(), LinkError> {
     })
 }
 
-#[cfg(unix)]
+/// symlink を張る（境界 B37）。
+///
+/// 境界が張らない OS（Windows = `None`）では [`plan_for`] が `link: None` を返すのでここへは来ない。
+/// 万一呼ばれたら**黙って成功させない**（権限が要ることを理由つきで返す）
 fn create_symlink(target: &Path, link: &Path) -> Result<(), LinkError> {
-    std::os::unix::fs::symlink(target, link).map_err(|e| LinkError::Create {
+    let Some(result) = crate::platform::fs_meta::make_symlink(target, link) else {
+        return Err(LinkError::SymlinkUnsupported {
+            path: link.display().to_string(),
+        });
+    };
+    result.map_err(|e| LinkError::Create {
         path: link.display().to_string(),
         error: e.to_string(),
-    })
-}
-
-/// Windows では [`plan_for`] が `link: None` を返すのでここへは来ない。
-/// 万一呼ばれたら**黙って成功させない**（権限が要ることを理由つきで返す）
-#[cfg(not(unix))]
-fn create_symlink(_target: &Path, link: &Path) -> Result<(), LinkError> {
-    Err(LinkError::SymlinkUnsupported {
-        path: link.display().to_string(),
     })
 }
 

@@ -99,14 +99,13 @@ pub fn write_script(path: &Path, text: &str) {
     });
     std::fs::write(path, body)
         .unwrap_or_else(|e| panic!("偽の実行ファイルを書けない: {} ({e})", path.display()));
-    #[cfg(unix)]
+    // 境界 B37。実行ビットの無い OS（Windows）は何もしない = 空打ちもしない
+    crate::platform::fs_meta::make_executable(path)
+        .unwrap_or_else(|e| panic!("実行権を付けられない: {} ({e})", path.display()));
+    if crate::platform::fs_meta::EXECUTABLE_BY_MODE
+        && std::env::var(LEGACY_ENV).as_deref() != Ok("1")
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-            .unwrap_or_else(|e| panic!("実行権を付けられない: {} ({e})", path.display()));
-        if std::env::var(LEGACY_ENV).as_deref() != Ok("1") {
-            warm(path);
-        }
+        warm(path);
     }
 }
 

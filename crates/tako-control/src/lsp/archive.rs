@@ -43,17 +43,8 @@ fn format_error(detail: impl Into<String>) -> ArchiveError {
     ArchiveError::Format(detail.into())
 }
 
-/// 書いたファイルを実行できるようにする（unix だけ。Windows は拡張子で決まる）
-pub fn make_executable(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
-}
+/// 書いたファイルを実行できるようにする（境界 B37。unix だけ。Windows は拡張子で決まる = 何もしない）
+pub use tako_core::platform::fs_meta::make_executable;
 
 /// gzip 1 枚を `dest` へ解く（上限 `limit` バイト。超えたら止める = 壊れた入力で disk を埋めない）
 pub fn gunzip_to(archive: &Path, dest: &Path, limit: u64) -> Result<u64, ArchiveError> {
