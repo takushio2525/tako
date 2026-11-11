@@ -969,6 +969,13 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
              `cfg(target_os = \"macos\")` のモジュール）",
         ),
         (
+            "crates/tako-control/src/platform/process.rs",
+            2,
+            "境界 B5 の制御側のテストモジュール内（`#[cfg(unix)]` の `/bin/sh`）。daemon の切り離し \
+             `configure_daemon_child` の単体 2 件（シグナルマスクの継承 #590・fd の継承 #1768）で、\
+             #2860 で本体と一緒に `remote.rs` から移した（製品コードの起動ではない）",
+        ),
+        (
             "crates/tako-control/src/queue.rs",
             2,
             "テストモジュール内（#1994。受付番号 = 生きた pid の代役として眠るだけの子を起こす。\
@@ -984,9 +991,10 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
         ),
         (
             "crates/tako-control/src/remote.rs",
-            6,
-            "`/bin/sh` / `/bin/sleep`（`#[cfg(unix)]` とテスト。#1768 の daemon の子の fd 検査で \
-             1 件増えた）。ゾンビ判定の `/bin/ps` は              #1067 で境界（`platform::process::is_zombie`）へ移し、抑止を通している。\
+            4,
+            "`/bin/sh` / `/bin/sleep`（`#[cfg(unix)]` とテスト）。daemon の切り離しの単体 2 件（#590 / #1768 の \
+             `/bin/sh`）は #2860 で `configure_daemon_child` と一緒に境界 `platform/process.rs` へ移した（6 → 4）。\
+             ゾンビ判定の `/bin/ps` は              #1067 で境界（`platform::process::is_zombie`）へ移し、抑止を通している。\
              停止のテストの使い捨ての子（`spawn_disposable_sleep`）は #1599 で両 OS 化して抑止を通した（1 件減った）",
         ),
         (
@@ -2322,5 +2330,162 @@ fn fdaの案内のos差が境界の外に戻っていない() {
          呼び手は `platform::fda::supported()` の答えを見て対象外なら項目を出さない 1 本の経路で組む。\
          `cfg` を書いてよいのは境界の中の実装選択だけ（設計 §2.1）",
         violations.join("\n  ")
+    );
+}
+
+/// **#2860 の番犬**（#1538 の表の S5）: 子プロセスを**グループで起こす・打ち切る・刈り取る・
+/// 終了シグナルを読む・daemon として切り離す**ための unix の API（`process_group` / `getpgid` /
+/// `pre_exec` / `ExitStatusExt`）の直呼びが、境界 B5 の `platform::process` の外の本番コードに
+/// **増えていない**こと。
+///
+/// ## なぜ要るか
+///
+/// どれも unix にしか無い API なので、呼び手に `#[cfg(unix)]` で直に書くと Windows の腕は
+/// 「何もしない」か別の手段になり、**コンパイルもテストも通ったうえで黙って弱い動きになる**
+/// （#1538 / #1374 の実害の形）。#2860 で `tako_core::platform::process`（`lead_own_group` /
+/// `signal_own_group` / `await_group_or_kill` / `kill_group` / `exit_signal` / `force_kill_pid`）と
+/// `tako_control::platform::process`（`watch_shutdown_signals` / `configure_daemon_child` /
+/// `signal_relay` / `terminate_child_tree`）へ寄せ、呼び手は境界の口を 1 本呼ぶだけになった。
+///
+/// ## なぜ「件数」で見るのか
+///
+/// `canonicalizeの直呼びが境界の外に残っていない` と同じ形。ファイル単位の許可にすると
+/// 「そのファイルなら何個でも増やせる」穴になるので、ファイルごとの件数を理由つきで固定する。
+/// 数えるのは本番コードだけ（テスト領域・`#[cfg(test)] mod x;` で読むファイル・コメント・文字列を
+/// 除いた眺め = #2856 の番犬と同じ）。#2860 の時点で境界の外は 0 件なので、表は空。
+///
+/// 落ちたときの直し方:
+/// - グループで起こす / 打ち切る / 終了シグナルを読む / daemon にするなら境界の口を呼ぶ（件数は増えない）
+/// - 境界の口で表せない使い方なら境界へ口を足す。どうしても境界の外に置くなら、この表へ件数を
+///   **理由つきで**足す（減ったら表から外してよい）
+const S5_PROCESS_APIS: [&str; 4] = ["process_group", "getpgid", "pre_exec", "ExitStatusExt"];
+/// 境界の外の本番コードに残してよい直呼び (パス, 件数, 理由)。#2860 の時点で 0 件
+const S5_BASELINE: &[(&str, usize, &str)] = &[];
+/// 境界の中に在るはずの直呼び（改名・移動で走査が空振りし、0 件のまま緑になるのを防ぐ）
+const S5_BOUNDARY: [(&str, &str); 4] = [
+    ("crates/tako-core/src/platform/process.rs", "process_group"),
+    ("crates/tako-core/src/platform/process.rs", "getpgid"),
+    ("crates/tako-core/src/platform/process.rs", "ExitStatusExt"),
+    ("crates/tako-control/src/platform/process.rs", "pre_exec"),
+];
+
+/// コードの眺めの中の API の直呼び `(行番号, API)`。識別子として現れるものだけ
+/// （`my_pre_exec` / `process_group_id` などの部分一致は除く）
+fn s5_api_sites(view: &str) -> Vec<(usize, &'static str)> {
+    let bytes = view.as_bytes();
+    let is_id = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut sites = Vec::new();
+    for api in S5_PROCESS_APIS {
+        for (at, _) in view.match_indices(api) {
+            let end = at + api.len();
+            if (at == 0 || !is_id(bytes[at - 1])) && (end >= bytes.len() || !is_id(bytes[end])) {
+                sites.push((view[..at].matches('\n').count() + 1, api));
+            }
+        }
+    }
+    sites.sort();
+    sites
+}
+
+#[test]
+fn プロセスグループと終了シグナルの直呼びが境界の外に増えていない() {
+    // 検出力: #2860 より前の呼び手の形は数えられ、当たってはいけない形は数えない（リポジトリは触らない）
+    for (legacy, want) in [
+        // probe::group_output_with_timeout のグループの頭
+        (
+            "fn f(command: &mut Command) {\n    #[cfg(unix)]\n    {\n        \
+             use std::os::unix::process::CommandExt;\n        command.process_group(0);\n    }\n}\n",
+            1,
+        ),
+        // probe::kill_on_timeout のグループの判定
+        (
+            "fn f(pid: i32) -> bool {\n    unsafe { libc::getpgid(pid) == pid }\n}\n",
+            1,
+        ),
+        // remote::configure_daemon_child の切り離し
+        (
+            "fn f(cmd: &mut Command) {\n    unsafe {\n        cmd.pre_exec(|| {\n            \
+             libc::setsid();\n            Ok(())\n        });\n    }\n}\n",
+            1,
+        ),
+        // queue_wrapper::exit_code_of / backend_reattach の終了シグナルの読み取り
+        (
+            "fn f(status: ExitStatus) -> Option<i32> {\n    \
+             use std::os::unix::process::ExitStatusExt;\n    status.signal()\n}\n",
+            1,
+        ),
+        // 当たってはいけない形: コメント・文字列・部分一致・境界の口の呼び出し・テスト領域
+        (
+            "// process_group(0) と pre_exec は説明\nconst S: &str = \"getpgid ExitStatusExt\";\n\
+             fn my_pre_exec_like(process_group_id: u32) {}\n\
+             fn g(command: &mut Command) {\n    crate::platform::process::lead_own_group(command);\n}\n\
+             #[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        \
+             use std::os::unix::process::ExitStatusExt;\n    }\n}\n",
+            0,
+        ),
+    ] {
+        let got = s5_api_sites(&production_code_view(legacy)).len();
+        assert_eq!(
+            got, want,
+            "#2860 の番犬の数え方がずれた（{want} 件のはずが {got} 件）: {legacy}"
+        );
+    }
+
+    // 本物のファイル: 境界（`crates/*/src/platform/`）の外の本番コード
+    let files = production_range::product_sources();
+    let test_files = production_range::test_only_files(&files);
+    let mut actual: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for rel in &files {
+        if rel.contains("/src/platform/") || test_files.contains(rel) {
+            continue;
+        }
+        for (line, api) in s5_api_sites(&production_code_view(&read_rel(rel))) {
+            actual
+                .entry(rel.clone())
+                .or_default()
+                .push(format!("{rel}:{line} `{api}`"));
+        }
+    }
+    let expected: std::collections::BTreeMap<&str, usize> =
+        S5_BASELINE.iter().map(|(p, n, _)| (*p, *n)).collect();
+    let mut diffs = Vec::new();
+    for (path, sites) in &actual {
+        let want = expected.get(path.as_str()).copied().unwrap_or(0);
+        if sites.len() > want {
+            diffs.push(format!(
+                "{path}: {want} 件のはずが {} 件（増えている）:\n    {}",
+                sites.len(),
+                sites.join("\n    ")
+            ));
+        }
+    }
+    for (path, want) in &expected {
+        let got = actual.get(*path).map_or(0, Vec::len);
+        if got < *want {
+            diffs.push(format!(
+                "{path}: {want} 件の想定だが {got} 件（減ったので表を更新してよい）"
+            ));
+        }
+    }
+    // 境界の中には在る（走査の空振りで 0 件のまま緑にならない）
+    for (rel, api) in S5_BOUNDARY {
+        if !s5_api_sites(&production_code_view(&read_rel(rel)))
+            .iter()
+            .any(|(_, a)| *a == api)
+        {
+            diffs.push(format!(
+                "{rel}: `{api}` が境界の本番コードに無い（改名・移動したならこの番犬の S5_BOUNDARY も直す）"
+            ));
+        }
+    }
+    assert!(
+        diffs.is_empty(),
+        "子プロセスのグループ・打ち切り・終了シグナル・daemon 化の unix の API の直呼びが、境界 B5 の外で\
+         想定と違う（#2860）:\n  {}\n\
+         → `tako_core::platform::process`（lead_own_group / signal_own_group / await_group_or_kill / \
+         kill_group / exit_signal / force_kill_pid）か `tako_control::platform::process`\
+         （watch_shutdown_signals / configure_daemon_child / signal_relay / terminate_child_tree）の口を呼んでください。\
+         `cfg` を書いてよいのは境界の中の実装選択だけ（設計 §2.1）",
+        diffs.join("\n  ")
     );
 }

@@ -41,8 +41,9 @@
 //!   端末のときは横取りしない（cargo 自身のバーを人がそのまま見る）。A/B は wrapper のプロセスの env
 //!   `TAKO_1996_LEGACY=1`（stderr を受けず進みの env も足さない = 従来の素通し）
 //!
-//! 送受信（IPC の 1 往復）は呼び手（tako-cli の transport）が閉包で渡す。ここは状態の進め方と
-//! OS 依存（シグナル・子の木）だけを持つ。
+//! 送受信（IPC の 1 往復）は呼び手（tako-cli の transport）が閉包で渡す。ここは状態の進め方を持ち、
+//! OS 依存（シグナルの受け取りと転送・子の木の停止・終了シグナルの読み取り）は境界 B5 の
+//! `platform::process` の口を呼ぶ（#2860）。
 
 use std::io::{IsTerminal, Write};
 use std::path::Path;
@@ -53,6 +54,9 @@ use serde_json::Value;
 use tako_core::i18n::Lang;
 use tako_core::queue::{self as q, CallerRole, JobKind, JobWire, Priority, PriorityHint};
 
+// シグナルの受け取りと転送（unix。Windows は何もしない = Ctrl+C はコンソールの全員に届く）。
+// OS 差は境界 B5 の制御側（#2860。子とその子孫を止める取り消しは `platform::process::terminate_child_tree`）
+use crate::platform::process::signal_relay as signals;
 use crate::protocol::Request;
 use crate::queue::{unix_ms, ENV_JOB};
 use crate::ReplyNote;
@@ -129,12 +133,9 @@ pub fn exit_code_of(status: ExitStatus) -> i32 {
     if let Some(code) = status.code() {
         return code;
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(sig) = status.signal() {
-            return 128 + sig;
-        }
+    // シグナルの番号は unix でしか読めない（境界が unix 以外で `None` を返す。#2860）
+    if let Some(sig) = tako_core::platform::process::exit_signal(status) {
+        return 128 + sig;
     }
     1
 }
@@ -728,14 +729,18 @@ fn run_with(
                 adopt_job_priority(&mut wire, &v);
                 if v["cancel"] == true && cancel_at.is_none() {
                     note(&ReplyNote::QueueStoppingCancelled(KILL_GRACE.as_secs()).text_in(lang));
-                    tree::terminate(&mut child, &mut descendants, false);
+                    crate::platform::process::terminate_child_tree(
+                        &mut child,
+                        &mut descendants,
+                        false,
+                    );
                     cancel_at = Some(Instant::now());
                 }
             }
         }
         if let Some(at) = cancel_at {
             if !killed && at.elapsed() >= KILL_GRACE {
-                tree::terminate(&mut child, &mut descendants, true);
+                crate::platform::process::terminate_child_tree(&mut child, &mut descendants, true);
                 killed = true;
             }
         }
@@ -827,109 +832,6 @@ mod progress_tap {
 /// 待ちから外れる（届かなくても構わない。調停役は pid の生存でも外す）
 fn withdraw(send: &mut dyn FnMut(Request) -> Result<Value, SendError>, wire: &JobWire) {
     let _ = send(request("done", wire));
-}
-
-/// シグナルの受け取りと転送（unix。Windows は何もしない = Ctrl+C はコンソールの全員に届く）
-mod signals {
-    #[cfg(unix)]
-    mod imp {
-        use std::sync::atomic::{AtomicU32, Ordering};
-
-        static PENDING: AtomicU32 = AtomicU32::new(0);
-        const WATCHED: [libc::c_int; 4] =
-            [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
-
-        extern "C" fn on_signal(sig: libc::c_int) {
-            // async-signal-safe: アトミックへ立てるだけ
-            if (0..32).contains(&sig) {
-                PENDING.fetch_or(1 << sig, Ordering::SeqCst);
-            }
-        }
-
-        pub fn install() {
-            for sig in WATCHED {
-                // SAFETY: ハンドラはアトミックの更新だけをする async-signal-safe な関数
-                unsafe {
-                    libc::signal(sig, on_signal as *const () as libc::sighandler_t);
-                }
-            }
-        }
-
-        pub fn take() -> Vec<i32> {
-            let bits = PENDING.swap(0, Ordering::SeqCst);
-            (0..32).filter(|s| bits & (1 << s) != 0).collect()
-        }
-
-        pub fn forward(pid: u32, sig: i32) {
-            let Ok(pid) = libc::pid_t::try_from(pid) else {
-                return;
-            };
-            if pid > 0 {
-                // SAFETY: 自分が起こした子の pid へシグナルを送るだけ
-                unsafe {
-                    libc::kill(pid, sig);
-                }
-            }
-        }
-    }
-
-    #[cfg(not(unix))]
-    mod imp {
-        pub fn install() {}
-        pub fn take() -> Vec<i32> {
-            Vec::new()
-        }
-        pub fn forward(_pid: u32, _sig: i32) {}
-    }
-
-    pub use imp::{forward, install, take};
-}
-
-/// 子とその子孫を止める（取り消し）
-mod tree {
-    use std::process::Child;
-
-    use tako_core::platform::job::KillScope;
-
-    /// unix: 子とその子孫（libproc の親子表）へ SIGTERM（`force` なら SIGKILL）。
-    /// 親子表が採れなければ子だけ。入れ物（`KillScope`）は unix では空なので見ない
-    #[cfg(unix)]
-    pub fn terminate(child: &mut Child, _descendants: &mut KillScope, force: bool) {
-        let root = child.id();
-        let sig = if force { libc::SIGKILL } else { libc::SIGTERM };
-        let mut targets = vec![root];
-        if let Some(procs) = tako_core::platform::resources::processes() {
-            let mut frontier = vec![root];
-            while let Some(p) = frontier.pop() {
-                for r in procs.iter().filter(|r| r.ppid == p && r.pid != p) {
-                    if !targets.contains(&r.pid) {
-                        targets.push(r.pid);
-                        frontier.push(r.pid);
-                    }
-                }
-            }
-        }
-        for pid in targets {
-            if let Ok(pid) = libc::pid_t::try_from(pid) {
-                if pid > 0 {
-                    // SAFETY: 自分が起こした子とその子孫へ送るだけ
-                    unsafe {
-                        libc::kill(pid, sig);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Windows: 子とその子孫を入れ物（Job Object。境界 B30。#2462）ごと止める。寿命はペインを
-    /// 閉じるのと同じ（コンソールのプロセスは止め、GUI のアプリとその子孫は残す）。穏当な終了要求は
-    /// 無いので `force` は見ない（1 回目で止まる。2 回目の入れ物は空）。入れ物が無い回
-    /// （入れられなかった・A/B の `TAKO_2454_LEGACY=1`）は子だけ（孫は残る = #2462 の前）
-    #[cfg(not(unix))]
-    pub fn terminate(child: &mut Child, descendants: &mut KillScope, _force: bool) {
-        descendants.stop();
-        let _ = child.kill();
-    }
 }
 
 #[cfg(test)]

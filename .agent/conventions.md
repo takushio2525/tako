@@ -1817,7 +1817,9 @@ codex 0.154.0 はセッションの終わりに **SIGTERM**、agy はセッシ�
   （`probe::GROUP_TERM_GRACE` = 1 秒）の見張りと残りへの SIGKILL は刈り取り係
   `probe::reap_group_in_background` が持ち、**頭は判定が済むまで刈り取らない**（刈り取るとグループの番号が
   空いて別のグループへ SIGKILL を送りうる）。生き死には `kill(-pgid, 0)`（macOS は刈り取り前の頭だけだと
-  EPERM・刈り取った後は ESRCH）。番犬 `crates/tako-control/tests/issue2633_probe_group_term_watchdog.rs`、
+  EPERM・刈り取った後は ESRCH）。グループの判定・送り方・見張りの OS 差は境界 B5
+  `tako_core::platform::process`（`signal_own_group` / `await_group_or_kill` / `kill_group`。#2860）が持ち、
+  probe は A/B のゲートと猶予の値を渡して呼ぶだけ。番犬 `crates/tako-control/tests/issue2633_probe_group_term_watchdog.rs`、
   実経路 `bash scripts/measure-shutdown-hup-2633.sh`（`ONLY=c`）、A/B `TAKO_2633_LEGACY=1`
 - **ログインシェルの起こし方はシェル種別の表 `platform::exe::login_invocation` の 1 実装で決める**（#2577）。
   tcsh / csh は `-l` を唯一の引数としてしか受け付けず、`$SHELL -l -c …` が毎回 `Unknown option: '-l'` で
@@ -4666,7 +4668,7 @@ macOS の `/bin/sh`（bash 3.2）は並びの最後のコマンドを exec せ�
   `proc_pidinfo(PROC_PIDLISTFDS)` で開いている fd だけを列挙する。fd 上限は起こし方で
   256〜13 万と桁で変わるので総当たりにしない）。本体は async-signal-safe（確保しない・
   ロックを取らない）に保つ
-- **自前の `pre_exec` を書くなら、その中で呼ぶ**（`remote.rs` の `configure_daemon_child`）
+- **自前の `pre_exec` を書くなら、その中で呼ぶ**（境界 B5 の `tako_control::platform::process::configure_daemon_child`。#2860 で `remote.rs` から移した）
 - **`pre_exec` を足せない起動（alacritty の PTY）は `fd_inherit::spawn_sealed(|| …)` で包む**。
   包んでいるあいだだけ `pthread_atfork` の子ハンドラが構え、そのスレッドが起こした fork の子で
   掃除を走らせる（ほかのスレッドの fork には効かない。親の fd は書き換えない）

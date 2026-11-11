@@ -1169,37 +1169,9 @@ fn recheck_named(socket: &str) -> (usize, Vec<u32>) {
     (clients, servers)
 }
 
-/// **pid を名指し**して器を落とす。名前一致（`taskkill /IM` / `Stop-Process -Name`）は
-/// 他インスタンスの器を巻き込むので絶対に使わない。
-/// Windows は `/T` で器の中の pwsh ごと落とす
-fn force_kill_pid(pid: u32) {
-    if pid == 0 {
-        return;
-    }
-    #[cfg(windows)]
-    {
-        let mut cmd = std::process::Command::new("taskkill");
-        crate::platform::process::no_console_window(&mut cmd);
-        let _ = cmd.args(["/PID", &pid.to_string(), "/T", "/F"]).output();
-    }
-    #[cfg(not(windows))]
-    {
-        // unix でこの経路へ来るのは名前で列挙した器だけ（ソケットファイルがある
-        // 環境では生じない）。実装を空にすると「落としたつもり」になるので、
-        // 同じ意味の操作を置く。**子プロセスは起こさない**（`kill(1)` を spawn すると
-        // Windows のコンソール窓抑止の境界検査に引っかかるうえ、ここでは不要）
-        let Ok(pid) = libc::pid_t::try_from(pid) else {
-            return;
-        };
-        if pid > 0 {
-            // SAFETY: 正の pid（プロセスグループ / 全プロセスの特別値ではない）へ
-            // SIGKILL を送るだけ。引数は値渡しでポインタを触らない
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-        }
-    }
-}
-
 /// 名前で列挙した器を回収する。**生きている器の pid だけ**を名指しで落とす
+/// （名前一致は使わない。落とし方の OS 差 = Windows は `/T` で器の中の pwsh ごとは境界
+/// [`crate::platform::process::force_kill_pid`] が持つ。#1282 / #2860）
 fn reclaim_named(entry: &ServerEntry) -> Result<Vec<u32>, usize> {
     let (clients, live_pids) = recheck_named(&entry.socket);
     if clients > 0 {
@@ -1210,7 +1182,7 @@ fn reclaim_named(entry: &ServerEntry) -> Result<Vec<u32>, usize> {
         if !live_pids.contains(&pid) {
             continue; // もう居ない
         }
-        force_kill_pid(pid);
+        crate::platform::process::force_kill_pid(pid);
         killed.push(pid);
     }
     Ok(killed)

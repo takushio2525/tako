@@ -3,7 +3,7 @@
 //!
 //! Windows の `TerminateProcess`・`Child::kill()` は子孫を道連れにしない。#2462 まで:
 //!
-//! - `tako queue` の取り消し（`queue_wrapper` の `tree::terminate`）は直下の子だけを止め、
+//! - `tako queue` の取り消し（`queue_wrapper` の `tree::terminate`。#2860 で `platform::process::terminate_child_tree` へ移した）は直下の子だけを止め、
 //!   `tako queue cargo build` の rustc・`cmd /C` の孫が残った
 //! - エージェントの再起動（session-restart の harness = `platform::process::terminate`）は
 //!   エージェントの pid だけを止め、古いエージェントが起こした MCP サーバ・背景のシェルが

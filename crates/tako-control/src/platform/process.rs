@@ -2,6 +2,18 @@
 //!
 //! 「プロセスを終わらせる」操作のプラットフォーム差を閉じ込める。
 //! 検査側（列挙・親子関係・listen ポート）は `tako-core` 側の境界で扱う。
+//!
+//! 制御側の呼び手（`remote` の daemon・`queue_wrapper` の包み）が使う**シグナルの受け取り・転送**と
+//! **daemon として切り離す**起こし方・**起こした子とその子孫を止める**取り消しの OS 差もここに置く
+//! （#2860。#1538 の表の S5）。中身は移す前の呼び手の `cfg` の塊をそのまま写したもので、unix 以外の腕
+//! （何もしない / 入れ物ごと止める）も移す前の挙動のまま。プロセスグループの扱いと終了シグナルの読み取りは
+//! `tako-core` の呼び手も使うので `tako_core::platform::process` にある。
+
+use std::process::{Child, Command};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
+use tako_core::platform::job::KillScope;
 
 /// 指定 PID の終了を要求する。
 ///
@@ -179,6 +191,209 @@ pub fn is_zombie(pid: u32) -> bool {
         let _ = pid;
         false
     }
+}
+
+/// SIGTERM / SIGINT を受けたら `shutdown` を立てる（remote daemon の停止の受け口。#590 / #2860）。
+///
+/// 先にシグナルマスクを空に戻す（[`reset_signal_mask`]。以後に spawn するスレッドは作成元の
+/// マスクを継承するので、ハンドラの設置より前・スレッドの生成より前に戻す）。ハンドラはフラグを
+/// 立てるだけ（async-signal-safe）で、200ms おきに見る見張りのスレッド（`signal-watcher`）が
+/// `shutdown` へ写す。見張りを立てられなければ `Err`（daemon は起動を中止する）。
+/// unix 以外は何もしない（受けるシグナルが無い。daemon は admin API の shutdown で止める）
+pub fn watch_shutdown_signals(shutdown: &Arc<AtomicBool>) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::sync::atomic::Ordering;
+        use std::sync::atomic::Ordering::Relaxed;
+        // #590: **シグナルマスクを空に戻す**。以後に spawn するスレッドは作成元の
+        // マスクを継承するので、ハンドラ設置より前・スレッド生成より前のここで戻す
+        reset_signal_mask();
+        let _ = unsafe {
+            libc::signal(
+                libc::SIGTERM,
+                signal_handler as *const () as libc::sighandler_t,
+            )
+        };
+        let _ = unsafe {
+            libc::signal(
+                libc::SIGINT,
+                signal_handler as *const () as libc::sighandler_t,
+            )
+        };
+        static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
+        extern "C" fn signal_handler(_: libc::c_int) {
+            SHUTDOWN_FLAG.store(true, Relaxed);
+        }
+
+        // シグナル待ちスレッド
+        let shutdown_clone = shutdown.clone();
+        std::thread::Builder::new()
+            .name("signal-watcher".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                if SHUTDOWN_FLAG.load(Relaxed) {
+                    shutdown_clone.store(true, Ordering::Relaxed);
+                    break;
+                }
+            })?;
+    }
+    #[cfg(not(unix))]
+    let _ = shutdown;
+    Ok(())
+}
+
+/// シグナルマスクを空に戻す（#590）。
+///
+/// シグナルマスクは fork + exec をまたいで継承される。GUI（tako-app = GPUI / AppKit）
+/// から起動した daemon は SIGTERM / SIGHUP がブロックされたまま生まれ、実測では
+/// ハンドラを設置しても発火せず（SIGHUP の既定動作すら起きず）、`tako remote stop` と
+/// GUI の kill switch（全遮断）が無言で失敗していた。daemon 側（[`watch_shutdown_signals`]）と
+/// プロセス起動側（[`configure_daemon_child`]）の両方で戻すことで、どの経路から起動しても
+/// 停止できることを保証する
+#[cfg(unix)]
+fn reset_signal_mask() {
+    unsafe {
+        let mut empty: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut empty);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+    }
+}
+
+/// デーモン子プロセスの起動条件を整える（「daemon として切り離す」口。#590 / #2860）。
+///
+/// - `setsid`: プロセスグループから切り離し、親（tmux セッション等）の終了に
+///   巻き添えで死なないようにする
+/// - シグナルマスクを空に戻す: 親（GUI = GPUI / AppKit）がブロックしている
+///   シグナルは exec をまたいで継承される。戻さないと生まれた daemon が SIGTERM を
+///   受け取れず、`tako remote stop` と GUI の kill switch が無言で失敗する
+/// - GUI の fd を受け継がない（#1768）: GUI が CLOEXEC 無しで開いた fd（Metal の
+///   シェーダキャッシュ等）へ CLOEXEC を立て、長生きする daemon に握らせない。
+///   子の中で掃くので、掃いてから fork までに別スレッドが開いた fd の隙間も無い
+///
+/// （`pre_exec` は fork 後・exec 前の子プロセスで走るので、ここで呼ぶ
+/// `setsid` / `pthread_sigmask` / `seal_inherited_fds` はどれも async-signal-safe）。
+/// Windows は何もしない（unix の setsid 相当が無い。コンソール窓の抑止は呼び手が
+/// `tako_core::platform::process::no_console_window` で付ける）
+pub fn configure_daemon_child(cmd: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                reset_signal_mask();
+                tako_core::platform::fd_inherit::seal_inherited_fds();
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cmd;
+    }
+}
+
+/// シグナルの受け取りと転送（`tako queue` の包み。#1994 / #2860）。
+///
+/// unix は INT / TERM / HUP / QUIT を受けて溜め（`install` / `take`）、包んだ子へそのまま
+/// 送る（`forward`）。Windows は何もしない = Ctrl+C はコンソールの全員に届く
+pub mod signal_relay {
+    #[cfg(unix)]
+    mod imp {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static PENDING: AtomicU32 = AtomicU32::new(0);
+        const WATCHED: [libc::c_int; 4] =
+            [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
+
+        extern "C" fn on_signal(sig: libc::c_int) {
+            // async-signal-safe: アトミックへ立てるだけ
+            if (0..32).contains(&sig) {
+                PENDING.fetch_or(1 << sig, Ordering::SeqCst);
+            }
+        }
+
+        pub fn install() {
+            for sig in WATCHED {
+                // SAFETY: ハンドラはアトミックの更新だけをする async-signal-safe な関数
+                unsafe {
+                    libc::signal(sig, on_signal as *const () as libc::sighandler_t);
+                }
+            }
+        }
+
+        pub fn take() -> Vec<i32> {
+            let bits = PENDING.swap(0, Ordering::SeqCst);
+            (0..32).filter(|s| bits & (1 << s) != 0).collect()
+        }
+
+        pub fn forward(pid: u32, sig: i32) {
+            let Ok(pid) = libc::pid_t::try_from(pid) else {
+                return;
+            };
+            if pid > 0 {
+                // SAFETY: 自分が起こした子の pid へシグナルを送るだけ
+                unsafe {
+                    libc::kill(pid, sig);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    mod imp {
+        pub fn install() {}
+        pub fn take() -> Vec<i32> {
+            Vec::new()
+        }
+        pub fn forward(_pid: u32, _sig: i32) {}
+    }
+
+    pub use imp::{forward, install, take};
+}
+
+/// 起こした子とその子孫を止める（`tako queue` の取り消し。#1994 / #2462 / #2860）。
+/// 名前は pid を指定する [`terminate`] と分けてある（呼び出しの番犬 `issue1984_ui_thread_offload_watchdog` は
+/// 関数を名前で引くので、同じファイルに同名があると取り違える）。
+///
+/// unix: 子とその子孫（libproc の親子表）へ SIGTERM（`force` なら SIGKILL）。
+/// 親子表が採れなければ子だけ。入れ物（`KillScope`）は unix では空なので見ない
+#[cfg(unix)]
+pub fn terminate_child_tree(child: &mut Child, _descendants: &mut KillScope, force: bool) {
+    let root = child.id();
+    let sig = if force { libc::SIGKILL } else { libc::SIGTERM };
+    let mut targets = vec![root];
+    if let Some(procs) = tako_core::platform::resources::processes() {
+        let mut frontier = vec![root];
+        while let Some(p) = frontier.pop() {
+            for r in procs.iter().filter(|r| r.ppid == p && r.pid != p) {
+                if !targets.contains(&r.pid) {
+                    targets.push(r.pid);
+                    frontier.push(r.pid);
+                }
+            }
+        }
+    }
+    for pid in targets {
+        if let Ok(pid) = libc::pid_t::try_from(pid) {
+            if pid > 0 {
+                // SAFETY: 自分が起こした子とその子孫へ送るだけ
+                unsafe {
+                    libc::kill(pid, sig);
+                }
+            }
+        }
+    }
+}
+
+/// Windows: 子とその子孫を入れ物（Job Object。境界 B30。#2462）ごと止める。寿命はペインを
+/// 閉じるのと同じ（コンソールのプロセスは止め、GUI のアプリとその子孫は残す）。穏当な終了要求は
+/// 無いので `force` は見ない（1 回目で止まる。2 回目の入れ物は空）。入れ物が無い回
+/// （入れられなかった・A/B の `TAKO_2454_LEGACY=1`）は子だけ（孫は残る = #2462 の前）
+#[cfg(not(unix))]
+pub fn terminate_child_tree(child: &mut Child, descendants: &mut KillScope, _force: bool) {
+    descendants.stop();
+    let _ = child.kill();
 }
 
 #[cfg(unix)]
@@ -477,5 +692,135 @@ mod tests {
             assert_eq!(request_name(false), "TerminateProcess");
             assert_eq!(request_name(true), "TerminateProcess");
         }
+    }
+
+    /// #590: シグナルマスクのリセットが効くこと。
+    /// GUI（GPUI / AppKit）から起動した daemon は SIGTERM がブロックされたまま
+    /// 生まれ、`tako remote stop` と kill switch が無言で失敗していた
+    #[cfg(unix)]
+    #[test]
+    fn reset_signal_maskはブロック中のsigtermを解除する() {
+        // 現在のスレッドのマスクに SIGTERM が入っているか
+        fn sigterm_blocked() -> bool {
+            unsafe {
+                let mut cur: libc::sigset_t = std::mem::zeroed();
+                libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut cur);
+                libc::sigismember(&cur, libc::SIGTERM) == 1
+            }
+        }
+        unsafe {
+            let mut block: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut block);
+            libc::sigaddset(&mut block, libc::SIGTERM);
+            let mut old: libc::sigset_t = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
+            assert!(sigterm_blocked(), "前提: SIGTERM をブロックできている");
+            reset_signal_mask();
+            assert!(
+                !sigterm_blocked(),
+                "reset_signal_mask 後は SIGTERM のブロックが解除される"
+            );
+            // テストスレッドのマスクを元に戻す（他テストへ影響させない）
+            libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+        }
+    }
+
+    /// #590: `configure_daemon_child` を通した子プロセスは、親が SIGTERM を
+    /// ブロックしていても**ブロックを継承しない**。
+    ///
+    /// 判定は子（sh）に自分自身へ SIGTERM を送らせる方式:
+    /// ブロックが継承されていれば死なず "SURVIVED" を出力し、
+    /// 解除されていれば既定動作で死んで何も出力しない。
+    /// `reset_signal_mask()` の呼び出しを消すとこのテストは失敗する
+    #[cfg(unix)]
+    #[test]
+    fn configure_daemon_childは親のブロックを子へ継承しない() {
+        let run = |configure: bool| -> String {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.args(["-c", "kill -s TERM $$; echo SURVIVED"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            if configure {
+                configure_daemon_child(&mut cmd);
+            }
+            let out = cmd.output().expect("sh を起動できる");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        unsafe {
+            let mut block: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut block);
+            libc::sigaddset(&mut block, libc::SIGTERM);
+            let mut old: libc::sigset_t = std::mem::zeroed();
+            // このスレッドで SIGTERM をブロックする（GUI = 親の状態を再現）
+            libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
+            // 素の spawn: ブロックが継承されるので SIGTERM で死なない（前提の確認）
+            let inherited = run(false);
+            // configure 済み: マスクが空に戻るので SIGTERM で死ぬ
+            let configured = run(true);
+            libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+            assert_eq!(
+                inherited, "SURVIVED",
+                "前提: 素の spawn では親のブロックが子へ継承される"
+            );
+            assert_eq!(
+                configured, "",
+                "configure_daemon_child 後は SIGTERM が届いて子が終了する"
+            );
+        }
+    }
+
+    /// #1768: `configure_daemon_child` を通した daemon の子は、GUI が CLOEXEC 無しで
+    /// 開いた fd（Metal のシェーダキャッシュ等）を受け継がない。
+    ///
+    /// 掃除は子の中（`pre_exec`）で走るので、**親の fd は CLOEXEC 無しのまま残る**。
+    /// 測っているあいだに親の fd へ CLOEXEC が立った回（親で掃除を直接呼ぶ誰かが
+    /// 並走した）は、子で見えないのがどちらの手柄か分からないので、開き直して測り直す
+    #[cfg(unix)]
+    #[test]
+    fn configure_daemon_childの子はguiがcloexec無しで開いたfdを受け継がない() {
+        use tako_core::platform::fd_inherit::{inherited_probe_script, observed_inherited};
+        let site = include_str!("process.rs")
+            .lines()
+            .position(|l| l.starts_with("pub fn configure_daemon_child("))
+            .map_or_else(|| "?".to_string(), |i| (i + 1).to_string());
+        let cloexec = |fd: i32| unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC != 0;
+        let run = |fd: i32, configure: bool| -> Option<Vec<i32>> {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.args(["-c", &inherited_probe_script(&[fd])])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            if configure {
+                configure_daemon_child(&mut cmd);
+            }
+            let out = cmd.output().expect("sh を起動できる");
+            observed_inherited(&String::from_utf8_lossy(&out.stdout))
+        };
+        for _ in 0..5 {
+            let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+            assert!(fd >= 3, "/dev/null を開ける: {fd}");
+            let raw = run(fd, false);
+            let configured = run(fd, true);
+            let parent_untouched = !cloexec(fd);
+            unsafe { libc::close(fd) };
+            if !parent_untouched {
+                continue;
+            }
+            assert_eq!(
+                raw,
+                Some(vec![fd]),
+                "前提: 素の spawn では CLOEXEC 無しの fd が子へ見える"
+            );
+            assert_eq!(
+                configured,
+                Some(vec![]),
+                "crates/tako-control/src/platform/process.rs:{site}: daemon の子が CLOEXEC 無しの fd {fd} を\
+                 受け継いだ。configure_daemon_child の pre_exec で \
+                 platform::fd_inherit::seal_inherited_fds() を通していない（#1768）"
+            );
+            return;
+        }
+        panic!("5 回とも別のテストが親で fd を掃いたので、子の中の掃除を測れなかった");
     }
 }

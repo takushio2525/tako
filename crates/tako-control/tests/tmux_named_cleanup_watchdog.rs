@@ -43,11 +43,16 @@ fn read_code(root: &Path, rel: &str) -> String {
     code_view::without_comments_checked(&read(root, rel), rel)
 }
 
-/// 走査対象の製品コード（テストの器は `psmux_cleanup_timeout_watchdog` が見ている）
-const PRODUCT_SOURCES: [&str; 2] = [
+/// 走査対象の製品コード（テストの器は `psmux_cleanup_timeout_watchdog` が見ている）。
+/// 器を pid で落とす本体 `force_kill_pid` は #2860 で境界 B5 の `platform/process.rs` へ移した
+const PRODUCT_SOURCES: [&str; 3] = [
     "crates/tako-core/src/tmux_cleanup.rs",
     "crates/tako-core/src/platform/procinfo.rs",
+    KILL_BOUNDARY,
 ];
+
+/// 器を pid で落とす本体（`force_kill_pid`）の置き場（#2860 で `tmux_cleanup.rs` から移した）
+const KILL_BOUNDARY: &str = "crates/tako-core/src/platform/process.rs";
 
 /// 名前で対象を選ぶ強制終了の書き方。**1 つでもあれば落とす**
 const NAME_WIDE_KILL: [&str; 5] = ["/IM", "Stop-Process", "-Name ", "pkill", "killall"];
@@ -79,7 +84,13 @@ fn 名前一致の一括killが製品コードへ入っていない() {
 #[test]
 fn 器の強制終了はpidを名指ししている() {
     let root = workspace_root();
-    let text = read_code(&root, "crates/tako-core/src/tmux_cleanup.rs");
+    // 回収本体は境界の口を通す（#2860。OS ごとの落とし方は境界の中）
+    let cleanup = read_code(&root, "crates/tako-core/src/tmux_cleanup.rs");
+    assert!(
+        cleanup.contains("platform::process::force_kill_pid("),
+        "器の回収が境界の `platform::process::force_kill_pid` を通っていない（#1282 / #2860）"
+    );
+    let text = read_code(&root, KILL_BOUNDARY);
     assert!(
         text.contains("\"/PID\""),
         "Windows の強制終了が pid 指定（taskkill /PID）になっていない（#1282）"
