@@ -2489,3 +2489,236 @@ fn プロセスグループと終了シグナルの直呼びが境界の外に�
         diffs.join("\n  ")
     );
 }
+
+/// **#2861 の番犬**（#1538 の表の S6）: ファイルのメタデータの unix の拡張
+/// （`std::os::unix::fs` の `MetadataExt` / `PermissionsExt` / `symlink`）の直呼びが、境界 B37 の
+/// `tako_core::platform::fs_meta`（ほか `crates/*/src/platform/` の境界）の外の本番コードに
+/// **増えていない**こと。
+///
+/// ## なぜ要るか
+///
+/// どれも unix にしか無い API なので、呼び手に `#[cfg(unix)]` で直に書くと Windows の腕は
+/// 「0 を返す」「何もしない」になり、**コンパイルもテストも通ったうえで黙って弱い動きになる**
+/// （#1538 / #1374 の実害の形。usage の索引は Windows で同一性が常に 0 = 同じ大きさ・更新時刻のまま
+/// 差し替わったファイルを見分けられない、がどこにも宣言されていなかった）。#2861 で同一性
+/// （`identity` = Windows は `None`）・状態変更時刻（`change_time_secs`）・実行ビット
+/// （`is_executable` / `make_executable` / `EXECUTABLE_BY_MODE`）・symlink（`make_symlink` = Windows は
+/// `None`）・置き換え保存（`save_replacing`）を境界へ寄せ、縮退は境界の型と doc に出した。
+///
+/// ## 数え方
+///
+/// `MetadataExt` / `PermissionsExt` は識別子として現れるたびに 1 件（`use` でも完全修飾の呼び出しでも）。
+/// `symlink` は `unix::fs::` の直後（`unix::fs::{…}` の中を含む）に現れたものだけを 1 件
+/// （`symlink_metadata` / `is_symlink` / 境界の口 `make_symlink` は数えない）。数えるのは本番コードだけ
+/// （テスト領域・`#[cfg(test)] mod x;` で読むファイル・コメント・文字列を除いた眺め = #2856 / #2860 の
+/// 番犬と同じ）。`canonicalizeの直呼びが境界の外に残っていない` と同じく、ファイルごとの件数を
+/// 理由つきで固定する（ファイル単位の許可は「そのファイルなら何個でも増やせる」穴になる）。
+///
+/// 落ちたときの直し方:
+/// - ファイルの同一性・実行ビット・symlink・置き換え保存なら境界の口を呼ぶ（件数は増えない）
+/// - 境界の口で表せない使い方なら境界へ口を足す。どうしても境界の外に置くなら、この表へ件数を
+///   **理由つきで**足す（減ったら表から外してよい）
+const S6_FS_META_APIS: [&str; 3] = ["MetadataExt", "PermissionsExt", "symlink"];
+/// 境界の外の本番コードに残してよい直呼び (パス, 件数, 理由)
+const S6_BASELINE: &[(&str, usize, &str)] = &[
+    (
+        "crates/tako-app/src/main.rs",
+        2,
+        "セルフテストの #772 の項目（偽 claude の symlink を張る・差し替える）。製品バイナリの中の \
+         検証コード = #1538 の表の X5（#1564 の判断待ち）",
+    ),
+    (
+        "crates/tako-control/src/ipc.rs",
+        2,
+        "IPC の受け口の unix の実装 `mod unix_imp`（ソケットファイルの権限・lstat の同一性で張り直しを \
+         見る）。#1538 の表の F1（IPC トランスポート B3。#2847 の着地後に寄せる）",
+    ),
+    (
+        "crates/tako-core/src/ipc_socket.rs",
+        1,
+        "IPC のソケットの置き場の指し札を本人だけの権限にする（`write_pointer`）。#1538 の表の F1 \
+         （IPC トランスポートと一緒に寄せる。B32 の `private_file` の口が受け皿の候補）",
+    ),
+];
+/// 境界の中に在るはずの直呼び（改名・移動で走査が空振りし、件数が減ったまま緑になるのを防ぐ）
+const S6_BOUNDARY: [(&str, &str); 3] = [
+    ("crates/tako-core/src/platform/fs_meta.rs", "MetadataExt"),
+    ("crates/tako-core/src/platform/fs_meta.rs", "PermissionsExt"),
+    ("crates/tako-core/src/platform/fs_meta.rs", "symlink"),
+];
+
+/// コードの眺めの中のメタデータの unix の拡張の直呼び `(行番号, API)`
+fn s6_api_sites(view: &str) -> Vec<(usize, &'static str)> {
+    let bytes = view.as_bytes();
+    let is_id = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let line_of = |at: usize| view[..at].matches('\n').count() + 1;
+    let word_at = |at: usize, word: &str| {
+        bytes[at..].starts_with(word.as_bytes())
+            && (at == 0 || !is_id(bytes[at - 1]))
+            && bytes.get(at + word.len()).is_none_or(|b| !is_id(*b))
+    };
+    let skip_ws = |mut i: usize| {
+        while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        i
+    };
+    let mut sites = Vec::new();
+    for api in ["MetadataExt", "PermissionsExt"] {
+        for (at, _) in view.match_indices(api) {
+            if word_at(at, api) {
+                sites.push((line_of(at), api));
+            }
+        }
+    }
+    // `unix :: fs ::` の直後の `symlink`、または直後の `{…}` の中の `symlink`
+    for (at, _) in view.match_indices("unix") {
+        if !word_at(at, "unix") {
+            continue;
+        }
+        let mut i = at + "unix".len();
+        let mut path_ok = true;
+        for tok in ["::", "fs", "::"] {
+            i = skip_ws(i);
+            if !bytes[i..].starts_with(tok.as_bytes()) || (tok == "fs" && !word_at(i, "fs")) {
+                path_ok = false;
+                break;
+            }
+            i += tok.len();
+        }
+        if !path_ok {
+            continue;
+        }
+        let i = skip_ws(i);
+        if word_at(i, "symlink") {
+            sites.push((line_of(i), "symlink"));
+        } else if bytes.get(i) == Some(&b'{') {
+            let mut depth = 0usize;
+            for (j, b) in bytes.iter().enumerate().skip(i) {
+                match *b {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ if word_at(j, "symlink") => sites.push((line_of(j), "symlink")),
+                    _ => {}
+                }
+            }
+        }
+    }
+    sites.sort();
+    sites
+}
+
+#[test]
+fn ファイルのメタデータのunix拡張の直呼びが境界の外に増えていない() {
+    // 検出力: #2861 より前の呼び手の形は数えられ、当たってはいけない形は数えない（リポジトリは触らない）
+    for (legacy, want) in [
+        // usage::index の ino_of / dev_of
+        (
+            "#[cfg(unix)]\nfn ino_of(m: &std::fs::Metadata) -> u64 {\n    \
+             use std::os::unix::fs::MetadataExt as _;\n    m.ino()\n}\n",
+            1,
+        ),
+        // user_tasks::store_stamp の完全修飾の呼び出し
+        (
+            "fn f(meta: &Metadata) -> u64 {\n    std::os::unix::fs::MetadataExt::ino(meta)\n}\n",
+            1,
+        ),
+        // lsp::archive / fake_exec の実行ビット
+        (
+            "fn f(path: &Path) {\n    use std::os::unix::fs::PermissionsExt;\n    \
+             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));\n}\n",
+            1,
+        ),
+        // tako_cli_path::create_symlink（完全修飾 / use の group / 空白を挟んだ path）
+        (
+            "fn f(t: &Path, l: &Path) {\n    let _ = std::os::unix::fs::symlink(t, l);\n}\n",
+            1,
+        ),
+        (
+            "use std::os::unix::fs::{\n    MetadataExt,\n    symlink,\n};\n",
+            2,
+        ),
+        ("fn f() { let _ = std::os::unix :: fs :: symlink(a, b); }\n", 1),
+        // 当たってはいけない形: コメント・文字列・部分一致・別の名前・境界の口の呼び出し・テスト領域
+        (
+            "// MetadataExt と std::os::unix::fs::symlink は説明\n\
+             const S: &str = \"PermissionsExt std::os::unix::fs::symlink\";\n\
+             fn my_MetadataExt_like(m: &Metadata) -> bool { m.file_type().is_symlink() }\n\
+             fn g(p: &Path) { let _ = std::fs::symlink_metadata(p); let _ = std::os::unix::fs::lchown(p, None, None); }\n\
+             fn h(t: &Path, l: &Path) { let _ = crate::platform::fs_meta::make_symlink(t, l); \
+             let _ = tako_core::platform::fs_meta::identity(&m); }\n\
+             use std::os::unix::fsx::symlink;\n\
+             #[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        \
+             use std::os::unix::fs::{PermissionsExt, symlink};\n    }\n}\n",
+            0,
+        ),
+    ] {
+        let got = s6_api_sites(&production_code_view(legacy)).len();
+        assert_eq!(
+            got, want,
+            "#2861 の番犬の数え方がずれた（{want} 件のはずが {got} 件）: {legacy}"
+        );
+    }
+
+    // 本物のファイル: 境界（`crates/*/src/platform/`）の外の本番コード
+    let files = production_range::product_sources();
+    let test_files = production_range::test_only_files(&files);
+    let mut actual: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for rel in &files {
+        if rel.contains("/src/platform/") || test_files.contains(rel) {
+            continue;
+        }
+        for (line, api) in s6_api_sites(&production_code_view(&read_rel(rel))) {
+            actual
+                .entry(rel.clone())
+                .or_default()
+                .push(format!("{rel}:{line} `{api}`"));
+        }
+    }
+    let expected: std::collections::BTreeMap<&str, usize> =
+        S6_BASELINE.iter().map(|(p, n, _)| (*p, *n)).collect();
+    let mut diffs = Vec::new();
+    for (path, sites) in &actual {
+        let want = expected.get(path.as_str()).copied().unwrap_or(0);
+        if sites.len() > want {
+            diffs.push(format!(
+                "{path}: {want} 件のはずが {} 件（増えている）:\n    {}",
+                sites.len(),
+                sites.join("\n    ")
+            ));
+        }
+    }
+    for (path, want) in &expected {
+        let got = actual.get(*path).map_or(0, Vec::len);
+        if got < *want {
+            diffs.push(format!(
+                "{path}: {want} 件の想定だが {got} 件（減ったので表を更新してよい）"
+            ));
+        }
+    }
+    // 境界の中には在る（走査の空振りで 0 件のまま緑にならない）
+    for (rel, api) in S6_BOUNDARY {
+        if !s6_api_sites(&production_code_view(&read_rel(rel)))
+            .iter()
+            .any(|(_, a)| *a == api)
+        {
+            diffs.push(format!(
+                "{rel}: `{api}` が境界の本番コードに無い（改名・移動したならこの番犬の S6_BOUNDARY も直す）"
+            ));
+        }
+    }
+    assert!(
+        diffs.is_empty(),
+        "ファイルのメタデータの unix の拡張（{}）の直呼びが、境界 B37 の外で想定と違う（#2861）:\n  {}\n\
+         → `tako_core::platform::fs_meta`（identity / change_time_secs / is_executable / make_executable / \
+         EXECUTABLE_BY_MODE / make_symlink / save_replacing）の口を呼んでください。Windows の縮退は境界の型と \
+         doc に出す（同一性は `None` = 比較に使わない）。`cfg` を書いてよいのは境界の中の実装選択だけ（設計 §2.1）",
+        S6_FS_META_APIS.join(" / "),
+        diffs.join("\n  ")
+    );
+}

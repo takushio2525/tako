@@ -92,10 +92,8 @@ pub struct StoreStamp {
 /// 新しい版のまま古い中身で覚え、次の変更まで取り逃がす）
 pub fn store_stamp(path: &Path) -> Option<StoreStamp> {
     let meta = std::fs::metadata(path).ok().filter(|m| m.is_file())?;
-    #[cfg(unix)]
-    let ino = std::os::unix::fs::MetadataExt::ino(&meta);
-    #[cfg(not(unix))]
-    let ino = 0;
+    // 境界 B37 の同一性。Windows（`None`）は 0 = 比べると常に等しい = inode を比較に使わない
+    let ino = tako_core::platform::fs_meta::identity(&meta).map_or(0, |id| id.ino);
     Some(StoreStamp {
         len: meta.len(),
         modified: meta.modified().ok(),

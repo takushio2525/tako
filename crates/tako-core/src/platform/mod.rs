@@ -20,6 +20,9 @@ pub mod fd_inherit;
 pub mod fd_limit;
 pub mod font;
 pub mod fs_copy;
+/// ファイルの同一性・状態変更時刻・実行ビット・symlink・置き換え保存（境界 B37。Windows の縮退は
+/// 型と doc で見える = 同一性は `None` ほか。#2861）
+pub mod fs_meta;
 /// 上書きしない移動（境界 B28 の core 分。#1842）
 pub mod fs_move;
 pub mod ime;

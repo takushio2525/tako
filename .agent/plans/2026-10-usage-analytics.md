@@ -405,7 +405,9 @@ usage            [今の 7d ▾] [プロジェクト ▾]
 
 - 同じ id の行は連続するので（§1.1）、増分の読み手は「そのファイルの最後の id と数えた値」だけ覚えればよい。続きの行で
   output が増えていたら差分だけを足す
-- ファイルが縮んだ・`ino` が変わったら最初から読み直す（その transcript の分は `message.id` で数え直し済みを除く）
+- ファイルが縮んだ・`ino` が変わったら最初から読み直す（その transcript の分は `message.id` で数え直し済みを除く）。
+  `dev` / `ino` は境界 B37 の `fs_meta::identity` から取る。**Windows は同一性が `None` = 0 で埋める**
+  （比べると常に等しい = 縮み・大きさ・読んだ位置だけで見る。同じ大きさのまま差し替わった transcript は見分けられない。#2861）
 - transcript が消えても集約は残す。**保持は 365 日**（Claude-Code-Usage-Monitor の warehouse の既定と同じ）、35 日より古い刻みは月替わりに日単位へまとめる（S2 の判断点）
 - 書き込みは追記（`buckets` / `limits`）と config_io の排他 + アトミック書き換え（`cursor` / `sessions`）
 - 新しい永続ファイルなので、`migration_registry` の指紋に登録し、置き場は設定共有のカタログ（#513 の許可リスト）に
