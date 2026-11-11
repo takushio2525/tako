@@ -557,6 +557,14 @@ const POLICY_ONLY: [(&str, &str); 2] = [
     ),
 ];
 
+/// ソースの形の規則: (ファイル, 関数の頭, 通るべき入口, 置いてはいけない形と理由)
+type SourceRule = (
+    &'static str,
+    &'static str,
+    &'static str,
+    Vec<(&'static str, &'static str)>,
+);
+
 #[test]
 fn worker_の1m警告はspawnと同じ解決を通る() {
     let orch = "crates/tako-control/src/orchestrator/mod.rs";
@@ -566,8 +574,7 @@ fn worker_の1m警告はspawnと同じ解決を通る() {
         "\"worker\"",
         "worker の [1m] 警告を自前で組んでいる（`profiles show` と起動の警告がずれる）",
     );
-    // (ファイル, 関数の頭, 通るべき入口, 置いてはいけない形と理由)
-    let rules: [(&str, &str, &str, Vec<(&str, &str)>); 3] = [
+    let rules: [SourceRule; 3] = [
         (
             orch,
             "pub fn worker_one_m_model_note(",

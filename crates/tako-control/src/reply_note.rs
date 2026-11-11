@@ -278,10 +278,12 @@ pub enum ReplyNote {
     /// `worker モデルポリシー: delegate（master が判断）`
     WorkerPolicyDelegate,
     /// `worker モデルポリシー: <policy>（worker の既定: <model> / <effort>。<欄> は <出どころ>）`（#2907）。
-    /// ポリシーの文が spawn の値を言えないとき（上の段が決める・既定の worker が claude 以外）
+    /// ポリシーの文が spawn の値を言えないとき（上の段が決める・既定の worker が claude 以外）。
+    /// `worker` は Box（この腕が `ReplyNote` の最大の腕になり、`Result<_, ReplyNote>` が
+    /// clippy の result_large_err の閾値を超えるため。#2915 で値の欄が 1 つ増えた）
     WorkerPolicyResolved {
         policy: crate::orchestrator::WorkerModelPolicy,
-        worker: crate::orchestrator::DefaultWorkerLaunch,
+        worker: Box<crate::orchestrator::DefaultWorkerLaunch>,
     },
     /// `worker モデルポリシー: <policy>（worker の既定を決められない: <理由>）`（#2907。`why` は spawn と同じ断り）
     WorkerPolicyUnresolved {
@@ -4640,7 +4642,10 @@ impl ReplyNote {
         match policy {
             // delegate は値を出さない（master がタスクごとに決める）
             Policy::Delegate => Self::WorkerPolicyDelegate,
-            _ if !worker.follows_policy() => Self::WorkerPolicyResolved { policy, worker },
+            _ if !worker.follows_policy() => Self::WorkerPolicyResolved {
+                policy,
+                worker: Box::new(worker),
+            },
             Policy::Inherit if profile.master_agent_is_claude() => Self::WorkerPolicyInherit {
                 model: worker.model,
                 effort: worker.effort,

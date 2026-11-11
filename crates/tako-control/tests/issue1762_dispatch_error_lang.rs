@@ -21189,7 +21189,7 @@ fn reply_note_table() -> Vec<(ReplyNote, String)> {
         (
             ReplyNote::WorkerPolicyResolved {
                 policy: tako_control::orchestrator::WorkerModelPolicy::Inherit,
-                worker: tako_control::orchestrator::DefaultWorkerLaunch {
+                worker: Box::new(tako_control::orchestrator::DefaultWorkerLaunch {
                     agent: tako_control::orchestrator::WorkerAgent::Claude,
                     model: "(claude CLI default)".into(),
                     model_value: None,
@@ -21198,7 +21198,7 @@ fn reply_note_table() -> Vec<(ReplyNote, String)> {
                     effort_origin: Some(tako_control::orchestrator::WorkerValueOrigin::AgentConfig(
                         tako_control::orchestrator::WorkerAgent::Claude,
                     )),
-                },
+                }),
             },
             "worker モデルポリシー: inherit（worker の既定: (claude CLI default) / medium。effort は worker_agents.claude）"
                 .into(),
