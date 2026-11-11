@@ -18951,6 +18951,73 @@ mod help_text_parity {
         }
     }
 
+    /// #2902: `--answers` の `launch_agent` の説明（`SetupAnswers::launch_agent` の doc）が今の挙動を述べる。
+    /// `--answers` は `--yes` と同じ非対話なので、値によらず対話のアシスタントは開かない。
+    /// #2897 の検査と同じく、挙動を決めている側（`SetupArgs::assume_yes` / `setup::opens_dialogue`）を
+    /// 前提として確かめてから説明を見る
+    #[test]
+    fn answersのlaunch_agentの説明が対話を開かない挙動と一致する() {
+        for value in ["claude", "codex", "agy", "none"] {
+            let json = format!(r#"{{"launch_agent":"{value}"}}"#);
+            let cli = Cli::try_parse_from(["tako", "setup", "--answers", json.as_str()])
+                .unwrap_or_else(|e| panic!("setup --answers {json} が通らない: {e}"));
+            let Command::Setup(args) = cli.command else {
+                panic!("setup --answers {json} が setup にならない");
+            };
+            let loaded = setup::load_answers(args.answers.as_deref()).unwrap_or_else(|e| {
+                panic!("launch_agent={value} を受け付けない（互換で受理する）: {e}")
+            });
+            // 端末でログイン済みでも、--answers の実行では開かない
+            let ctx = setup::DialogueContext {
+                usable_agent: true,
+                assume_yes: args.assume_yes(),
+                stdin_is_terminal: true,
+                launch_none: loaded.launch_agent.as_deref() == Some("none"),
+            };
+            assert!(
+                !setup::opens_dialogue(ctx),
+                "--answers の launch_agent={value} で対話のアシスタントが開く判定になった: {ctx:?}"
+            );
+        }
+
+        let rel = "crates/tako-control/src/setup.rs";
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(rel);
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} を読めない: {e}", path.display()));
+        let lines: Vec<&str> = src.lines().collect();
+        let decl: Vec<usize> = (0..lines.len())
+            .filter(|&i| lines[i].trim_start().starts_with("pub launch_agent:"))
+            .collect();
+        assert_eq!(
+            decl.len(),
+            1,
+            "{rel} の `pub launch_agent:` が 1 つではない（行 {:?}）",
+            decl.iter().map(|i| i + 1).collect::<Vec<_>>()
+        );
+        let at = decl[0];
+        let start = (0..at)
+            .rev()
+            .take_while(|&i| lines[i].trim_start().starts_with("///"))
+            .last()
+            .unwrap_or(at);
+        let doc = lines[start..at].join("\n");
+        let place = format!("{rel}:{}", start + 1);
+        for stale in ["その場で対話起動", "対話で選択"] {
+            assert!(
+                !doc.contains(stale),
+                "{place} の launch_agent の説明が「{stale}」と言っている（--answers の実行は対話を開かない）:\n{doc}"
+            );
+        }
+        for needed in ["`--yes` と同じ", "開かない", "selected_agent"] {
+            assert!(
+                doc.contains(needed),
+                "{place} の launch_agent の説明が「{needed}」に触れていない:\n{doc}"
+            );
+        }
+    }
+
     /// `tako setup-mcp --help` が**実際に書く場所**を述べている（#1248 の①）
     #[test]
     fn setup_mcpのhelpが書き先の正本と一致する() {

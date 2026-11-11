@@ -3466,7 +3466,8 @@ pub(crate) struct DialogueContext {
     pub(crate) assume_yes: bool,
     /// stdin が端末か
     pub(crate) stdin_is_terminal: bool,
-    /// `--answers` の `launch_agent: none`
+    /// `--answers` の `launch_agent: none`（`--answers` は `assume_yes` も立てるので、いまの CLI の
+    /// 経路ではこの欄だけで結果は変わらない。互換のために残す = #2902）
     pub(crate) launch_none: bool,
 }
 
@@ -3964,7 +3965,7 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
 
     // --- 対話エージェント起動（Issue #295 / #322 / #391）---
     // 既定: 検出フロー完了後に setup agent を対話起動し、設定変更・解説・次の一歩を対話で行う。
-    // スキップ条件: --yes / 非 TTY / --answers launch_agent=none /
+    // スキップ条件: --yes / --answers（launch_agent の値によらない。#2902）/ 非 TTY /
     // **選んだ系統が使えない**（未導入・未認証。#1501。起こしてもログイン画面で止まる）
     let usable_agent = selected_agent.filter(|agent| agent.authenticated);
     let skip_agent = !opens_dialogue(DialogueContext {
