@@ -5639,12 +5639,10 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
             eprintln!("{warning}");
         }
     }
-    if let Some(warning) = profile
-        .resolve_worker_model()
-        .filter(|m| Some(*m) != profile.model.as_deref())
-        .and_then(|m| orchestrator::one_m_model_warning_in(m, "worker", lang))
-    {
-        eprintln!("{warning}");
+    // #2915: worker は spawn の実際の model（`profiles show` の warnings と同じ 1 実装）。
+    // アカウントの解決が失敗する状態でも起動は止めない（言わないだけ。理由は起動の行が言う = #2907）
+    if let Some(warning) = orchestrator::worker_one_m_model_note(&profile) {
+        eprintln!("{}", warning.text_in(lang));
     }
 
     // #1139: 起動時ロードが予算を超えていたら 1 行だけ出す（超過が無ければ黙る）。
