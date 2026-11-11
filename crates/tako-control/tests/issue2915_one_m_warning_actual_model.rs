@@ -389,7 +389,7 @@ fn check_case(data: &Path, idx: usize, case: &Case, failures: &mut Vec<String>) 
     }
 
     // 1. `tako master` の起動の警告と同じ口
-    let cli = tako_control::orchestrator::worker_one_m_model_note(&profile);
+    let cli = tako_control::orchestrator::worker_one_m_model_note(&profile, &name);
     for lang in [Lang::Ja, Lang::En] {
         let got: Vec<String> = cli.iter().map(|n| n.text_in(lang)).collect();
         let named = one_m_models(&got, "worker", lang);

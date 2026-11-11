@@ -3087,15 +3087,114 @@ pub fn sandbox_bypass_hint_command(profile_name: &str) -> String {
     format!("tako orchestrator profiles set {profile_name} --bypass-sandbox true")
 }
 
+/// `[1m]` 警告の解除の手段 = 警告が名指すモデルを決めた段（#2918）。
+///
+/// 段ごとに効く解除が違う。#2918 より前は出どころに関係なく master の `--clear-model` を案内して
+/// いたので、worker の `[1m]`（ポリシーの段・`worker_agents.claude.model`・アカウントの既定）は
+/// 案内どおりに打っても消えなかった（master の model だけが外れた）。コマンドは
+/// [`Self::command`] の 1 か所で組む（最簡形。#322）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OneMClear {
+    /// プロファイル本人の `model`（master / solo）: `profiles set <名前> [--solo] --clear-model`
+    Model { profile: String, kind: ProfileKind },
+    /// worker のポリシーの段（fixed の `worker_model`）: `profiles set <名前> --clear-worker-model`
+    WorkerModel { profile: String },
+    /// `worker_agents.<agent>.model`: `profiles set <名前> --agent <agent> --clear-agent-model`
+    AgentModel { profile: String, agent: WorkerAgent },
+    /// アカウントの `default_model`。プロファイルの欄では外せない（spawn はアカウントの既定を先に見る）
+    /// ので、アカウントを `default_model` 抜きで登録し直す（`accounts add` は丸ごと置き換える）。
+    /// `keep` は残す欄（読めなかったら `None` = コマンドを組まずに確かめ方を案内する）
+    AccountModel {
+        account: String,
+        keep: Option<AccountKeep>,
+    },
+}
+
+/// [`OneMClear::AccountModel`] で登録し直すときに残すアカウントの欄（`default_model` 以外の全部）。
+/// accounts.yaml に書いてあるままの値（`~` を展開しない = 登録し直しても書いてある形が変わらない）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountKeep {
+    pub config_dir: Option<String>,
+    pub inherit: bool,
+    pub description: Option<String>,
+    pub default_effort: Option<String>,
+}
+
+impl OneMClear {
+    /// アカウント `name` の `default_model` を外す手段（accounts.yaml から残す欄を読む）
+    pub fn account(name: &str) -> Self {
+        let keep = AccountsConfig::load_typed()
+            .ok()
+            .and_then(|config| config.accounts.get(name).cloned())
+            .map(|entry| AccountKeep {
+                config_dir: entry.config_dir,
+                inherit: entry.inherit,
+                description: entry.description,
+                default_effort: entry.default_effort,
+            });
+        Self::AccountModel {
+            account: name.to_string(),
+            keep,
+        }
+    }
+
+    /// 解除のコマンド（そのまま打てる形。既定値で済む引数を付けない = #322）。
+    /// `None` = 組めない（アカウントの欄が読めない）。値は `dialect` の規則で必要なときだけ引用する
+    /// （プロファイル名・系統名は検証済みの文字だけなので引用しない）
+    pub fn command(
+        &self,
+        dialect: tako_core::platform::shell_dialect::ShellDialect,
+    ) -> Option<String> {
+        let q = |s: &str| dialect.quote_fragment(s);
+        match self {
+            Self::Model { profile, kind } => {
+                let solo = if *kind == ProfileKind::Solo {
+                    " --solo"
+                } else {
+                    ""
+                };
+                Some(format!(
+                    "tako orchestrator profiles set {profile}{solo} --clear-model"
+                ))
+            }
+            Self::WorkerModel { profile } => Some(format!(
+                "tako orchestrator profiles set {profile} --clear-worker-model"
+            )),
+            Self::AgentModel { profile, agent } => Some(format!(
+                "tako orchestrator profiles set {profile} --agent {} --clear-agent-model",
+                agent.as_str()
+            )),
+            Self::AccountModel { account, keep } => {
+                let keep = keep.as_ref()?;
+                let mut cmd = format!("tako orchestrator accounts add {}", q(account));
+                // `accounts add` は config_dir か inherit のどちらかが要る（#512）
+                match (&keep.config_dir, keep.inherit) {
+                    (Some(dir), false) => cmd.push_str(&format!(" --config-dir {}", q(dir))),
+                    _ => cmd.push_str(" --inherit"),
+                }
+                if let Some(d) = &keep.description {
+                    cmd.push_str(&format!(" --description {}", q(d)));
+                }
+                if let Some(e) = &keep.default_effort {
+                    cmd.push_str(&format!(" --default-effort {}", q(e)));
+                }
+                Some(cmd)
+            }
+        }
+    }
+}
+
 /// 1M コンテキスト版モデル（`[1m]` サフィックス）への警告（型）。
 /// プロファイルへの明示 opt-in は尊重して起動は継続するため、警告のみ（Issue #27）。
-/// `profile_warnings`（応答の `warnings`）が使い、呼び手が表示言語で組む（#2365）
-pub fn one_m_model_note(model: &str, source: &str) -> Option<crate::ReplyNote> {
+/// `profile_warnings`（応答の `warnings`）が使い、呼び手が表示言語で組む（#2365）。
+/// `clear` は解除の手段 = モデルを決めた段（#2918）
+pub fn one_m_model_note(model: &str, source: &str, clear: OneMClear) -> Option<crate::ReplyNote> {
     model
         .contains("[1m]")
         .then(|| crate::ReplyNote::OneMModelWarning {
             source: source.to_string(),
             model: model.to_string(),
+            clear: Box::new(clear),
         })
 }
 
@@ -3103,9 +3202,10 @@ pub fn one_m_model_note(model: &str, source: &str) -> Option<crate::ReplyNote> {
 pub fn one_m_model_warning_in(
     model: &str,
     source: &str,
+    clear: OneMClear,
     lang: tako_core::i18n::Lang,
 ) -> Option<String> {
-    one_m_model_note(model, source).map(|n| n.text_in(lang))
+    one_m_model_note(model, source, clear).map(|n| n.text_in(lang))
 }
 
 /// 既定の worker（spawn が agent / model / effort / account を省いて立てたとき）の `[1m]` 警告（#2915）。
@@ -3121,7 +3221,12 @@ pub fn one_m_model_warning_in(
 /// - spawn が断る状態（未登録のアカウント）は `[1m]` で起動しないので言わない（断りは
 ///   `ProfileAccountUnregistered` と起動の行の `WorkerPolicyUnresolved` が言う。#2907）
 /// - master の警告と同じモデルなら master の分だけ（inherit で同一のとき二重に言わない。#27）
-pub fn worker_one_m_model_note(profile: &Profile) -> Option<crate::ReplyNote> {
+///
+/// 解除の案内は model を決めた段から組む（#2918。`name` はプロファイル名 = 案内のコマンドに入る）:
+/// アカウントの既定 → そのアカウントを登録し直す・`worker_agents.<agent>.model` →
+/// `--agent <agent> --clear-agent-model`・それ以外（ポリシーの段 = fixed の `worker_model`。inherit /
+/// delegate の model は master と同じなので上で master の分に寄る）→ `--clear-worker-model`
+pub fn worker_one_m_model_note(profile: &Profile, name: &str) -> Option<crate::ReplyNote> {
     let worker = profile.default_worker_launch().ok()?;
     if !inherits_claude_vocabulary_defaults(worker.agent) {
         return None;
@@ -3131,7 +3236,17 @@ pub fn worker_one_m_model_note(profile: &Profile) -> Option<crate::ReplyNote> {
     if master_warned {
         return None;
     }
-    one_m_model_note(model, "worker")
+    let clear = match &worker.model_origin {
+        Some(WorkerValueOrigin::Account(account)) => OneMClear::account(account),
+        Some(WorkerValueOrigin::AgentConfig(agent)) => OneMClear::AgentModel {
+            profile: name.to_string(),
+            agent: *agent,
+        },
+        None => OneMClear::WorkerModel {
+            profile: name.to_string(),
+        },
+    };
+    one_m_model_note(model, "worker", clear)
 }
 
 // --- system prompt の組み立て（Issue #1154）---
@@ -4029,17 +4144,28 @@ pub fn decide_adopt(
 /// projects.yaml / accounts.yaml は**参照があるときだけ**読む（list は全プロファイル
 /// 分呼ばれるので、無条件に読むとプロファイル数ぶんのファイル読み込みが増える）。
 /// 警告は型（[`crate::ReplyNote`]）で返す = 呼び手が表示言語で組む（#2365）。
-/// `kind` は worker の `[1m]` を言うかを決める（solo は worker を spawn しない。#2915）
-pub fn profile_warnings(profile: &Profile, kind: ProfileKind) -> Vec<crate::ReplyNote> {
+/// `kind` は worker の `[1m]` を言うかを決める（solo は worker を spawn しない。#2915）。
+/// `name` はプロファイル名（`[1m]` の解除の案内のコマンドに入る。#2918）
+pub fn profile_warnings(profile: &Profile, name: &str, kind: ProfileKind) -> Vec<crate::ReplyNote> {
     let mut warnings = Vec::new();
 
     // [1m] モデル（Max / API プラン限定）。inherit で master と同一なら master 分のみ。
-    // claude 以外の master の model は claude 表記でないため対象外（#127）
+    // claude 以外の master の model は claude 表記でないため対象外（#127）。
+    // 解除はプロファイル本人の model（solo のプロファイルは `--solo` で指す。#2918）
     if let Some(w) = profile
         .model
         .as_deref()
         .filter(|_| profile.master_agent_is_claude())
-        .and_then(|m| one_m_model_note(m, "master"))
+        .and_then(|m| {
+            one_m_model_note(
+                m,
+                "master",
+                OneMClear::Model {
+                    profile: name.to_string(),
+                    kind,
+                },
+            )
+        })
     {
         warnings.push(w);
     }
@@ -4047,7 +4173,7 @@ pub fn profile_warnings(profile: &Profile, kind: ProfileKind) -> Vec<crate::Repl
     // solo は worker を spawn しないので言わない（spawn の解決は master_account の既定まで引くので、
     // solo に出すと worker の居ない [1m] を名乗る。#2891 の注記と同じ扱い）
     if kind == ProfileKind::Master {
-        warnings.extend(worker_one_m_model_note(profile));
+        warnings.extend(worker_one_m_model_note(profile, name));
     }
 
     // 未登録の project キー（master 起動時に明示エラーになる。#500 Part 7）
@@ -7462,9 +7588,105 @@ worker_agents:
 
     #[test]
     fn one_m_warning_only_for_1m_models() {
-        assert!(one_m_model_note("claude-opus-4-6[1m]", "master").is_some());
-        assert!(one_m_model_note("claude-opus-4-6", "master").is_none());
-        assert!(one_m_model_note("claude-sonnet-5", "worker").is_none());
+        let clear = || OneMClear::WorkerModel {
+            profile: "default".into(),
+        };
+        assert!(one_m_model_note("claude-opus-4-6[1m]", "master", clear()).is_some());
+        assert!(one_m_model_note("claude-opus-4-6", "master", clear()).is_none());
+        assert!(one_m_model_note("claude-sonnet-5", "worker", clear()).is_none());
+    }
+
+    /// `[1m]` の解除のコマンドは段ごとに違い、そのまま打てる形（#2918）
+    #[test]
+    fn one_mの解除のコマンドは段ごとに組む() {
+        use tako_core::platform::shell_dialect::ShellDialect;
+        let sh = ShellDialect::Posix;
+        let cmd = |c: OneMClear| c.command(sh);
+        assert_eq!(
+            cmd(OneMClear::Model {
+                profile: "p1".into(),
+                kind: ProfileKind::Master
+            })
+            .as_deref(),
+            Some("tako orchestrator profiles set p1 --clear-model")
+        );
+        // solo のプロファイルは `--solo` で指す（無いと同名の master のプロファイルを触る）
+        assert_eq!(
+            cmd(OneMClear::Model {
+                profile: "p1".into(),
+                kind: ProfileKind::Solo
+            })
+            .as_deref(),
+            Some("tako orchestrator profiles set p1 --solo --clear-model")
+        );
+        assert_eq!(
+            cmd(OneMClear::WorkerModel {
+                profile: "p1".into()
+            })
+            .as_deref(),
+            Some("tako orchestrator profiles set p1 --clear-worker-model")
+        );
+        assert_eq!(
+            cmd(OneMClear::AgentModel {
+                profile: "p1".into(),
+                agent: WorkerAgent::Claude
+            })
+            .as_deref(),
+            Some("tako orchestrator profiles set p1 --agent claude --clear-agent-model")
+        );
+        // アカウント: default_model だけを落とし、残りの欄は書いてあるまま付け直す
+        let keep = AccountKeep {
+            config_dir: Some("~/.claude x".into()),
+            inherit: false,
+            description: Some("大学 用".into()),
+            default_effort: Some("low".into()),
+        };
+        assert_eq!(
+            cmd(OneMClear::AccountModel {
+                account: "univ".into(),
+                keep: Some(keep.clone())
+            })
+            .as_deref(),
+            Some(
+                "tako orchestrator accounts add univ --config-dir '~/.claude x' \
+                 --description '大学 用' --default-effort low"
+            )
+        );
+        // 最簡形: 書いていない欄は付けない（inherit は config_dir の代わりに必ず要る）
+        assert_eq!(
+            cmd(OneMClear::AccountModel {
+                account: "a1".into(),
+                keep: Some(AccountKeep {
+                    config_dir: None,
+                    inherit: true,
+                    description: None,
+                    default_effort: None,
+                })
+            })
+            .as_deref(),
+            Some("tako orchestrator accounts add a1 --inherit")
+        );
+        // PowerShell は必要な文字だけを逃がす（素の語は囲まない）
+        assert_eq!(
+            OneMClear::AccountModel {
+                account: "univ".into(),
+                keep: Some(keep)
+            }
+            .command(ShellDialect::PowerShell)
+            .as_deref(),
+            Some(
+                "tako orchestrator accounts add univ --config-dir `~/.claude` x \
+                 --description 大学` 用 --default-effort low"
+            )
+        );
+        // 残す欄が読めない = 欄を落とすコマンドは組まない
+        assert_eq!(
+            cmd(OneMClear::AccountModel {
+                account: "a1".into(),
+                keep: None
+            }),
+            None
+        );
     }
 
     // #27 の移行の振る舞い（コメント保持 / 明示モデル尊重 / #67 の再設定尊重 /
@@ -8900,7 +9122,7 @@ worker_agents:
         // projects / accounts を参照しないプロファイルなので設定ファイルを読まない
         let plain = Profile::default();
         assert!(
-            profile_warnings(&plain, ProfileKind::Master).is_empty(),
+            profile_warnings(&plain, "p1", ProfileKind::Master).is_empty(),
             "既定は警告なし"
         );
 
@@ -8908,9 +9130,21 @@ worker_agents:
             model: Some("claude-opus-4-6[1m]".into()),
             ..Default::default()
         };
-        let w = profile_warnings(&one_m, ProfileKind::Master);
+        let w = profile_warnings(&one_m, "p1", ProfileKind::Master);
         assert_eq!(w.len(), 1, "inherit で同一モデルなら master 分のみ: {w:?}");
         assert!(w[0].text_in(tako_core::i18n::Lang::Ja).contains("master"));
+        // 解除はこのプロファイルの model（#2918）
+        assert!(
+            w[0].text_in(tako_core::i18n::Lang::Ja)
+                .contains("`tako orchestrator profiles set p1 --clear-model`"),
+            "{w:?}"
+        );
+        let w = profile_warnings(&one_m, "p1", ProfileKind::Solo);
+        assert!(
+            w[0].text_in(tako_core::i18n::Lang::En)
+                .contains("`tako orchestrator profiles set p1 --solo --clear-model`"),
+            "solo のプロファイルは --solo で指す: {w:?}"
+        );
 
         let both = Profile {
             model: Some("claude-opus-4-6".into()),
@@ -8918,11 +9152,17 @@ worker_agents:
             worker_model: Some("claude-sonnet-5[1m]".into()),
             ..Default::default()
         };
-        let w = profile_warnings(&both, ProfileKind::Master);
+        let w = profile_warnings(&both, "p1", ProfileKind::Master);
         assert_eq!(w.len(), 1, "worker 側だけ [1m]: {w:?}");
         assert!(w[0].text_in(tako_core::i18n::Lang::Ja).contains("worker"));
+        // ポリシーの段（fixed の worker_model）の [1m] は --clear-worker-model で外れる（#2918）
+        assert!(
+            w[0].text_in(tako_core::i18n::Lang::Ja)
+                .contains("`tako orchestrator profiles set p1 --clear-worker-model`"),
+            "{w:?}"
+        );
         // solo は worker を spawn しないので worker の [1m] は言わない（#2915）
-        let w = profile_warnings(&both, ProfileKind::Solo);
+        let w = profile_warnings(&both, "p1", ProfileKind::Solo);
         assert!(w.is_empty(), "solo は worker の [1m] を言わない: {w:?}");
     }
 }

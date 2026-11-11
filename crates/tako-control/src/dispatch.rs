@@ -17276,7 +17276,7 @@ fn profile_to_json(
     }
     // 参照整合性の警告（未登録 project / アカウント / [1m] モデル）は list / show /
     // set のすべてに載せる。GUI は保存前の確認に、CLI / MCP は起動前の気づきに使う（#721）
-    let mut warnings: Vec<String> = orchestrator::profile_warnings(profile, kind)
+    let mut warnings: Vec<String> = orchestrator::profile_warnings(profile, name, kind)
         .into_iter()
         .map(String::from)
         .collect();

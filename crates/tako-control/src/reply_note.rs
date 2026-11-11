@@ -244,8 +244,14 @@ pub enum ReplyNote {
     // ---- `tako master` / `tako solo` の起動の流れ ----
     /// MCP の登録パス（`~/.claude.json` の `mcpServers.tako.command`）が消えている（2 行）
     McpPathMissing(String),
-    /// `[警告] <source> のモデル '<model>' は 1M コンテキスト版のため…`（2 行。`profile_warnings` と共有）
-    OneMModelWarning { source: String, model: String },
+    /// `[警告] <source> のモデル '<model>' は 1M コンテキスト版のため…`（2 行。`profile_warnings` と共有）。
+    /// 2 行目の解除の案内は `clear`（モデルを決めた段）から組む（#2918。`Box` は `ReplyNote` を
+    /// `Err` に載せる関数の大きさ = clippy の result_large_err を抑えるため）
+    OneMModelWarning {
+        source: String,
+        model: String,
+        clear: Box<crate::orchestrator::OneMClear>,
+    },
     /// `master を起動しました: <場所>`（場所は `LaunchTab*` / `LaunchInline` の文）
     MasterLaunched(String),
     /// `solo を起動しました: <場所>`
@@ -1675,15 +1681,28 @@ impl ReplyNote {
                 "[warning] the registered MCP path is gone: {cmd}\n        \
                  starting without the tako MCP. Run tako setup-mcp to repair it."
             ),
-            (Self::OneMModelWarning { source, model }, Ja) => format!(
-                "[警告] {source} のモデル '{model}' は 1M コンテキスト版のため、Pro プランでは起動できない可能性があります（Max / API プラン向け）。\n  \
-                 起動に失敗する場合は `tako orchestrator profiles set <プロファイル名> --clear-model` で解除してください"
+            (
+                Self::OneMModelWarning {
+                    source,
+                    model,
+                    clear,
+                },
+                Ja,
+            ) => format!(
+                "[警告] {source} のモデル '{model}' は 1M コンテキスト版のため、Pro プランでは起動できない可能性があります（Max / API プラン向け）。\n  {}",
+                one_m_clear_line(clear, Ja)
             ),
-            (Self::OneMModelWarning { source, model }, En) => format!(
+            (
+                Self::OneMModelWarning {
+                    source,
+                    model,
+                    clear,
+                },
+                En,
+            ) => format!(
                 "[warning] the {source} model '{model}' is a 1M-context model, so it may not start \
-                 on the Pro plan (it is meant for the Max / API plans).\n  \
-                 If it fails to start, clear it with \
-                 `tako orchestrator profiles set <profile> --clear-model`"
+                 on the Pro plan (it is meant for the Max / API plans).\n  {}",
+                one_m_clear_line(clear, En)
             ),
             (Self::MasterLaunched(location), Ja) => format!("master を起動しました: {location}"),
             (Self::MasterLaunched(location), En) => format!("launched master: {location}"),
@@ -4536,6 +4555,48 @@ fn jobserver_off_en(code: Option<&str>) -> String {
         }
         Some(other) => other.to_string(),
         None => "?".into(),
+    }
+}
+
+/// [`ReplyNote::OneMModelWarning`] の 2 行目 = 解除の案内（#2918）。
+///
+/// コマンドは `clear`（モデルを決めた段）から [`crate::orchestrator::OneMClear::command`] が組む。
+/// 値の引用はペインのシェルの方言（`launch_cmd::launch_dialect` = 利用者がコマンドを打つシェル）。
+/// アカウントの既定は全プロファイルで共有なので、どのアカウントから来たかと影響の広さを添える
+fn one_m_clear_line(clear: &crate::orchestrator::OneMClear, lang: Lang) -> String {
+    use crate::orchestrator::OneMClear;
+    let dialect = crate::launch_cmd::launch_dialect();
+    let command = clear.command(dialect);
+    match (clear, command, lang) {
+        (OneMClear::AccountModel { account, .. }, Some(cmd), Lang::Ja) => format!(
+            "このモデルはアカウント '{account}' の default_model から来ています。起動に失敗する場合は \
+             `{cmd}` で default_model を外してください（このアカウントを使う他のプロファイルにも効きます）"
+        ),
+        (OneMClear::AccountModel { account, .. }, Some(cmd), Lang::En) => format!(
+            "This model comes from the default_model of account '{account}'. If it fails to start, \
+             remove that default_model with `{cmd}` (this also applies to the other profiles that \
+             use this account)"
+        ),
+        // 残す欄が読めない（accounts.yaml がその場で変わった等）: 欄を落とすコマンドを組まない
+        (OneMClear::AccountModel { account, .. }, None, Lang::Ja) => format!(
+            "このモデルはアカウント '{account}' の default_model から来ています。起動に失敗する場合は \
+             アカウントの default_model を外してください（今の設定は `tako orchestrator accounts show {}`）",
+            dialect.quote_fragment(account)
+        ),
+        (OneMClear::AccountModel { account, .. }, None, Lang::En) => format!(
+            "This model comes from the default_model of account '{account}'. If it fails to start, \
+             remove the account's default_model (see its current settings with \
+             `tako orchestrator accounts show {}`)",
+            dialect.quote_fragment(account)
+        ),
+        (_, cmd, Lang::Ja) => format!(
+            "起動に失敗する場合は `{}` で解除してください",
+            cmd.unwrap_or_default()
+        ),
+        (_, cmd, Lang::En) => format!(
+            "If it fails to start, clear it with `{}`",
+            cmd.unwrap_or_default()
+        ),
     }
 }
 
