@@ -277,6 +277,17 @@ pub enum ReplyNote {
     WorkerPolicyFixed { model: String, effort: String },
     /// `worker モデルポリシー: delegate（master が判断）`
     WorkerPolicyDelegate,
+    /// `worker モデルポリシー: <policy>（worker の既定: <model> / <effort>。<欄> は <出どころ>）`（#2907）。
+    /// ポリシーの文が spawn の値を言えないとき（上の段が決める・既定の worker が claude 以外）
+    WorkerPolicyResolved {
+        policy: crate::orchestrator::WorkerModelPolicy,
+        worker: crate::orchestrator::DefaultWorkerLaunch,
+    },
+    /// `worker モデルポリシー: <policy>（worker の既定を決められない: <理由>）`（#2907。`why` は spawn と同じ断り）
+    WorkerPolicyUnresolved {
+        policy: crate::orchestrator::WorkerModelPolicy,
+        why: ConfigError,
+    },
     /// `projects 制限: <keys>`
     ProjectsRestriction(String),
     /// `ファイルツリーに追加: <names>`
@@ -1706,45 +1717,32 @@ impl ReplyNote {
             (Self::LimitResumeOn, En) => {
                 "auto-resume after usage limits: on (profile default; #1140)".into()
             }
-            (Self::WorkerPolicyInherit { model, effort }, Ja) => {
-                format!("worker モデルポリシー: inherit（master と同じ {model} / {effort}）")
-            }
-            (Self::WorkerPolicyInherit { model, effort }, En) => {
-                format!("worker model policy: inherit (same as master: {model} / {effort})")
-            }
+            // #2907: 見出しの後ろの本文は `worker_policy_body_in` が日英で持つ（system prompt の
+            // Session Identity の行も同じ本文を載せる）
             (
-                Self::WorkerPolicyInheritNonClaude {
-                    agent,
-                    model,
-                    effort,
-                },
+                Self::WorkerPolicyInherit { .. }
+                | Self::WorkerPolicyInheritNonClaude { .. }
+                | Self::WorkerPolicyFixed { .. }
+                | Self::WorkerPolicyDelegate
+                | Self::WorkerPolicyResolved { .. }
+                | Self::WorkerPolicyUnresolved { .. },
                 Ja,
             ) => format!(
-                "worker モデルポリシー: inherit（master は {agent} のため claude worker へは非継承: {model} / {effort}）"
+                "worker モデルポリシー: {}",
+                self.worker_policy_body_in(Ja).unwrap_or_default()
             ),
             (
-                Self::WorkerPolicyInheritNonClaude {
-                    agent,
-                    model,
-                    effort,
-                },
+                Self::WorkerPolicyInherit { .. }
+                | Self::WorkerPolicyInheritNonClaude { .. }
+                | Self::WorkerPolicyFixed { .. }
+                | Self::WorkerPolicyDelegate
+                | Self::WorkerPolicyResolved { .. }
+                | Self::WorkerPolicyUnresolved { .. },
                 En,
             ) => format!(
-                "worker model policy: inherit (the master is {agent}, so claude workers do not \
-                 inherit it: {model} / {effort})"
+                "worker model policy: {}",
+                self.worker_policy_body_in(En).unwrap_or_default()
             ),
-            (Self::WorkerPolicyFixed { model, effort }, Ja) => {
-                format!("worker モデルポリシー: fixed（{model} / {effort}）")
-            }
-            (Self::WorkerPolicyFixed { model, effort }, En) => {
-                format!("worker model policy: fixed ({model} / {effort})")
-            }
-            (Self::WorkerPolicyDelegate, Ja) => {
-                "worker モデルポリシー: delegate（master が判断）".into()
-            }
-            (Self::WorkerPolicyDelegate, En) => {
-                "worker model policy: delegate (the master decides)".into()
-            }
             (Self::ProjectsRestriction(keys), Ja) => format!("projects 制限: {keys}"),
             (Self::ProjectsRestriction(keys), En) => format!("projects restriction: {keys}"),
             (Self::TreeFoldersAdded(names), Ja) => format!("ファイルツリーに追加: {names}"),
@@ -4621,6 +4619,153 @@ fn worker_setting_unused_text(
                 "{key} ({value}) {why}. The default worker ({agent}) starts with {field} \
                  {effective}{source}.{fix}"
             )
+        }
+    }
+}
+
+impl ReplyNote {
+    /// `tako master` の起動の行（と system prompt の Session Identity の行）の worker ポリシー（#2907）。
+    ///
+    /// 値は spawn と同じ 1 実装（`Profile::default_worker_launch` = `plan_worker_launch_typed`）の答え。
+    /// ポリシーの文（「master と同じ」「fixed」）が値を言えるときは #2365 より前からの文のまま、言えない
+    /// とき（上の段が決める・既定の worker が claude 以外）は [`Self::WorkerPolicyResolved`]、spawn が断る
+    /// 状態（未登録のアカウント）は [`Self::WorkerPolicyUnresolved`]（起動は止めない）
+    pub fn worker_policy(profile: &crate::orchestrator::Profile) -> Self {
+        use crate::orchestrator::WorkerModelPolicy as Policy;
+        let policy = profile.worker_model_policy;
+        let worker = match profile.default_worker_launch() {
+            Ok(w) => w,
+            Err(why) => return Self::WorkerPolicyUnresolved { policy, why },
+        };
+        match policy {
+            // delegate は値を出さない（master がタスクごとに決める）
+            Policy::Delegate => Self::WorkerPolicyDelegate,
+            _ if !worker.follows_policy() => Self::WorkerPolicyResolved { policy, worker },
+            Policy::Inherit if profile.master_agent_is_claude() => Self::WorkerPolicyInherit {
+                model: worker.model,
+                effort: worker.effort,
+            },
+            // master が claude 以外なら master の model / effort は claude worker へ継承しない（#127）
+            Policy::Inherit => Self::WorkerPolicyInheritNonClaude {
+                agent: profile
+                    .master_agent
+                    .clone()
+                    .unwrap_or_else(|| "claude".into()),
+                model: worker.model,
+                effort: worker.effort,
+            },
+            Policy::Fixed => Self::WorkerPolicyFixed {
+                model: worker.model,
+                effort: worker.effort,
+            },
+        }
+    }
+
+    /// worker ポリシーの行の本文（見出し「worker モデルポリシー: 」の後ろ。#2907）。
+    /// worker ポリシーの注記でなければ `None`
+    pub fn worker_policy_body_in(&self, lang: Lang) -> Option<String> {
+        use Lang::{En, Ja};
+        Some(match (self, lang) {
+            (Self::WorkerPolicyInherit { model, effort }, Ja) => {
+                format!("inherit（master と同じ {model} / {effort}）")
+            }
+            (Self::WorkerPolicyInherit { model, effort }, En) => {
+                format!("inherit (same as master: {model} / {effort})")
+            }
+            (
+                Self::WorkerPolicyInheritNonClaude {
+                    agent,
+                    model,
+                    effort,
+                },
+                Ja,
+            ) => format!(
+                "inherit（master は {agent} のため claude worker へは非継承: {model} / {effort}）"
+            ),
+            (
+                Self::WorkerPolicyInheritNonClaude {
+                    agent,
+                    model,
+                    effort,
+                },
+                En,
+            ) => format!(
+                "inherit (the master is {agent}, so claude workers do not inherit it: \
+                 {model} / {effort})"
+            ),
+            (Self::WorkerPolicyFixed { model, effort }, Ja) => {
+                format!("fixed（{model} / {effort}）")
+            }
+            (Self::WorkerPolicyFixed { model, effort }, En) => {
+                format!("fixed ({model} / {effort})")
+            }
+            (Self::WorkerPolicyDelegate, Ja) => "delegate（master が判断）".into(),
+            (Self::WorkerPolicyDelegate, En) => "delegate (the master decides)".into(),
+            (Self::WorkerPolicyResolved { policy, worker }, Ja) => format!(
+                "{}（worker の既定: {} / {}{}）",
+                policy.as_str(),
+                worker.model,
+                worker.effort,
+                worker_origin_text(worker, Ja)
+            ),
+            (Self::WorkerPolicyResolved { policy, worker }, En) => format!(
+                "{} (worker defaults: {} / {}{})",
+                policy.as_str(),
+                worker.model,
+                worker.effort,
+                worker_origin_text(worker, En)
+            ),
+            (Self::WorkerPolicyUnresolved { policy, why }, Ja) => format!(
+                "{}（worker の既定を決められない: {}）",
+                policy.as_str(),
+                why.text_in(Ja)
+            ),
+            (Self::WorkerPolicyUnresolved { policy, why }, En) => format!(
+                "{} (cannot resolve the worker defaults: {})",
+                policy.as_str(),
+                why.text_in(En)
+            ),
+            _ => return None,
+        })
+    }
+}
+
+/// [`ReplyNote::WorkerPolicyResolved`] の出どころ（ポリシーの段より上が決めた欄。#2907）。
+/// 2 欄が同じ段なら 1 つにまとめる。どちらもポリシーの段 / CLI の既定なら空
+fn worker_origin_text(worker: &crate::orchestrator::DefaultWorkerLaunch, lang: Lang) -> String {
+    use crate::orchestrator::WorkerValueOrigin as Origin;
+    let origin = |o: &Origin| match (o, lang) {
+        (Origin::Account(name), Lang::Ja) => format!("アカウント {name} の既定"),
+        (Origin::Account(name), Lang::En) => format!("account {name}"),
+        (Origin::AgentConfig(agent), _) => format!("worker_agents.{}", agent.as_str()),
+    };
+    let fields: Vec<(&str, String)> = match (&worker.model_origin, &worker.effort_origin) {
+        (Some(m), Some(e)) if m == e => vec![(
+            match lang {
+                Lang::Ja => "model・effort",
+                Lang::En => "model and effort",
+            },
+            origin(m),
+        )],
+        (m, e) => [("model", m), ("effort", e)]
+            .into_iter()
+            .filter_map(|(field, o)| o.as_ref().map(|o| (field, origin(o))))
+            .collect(),
+    };
+    if fields.is_empty() {
+        return String::new();
+    }
+    match lang {
+        Lang::Ja => {
+            let parts: Vec<String> = fields.iter().map(|(f, o)| format!("{f} は {o}")).collect();
+            format!("。{}", parts.join("、"))
+        }
+        Lang::En => {
+            let parts: Vec<String> = fields
+                .iter()
+                .map(|(f, o)| format!("{f} from {o}"))
+                .collect();
+            format!("; {}", parts.join(", "))
         }
     }
 }

@@ -5722,24 +5722,9 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     if orchestrator::resolve_master_limit_resume(&profile) {
         eprintln!("{}", ReplyNote::LimitResumeOn.text_in(lang));
     }
-    let policy_line = match profile.worker_model_policy {
-        orchestrator::WorkerModelPolicy::Inherit if profile.master_agent_is_claude() => {
-            ReplyNote::WorkerPolicyInherit {
-                model: profile.model_label().to_string(),
-                effort: profile.effort.clone(),
-            }
-        }
-        orchestrator::WorkerModelPolicy::Inherit => ReplyNote::WorkerPolicyInheritNonClaude {
-            agent: master_agent.as_str().to_string(),
-            model: profile.worker_model_label().to_string(),
-            effort: profile.resolve_worker_effort().to_string(),
-        },
-        orchestrator::WorkerModelPolicy::Fixed => ReplyNote::WorkerPolicyFixed {
-            model: profile.worker_model_label().to_string(),
-            effort: profile.resolve_worker_effort().to_string(),
-        },
-        orchestrator::WorkerModelPolicy::Delegate => ReplyNote::WorkerPolicyDelegate,
-    };
+    // #2907: 値は spawn と同じ 1 実装の答え（ポリシーの段だけの値を出すと、worker_agents / アカウントの
+    // 既定が先に効いていても古い値を名乗る）。system prompt の Session Identity の行も同じ本文
+    let policy_line = ReplyNote::worker_policy(&profile);
     eprintln!("{}", policy_line.text_in(lang));
     // Part 4: env の可視化（キー名のみ。Issue #500 / #547）
     print_master_env(&profile, profile_name, lang);

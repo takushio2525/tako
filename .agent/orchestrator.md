@@ -279,8 +279,20 @@ fixed だけ）・既定の worker が codex / agy（claude の語彙を渡さ�
 spawn しないので出さない。番犬は `tests/issue2891_resolved_worker_launch.rs`（MCP の tools/call → dispatch で
 show の resolved と spawn の応答・起動コマンドの `--model` / `--effort` を突き合わせる + ソースの形）。
 
-`tako master` の起動の行（`WorkerPolicy*`）と master の system prompt の「Worker Model Policy」節は、いまも
-ポリシーの段の値（`worker_model_label()` / `resolve_worker_effort()`）を出す（#2891 の範囲外。#2907）。
+**`tako master` の起動の行と master の system prompt の worker の値も同じ 1 実装（#2907）**。既定の worker の
+値は `Profile::default_worker_launch`（`plan_worker_launch_typed(None, None, None, None)` を見せる形にしたもの）
+が 1 か所で出し、prompt の「Worker Model Policy」節の値の行・その下の「Available Worker Agents」の行
+（系統ごとに `spawn --agent <系統>` と同じ解決）・Session Identity の「Worker model policy」行・起動の行
+（`ReplyNote::worker_policy`。Session Identity は同じ本文の日本語）がすべてそれを読む。ポリシーの文
+（「master と同じ」「fixed」）が spawn の値を言えるとき（上の段が無い・既定の worker が claude・inherit なら
+master も claude）は #2907 より前の文とバイト一致のまま。言えないときは頭の 1 行を「model / effort を省いた
+spawn が使う値」へ替え、上の段が決めた欄は同じ行の括弧で出どころ（`worker_agents.<系統>` / アカウント）を
+添える（行は増やさない）。起動の行は `inherit（worker の既定: <model> / <effort>。effort は worker_agents.claude）`
+の形（`ReplyNote::WorkerPolicyResolved`）。spawn が断る状態（未登録のアカウント）は prompt の組み立てと
+起動を止めず、値の代わりに spawn と同じ断りの理由を出す（`ReplyNote::WorkerPolicyUnresolved`）。修正前は 3 か所とも
+ポリシーの段の値で、inherit + `worker_agents.claude.effort: medium` で「Effort: high」と書き、同じ prompt の
+「Available Worker Agents」の「effort medium」と食い違っていた。番犬は
+`tests/issue2907_prompt_worker_policy_values.rs`（prompt / 起動の行と spawn の起動コマンドの突き合わせ + ソースの形）。
 
 ### master のエージェント種別（claude / codex。Issue #127）
 
