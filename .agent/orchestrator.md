@@ -227,7 +227,10 @@ worker_model_policy: inherit
 - **model 未指定（キー自体を書かない）**: `--model` を付けずに claude を起動し、
   claude CLI の既定モデルに委ねる。**これが既定**（どのプランでも確実に起動する）
 - **`[1m]` 付きモデル**: 1M コンテキスト版は Max / API プラン限定。**明示 opt-in のみ**。
-  Pro プランでは master が起動できないため、起動時に警告が出る
+  Pro プランでは master が起動できないため、起動時に警告が出る。worker の警告（`tako master` の起動と
+  `profiles list` / `show` / `set` の `warnings`）は spawn が実際に付ける model（アカウントの
+  `default_model` → `worker_agents.claude.model` → ポリシーの段 = `resolved_worker_model` と同じ値）で
+  判定し、既定の worker が claude のときだけ出す（worker を spawn しない solo のプロファイルには出さない。#2915）
 - **旧バージョンからのマイグレーション**: 0.2.3 以前が default.yaml に書き込んだ
   `model: claude-opus-4-6[1m]`（旧既定値と完全一致の場合のみ）は、`tako master` /
   `tako setup` / spawn 時に自動で除去される（`default.yaml.backup-1m` にバックアップ）。

@@ -1273,6 +1273,9 @@ pub struct DefaultWorkerLaunch {
     pub agent: WorkerAgent,
     /// 表示ラベル（値が無い = その系統の CLI の既定 = `(<agent> CLI default)`）
     pub model: String,
+    /// spawn が起動コマンドへ渡す model の値そのもの（`None` = その系統の CLI の既定に委ねる）。
+    /// 表示ラベルから値を逆算しないための欄（`[1m]` の警告が読む。#2915）
+    pub model_value: Option<String>,
     pub effort: String,
     /// model をポリシーの段より上が決めたとき、その段
     pub model_origin: Option<WorkerValueOrigin>,
@@ -1300,6 +1303,7 @@ impl DefaultWorkerLaunch {
         Self {
             agent: launch.agent,
             model: label(launch.model.as_deref()),
+            model_value: launch.model.clone(),
             effort: label(launch.effort.as_deref()),
             model_origin: origin(launch.model_source),
             effort_origin: origin(launch.effort_source),
@@ -3104,6 +3108,32 @@ pub fn one_m_model_warning_in(
     one_m_model_note(model, source).map(|n| n.text_in(lang))
 }
 
+/// 既定の worker（spawn が agent / model / effort / account を省いて立てたとき）の `[1m]` 警告（#2915）。
+///
+/// `tako master` の起動の警告と [`profile_warnings`]（`profiles list` / `show` / `set` の `warnings`）が
+/// これ 1 つを呼ぶ。model は spawn と同じ 1 実装 [`Profile::default_worker_launch`] の答え。ポリシーの段
+/// だけの [`Profile::resolve_worker_model`] を見ていたので、上の段（アカウントの `default_model`・
+/// `worker_agents.claude.model`）が `[1m]` を決めても黙り、ポリシーの段だけ `[1m]` で spawn は別の
+/// モデルを使うときに鳴っていた（#2915）。
+///
+/// - `[1m]` は claude の語彙なので、既定の worker が claude の語彙を受け取る系統のときだけ見る
+///   （#1013 のマトリクス。codex / agy の model 名には当てない）
+/// - spawn が断る状態（未登録のアカウント）は `[1m]` で起動しないので言わない（断りは
+///   `ProfileAccountUnregistered` と起動の行の `WorkerPolicyUnresolved` が言う。#2907）
+/// - master の警告と同じモデルなら master の分だけ（inherit で同一のとき二重に言わない。#27）
+pub fn worker_one_m_model_note(profile: &Profile) -> Option<crate::ReplyNote> {
+    let worker = profile.default_worker_launch().ok()?;
+    if !inherits_claude_vocabulary_defaults(worker.agent) {
+        return None;
+    }
+    let model = worker.model_value.as_deref()?;
+    let master_warned = profile.master_agent_is_claude() && profile.model.as_deref() == Some(model);
+    if master_warned {
+        return None;
+    }
+    one_m_model_note(model, "worker")
+}
+
 // --- system prompt の組み立て（Issue #1154）---
 //
 // 予算の内訳を「生成とは別に数え直す」実装にすると必ずずれるので、
@@ -3998,8 +4028,9 @@ pub fn decide_adopt(
 ///
 /// projects.yaml / accounts.yaml は**参照があるときだけ**読む（list は全プロファイル
 /// 分呼ばれるので、無条件に読むとプロファイル数ぶんのファイル読み込みが増える）。
-/// 警告は型（[`crate::ReplyNote`]）で返す = 呼び手が表示言語で組む（#2365）
-pub fn profile_warnings(profile: &Profile) -> Vec<crate::ReplyNote> {
+/// 警告は型（[`crate::ReplyNote`]）で返す = 呼び手が表示言語で組む（#2365）。
+/// `kind` は worker の `[1m]` を言うかを決める（solo は worker を spawn しない。#2915）
+pub fn profile_warnings(profile: &Profile, kind: ProfileKind) -> Vec<crate::ReplyNote> {
     let mut warnings = Vec::new();
 
     // [1m] モデル（Max / API プラン限定）。inherit で master と同一なら master 分のみ。
@@ -4012,12 +4043,11 @@ pub fn profile_warnings(profile: &Profile) -> Vec<crate::ReplyNote> {
     {
         warnings.push(w);
     }
-    if let Some(w) = profile
-        .resolve_worker_model()
-        .filter(|m| Some(*m) != profile.model.as_deref())
-        .and_then(|m| one_m_model_note(m, "worker"))
-    {
-        warnings.push(w);
+    // worker は spawn の実際の model（上の段 = アカウントの既定・worker_agents.claude.model を含む。#2915）。
+    // solo は worker を spawn しないので言わない（spawn の解決は master_account の既定まで引くので、
+    // solo に出すと worker の居ない [1m] を名乗る。#2891 の注記と同じ扱い）
+    if kind == ProfileKind::Master {
+        warnings.extend(worker_one_m_model_note(profile));
     }
 
     // 未登録の project キー（master 起動時に明示エラーになる。#500 Part 7）
@@ -8869,13 +8899,16 @@ worker_agents:
     fn 参照整合性の警告が1mモデルを検出する() {
         // projects / accounts を参照しないプロファイルなので設定ファイルを読まない
         let plain = Profile::default();
-        assert!(profile_warnings(&plain).is_empty(), "既定は警告なし");
+        assert!(
+            profile_warnings(&plain, ProfileKind::Master).is_empty(),
+            "既定は警告なし"
+        );
 
         let one_m = Profile {
             model: Some("claude-opus-4-6[1m]".into()),
             ..Default::default()
         };
-        let w = profile_warnings(&one_m);
+        let w = profile_warnings(&one_m, ProfileKind::Master);
         assert_eq!(w.len(), 1, "inherit で同一モデルなら master 分のみ: {w:?}");
         assert!(w[0].text_in(tako_core::i18n::Lang::Ja).contains("master"));
 
@@ -8885,8 +8918,11 @@ worker_agents:
             worker_model: Some("claude-sonnet-5[1m]".into()),
             ..Default::default()
         };
-        let w = profile_warnings(&both);
+        let w = profile_warnings(&both, ProfileKind::Master);
         assert_eq!(w.len(), 1, "worker 側だけ [1m]: {w:?}");
         assert!(w[0].text_in(tako_core::i18n::Lang::Ja).contains("worker"));
+        // solo は worker を spawn しないので worker の [1m] は言わない（#2915）
+        let w = profile_warnings(&both, ProfileKind::Solo);
+        assert!(w.is_empty(), "solo は worker の [1m] を言わない: {w:?}");
     }
 }

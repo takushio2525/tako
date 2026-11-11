@@ -21192,6 +21192,7 @@ fn reply_note_table() -> Vec<(ReplyNote, String)> {
                 worker: tako_control::orchestrator::DefaultWorkerLaunch {
                     agent: tako_control::orchestrator::WorkerAgent::Claude,
                     model: "(claude CLI default)".into(),
+                    model_value: None,
                     effort: "medium".into(),
                     model_origin: None,
                     effort_origin: Some(tako_control::orchestrator::WorkerValueOrigin::AgentConfig(
@@ -21400,6 +21401,11 @@ const NOTE_ITEM_SCOPES: &[(&str, &str, &str)] = &[
     // #2365 の続き: 他モジュールが組む注記（プロファイルの参照・採用の判断・ctx の窓・会話の再開・worker の MCP）
     (ORCH_MOD_PATH, ORCH_MOD_SRC, "pub fn profile_warnings("),
     (ORCH_MOD_PATH, ORCH_MOD_SRC, "pub fn one_m_model_note("),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        "pub fn worker_one_m_model_note(",
+    ),
     (ORCH_MOD_PATH, ORCH_MOD_SRC, "pub fn decide_adopt("),
     (CLAUDE_CTX_PATH, CLAUDE_CTX_SRC, "pub fn window_warning("),
     (
