@@ -80,7 +80,7 @@ fn store_path_or_refuse() -> Result<PathBuf, String> {
 /// 置き場の版（#2031）。前回と同じなら中身も同じとみなし、読み直さない。
 ///
 /// 書き込みは一時ファイルからの rename（`config_io::atomic_write`）なので、同じ時刻の
-/// 書き直しでも inode が変わる（unix）。不在は `None`（作られた・消えたも差分になる）
+/// 書き直しでも inode（Windows はファイル ID = #2921）が変わる。不在は `None`（作られた・消えたも差分になる）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreStamp {
     len: u64,
@@ -92,8 +92,9 @@ pub struct StoreStamp {
 /// 新しい版のまま古い中身で覚え、次の変更まで取り逃がす）
 pub fn store_stamp(path: &Path) -> Option<StoreStamp> {
     let meta = std::fs::metadata(path).ok().filter(|m| m.is_file())?;
-    // 境界 B37 の同一性。Windows（`None`）は 0 = 比べると常に等しい = inode を比較に使わない
-    let ino = tako_core::platform::fs_meta::identity(&meta).map_or(0, |id| id.ino);
+    // 境界 B37 の同一性（Windows はファイル ID = #2921）。取れない（`None`）は 0 =
+    // 比べると常に等しい = inode を比較に使わない
+    let ino = tako_core::platform::fs_meta::identity(path, &meta).map_or(0, |id| id.ino);
     Some(StoreStamp {
         len: meta.len(),
         modified: meta.modified().ok(),
