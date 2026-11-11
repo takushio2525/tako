@@ -32959,7 +32959,13 @@ mod tests {
 
     /// **最初のプロンプトを出したシェル**（OSC 133;A を受けた）への送信は、作りたての経過が
     /// 上限の内でも修正前とバイト一致で即時に書く（待ちが入らない = 応答が `null`・送達フローを
-    /// 積まない）。書いたバイトは端末を raw にした `cat` がそのままファイルへ落とす
+    /// 積まない）。書いたバイトは端末を raw にした `cat` がそのままファイルへ落とす。
+    ///
+    /// 印は `stty raw -echo` の**後**に出す（#2920）。先に出すと、印を待って抜けた送信が raw に
+    /// なる前の端末へ届く回に ICRNL が `\r` を `\n` に変え、製品の差ではなくテストの窓で比較が
+    /// 崩れる（CI の macOS で間欠的に落ちた）。raw にした後に届いた入力は `cat` が起きるまで
+    /// 端末の入力キューに raw のまま残るので、待ちの意味（プロンプトを出したシェル）は変わらない。
+    /// 番犬は `tests/issue2920_ready_mark_before_stty_watchdog.rs`
     #[cfg(unix)]
     #[test]
     fn issue2826_プロンプトを出したシェルへは修正前とバイト一致で即時に書く() {
@@ -32977,7 +32983,7 @@ mod tests {
             let pane = host.root_pane();
             let file = dir.path().join(format!("got-{legacy}"));
             let script = format!(
-                "printf '\\033]133;A\\007'; stty raw -echo; exec cat > '{}'",
+                "stty raw -echo; printf '\\033]133;A\\007'; exec cat > '{}'",
                 file.display()
             );
             i2826_shell_pane(&mut host, pane, &script, |s| s.shell_marks().prompts >= 1);
