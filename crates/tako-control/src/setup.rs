@@ -157,9 +157,11 @@ pub struct SetupAnswers {
     pub projects: Option<BTreeMap<String, crate::orchestrator::ProjectEntry>>,
     pub orchestrator: Option<SetupOrchestratorAnswers>,
     pub sleep_guard: Option<SetupSleepGuardAnswers>,
-    /// setup 完了後に起動するエージェント CLI（Issue #295）。
-    /// "claude" / "codex" / "agy" = その場で対話起動、"none" = 起動しない。
-    /// 省略時は TTY があれば対話で選択、なければ "none"
+    /// setup の最後の対話のアシスタント（Issue #295。#391 で起動の選択を外し、#2902 で説明を挙動へ合わせた）。
+    /// **`--answers` の実行は `--yes` と同じ非対話なので、値によらず対話のアシスタントは開かない**
+    /// （MCP `tako_setup` も子を `--yes --answers -` で端末なしに起こす）。開くのは端末の素の
+    /// `tako setup` だけで、系統は `selected_agent` の解決結果（この欄で選ぶ口は無い）。
+    /// 受け付ける値は "claude" / "codex" / "agy" / "none"（互換のため。読むのは "none" の判定 1 か所だけ）
     pub launch_agent: Option<String>,
     /// AI 系設定の git 共有（Issue #513）。**オプション**なので省略時は何もしない
     /// （標準 setup の質問ゼロ原則 #262 を守る）。明示指定か `--review` でだけ配線する

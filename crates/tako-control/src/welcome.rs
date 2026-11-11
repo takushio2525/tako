@@ -342,7 +342,8 @@ pub fn startup_action(flow: Flow, setup_completed: bool) -> Startup {
 ///
 /// - `install: false` = エージェント CLI の公式インストーラも brew / winget の依存導入も
 ///   **走らせない**（同意なしにネットワークのスクリプトを実行しない。導入はボタンの同意で行う）
-/// - `launch_agent: none` = 対話アシスタントを起こさない（GUI の裏で走るので端末が無い）
+/// - `launch_agent: none` = 対話アシスタントを起こさない意図の明示（`--yes --answers -` で GUI の裏で
+///   走り端末も無いので、値によらず開かない。#2902）
 ///
 /// 走るのは PATH（tako CLI・導入済みのエージェント CLI）・シェル統合・MCP の登録・
 /// 指示ファイル（無ければ作る）・プロファイル・テンプレ・データの移行で、どれも冪等
