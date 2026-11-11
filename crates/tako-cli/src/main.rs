@@ -5631,17 +5631,23 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     orchestrator::agent_cli::preflight(master_agent).map_err(|e| e.message_in(lang))?;
 
     if profile.master_agent_is_claude() {
+        // 解除の案内はこのプロファイルの model（#2918。プロファイル名を入れて、そのまま打てる形）
+        let clear = orchestrator::OneMClear::Model {
+            profile: profile_name.to_string(),
+            kind: orchestrator::ProfileKind::Master,
+        };
         if let Some(warning) = profile
             .model
             .as_deref()
-            .and_then(|m| orchestrator::one_m_model_warning_in(m, "master", lang))
+            .and_then(|m| orchestrator::one_m_model_warning_in(m, "master", clear, lang))
         {
             eprintln!("{warning}");
         }
     }
     // #2915: worker は spawn の実際の model（`profiles show` の warnings と同じ 1 実装）。
-    // アカウントの解決が失敗する状態でも起動は止めない（言わないだけ。理由は起動の行が言う = #2907）
-    if let Some(warning) = orchestrator::worker_one_m_model_note(&profile) {
+    // アカウントの解決が失敗する状態でも起動は止めない（言わないだけ。理由は起動の行が言う = #2907）。
+    // 解除の案内は model を決めた段から組む（#2918）
+    if let Some(warning) = orchestrator::worker_one_m_model_note(&profile, profile_name) {
         eprintln!("{}", warning.text_in(lang));
     }
 
@@ -5863,10 +5869,15 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     orchestrator::agent_cli::preflight(solo_agent).map_err(|e| e.message_in(lang))?;
 
     if profile.master_agent_is_claude() {
+        // 解除は solo のプロファイルの model（`--solo` が無いと同名の master のプロファイルを触る。#2918）
+        let clear = orchestrator::OneMClear::Model {
+            profile: profile_name.to_string(),
+            kind: orchestrator::ProfileKind::Solo,
+        };
         if let Some(warning) = profile
             .model
             .as_deref()
-            .and_then(|m| orchestrator::one_m_model_warning_in(m, "solo", lang))
+            .and_then(|m| orchestrator::one_m_model_warning_in(m, "solo", clear, lang))
         {
             eprintln!("{warning}");
         }

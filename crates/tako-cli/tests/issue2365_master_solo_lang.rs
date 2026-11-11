@@ -179,7 +179,8 @@ fn cases() -> Vec<Case> {
                 solo: false,
                 key: "onem",
             },
-            "[警告] master のモデル 'claude-opus-4-6[1m]' は 1M コンテキスト版のため、Pro プランでは起動できない可能性があります（Max / API プラン向け）。\n  起動に失敗する場合は `tako orchestrator profiles set <プロファイル名> --clear-model` で解除してください",
+            // 解除の案内は #2918 でプロファイル名入りのそのまま打てる形になった（旧 `<プロファイル名>`）
+            "[警告] master のモデル 'claude-opus-4-6[1m]' は 1M コンテキスト版のため、Pro プランでは起動できない可能性があります（Max / API プラン向け）。\n  起動に失敗する場合は `tako orchestrator profiles set onem --clear-model` で解除してください",
         ),
         case(
             "solo_one_m_model",
@@ -188,7 +189,8 @@ fn cases() -> Vec<Case> {
                 solo: true,
                 key: "onem",
             },
-            "[警告] solo のモデル 'claude-opus-4-6[1m]' は 1M コンテキスト版のため",
+            // solo のプロファイルは `--solo` で指す（#2918）
+            "[警告] solo のモデル 'claude-opus-4-6[1m]' は 1M コンテキスト版のため、Pro プランでは起動できない可能性があります（Max / API プラン向け）。\n  起動に失敗する場合は `tako orchestrator profiles set onem --solo --clear-model` で解除してください",
         ),
         case(
             "master_mcp_path_gone",

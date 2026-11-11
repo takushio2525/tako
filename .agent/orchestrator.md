@@ -231,6 +231,14 @@ worker_model_policy: inherit
   `profiles list` / `show` / `set` の `warnings`）は spawn が実際に付ける model（アカウントの
   `default_model` → `worker_agents.claude.model` → ポリシーの段 = `resolved_worker_model` と同じ値）で
   判定し、既定の worker が claude のときだけ出す（worker を spawn しない solo のプロファイルには出さない。#2915）
+- **`[1m]` 警告の解除の案内はモデルを決めた段から組む**（#2918。型 `orchestrator::OneMClear`・コマンドは
+  `OneMClear::command` の 1 か所）。プロファイル名入りのそのまま打てる形で、段ごとに効く解除が違う:
+  master / solo の `model` → `profiles set <名前> --clear-model`（solo は `--solo` 付き。無いと同名の
+  master のプロファイルを触る）・ポリシーの段（fixed の `worker_model`）→ `--clear-worker-model`・
+  `worker_agents.claude.model` → `--agent claude --clear-agent-model`・アカウントの `default_model` →
+  `accounts add <アカウント>` で `default_model` だけを落として登録し直す（`accounts add` は丸ごと置き換えるので
+  config_dir / inherit / description / default_effort は書いてあるまま付け直す。アカウントは全プロファイルで共有と添える）。
+  #2918 より前は出どころに関係なく `--clear-model` だったので、worker の `[1m]` は打っても消えなかった
 - **旧バージョンからのマイグレーション**: 0.2.3 以前が default.yaml に書き込んだ
   `model: claude-opus-4-6[1m]`（旧既定値と完全一致の場合のみ）は、`tako master` /
   `tako setup` / spawn 時に自動で除去される（`default.yaml.backup-1m` にバックアップ）。
