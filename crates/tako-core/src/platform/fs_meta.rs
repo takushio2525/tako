@@ -93,7 +93,8 @@ pub fn change_time_secs(path: &Path, m: &std::fs::Metadata) -> Option<i64> {
 /// NTFS は 64 ビットのファイル参照番号を上位 0 で広げたもの = 下位 64 ビットをそのまま返す
 /// （`GetFileInformationByHandle` の `nFileIndexHigh:Low` と同じ値）。ReFS の上位が 0 でない ID は
 /// 上位を混ぜて畳む（同じパスの前後の 2 つを比べるだけなので、畳んだ値が偶然一致する確率は無視できる）
-#[cfg(any(windows, test))]
+// Windows の腕だけが使う純関数。全 OS でテストできるよう cfg で外さない
+#[cfg_attr(not(windows), allow(dead_code))]
 fn fold_file_id(id: [u8; 16]) -> u64 {
     let mut low = [0u8; 8];
     let mut high = [0u8; 8];
@@ -109,7 +110,8 @@ fn fold_file_id(id: [u8; 16]) -> u64 {
 
 /// Windows の時刻（1601-01-01 からの 100 ns 単位）を unix epoch 秒へ（unix の `st_ctime` と同じく切り捨て）。
 /// 0 以下は「記録が無い」（ChangeTime を持たないファイルシステムは 0 を返す）= `None`
-#[cfg(any(windows, test))]
+// Windows の腕だけが使う純関数。全 OS でテストできるよう cfg で外さない
+#[cfg_attr(not(windows), allow(dead_code))]
 fn filetime_to_unix_secs(filetime: i64) -> Option<i64> {
     /// 1601-01-01 から 1970-01-01 までの 100 ns の数
     const UNIX_EPOCH_AS_FILETIME: i64 = 116_444_736_000_000_000;
@@ -895,7 +897,9 @@ mod tests {
             std::fs::write(&path, "old").unwrap();
             // フォルダ「だけ」にファイルの追加（WD）を拒む ACE を足す（継承しない = a.txt には書ける）
             let icacls = |args: &[&str]| {
-                let out = std::process::Command::new("icacls")
+                let mut command = std::process::Command::new("icacls");
+                crate::platform::process::no_console_window(&mut command);
+                let out = command
                     .arg(dir.path())
                     .args(args)
                     .output()
