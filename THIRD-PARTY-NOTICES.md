@@ -320,9 +320,16 @@ This software is provided by the copyright holders and contributors “as is” 
 
 ### Geist / Geist Mono（フォント / fonts）
 
-- バージョン / Version: npm パッケージ `geist` **1.7.2** 同梱の可変フォント
+- バージョン / Version: npm パッケージ `geist` **1.7.2** 同梱の可変フォント（フォントの
+  ファイルだけを取り出して同梱している。`geist` は Next.js 用のフォントローダーで `next` を
+  peer に要求するので、PWA の npm 依存には入れない = #2930 / only the font files are vendored;
+  the package is a Next.js font loader that requires `next` as a peer, so it is not an npm
+  dependency of the PWA）
 - 同梱物 / Bundled files: `web/tako-remote/public/fonts/Geist-Variable.woff2`、
   `web/tako-remote/public/fonts/GeistMono-Variable.woff2`（パッケージ同梱のものとバイト一致）
+- 更新 / Updating: `npm pack geist@<版>` で取った包みの `dist/fonts/geist-sans/Geist-Variable.woff2` と
+  `dist/fonts/geist-mono/GeistMono-Variable.woff2` を上の 2 つへ写し、この節の版を書き換える /
+  copy those two files from the `npm pack geist@<version>` tarball and update the version above
 - 上流 / Upstream: https://github.com/vercel/geist-font
 - ライセンス / License: SIL Open Font License 1.1（フォントのメタデータにも著作権表示と
   ライセンス名が入っている）
