@@ -51,21 +51,6 @@ fn dispatch_source() -> String {
     code_view::without_comments_checked(&text, rel)
 }
 
-/// `Request::<variant>` のブロックを切り出す（他の variant のアームを誤って拾わない）
-fn request_block(source: &str, variant: &str) -> String {
-    let needle = format!("Request::{variant} {{");
-    let start = source
-        .find(&needle)
-        .unwrap_or_else(|| panic!("dispatch に Request::{variant} が無い"));
-    let rest = &source[start..];
-    // 次の `Request::` まで（= このアームの範囲）
-    let end = rest[needle.len()..]
-        .find("\n        Request::")
-        .map(|i| i + needle.len())
-        .unwrap_or(rest.len());
-    rest[..end].to_string()
-}
-
 /// `fn <name>(` の本体（次の行頭の `}` まで）を切り出す
 fn fn_block(source: &str, name: &str) -> String {
     let needle = format!("fn {name}(");
@@ -77,13 +62,14 @@ fn fn_block(source: &str, name: &str) -> String {
     rest[..end].to_string()
 }
 
-/// ツールごとの action のアームの置き場。SetupDeps は同期の腕と background の腕
-/// （`OffloadJob::SetupDeps`）が通る 1 関数 `setup_deps_reply` に置く（#2433）
+/// ツールごとの action のアームの置き場。SetupDeps / SetupBootstrap は同期の腕と background の腕
+/// （`OffloadJob::SetupDeps` / `OffloadJob::SetupBootstrap`）が通る 1 関数
+/// `setup_deps_reply`（#2433）/ `setup_bootstrap_reply`（#2956）に置く
 fn action_blocks(source: &str) -> [(&'static str, String); 2] {
     [
         (
             "tako_setup_bootstrap",
-            request_block(source, "SetupBootstrap"),
+            fn_block(source, "setup_bootstrap_reply"),
         ),
         ("tako_setup_deps", fn_block(source, "setup_deps_reply")),
     ]

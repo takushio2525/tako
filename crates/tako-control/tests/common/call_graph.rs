@@ -509,6 +509,25 @@ impl Graph {
         out
     }
 
+    /// 関数 `f` の生きた範囲のうち、バイト位置 `[from, to)` の中で呼ぶ関数と、その呼び出しの行
+    /// （解決できたものだけ。`(行き先, 行)`）。巨大な `match` の 1 つの腕だけを入口にしたい番犬が使う
+    /// （#2956: `dispatch_inner` の腕ごとに、UI スレッドの同期の腕から届く先を辿る）
+    pub fn callees_in(&self, f: usize, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let src = &self.sources[self.fns[f].file];
+        let mut out: Vec<(usize, usize)> = self
+            .calls(f)
+            .iter()
+            .filter(|c| c.at >= from && c.at < to)
+            .flat_map(|c| {
+                let line = src.line_of(c.at);
+                self.resolve(f, c).into_iter().map(move |g| (g, line))
+            })
+            .collect();
+        out.sort();
+        out.dedup_by_key(|(g, _)| *g);
+        out
+    }
+
     /// 呼び出しの行き先（確かに当たる形だけ。[`CallForm::Method`] は辿らない）
     fn resolve(&self, caller: usize, call: &Call) -> Vec<usize> {
         let def = &self.fns[caller];

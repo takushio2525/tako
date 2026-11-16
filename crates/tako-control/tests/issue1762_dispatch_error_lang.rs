@@ -13234,10 +13234,15 @@ fn setup_dispatch_lines() -> Vec<(usize, &'static str)> {
             out.push((line, code));
         }
     }
+    // 分岐の外へ出した応答の 1 実装（同期の腕と background のジョブが通る）も範囲に入れる
+    // （#2433 の `setup_deps_reply`・#2956 の `setup_bootstrap_reply` / `setup_models_reply`）
     for head in [
         "pub fn setup_mcp_typed(",
         "pub fn setup_mcp_agents(",
         "fn run_setup_cli_within(",
+        "fn setup_deps_reply(",
+        "fn setup_bootstrap_reply(",
+        "fn setup_models_reply(",
     ] {
         out.extend(front_scope_lines(DISPATCH_SRC, Some(head)).unwrap_or_default());
     }

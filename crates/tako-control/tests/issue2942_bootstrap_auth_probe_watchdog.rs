@@ -366,14 +366,15 @@ fn 利用者の口は上限つきの認証確認を通る() {
          通っていない（#2942。打ち切った子の孫が残る）"
     );
 
-    // MCP の口: dispatch の `SetupBootstrap` の腕が上の 2 つの入口を呼ぶ（入口の一覧の前提）
+    // MCP の口: dispatch の `SetupBootstrap` の応答（同期の腕と background のジョブが通る 1 実装
+    // `setup_bootstrap_reply` = #2956）が上の 2 つの入口を呼ぶ（入口の一覧の前提）
     let dispatch = read(DISPATCH);
     let arm_at = dispatch
-        .find("Request::SetupBootstrap {")
-        .expect("dispatch に `Request::SetupBootstrap {` の腕がある");
+        .find("fn setup_bootstrap_reply(")
+        .expect("dispatch に `fn setup_bootstrap_reply(` がある（#2956）");
     let arm: String = dispatch[arm_at..]
         .lines()
-        .take(40)
+        .take(70)
         .collect::<Vec<_>>()
         .join("\n");
     for needle in [
