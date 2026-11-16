@@ -23,6 +23,9 @@
          setup の 2 回目（足し直す・冪等）
       5. `tako setup-mcp`（登録済み = そのまま / 登録先が消えた = 付け替え）
       6. 境界: 未ログインでも setup は完走する（#1501）/ 不正な answers は書く前に断る
+      7. 検証プロセス（TAKO_ISOLATED=1 + 砂場の data dir）の setup・`bootstrap path` / `undo-path`・
+         `setup undo` はユーザー環境変数 Path を変えず、書かなかったことを言う（#2959）。同じバイナリの
+         旧アーム（TAKO_2959_LEGACY=1）は書き足す = 修正前の不具合の再現（A/B）
 
     隔離: USERPROFILE / APPDATA / LOCALAPPDATA / TEMP をランナーの一時 dir の砂場へ向け、HOME と
     TAKO_* / CLAUDE_CONFIG_DIR を外す（データの置き場は既定の解決 = %APPDATA%\tako を通す）。
@@ -565,6 +568,68 @@ try {
     Assert-Contains $r 'bogus' '不正な answers' '断りの文が不正な値を名指す'
     $profilesAfter = @(Get-ChildItem -LiteralPath $DataDir -Recurse -File | ForEach-Object { "$($_.FullName)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" })
     Assert-That ((Compare-Object $profilesBefore $profilesAfter | Measure-Object).Count -eq 0) '不正な answers で断ったのにデータの置き場のファイルが変わった（書く前に断る）'
+
+    # --- 7. 検証プロセスは Path に触らない（#2959）-----------------------------------------
+    # 隔離の起動（TAKO_ISOLATED=1 + 砂場の data dir）の setup は、ユーザー環境変数 Path（アカウント全体の
+    # レジストリ = HOME を向け直しても砂場に閉じない）を読みも書きもせず、理由と通す対象の置き場を言う。
+    # 同じバイナリの旧アーム（TAKO_2959_LEGACY=1）は書き足す = 修正前の不具合がここで再現する
+    $script:Stage = '7. 検証プロセスは Path に触らない（#2959）'
+    Write-Host "-- $script:Stage"
+    $null = Invoke-UndoPath '#2959 の前の undo-path'
+    Assert-UserPathRestored '#2959 の前の undo-path'
+    $Iso = @{
+        TAKO_ISOLATED      = '1'
+        TAKO_DATA_DIR      = (Join-Path $Root 'iso-data')
+        TAKO_DISCOVERY_DIR = (Join-Path $Root 'iso-disc')
+    }
+    $IsoLegacy = $Iso.Clone()
+    $IsoLegacy['TAKO_2959_LEGACY'] = '1'
+    $raw0 = (Get-TakoUserPath).Raw
+
+    $r = Invoke-Tako @('setup', '--yes', '--answers', '-') $AutoSetupAnswers $Iso
+    Assert-Exit0 $r '検証プロセスの setup'
+    Assert-Contains $r '[スキップ] tako CLI の PATH: 検証用の起動' '検証プロセスの setup' 'tako CLI の段は Path に書かなかったと言う'
+    Assert-Contains $r '[スキップ] 検証用の起動' '検証プロセスの setup' 'PATH の段（[2/3]）も書かなかったと言う'
+    Assert-That ((Get-TakoUserPath).Raw -eq $raw0) "検証プロセスの setup がユーザー環境変数 Path を書き換えた（#2959）。いまの値: $((Get-TakoUserPath).Raw)"
+    Assert-NoAgentLaunch
+
+    $r = Invoke-Tako @('setup', 'bootstrap', 'path', '--json') -ExtraEnv $Iso
+    Assert-Exit0 $r '検証プロセスの bootstrap path'
+    $j = ConvertFrom-TakoJson $r '検証プロセスの bootstrap path'
+    Assert-That ($j.change -eq 'skipped' -and $j.skipped -eq 'verification_process' -and -not $j.wrote) `
+        "検証プロセスの bootstrap path が飛ばさない: change=$($j.change) skipped=$($j.skipped) wrote=$($j.wrote)"
+    Assert-That ([string]$j.note).Contains('#2959') "検証プロセスの bootstrap path の note が理由を言わない: $($j.note)"
+    Assert-That (@($j.dirs | Where-Object { (ConvertTo-TakoPathKey $_) -eq (ConvertTo-TakoPathKey $ClaudeBin) }).Count -eq 1) `
+        "検証プロセスの bootstrap path が通す対象の置き場に claude の置き場を並べない: $(@($j.dirs) -join ' / ')"
+    Assert-That ((Get-TakoUserPath).Raw -eq $raw0) '検証プロセスの bootstrap path がユーザー環境変数 Path を書き換えた（#2959）'
+
+    # 外す側: 本番の path で足した後、検証プロセスの undo-path / setup undo は外さない（読みもしない）
+    $r = Invoke-Tako @('setup', 'bootstrap', 'path', '--json')
+    Assert-Exit0 $r '本番の bootstrap path（#2959 の外す側の前提）'
+    Assert-UserPathHas $ClaudeBin '本番の bootstrap path は今までどおり足す'
+    $raw1 = (Get-TakoUserPath).Raw
+    $r = Invoke-Tako @('setup', 'bootstrap', 'undo-path', '--json') -ExtraEnv $Iso
+    Assert-Exit0 $r '検証プロセスの undo-path'
+    $j = ConvertFrom-TakoJson $r '検証プロセスの undo-path'
+    Assert-That ($j.change -eq 'skipped' -and @($j.removed_dirs).Count -eq 0) "検証プロセスの undo-path が飛ばさない: change=$($j.change)"
+    Assert-That ((Get-TakoUserPath).Raw -eq $raw1) '検証プロセスの undo-path がユーザー環境変数 Path を書き換えた（#2959）'
+    $r = Invoke-Tako @('setup', 'undo', '--dry-run', '--json') -ExtraEnv $Iso
+    Assert-Exit0 $r '検証プロセスの setup undo'
+    $j = ConvertFrom-TakoJson $r '検証プロセスの setup undo'
+    $up = @($j.items | Where-Object { $_.kind -eq 'user_path' })
+    Assert-That ($up.Count -eq 1 -and $up[0].reason.code -eq 'verification_registry') `
+        "検証プロセスの setup undo が Path の項目を verification_registry で知らせない: $(@($up | ForEach-Object { $_.outcome }) -join ' / ')"
+    Assert-That ((Get-TakoUserPath).Raw -eq $raw1) '検証プロセスの setup undo がユーザー環境変数 Path を書き換えた（#2959）'
+    $null = Invoke-UndoPath '#2959 の外す側の後の undo-path'
+    Assert-UserPathRestored '#2959 の外す側の後の undo-path'
+
+    # A/B: 同じバイナリの旧アームは検証プロセスでも本物の Path へ書き足す（修正前の不具合の再現）
+    $r = Invoke-Tako @('setup', 'bootstrap', 'path', '--json') -ExtraEnv $IsoLegacy
+    Assert-Exit0 $r '旧アームの検証プロセスの bootstrap path'
+    Assert-UserPathHas $ClaudeBin '旧アーム（TAKO_2959_LEGACY=1）は修正前と同じく検証プロセスでも書き足す（A/B の前提）'
+    Write-Host '   A/B: 修正後は Path を変えない・旧アームは砂場の .local\bin を書き足す'
+    $null = Invoke-UndoPath '#2959 の A/B の後の undo-path'
+    Assert-UserPathRestored '#2959 の A/B の後の undo-path'
 
     # --- 砂場の外へ書いていない ----------------------------------------------------
     $script:Stage = '隔離'

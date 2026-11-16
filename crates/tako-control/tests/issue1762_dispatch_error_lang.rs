@@ -11976,10 +11976,11 @@ fn user_path_index(e: &UserPathError) -> usize {
         UserPathError::Spawn { .. } => 1,
         UserPathError::Failed { .. } => 2,
         UserPathError::BadOutput { .. } => 3,
+        UserPathError::VerificationProcess => 4,
     }
 }
 
-const USER_PATH_VARIANTS: usize = 4;
+const USER_PATH_VARIANTS: usize = 5;
 
 /// `AgentMcpError` の通し番号
 fn agent_mcp_index(e: &AgentMcpError) -> usize {
@@ -12575,6 +12576,13 @@ fn user_path_table() -> Vec<(UserPathError, String)> {
                 "ユーザー PATH の読み出し結果を解釈できません: {:?}",
                 "TAKO_KIND=ExpandString"
             ),
+        ),
+        // #2959 で足した断り（#2365 より後に生まれたので、旧い固定文は今の日本語の文そのもの）
+        (
+            UserPathError::VerificationProcess,
+            "検証用の起動（TAKO_ISOLATED・セルフテスト・テスト）なので、利用者全体のレジストリの\
+             ユーザー環境変数 Path へは書きません（#2959）"
+                .into(),
         ),
     ]
 }

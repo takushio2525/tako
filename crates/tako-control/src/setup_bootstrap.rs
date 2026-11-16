@@ -1748,6 +1748,10 @@ pub fn run_tako_cli_path_stage() -> String {
     }
     let before = tako_cli_path_json();
     match ensure_tako_cli_path_inner() {
+        // #2959: 検証プロセスはユーザー環境変数 Path に触っていない（「設置しました」と言わない）
+        Ok(value) if !value["path"]["skipped"].is_null() => {
+            tako_cli_stage_skipped_line(&value["path"], tako_core::i18n::lang())
+        }
         Ok(value) => {
             let after = &value["tako_cli"];
             let dir = after["dir_display"].as_str().unwrap_or("?");
@@ -1796,6 +1800,29 @@ pub fn run_tako_cli_path_stage() -> String {
             e.into_ja()
         ),
     }
+}
+
+/// tako CLI の段で検証プロセスがユーザー環境変数 Path を飛ばしたときの行（**純粋関数**。#2959）。
+/// `path` は [`ensure_user_path_dirs`] の応答（`note` が [`UserPathSkipText::Add`] の全文）。
+/// 1 行目に段の名前と印、2 行目から後は段の行の字下げ（9 桁）にそろえる
+fn tako_cli_stage_skipped_line(path: &Value, lang: tako_core::i18n::Lang) -> String {
+    use tako_core::i18n::Lang::{En, Ja};
+    let fallback = UserPathSkipText::Add { dirs: Vec::new() }.text_in(lang);
+    let note = path["note"].as_str().unwrap_or(&fallback);
+    let head = match lang {
+        Ja => "tako CLI の PATH",
+        En => "tako CLI on PATH",
+    };
+    let mut lines = note.lines();
+    let mut out = format!(
+        "  {} {head}: {}",
+        UserPathSkipText::tag_in(lang),
+        lines.next().unwrap_or_default()
+    );
+    for line in lines {
+        out.push_str(&format!("\n         {line}"));
+    }
+    out
 }
 
 /// `tako setup --check` の 1 行（#1502）。**判定は [`tako_cli_path_json`] の 1 実装**。
@@ -2171,7 +2198,7 @@ fn ensure_user_path(
     let dirs = user_path_dirs(home, tako, UserPathOp::Path(agent));
     let path = ensure_user_path_dirs(&dirs)?;
     let verified = path["verified"].as_bool().unwrap_or(false);
-    Ok(json!({
+    let mut value = json!({
         "agent": agent.as_str(),
         "shell": path["shell"],
         // 書き先は「ファイル」ではないので、人へはレジストリのキーを見せる
@@ -2187,7 +2214,14 @@ fn ensure_user_path(
         "tako_cli_link_change": link_change.as_str(),
         "tako_cli": tako_cli_path_json(),
         "note": user_path_note(agent, verified, user_path::rereads_for_new_panes()),
-    }))
+    });
+    // #2959: 検証プロセスは書いていない。注記は「書かなかった」知らせに差し替える
+    // （本番の応答は欄も値も #2959 前のまま）
+    if !path["skipped"].is_null() {
+        value["skipped"] = path["skipped"].clone();
+        value["note"] = path["note"].clone();
+    }
+    Ok(value)
 }
 
 /// Windows の PATH 段の注記（**純粋関数**。読み直すかを引数で受ける）。
@@ -2215,21 +2249,61 @@ fn user_path_note(agent: AgentKind, verified: bool, rereads: bool) -> String {
 /// ユーザー環境変数 `Path` へ `dirs` を**1 エントリずつ末尾追記**する（境界 B23）。
 ///
 /// unix と違いマーカーが無いので「ブロックごと書き直す」ができず、
-/// エントリ単位の追記になる。既に在るものは触らない（冪等）
+/// エントリ単位の追記になる。既に在るものは触らない（冪等）。
+/// **検証プロセスは本物のレジストリを読みも書きもしない**（#2959。門は [`user_path::skip_for_verification`]）
 fn ensure_user_path_dirs(dirs: &[PathBuf]) -> Result<Value, SetupRefusal> {
     let process_path = std::env::var("PATH").unwrap_or_default();
+    ensure_user_path_dirs_with(
+        dirs,
+        &process_path,
+        user_path::skip_for_verification(),
+        &user_path::Registry,
+        tako_core::i18n::lang(),
+    )
+}
+
+/// [`ensure_user_path_dirs`] の中身（読み書きの口・門の答え・表示言語を引数で受ける。#2959）。
+///
+/// `skip` なら `store` には**一度も触らず**、通す対象の置き場と理由（[`UserPathSkipText::Add`]）を返す。
+/// `skip` でないときの読み書きと応答は #2959 前とバイト単位で同じ（単体テストで縛る）
+fn ensure_user_path_dirs_with(
+    dirs: &[PathBuf],
+    process_path: &str,
+    skip: bool,
+    store: &dyn user_path::Store,
+    lang: tako_core::i18n::Lang,
+) -> Result<Value, SetupRefusal> {
+    if skip {
+        let process_has = dirs
+            .iter()
+            .all(|entry| user_path::contains_entry(process_path, entry));
+        let dirs_display: Vec<String> = dirs.iter().map(|d| display_path(d)).collect();
+        return Ok(json!({
+            "shell": "windows-user-path",
+            "profile": "HKCU\\Environment\\Path",
+            "profile_display": "ユーザー環境変数 Path",
+            "dirs": dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>(),
+            "dirs_display": dirs_display,
+            "change": USER_PATH_SKIPPED,
+            "wrote": false,
+            // このプロセスの PATH に全部あれば、このタブからは引ける（新しいタブは確かめていない）
+            "verified": process_has,
+            "skipped": USER_PATH_SKIP_REASON,
+            "note": UserPathSkipText::Add { dirs: dirs_display.clone() }.text_in(lang),
+        }));
+    }
     let mut change = PathChange::AlreadyOnPath;
     let mut process_has = true;
     for entry in dirs {
-        process_has &= user_path::contains_entry(&process_path, entry);
-        let current = user_path::read_typed()?;
+        process_has &= user_path::contains_entry(process_path, entry);
+        let current = store.read()?;
         // レジストリに既に在る = 新しいターミナルからは引ける
         if let Some(next) = user_path::append_entry(&current.raw, entry) {
-            user_path::write_typed(&user_path::UserPathValue {
+            store.write(&user_path::UserPathValue {
                 raw: next,
                 kind: current.kind.clone(),
             })?;
-            let after = user_path::read_typed()?;
+            let after = store.read()?;
             if !user_path::contains_entry(&after.raw, entry) {
                 return Err(SetupRefusal::UserPathNotReflected {
                     dir: display_path(entry),
@@ -2314,6 +2388,8 @@ pub fn undo_path_for_typed(agent: AgentKind) -> Result<Value, SetupRefusal> {
 /// （path は入っている系統の置き場も足し直す = undo-path の逆。#2775）
 /// この非対称は受け入れる。目印のための状態ファイルは作らない
 /// （#513 の共有カタログへ分類が要るものを、可逆な 1 操作のために増やさない）
+///
+/// **検証プロセスは本物のレジストリを読みも書きもしない**（#2959。足す側と同じ門）
 fn undo_user_path(
     agent: AgentKind,
     home: &Path,
@@ -2321,11 +2397,49 @@ fn undo_user_path(
     link_change: tako_cli_path::LinkChange,
 ) -> Result<Value, SetupRefusal> {
     let dirs = user_path_dirs(home, tako, UserPathOp::Undo(agent));
+    undo_user_path_dirs_with(
+        agent,
+        &dirs,
+        link_change,
+        user_path::skip_for_verification(),
+        &user_path::Registry,
+        tako_core::i18n::lang(),
+    )
+}
+
+/// [`undo_user_path`] の中身（読み書きの口・門の答え・表示言語を引数で受ける。#2959）。
+///
+/// `skip` なら `store` には**一度も触らず**、外す対象の置き場と理由（[`UserPathSkipText::Remove`]）を返す。
+/// `skip` でないときの読み書きと応答（欄の並びも）は #2959 前とバイト単位で同じ（単体テストで縛る）
+fn undo_user_path_dirs_with(
+    agent: AgentKind,
+    dirs: &[PathBuf],
+    link_change: tako_cli_path::LinkChange,
+    skip: bool,
+    store: &dyn user_path::Store,
+    lang: tako_core::i18n::Lang,
+) -> Result<Value, SetupRefusal> {
+    if skip {
+        return Ok(json!({
+            "agent": agent.as_str(),
+            "shell": "windows-user-path",
+            "profile": "HKCU\\Environment\\Path",
+            "dirs": dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>(),
+            "removed_dirs": Vec::<String>::new(),
+            "change": USER_PATH_SKIPPED,
+            "tako_cli_link_change": link_change.as_str(),
+            "skipped": USER_PATH_SKIP_REASON,
+            "note": UserPathSkipText::Remove {
+                dirs: dirs.iter().map(|d| display_path(d)).collect(),
+            }
+            .text_in(lang),
+        }));
+    }
     let mut removed: Vec<&PathBuf> = Vec::new();
-    for entry in &dirs {
-        let current = user_path::read_typed()?;
+    for entry in dirs {
+        let current = store.read()?;
         if let Some(next) = user_path::remove_entry(&current.raw, entry) {
-            user_path::write_typed(&user_path::UserPathValue {
+            store.write(&user_path::UserPathValue {
                 raw: next,
                 kind: current.kind.clone(),
             })?;
@@ -2346,6 +2460,68 @@ fn undo_user_path(
         "change": change.as_str(),
         "tako_cli_link_change": link_change.as_str(),
     }))
+}
+
+/// 検証プロセスがユーザー環境変数 Path に触らずに飛ばしたときの `change`（#2959）
+pub const USER_PATH_SKIPPED: &str = "skipped";
+
+/// 飛ばした理由（応答の `skipped`。#2959）
+pub const USER_PATH_SKIP_REASON: &str = "verification_process";
+
+/// 検証プロセスがユーザー環境変数 Path（利用者全体のレジストリ）に触らずに飛ばした知らせ（#2959）。
+///
+/// 日英の対はこの (バリアント, 言語) の網羅 match の 1 か所。`dirs` は表示の形（`~` 短縮）で、
+/// PATH の値そのものは載せない。1 行目が理由（`tako setup` の残り作業の要点に載る）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserPathSkipText {
+    /// 通す段（setup の [2/3]・tako CLI の段・`tako setup bootstrap path`）
+    Add { dirs: Vec<String> },
+    /// 外す段（`tako setup bootstrap undo-path`）
+    Remove { dirs: Vec<String> },
+}
+
+impl UserPathSkipText {
+    pub fn text_in(&self, lang: tako_core::i18n::Lang) -> String {
+        use tako_core::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Add { dirs }, Ja) => format!(
+                "検証用の起動（TAKO_ISOLATED・セルフテスト・テスト）なので、利用者全体のレジストリの\
+                 ユーザー環境変数 Path へは書きません（読みもしません。#2959）。\n\
+                 通す対象の置き場: {}\n\
+                 この検証で先の段へ進めるなら、この置き場を tako を起こす前の PATH に足してください",
+                dirs.join("; ")
+            ),
+            (Self::Add { dirs }, En) => format!(
+                "This is a verification run (TAKO_ISOLATED, a self-test, or a test), so tako does not \
+                 write the user Path variable, a registry value for the whole user account \
+                 (it does not read it either; #2959).\n\
+                 Folders this step would put on Path: {}\n\
+                 To get past this step in the verification, add these folders to PATH before starting tako",
+                dirs.join("; ")
+            ),
+            (Self::Remove { dirs }, Ja) => format!(
+                "検証用の起動（TAKO_ISOLATED・セルフテスト・テスト）なので、利用者全体のレジストリの\
+                 ユーザー環境変数 Path からは外しません（読みもしません。#2959）。\n\
+                 外す対象の置き場: {}",
+                dirs.join("; ")
+            ),
+            (Self::Remove { dirs }, En) => format!(
+                "This is a verification run (TAKO_ISOLATED, a self-test, or a test), so tako does not \
+                 remove anything from the user Path variable, a registry value for the whole user \
+                 account (it does not read it either; #2959).\n\
+                 Folders this step would take off Path: {}",
+                dirs.join("; ")
+            ),
+        }
+    }
+
+    /// `tako setup` の行の頭に付ける印（`[スキップ]` / `[skipped]`）
+    pub fn tag_in(lang: tako_core::i18n::Lang) -> &'static str {
+        match lang {
+            tako_core::i18n::Lang::Ja => "[スキップ]",
+            tako_core::i18n::Lang::En => "[skipped]",
+        }
+    }
 }
 
 // --- 自動導入が通らなかったときの引き継ぎ（#1057）---
@@ -3558,6 +3734,196 @@ mod tests {
                     dir.display()
                 );
             }
+        }
+    }
+
+    // ---- #2959: 検証プロセスはユーザー環境変数 Path（利用者全体のレジストリ）を読みも書きもしない ----
+
+    use tako_core::i18n::Lang;
+
+    /// レジストリの代わり（読み書きの回数と値を覚える）。**本物のレジストリには触らない**
+    struct FakeStore {
+        value: std::cell::RefCell<user_path::UserPathValue>,
+        reads: std::cell::Cell<usize>,
+        writes: std::cell::Cell<usize>,
+    }
+
+    impl FakeStore {
+        fn new(raw: &str) -> Self {
+            Self {
+                value: std::cell::RefCell::new(user_path::UserPathValue::new(raw)),
+                reads: std::cell::Cell::new(0),
+                writes: std::cell::Cell::new(0),
+            }
+        }
+        fn raw(&self) -> String {
+            self.value.borrow().raw.clone()
+        }
+    }
+
+    impl user_path::Store for FakeStore {
+        fn read(&self) -> Result<user_path::UserPathValue, user_path::UserPathError> {
+            self.reads.set(self.reads.get() + 1);
+            Ok(self.value.borrow().clone())
+        }
+        fn write(&self, value: &user_path::UserPathValue) -> Result<(), user_path::UserPathError> {
+            self.writes.set(self.writes.get() + 1);
+            *self.value.borrow_mut() = value.clone();
+            Ok(())
+        }
+    }
+
+    /// 実機の形を模した値（**実ユーザー名は置かない** = #927。`winuser` はプレースホルダ）
+    const RAW_2959: &str =
+        "C:\\WINDOWS\\system32;C:\\Users\\winuser\\AppData\\Local\\Programs\\tako";
+
+    fn dirs_2959() -> Vec<PathBuf> {
+        vec![
+            PathBuf::from("C:\\Users\\winuser\\AppData\\Local\\Programs\\tako"),
+            PathBuf::from("C:\\Users\\winuser\\dev\\sandbox\\home\\.local\\bin"),
+        ]
+    }
+
+    /// 本番（門が立たない）の足す段は #2959 前と同じ読み書きと、欄の並びまで同じ応答を返す
+    #[test]
+    fn issue2959_本番の足す段は修正前と同じ読み書きと応答() {
+        let dirs = dirs_2959();
+        let store = FakeStore::new(RAW_2959);
+        let got =
+            ensure_user_path_dirs_with(&dirs, "C:\\WINDOWS\\system32", false, &store, Lang::En)
+                .expect("足せる");
+        // #2959 前の `ensure_user_path_dirs` が組んでいた形（preserve_order なので並びも含めて比べる）
+        let want = json!({
+            "shell": "windows-user-path",
+            "profile": "HKCU\\Environment\\Path",
+            "profile_display": "ユーザー環境変数 Path",
+            "dirs": dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>(),
+            "dirs_display": dirs.iter().map(|d| display_path(d)).collect::<Vec<_>>(),
+            "change": "installed",
+            "wrote": true,
+            "verified": false,
+        });
+        assert_eq!(got.to_string(), want.to_string());
+        assert_eq!(
+            store.raw(),
+            format!("{RAW_2959};C:\\Users\\winuser\\dev\\sandbox\\home\\.local\\bin"),
+            "末尾へ 1 つだけ足す（在る tako の置き場は触らない）"
+        );
+        // 置き場 1 つにつき読む → (足すなら) 書く → 読み直す
+        assert_eq!((store.reads.get(), store.writes.get()), (3, 1));
+
+        // 2 回目は冪等（読むだけ）。表示言語に依らず同じ応答（本番の文は #2959 前のまま）
+        let again = ensure_user_path_dirs_with(&dirs, "", false, &store, Lang::Ja).expect("冪等");
+        assert_eq!(again["change"], "already_on_path");
+        assert_eq!(again["wrote"], false);
+        assert!(again.get("skipped").is_none() && again.get("note").is_none());
+        assert_eq!(store.writes.get(), 1);
+    }
+
+    /// 本番の外す段も #2959 前と同じ（外したものだけを `removed_dirs` に並べる）
+    #[test]
+    fn issue2959_本番の外す段は修正前と同じ読み書きと応答() {
+        let dirs = dirs_2959();
+        let store = FakeStore::new(RAW_2959);
+        let got = undo_user_path_dirs_with(
+            AgentKind::Claude,
+            &dirs,
+            tako_cli_path::LinkChange::Absent,
+            false,
+            &store,
+            Lang::En,
+        )
+        .expect("外せる");
+        let want = json!({
+            "agent": "claude",
+            "shell": "windows-user-path",
+            "profile": "HKCU\\Environment\\Path",
+            "dirs": dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>(),
+            "removed_dirs": ["C:\\Users\\winuser\\AppData\\Local\\Programs\\tako"],
+            "change": "removed",
+            "tako_cli_link_change": "absent",
+        });
+        assert_eq!(got.to_string(), want.to_string());
+        assert_eq!(store.raw(), "C:\\WINDOWS\\system32");
+        assert_eq!((store.reads.get(), store.writes.get()), (2, 1));
+    }
+
+    /// 検証プロセス（門が立つ）は読みも書きもせず、通す / 外す対象の置き場と理由を日英で返す
+    #[test]
+    fn issue2959_検証プロセスはレジストリに触らず置き場と理由を日英で返す() {
+        let dirs = dirs_2959();
+        for lang in [Lang::Ja, Lang::En] {
+            let store = FakeStore::new(RAW_2959);
+            let add = ensure_user_path_dirs_with(&dirs, "", true, &store, lang).expect("飛ばす");
+            let undo = undo_user_path_dirs_with(
+                AgentKind::Claude,
+                &dirs,
+                tako_cli_path::LinkChange::Absent,
+                true,
+                &store,
+                lang,
+            )
+            .expect("飛ばす");
+            assert_eq!(
+                (store.reads.get(), store.writes.get()),
+                (0, 0),
+                "[{lang:?}] 門が立ったら読みも書きもしない"
+            );
+            assert_eq!(store.raw(), RAW_2959);
+            for (op, v) in [("path", &add), ("undo-path", &undo)] {
+                assert_eq!(v["change"], USER_PATH_SKIPPED, "[{lang:?}] {op}");
+                assert_eq!(v["skipped"], USER_PATH_SKIP_REASON, "[{lang:?}] {op}");
+                let note = v["note"].as_str().expect("知らせ");
+                assert!(note.contains("#2959"), "[{lang:?}] {op}: {note}");
+                for dir in &dirs {
+                    assert!(
+                        note.contains(&display_path(dir)),
+                        "[{lang:?}] {op}: 置き場 {} を言わない: {note}",
+                        dir.display()
+                    );
+                }
+                let japanese = note.chars().any(|c| ('\u{3040}'..='\u{30ff}').contains(&c));
+                assert_eq!(japanese, lang == Lang::Ja, "[{lang:?}] {op}: {note}");
+            }
+            assert_eq!(add["wrote"], false);
+            assert_eq!(add["verified"], false, "このプロセスの PATH に無い");
+            assert_eq!(undo["removed_dirs"], json!([]));
+            assert_eq!(undo["agent"], "claude");
+        }
+        // このプロセスの PATH に全部あれば、このタブからは引ける（`verified`）
+        let process = dirs
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(";");
+        let store = FakeStore::new(RAW_2959);
+        let add = ensure_user_path_dirs_with(&dirs, &process, true, &store, Lang::Ja).unwrap();
+        assert_eq!(add["verified"], true);
+        assert_eq!(store.reads.get(), 0);
+    }
+
+    /// tako CLI の段は「設置しました」と言わず、印・理由・置き場を段の字下げで出す
+    #[test]
+    fn issue2959_tako_cliの段は書かなかったことを日英で言う() {
+        let dirs = dirs_2959();
+        for (lang, head) in [
+            (Lang::Ja, "  [スキップ] tako CLI の PATH: 検証用の起動"),
+            (
+                Lang::En,
+                "  [skipped] tako CLI on PATH: This is a verification run",
+            ),
+        ] {
+            let path = ensure_user_path_dirs_with(&dirs, "", true, &FakeStore::new(""), lang)
+                .expect("飛ばす");
+            let line = tako_cli_stage_skipped_line(&path, lang);
+            assert!(line.starts_with(head), "[{lang:?}] {line}");
+            assert!(
+                !line.contains("設置") && !line.contains("installed"),
+                "{line}"
+            );
+            let rest: Vec<&str> = line.lines().skip(1).collect();
+            assert_eq!(rest.len(), 2, "[{lang:?}] 置き場と次の一手の 2 行: {line}");
+            assert!(rest.iter().all(|l| l.starts_with("         ")), "{line}");
         }
     }
 }
