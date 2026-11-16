@@ -32,10 +32,13 @@
 //!
 //! ## 分かっている限界
 //!
-//! - **unix の打ち切りで kill するのは直接の子だけ**（[`group_output_with_timeout`] で起こした子を除く）。
-//!   子が残した孫は孤児として残る（`claude mcp list` は MCP サーバを子として起こす）。上限が
+//! - **unix の打ち切りで kill するのは直接の子だけ**（[`group_output_with_timeout`] /
+//!   [`output_with_timeout_grouped`] で起こした子を除く）。子が残した孫は孤児として残る。上限が
 //!   無かったときはそもそも永久に待っていたので後退ではないが、孫まで畳むには生成時に
-//!   プロセスグループを分ける必要がある。**Windows は #2462 で孫まで畳む**: 待ちの 1 実装が子を
+//!   プロセスグループを分ける必要がある。エージェント CLI の問い合わせ（`claude auth status` /
+//!   `claude mcp list` = MCP サーバを子として起こす・`claude --version`）は #2942 から
+//!   [`output_with_timeout_grouped`] を通る（`agent_probe::output_within`）ので孫まで畳む。
+//!   **Windows は #2462 で孫まで畳む**: 待ちの 1 実装が子を
 //!   起こした直後に Job Object（境界 B30 の `platform::job::KillScope`）へ入れ、打ち切りで
 //!   コンソールのプロセスを止める（GUI のアプリとその子孫は残す・普通に終わったら何も止めない・
 //!   器の CLI は入れない）。A/B は `TAKO_2454_LEGACY=1`（Job を作らない = #2462 の前）
@@ -594,6 +597,21 @@ pub fn issue2255_legacy() -> bool {
     })
 }
 
+/// #2942 の A/B（`TAKO_2942_LEGACY=1`）。同一バイナリのまま修正前の形へ戻す:
+/// 環境診断の外（`tako setup bootstrap status` / `status-all`・MCP `tako_setup_bootstrap`・
+/// `tako setup` の検出と導入の段）の認証確認（`claude auth status --json` / `codex login status` /
+/// `agy models`）を**上限なしで**待つ（`status-all` は 1 系統ずつ）。返らない CLI が 1 つあると
+/// 何も出さずに固まる。環境診断（#2255）は上限つきのまま。**ゲートはこの 1 か所**
+pub fn issue2942_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_2942_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
 /// #1532 / #1533 の A/B（`TAKO_1532_LEGACY=1`）。同一バイナリのまま修正前の形へ戻す:
 /// ログインシェルに尋ねる問い合わせ（実行ファイルの検出 `platform::exe::find` の unix 実装・
 /// setup / 環境診断のログインシェルの PATH の読み取り）と check-health の `tako --version` を
@@ -719,6 +737,21 @@ pub fn group_output_with_timeout(command: &mut Command, label: &str, budget: Dur
             reason: e.to_string(),
         },
     }
+}
+
+/// [`output_with_timeout`] の、子に**自分のプロセスグループを率いさせる**版（#2942）。
+///
+/// 組み立て（コンソールウィンドウの抑止 = #586・`stdin` の遮断・名札にパスを含めない = #927）は
+/// [`output_with_timeout`] と同じで、待ちと打ち切りは [`group_output_with_timeout`] と同じ
+/// （グループへ SIGTERM を 1 回 → 猶予の後に残りを SIGKILL = #2633）。打ち切ったら**子が起こした孫も
+/// 残らない**（unix。Windows はグループを分けず、待ちの 1 実装の入れ物 = Job Object が孫を止める = #2462）。
+/// エージェント CLI の問い合わせ（`agent_probe::output_within`）のための口: `claude.cmd` や
+/// シェルの包み（`claude` → `node`）・`claude mcp list` が起こす MCP サーバは、直接の子だけを
+/// kill すると孤児として残る（#2942 の受け入れ = 偽物の孫が残らないこと）
+pub fn output_with_timeout_grouped(program: &str, args: &[&str], budget: Duration) -> Outcome {
+    let mut cmd = Command::new(program);
+    crate::platform::process::no_console_window(&mut cmd).args(args);
+    group_output_with_timeout(&mut cmd, &label(program, args), budget)
 }
 
 /// 打ち切りの kill。子が**自分のプロセスグループを率いている**（[`group_output_with_timeout`] で
@@ -1152,6 +1185,56 @@ mod tests {
         assert!(
             holder_alive,
             "孫がパイプを手放す（= 終わる）まで待ってから返った = `output()` と同じ待ち方"
+        );
+    }
+
+    /// #2942: グループを率いさせて起こした問い合わせは、打ち切ると**子が起こした孫まで**止まる
+    /// （エージェント CLI の問い合わせ = `agent_probe::output_within` の口。直接の子だけを kill する
+    /// [`output_with_timeout`] では孫が孤児として残る = モジュール冒頭の「分かっている限界」）。
+    ///
+    /// 孫の生死は時計ではなく**状態**で待つ（グループへの SIGTERM の後、刈り取り係が猶予の後に残りを畳む）
+    #[cfg(unix)]
+    #[test]
+    fn グループを率いさせた問い合わせは打ち切ると孫まで止まる() {
+        let dir = crate::test_residue::ScratchDir::new("probe-2942-grouped");
+        let pid_file = dir.path().join("grandchild.pid");
+        // 孫（sleep）を起こして pid を書き、子（sh）は孫を待って止まる = 返らない CLI の包みの形
+        let script = format!("/bin/sleep 600 & echo $! > '{}'; wait", pid_file.display());
+        let outcome =
+            output_with_timeout_grouped("/bin/sh", &["-c", &script], Duration::from_millis(500));
+        let notice = outcome.timeout_notice();
+        let grandchild: Option<i32> = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse().ok());
+        // SAFETY: シグナル 0 は送らずに生存だけを見る
+        let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
+        let deadline = Instant::now() + GROUP_TERM_GRACE + Duration::from_secs(10);
+        let mut still_alive = grandchild.is_some_and(alive);
+        while still_alive && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            still_alive = grandchild.is_some_and(alive);
+        }
+        if still_alive {
+            if let Some(pid) = grandchild {
+                // SAFETY: 自分が起こした sleep だけを落とす（落ちたテストの後始末）
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+        assert!(notice.is_some(), "上限で打ち切っていない: {outcome:?}");
+        assert_eq!(
+            notice.map(|n| n.label),
+            Some("sh -c".to_string() + " " + &script),
+            "名札は実行ファイル名と引数（パスを含めない = #927）"
+        );
+        assert!(
+            grandchild.is_some(),
+            "孫の pid を書けていない（注入が効いていない）"
+        );
+        assert!(
+            !still_alive,
+            "打ち切った問い合わせの孫（sleep）が残った = グループごと畳めていない（#2942）"
         );
     }
 

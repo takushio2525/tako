@@ -241,6 +241,9 @@ struct DetectedAgent {
     authenticated: bool,
     /// 正規化済みプラン名。個人識別子や token は保持しない。
     plan: Option<String>,
+    /// 認証の問い合わせを上限で打ち切った秒数（#2942）。`Some` なら `authenticated: false` は
+    /// 未認証ではなく**確かめられなかった**（表示を「認証: 不明」へ言い分ける）
+    auth_unconfirmed_secs: Option<u64>,
 }
 
 /// 外部コマンドへ 1 回聞く（**setup の probe は全部ここを通る**）。
@@ -292,13 +295,15 @@ fn detect_agents() -> (Vec<DetectedAgent>, Vec<(SetupAgent, u64)>) {
             continue;
         };
         // 認証とプランの問い合わせは正本 1 実装（#1505）。ここで別に CLI を
-        // 起こすと `tako setup --check` が 3 系統ぶんを 2 度ずつ叩くことになる
-        let auth = setup_bootstrap::auth_state_for(kind.install_kind(), &path);
+        // 起こすと `tako setup --check` が 3 系統ぶんを 2 度ずつ叩くことになる。
+        // 上限つき（#2942。返らない claude で `tako setup` が無言で固まらない）
+        let (auth, timeout) = setup_bootstrap::auth_state_bounded(kind.install_kind(), &path);
         detected.push(DetectedAgent {
             kind,
             path,
             authenticated: auth.authenticated,
             plan: auth.plan,
+            auth_unconfirmed_secs: timeout.map(|notice| notice.waited_secs),
         });
     }
     (detected, unconfirmed)
@@ -628,7 +633,11 @@ fn print_bootstrap_human(action: &str, value: &serde_json::Value) {
             let agent = value["agent"].as_str().unwrap_or("?");
             eprintln!("エージェント CLI の導入状況");
             eprintln!("─────────────────────────");
-            if value["next_step_unconfirmed"].is_object() {
+            // 段が打ち切りで決まっている（ログインシェル = #1532 / #1533・認証 = #2942）なら、
+            // 確かめられなかったことだけを言う（未導入・PATH に無い・未ログインとは言わない）
+            if value["next_step_unconfirmed"].is_object()
+                || auth_step_unconfirmed_secs(value).is_some()
+            {
                 print_bootstrap_agent_line(value);
                 return;
             }
@@ -641,14 +650,7 @@ fn print_bootstrap_human(action: &str, value: &serde_json::Value) {
                     ))
             );
             eprintln!("  PATH:   {}", path_label(value));
-            eprintln!(
-                "  認証:   {}",
-                if value["authenticated"].as_bool() == Some(true) {
-                    "済み"
-                } else {
-                    "未ログイン"
-                }
-            );
+            eprintln!("  認証:   {}", auth_label(value, tako_core::i18n::lang()));
             eprintln!(
                 "  次の一歩: {} ({step})",
                 value["next_step_description"].as_str().unwrap_or("")
@@ -702,6 +704,13 @@ fn print_bootstrap_agent_line(state: &serde_json::Value) {
         );
         return;
     }
+    let lang = tako_core::i18n::lang();
+    // 段が「ログイン」なのは認証の問い合わせを上限で打ち切ったせい（#2942）。未ログインとは言わず、
+    // 環境診断（`tako check-health` の `agent_cli.<系統>`）と同じ「認証: 不明（N 秒で応答なし）」
+    if let Some(secs) = auth_step_unconfirmed_secs(state) {
+        eprintln!("  [警告] {}", auth_unknown_line(agent, secs, lang));
+        return;
+    }
     let binary = state["binary"].as_str().map_or("未導入".to_string(), |p| {
         display_home_relative(Path::new(p))
     });
@@ -711,13 +720,37 @@ fn print_bootstrap_agent_line(state: &serde_json::Value) {
     eprintln!(
         "        PATH: {} / 認証: {} / 次の一歩: {}",
         path_label(state),
-        if state["authenticated"].as_bool() == Some(true) {
-            "済み"
-        } else {
-            "未ログイン"
-        },
+        auth_label(state, lang),
         state["next_step_description"].as_str().unwrap_or("")
     );
+}
+
+/// 段が「ログイン」で、それが認証の問い合わせを上限で打ち切ったせいなら、その秒数（#2942）。
+/// `BootstrapState::auth_unconfirmed` の JSON 側（`next_step` と `auth_unconfirmed` から読む）
+fn auth_step_unconfirmed_secs(state: &serde_json::Value) -> Option<u64> {
+    (state["next_step"].as_str() == Some("auth"))
+        .then(|| state["auth_unconfirmed"]["waited_secs"].as_u64())
+        .flatten()
+}
+
+/// 導入状況の認証の欄（**純粋関数**）。打ち切った系統は「未ログイン」と言わず「不明」（#2942）
+fn auth_label(state: &serde_json::Value, lang: tako_core::i18n::Lang) -> String {
+    if state["authenticated"].as_bool() == Some(true) {
+        "済み".to_string()
+    } else if state["auth_unconfirmed"].is_object() {
+        tako_control::HealthText::Unknown.text_in(lang)
+    } else {
+        "未ログイン".to_string()
+    }
+}
+
+/// 認証を確かめられなかった系統の 1 行（**純粋関数**）。文面は環境診断の `agent_cli.<系統>` の行
+/// （`diagnostics::agent_cli_items`）と同じ「{系統}: 認証: 不明（N 秒で応答なし）」（#2255 / #2942）
+fn auth_unknown_line(agent: &str, secs: u64, lang: tako_core::i18n::Lang) -> String {
+    format!(
+        "{agent}: {}",
+        tako_control::HealthText::AuthUnknown { secs }.text_in(lang)
+    )
 }
 
 /// 導入状況の PATH の欄。新しいタブでだけ引ける（#2428。Windows でインストーラが足した直後）なら
@@ -835,6 +868,7 @@ fn try_agent_handoff(target: AgentKind, reason: &str, assume_yes: bool) -> bool 
         path: path.to_string(),
         authenticated: false,
         plan: None,
+        auth_unconfirmed_secs: None,
     };
     let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     eprintln!();
@@ -934,6 +968,23 @@ fn run_bootstrap_stage(assume_yes: bool, install: InstallGate) -> BootstrapOutco
             "  .zprofile などのログインシェルの設定が入力を待っていないか確かめてから、tako setup をやり直してください"
         );
         return BootstrapOutcome::stuck(None, RemainingKind::AgentStatusUnknown, unconfirmed);
+    }
+    // 認証の問い合わせが上限内に答えず、ログイン済みかを確かめられない系統がある（#2942）。
+    // 「未ログイン」と見なしてログインへ人を送らない（ログイン済みかもしれない）。上の
+    // ログインシェルと同じく、理由をその場で出し、状態の確認を残り作業にして先へ進む（#1501）
+    let lang = tako_core::i18n::lang();
+    let auth_unknown: Vec<String> = states
+        .iter()
+        .filter_map(|(agent, state)| {
+            let notice = state.as_ref().ok()?.auth_unconfirmed()?;
+            Some(auth_unknown_line(agent.as_str(), notice.waited_secs, lang))
+        })
+        .collect();
+    if !auth_unknown.is_empty() {
+        for line in &auth_unknown {
+            eprintln!("  [警告] {line}");
+        }
+        return BootstrapOutcome::stuck(None, RemainingKind::AgentStatusUnknown, auth_unknown);
     }
     // 全滅の理由が「状態を読めない」なら、**それを残り作業として置いて先へ進む**（#1501）。
     // 読めないだけで設定の書き出し（指示ファイル / プロファイル / テンプレ）は通る
@@ -1162,6 +1213,14 @@ fn run_bootstrap_for(
         Ok(state) => state,
         Err(e) => return stuck(RemainingKind::AgentStatusUnknown, e),
     };
+    // 認証の問い合わせを上限で打ち切った（#2942）。ログイン済みかもしれないのでログインへ送らない
+    if let Some(notice) = state.auth_unconfirmed() {
+        eprintln!();
+        return stuck(
+            RemainingKind::AgentStatusUnknown,
+            auth_unknown_line(target.as_str(), notice.waited_secs, tako_core::i18n::lang()),
+        );
+    }
     if state.step == Step::Auth {
         eprintln!();
         eprintln!("  [3/3] {}", Step::Auth.describe_for(target));
@@ -1346,6 +1405,16 @@ struct DepCheckOutcome {
     tailscale: Option<setup_deps::DepStatus>,
 }
 
+/// `[検出]` 行の認証の欄（**純粋関数**）。認証の問い合わせを上限で打ち切った系統は「未認証」と
+/// 言わず、環境診断と同じ「認証: 不明（N 秒で応答なし）」（`HealthText::AuthUnknown`）にする（#2942）
+fn detected_auth_label(agent: &DetectedAgent, lang: tako_core::i18n::Lang) -> String {
+    match (agent.authenticated, agent.auth_unconfirmed_secs) {
+        (true, _) => "認証済み".to_string(),
+        (false, Some(secs)) => tako_control::HealthText::AuthUnknown { secs }.text_in(lang),
+        (false, None) => "未認証".to_string(),
+    }
+}
+
 /// 依存ツールのチェック段階。検出結果を `[OK]` / `[任意]` / `[不足]` / `[警告]` で表示し、
 /// 未導入の CLI 依存は「何を・どの導入器で・どこへ入れるか」を見せて
 /// `[y/N]` を聞く（#1499。`--yes` は同意扱い・非 TTY は案内だけで素通り）。
@@ -1362,11 +1431,7 @@ fn run_dependency_check(
     let (agents, unconfirmed) = detect_agents();
     eprintln!("  エージェント CLI:");
     for agent in &agents {
-        let auth = if agent.authenticated {
-            "認証済み"
-        } else {
-            "未認証"
-        };
+        let auth = detected_auth_label(agent, tako_core::i18n::lang());
         let plan = agent.plan.as_deref().unwrap_or("プラン不明");
         eprintln!(
             "    [検出] {}: {}（{auth} / {plan}）",
@@ -2187,11 +2252,8 @@ fn select_setup_agent(
             eprintln!();
             eprintln!("セットアップを進めるエージェントを選択してください:");
             for (index, agent) in agents.iter().enumerate() {
-                let auth = if agent.authenticated {
-                    "認証済み"
-                } else {
-                    "未認証"
-                };
+                // 打ち切った系統は「未認証」と言わない（#2942。`[検出]` の行と同じ欄）
+                let auth = detected_auth_label(agent, tako_core::i18n::lang());
                 eprintln!("  {}) {}（{auth}）", index + 1, agent.kind.as_str());
             }
             // 未導入の系統も見せる（選べないが「他にもある」ことは伝える。#1002）
@@ -3598,6 +3660,17 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
     // 選んだ系統の検出情報。**無い / 未認証でも止めない**（残り作業 1 件として脇に置く）
     let selected_agent = agents.iter().find(|agent| agent.kind == selected);
     match selected_agent {
+        // 認証の問い合わせを上限で打ち切った（#2942）。ログイン済みかもしれないので、ログインの
+        // 残り作業にせず「導入状況の確認」にする（導入の段が先に積んでいれば同じ種別として畳まれる）
+        Some(agent) if !agent.authenticated && agent.auth_unconfirmed_secs.is_some() => {
+            let secs = agent.auth_unconfirmed_secs.unwrap_or_default();
+            let line = auth_unknown_line(selected.as_str(), secs, tako_core::i18n::lang());
+            eprintln!("  [残り] {line}（この後の設定は先に進めます）");
+            remaining.push(Remaining::with_detail(
+                RemainingKind::AgentStatusUnknown,
+                vec![line],
+            ));
+        }
         Some(agent) if !agent.authenticated => {
             eprintln!(
                 "  [残り] {} は未認証です（この後の設定は先に進めます）",
@@ -4618,7 +4691,68 @@ mod tests {
             path: format!("/fake/{}", kind.as_str()),
             authenticated,
             plan: plan.map(str::to_string),
+            auth_unconfirmed_secs: None,
         }
+    }
+
+    // --- 認証の問い合わせの打ち切り（#2942）---
+
+    #[test]
+    fn 検出行の認証の欄は打ち切りを未認証と言わない() {
+        use tako_core::i18n::Lang;
+        let ok = detected(SetupAgent::Claude, true, Some("max"));
+        assert_eq!(detected_auth_label(&ok, Lang::Ja), "認証済み");
+        let no = detected(SetupAgent::Claude, false, None);
+        assert_eq!(detected_auth_label(&no, Lang::Ja), "未認証");
+        let mut hung = detected(SetupAgent::Claude, false, None);
+        hung.auth_unconfirmed_secs = Some(10);
+        // 環境診断と同じ文面（`HealthText::AuthUnknown`）・表示言語に従う（#2365）
+        assert_eq!(
+            detected_auth_label(&hung, Lang::Ja),
+            "認証: 不明（10 秒で応答なし）"
+        );
+        assert_eq!(
+            detected_auth_label(&hung, Lang::En),
+            "auth: unknown (no response in 10 s)"
+        );
+    }
+
+    #[test]
+    fn 導入状況の表示は認証の打ち切りを未ログインと言わない() {
+        use tako_core::i18n::Lang;
+        let hung = serde_json::json!({
+            "agent": "claude",
+            "next_step": "auth",
+            "authenticated": false,
+            "auth_unconfirmed": { "label": "claude auth status --json", "waited_secs": 4 },
+        });
+        assert_eq!(auth_step_unconfirmed_secs(&hung), Some(4));
+        assert_eq!(auth_label(&hung, Lang::Ja), "不明");
+        assert_eq!(
+            auth_unknown_line("claude", 4, Lang::Ja),
+            "claude: 認証: 不明（4 秒で応答なし）"
+        );
+        assert_eq!(
+            auth_unknown_line("claude", 4, Lang::En),
+            "claude: auth: unknown (no response in 4 s)"
+        );
+        // 確かめた答え（本当に未ログイン）は今まで通り
+        let no = serde_json::json!({
+            "agent": "claude",
+            "next_step": "auth",
+            "authenticated": false,
+            "auth_unconfirmed": null,
+        });
+        assert_eq!(auth_step_unconfirmed_secs(&no), None);
+        assert_eq!(auth_label(&no, Lang::Ja), "未ログイン");
+        // PATH の段なら段は認証で決まっていない（段の行は今まで通り・認証の欄だけ「不明」）
+        let mut path = hung.clone();
+        path["next_step"] = "path".into();
+        assert_eq!(auth_step_unconfirmed_secs(&path), None);
+        assert_eq!(auth_label(&path, Lang::Ja), "不明");
+        // 認証済みは打ち切りの欄より先に見る
+        let ok = serde_json::json!({ "next_step": "ready", "authenticated": true });
+        assert_eq!(auth_label(&ok, Lang::Ja), "済み");
     }
 
     #[test]

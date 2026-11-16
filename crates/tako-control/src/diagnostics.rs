@@ -320,10 +320,11 @@ impl Report {
 pub fn collect() -> Report {
     let lang = tako_core::i18n::lang();
     // #2255: 認証の問い合わせは上限つきで、系統を並べて聞く（返らない CLI 1 つで診断ごと
-    // 固まらないため）。A/B の旧経路は setup と同じ上限なしの 1 系統ずつ
+    // 固まらないため）。A/B の旧経路は修正前と同じ上限なしの 1 系統ずつ（#2942 から setup の
+    // 既定の `status_all` も上限つきなので、旧経路は名前で分けた `status_all_legacy` を呼ぶ）
     let bootstrap = || {
         if tako_core::probe::issue2255_legacy() {
-            crate::setup_bootstrap::status_all()
+            crate::setup_bootstrap::status_all_legacy()
         } else {
             crate::setup_bootstrap::status_all_within(tako_core::probe::auth_probe_timeout())
         }
