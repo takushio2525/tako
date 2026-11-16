@@ -112,6 +112,13 @@ pub mod notes {
         "The implementation is platform-neutral and takes the same path as macOS, but it has not been exercised on real Windows hardware yet (expected to work; suspect this first if it fails)",
     );
 
+    /// #937 の実機（2026-11-16）: claude の一覧と codex / agy が無いときの案内は確かめたが、
+    /// 一覧コマンドを起こして取る経路は実機に codex / agy が無く未実測
+    pub const WIN_MODELS_LIVE_FETCH_UNMEASURED: Note = Note::new(
+        "claude の一覧（同梱の既知リスト + 設定 dir の `.claude.json` のキャッシュ）と、codex / agy が見つからないときの導入案内は Windows 実機で確かめた。codex / agy の一覧コマンド（`codex debug models` / `agy models`）を Windows 実機で起こして取ったことはまだ無い",
+        "Verified on real Windows hardware: the claude list (bundled known models plus the `.claude.json` cache in the config dir) and the install guidance when codex / agy are missing. Fetching the live list by running `codex debug models` / `agy models` on real Windows hardware has not been done yet",
+    );
+
     // ─── 実測で分かっている縮退 ───────────────────────────────────
 
     /// #153 / #1283 / #2435。ターミナル内のパス検出は `\` の形も候補にするが、
@@ -1399,7 +1406,9 @@ pub const MATRIX: &[Feature] = &[
             note: notes::WIN_RESOURCES_UNIMPLEMENTED,
             issue: 2000,
         },
-        windows_evidence: Evidence::Unverified,
+        windows_evidence: Evidence::Measured(
+            "#937 / #2462 の Windows 11 実測（2026-11-16・0.8.40）: `tako queue` は機の値を「この OS ではまだ採れない（#2000）」と返し、cargo の札も配らない。`TAKO_QUEUE_SOCKET` を明示した調停役（`tako queue serve`）の下で、ペインから `tako queue cmd /c ping …` が受付されて走り、`tako queue cancel <番号>` で cmd.exe と孫の ping まで止まる（旧アーム `TAKO_2454_LEGACY=1` では孫が残る）。本番の GUI が調停役になる形は未実測",
+        ),
     },
     Feature {
         key: "tako_read_pane",
@@ -1496,7 +1505,9 @@ pub const MATRIX: &[Feature] = &[
             note: notes::WIN_REMOTE_SERVE_UNIX,
             issue: 971,
         },
-        windows_evidence: Evidence::Unverified,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測（2026-11-16・0.8.40）: `tako remote shortcuts` の一覧・add・remove の往復は通る（登録分は足せて消せる）。既定は `~\\Desktop` の実在だけを見るので、OneDrive へ移したデスクトップは既定に出ない（#2939）。スマホからの閲覧には daemon が要る（#971）",
+        ),
     },
     Feature {
         key: "tako_remote_start",
@@ -1613,13 +1624,12 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_scrollback",
         macos: Support::Supported,
-        // 上限は alacritty の `Term` 設定 + settings.json なので構造上は OS に依らないが、
-        // Windows 実機での往復は**未実測**。#591 の規約どおり Pending + 追跡 #937 で置く
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        // 上限は alacritty の `Term` 設定 + settings.json なので構造上は OS に依らない。
+        // #937 の実機（2026-11-16）で往復と効き目を確かめた
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測（2026-11-16・0.8.40）: `tako scrollback 1500` で settings.json の `scrollback_lines` が 1500 になり、既存の直接ペインと新しい直接ペインでそれぞれ 3000 行を出したあと、`tako list` の `scroll.history` が両方 1500 で止まる",
+        ),
     },
     Feature {
         // #1694: ワークスペース横断検索。走査（`ignore` の walker）・照合（`regex`）・バイナリ判定・
@@ -1770,14 +1780,17 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_setup_models",
         macos: Support::Supported,
-        // 取得は境界 B16（`platform::exe::find`）で解決した CLI を子プロセスとして
-        // 起動するだけなので構造上は動くが、Windows 実機での取得は**未実測**。
-        // #591 の規約どおり Pending + 追跡 #937 のまま置く（過大申告しない）
+        // 取得は境界 B16（`platform::exe::find`）で解決した CLI を子プロセスとして起動するだけ。
+        // #937 の実機（2026-11-16）で claude の一覧と codex / agy の未導入の案内は確かめたが、
+        // codex / agy の一覧コマンドを起こして取る経路は実機に CLI が無く**未実測**なので
+        // Pending + 追跡 #937 のまま置く（過大申告しない）
         windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
+            note: notes::WIN_MODELS_LIVE_FETCH_UNMEASURED,
             issue: 937,
         },
-        windows_evidence: Evidence::Unverified,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測（2026-11-16・0.8.40）: `tako setup models` が claude を同梱の既知リスト（opus / sonnet / fable）と設定 dir の `.claude.json` の `additionalModelOptionsCache`（砂場に置いた 1 件が local_cache で並ぶ）で返す。codex / agy は実機に無く、`irm …/install.ps1 | iex` の導入案内つきの失敗を返す。一覧コマンドの実取得は未実測",
+        ),
     },
     Feature {
         key: "tako_shell_integration",
@@ -1967,13 +1980,11 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_todo",
         macos: Support::Supported,
         // 中身は YAML の読み書きと dispatch の既存腕（`Send` / `TabNew`）だけで、
-        // OS 固有の API は使わない。ただし Windows 実機での往復は**未実測**なので、
-        // #591 の規約どおり Pending + 追跡 #937 で置く（実測できたら根拠と同時に外す）
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 937,
-        },
-        windows_evidence: Evidence::Unverified,
+        // OS 固有の API は使わない。#937 の実機（2026-11-16）で往復を確かめた
+        windows: Support::Supported,
+        windows_evidence: Evidence::Measured(
+            "#937 の Windows 11 実測（2026-11-16・0.8.40）: `tako todo` の add → list → show → update → expand（右パネルが tasks ビューで開く）→ respond（返答がスレッドに積まれる）→ done / dismiss の往復が通る。起票元の master への返答の配送は本物の master（実エージェント）が要るので未実測（role の札だけのペインでは「宛先不明」と理由つきで failed になる）",
+        ),
     },
     Feature {
         key: "tako_tree_folder",
