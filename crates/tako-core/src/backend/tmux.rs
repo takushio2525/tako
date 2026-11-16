@@ -97,6 +97,8 @@ impl SessionBackend for TmuxBackend {
             keeps_empty_server: true,
             disables_shell_prewarm: false,
             direct_inner_argv: false,
+            // 継いだ PATH をそのまま使い、ペインはログインシェルとして profile を読む（#2954）
+            rebuilds_pane_path: false,
             label: "tmux",
         }
     }

@@ -360,15 +360,59 @@ pub fn pane_path() -> Option<(String, String)> {
         return None;
     }
     let value = pane_path_in(&process_path()?, &registry_paths(), &env_lookup)?;
-    // 変数名は継いでいる表記に揃える（Windows の慣習は `Path`。名前の大小は区別されない）
-    let key = std::env::vars_os()
+    Some((path_key(), value))
+}
+
+/// PATH の変数名。継いでいる表記に揃える（Windows の慣習は `Path`。名前の大小は区別されない）
+fn path_key() -> String {
+    std::env::vars_os()
         .find_map(|(key, _)| {
             key.to_str()
                 .filter(|key| key.eq_ignore_ascii_case("PATH"))
                 .map(str::to_string)
         })
-        .unwrap_or_else(|| "Path".to_string());
-    Some((key, value))
+        .unwrap_or_else(|| "Path".to_string())
+}
+
+// --- 器のペインへ固定する PATH（#2954）---
+//
+// psmux 3.3.x は器のペインの PATH を、同梱の portable-pty（`get_base_env`）がレジストリの `Path`
+// （マシン + `;` + ユーザー）で丸ごと置き換える。器のクライアント → サーバーへは tako の組んだ PATH が
+// 継がれているのに、ペインのシェルへは届かない（検証で PATH の先頭に置いた偽の CLI も効かない）。
+// 器は `new-session -e` の値をその置き換えの**後**に当てるので、器なしのペインと同じ値をそこで固定する。
+// 値は器なしのペイン（`TerminalSession::spawn_in` の [`apply_pane_path`]）と同じ順で 1 本に決める。
+
+/// 器のペインへ固定する PATH を決める（**純粋関数**。#2954）。
+///
+/// 器なしのペインの PATH と同じ順: `explicit`（呼び手が `options.env` で明示した PATH。名前の大小を
+/// 問わない）→ `reread`（[`pane_path`] = #2428 の読み直し。足すものが無ければ `None`）→ `process`
+/// （起動時の値 = 器なしのペインがそのまま継ぐ値）。
+///
+/// 値が空（空白と `;` だけ）なら `None` = 固定しない。器が組むレジストリの PATH のほうが空の PATH より
+/// ましなので、修正前の振る舞いへ倒す
+pub fn container_pane_path_in(
+    explicit: &[(String, String)],
+    reread: impl FnOnce() -> Option<(String, String)>,
+    process: impl FnOnce() -> Option<(String, String)>,
+) -> Option<(String, String)> {
+    let chosen = match explicit
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+    {
+        Some(pair) => Some(pair.clone()),
+        None => reread().or_else(process),
+    }?;
+    let blank = chosen
+        .1
+        .trim_matches(|c: char| c == SEP || c.is_whitespace())
+        .is_empty();
+    (!blank).then_some(chosen)
+}
+
+/// 器のペインへ固定する PATH（`(変数名, 値)`。#2954）。`explicit` は呼び手の `options.env`。
+/// 器なしのペインが受け取る値と同じ材料（[`pane_path`] と起動時の PATH）を同じ順で引く
+pub fn container_pane_path(explicit: &[(String, String)]) -> Option<(String, String)> {
+    container_pane_path_in(explicit, pane_path, || Some((path_key(), process_path()?)))
 }
 
 /// 実環境の [`Reach`]。[`rereads_for_new_panes`] が false の環境では呼ばない
@@ -1058,6 +1102,69 @@ C:\\Program Files\\Git\\cmd;C:\\Users\\winuser\\AppData\\Roaming\\npm";
         let mut env = HashMap::new();
         apply_pane_path(&mut env, || None);
         assert!(env.is_empty());
+    }
+
+    // --- 器のペインへ固定する PATH（#2954）---
+
+    fn pair(key: &str, value: &str) -> Option<(String, String)> {
+        Some((key.to_string(), value.to_string()))
+    }
+
+    /// 器なしのペインと同じ順（明示 → 読み直し → 起動時の値）で 1 本に決まる
+    #[test]
+    fn issue2954_器のペインのpathは器なしのペインと同じ順で決まる() {
+        let fake = "C:\\Users\\winuser\\fake-bin;C:\\Windows\\system32";
+        // 読み直した値（#2428）があればそれ。起動時の値は引かない
+        assert_eq!(
+            container_pane_path_in(
+                &[],
+                || pair("Path", "C:\\a;C:\\new"),
+                || panic!("読み直しがあるのに起動時の値を引いた")
+            ),
+            pair("Path", "C:\\a;C:\\new")
+        );
+        // 読み直しで足すものが無ければ起動時の値（= 器なしのペインが継ぐ値。偽の CLI の置き場が先頭のまま）
+        assert_eq!(
+            container_pane_path_in(&[], || None, || pair("Path", fake)),
+            pair("Path", fake)
+        );
+        // 呼び手の明示は名前の大小を問わず勝ち、読み直しも起動時の値も引かない
+        for key in ["PATH", "Path", "path"] {
+            assert_eq!(
+                container_pane_path_in(
+                    &[
+                        ("TAKO_PANE_ID".to_string(), "7".to_string()),
+                        (key.to_string(), "X:\\mine".to_string()),
+                    ],
+                    || panic!("明示があるのに読み直した"),
+                    || panic!("明示があるのに起動時の値を引いた"),
+                ),
+                pair(key, "X:\\mine")
+            );
+        }
+    }
+
+    /// 空の PATH は固定しない（器のレジストリの PATH のほうが空よりまし = 修正前の振る舞い）
+    #[test]
+    fn issue2954_空のpathは器へ固定しない() {
+        for blank in ["", " ", ";", " ; ;"] {
+            assert_eq!(
+                container_pane_path_in(&[], || None, || pair("Path", blank)),
+                None,
+                "{blank:?}"
+            );
+            assert_eq!(
+                container_pane_path_in(
+                    &[("PATH".to_string(), blank.to_string())],
+                    || None,
+                    || pair("Path", "C:\\a"),
+                ),
+                None,
+                "明示の {blank:?}"
+            );
+        }
+        // 起動時の PATH が読めない（非 UTF-16 の値）も固定しない
+        assert_eq!(container_pane_path_in(&[], || None, || None), None);
     }
 
     #[test]

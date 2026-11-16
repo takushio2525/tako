@@ -911,6 +911,32 @@ tako mod / MCP tako_mod ──▶ ModHub を読んで行に組む（報告が無
   `crates/tako-control/tests/issue2484_psmux_warm_off_watchdog.rs`、実機の結合テストは
   `crates/tako-core/tests/psmux_backend.rs` の `本番が書くconfは警告なしで受理されwarm_offが効く` /
   `走っている器へ後からwarm_offを届けて待機サーバーを落とす` / `素のペインのシェルは包みのpwshを挟まずに起きる`
+- **器のペインの PATH は器なしのペインと同じ**（#2954。能力 `rebuilds_pane_path`）: psmux 3.3.x は同梱の
+  portable-pty（`cmdbuilder.rs` の `get_base_env`）がペインの env をレジストリの `Path`（マシン + `;` + ユーザー）で
+  丸ごと置き換える。器のクライアント → サーバー（`lpEnvironment = NULL`）へは tako の組んだ PATH が継がれて
+  いるのに、器のペインのシェルには届かず、検証で PATH の先頭に置いた偽の CLI も効かなかった（#2484 の実機）。
+  psmux は `new-session -e` をサーバーの起動時に `app.environment` へ入れ、ペインを起こすときにレジストリの
+  上書きの**後**で当てる（`apply_user_environment`。包みの経路も `--` の直接の argv も同じ）ので、
+  `PsmuxBackend::wrap_spawn` が器なしのペインと同じ決め方（呼び手の明示 → #2428 の読み直し → 起動時の値 =
+  境界 B23 の `user_path::container_pane_path`）の PATH を `-e` で固定する（`tmux_backend::wrap_options_for` が
+  セッションへ固定する env の並びの最後へ積む）。`-e` があると psmux は待機サーバーの横取りもしない
+  （冷えた起動で `-e` が当たる）。psmux の引数の解析は `;` で区切らないので Windows の PATH の `;` はそのまま運べる。
+  上流 psmux #773（3.4.0）は「継いだ値は触らずレジストリは欠けた変数だけ埋める」へ直したが、同じ値を固定しても
+  害は無いので版を問わず固定する。**環境ブロック**: 固定はレジストリの `Path` を器なしのペインと同じ値へ置き換える
+  だけで変数は増えない（器なしのペインと同じ大きさ + psmux が足す数個）。**コマンドライン**: `-e Path=…` は
+  器のクライアントとサーバーのコマンドラインに載るので、上界の見積もり（`platform::shell::command_line_len_upper`）
+  + 余白 2048 が `CreateProcessW` の上限 32767 を超えるなら固定せず修正前（レジストリの PATH）へ倒す
+  （`tmux_backend::pane_path_pin_fits`。ペインは起きる・stderr へ長さだけを出す）。
+  **`PSMUX_BARE_ENV`（psmux #167 の逃げ道 = 環境ブロックが大きすぎて err 87 になる利用者がペインの env を最小限へ
+  落とす）は包みの経路（`build_command`）でしか効かず、`--` の直接の argv（`build_raw_command`）では見られない**
+  （3.3.7 / 3.4.0 とも）。#2484 の段 2 の後は素のペインのシェルで効かなくなっていたので、tako の env か
+  `options.env` で立っていれば（`1` / 大小を問わない `true` = psmux と同じ読み方）素のペインのシェルも包ませる。
+  逃げ道の下でもペインの PATH は器のサーバーの PATH（= 器なしのペインと同じ値）で、`-e` は同じ値を当てる。
+  tmux の器は固定しない（継いだ PATH + ログインシェルの profile。`wrap_options` は `None` を渡す = macOS の argv は
+  1 語も変わらない）。A/B は `TAKO_2954_LEGACY=1`（固定しない・逃げ道でも直接の argv）。番犬は
+  `crates/tako-control/tests/issue2954_psmux_pane_path_watchdog.rs`、実機の結合テストは
+  `crates/tako-core/tests/psmux_backend.rs` の `issue2954_器のペインのpathは器なしのペインと同じ` /
+  `issue2954_bare_envの逃げ道が素のペインのシェルでも効く`
 - **最後のセッションが消えても器のサーバーを残す**（#2741。`exit-empty off` = `tmux_backend::exit_empty_conf`）:
   tmux の既定（`exit-empty on`）では、最後のセッションが消えたサーバーは「終わる」と決めてからプロセスが
   消えるまで待ち受けのソケットを開いたままにし、その間に繋いだ器のペインのクライアントが

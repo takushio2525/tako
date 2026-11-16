@@ -383,6 +383,25 @@ pub fn apply_arg_escaping(options: &mut alacritty_terminal::tty::Options) {
     imp::apply_arg_escaping(options);
 }
 
+/// Windows のコマンドライン（`CreateProcessW` の `lpCommandLine`）の上限。UTF-16 の要素数で、終端の NUL を含む
+pub const COMMAND_LINE_MAX: usize = 32_767;
+
+/// `program` と `args` を 1 本のコマンドラインへ組んだときの長さの**上界**（UTF-16 の要素数。**純関数**。#2954）。
+///
+/// 引用の規則そのもの（[`apply_arg_escaping`] が alacritty へ委ねている CRT の規則）は持たない。1 語ごとに
+/// 「両端の引用符 2 + 区切りの空白 1 + 倍になりうる `\` + エスケープされる `"`」を足した上からの見積もりで、
+/// 実物より短く見積もらない（上限の手前で止める判断にだけ使う）
+pub fn command_line_len_upper(program: &str, args: &[String]) -> usize {
+    std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .map(|word| {
+            word.encode_utf16().count()
+                + 3
+                + word.chars().filter(|c| matches!(c, '\\' | '"')).count()
+        })
+        .sum()
+}
+
 #[cfg(unix)]
 mod imp {
     use super::*;

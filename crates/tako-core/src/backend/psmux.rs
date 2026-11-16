@@ -27,6 +27,8 @@
 //! | `new-session -D` が他クライアントを切り離さない | 同上。**器に収束を期待しない** |
 //! | 既定の warm（warm pane + `<ソケット>____warm__` の待機サーバー）が器ごとに pwsh を余計に常駐させる（`-f` の器は待機サーバーを拾わない） | 本番の conf に能力 `disables_shell_prewarm` で `set -g warm off`（#2484。器 2 本で pwsh 10 本 → 4 本）。走っている器へは [`PsmuxBackend::sync_config`] が器ごとに読ませ、残った待機サーバーを落とす |
 //! | `new-session` のコマンドを必ず `pwsh -NoLogo -Command "<cmd>"` で包む（器 1 本に pwsh 2 本） | 素のペインのシェルは `-- <argv>` で包まずに渡す（能力 `direct_inner_argv`。#2484 の段 2） |
+//! | ペインの PATH をレジストリの `Path`（マシン + ユーザー）で丸ごと置き換える（3.3.x の portable-pty。上流 #773 は 3.4.0 で修正） | 器なしのペインと同じ PATH を `new-session -e` で固定する（能力 `rebuilds_pane_path`。`-e` は置き換えの後に当たる。#2954） |
+//! | 逃げ道 `PSMUX_BARE_ENV`（psmux #167）が `--` の直接の argv では効かない | 立っていれば素のペインのシェルも包みの経路で渡す（[`PsmuxBackend::wrap_spawn`]。#2954） |
 //! | `-t` なしのコマンドは「いちばん最近のセッション」のサーバー 1 本にしか届かない（セッションごとに別サーバー） | conf の再適用は器ごとに `-t` を付ける（[`source_conf_argvs`]） |
 //! | 器の中のシェルは tako の ConPTY の子ではない（コードページ固定が届かない） | [`SessionBackend::pane_pids`] で器へ `#{pane_pid}` を尋ね、器の内側にも B19 の固定を当てる（#659） |
 //! | ホイールで copy mode に入り、滞在中の打鍵をシェルへ渡さない | `#{pane_in_mode}` で確かめてから、解除キー `q` を打鍵と同じ PTY へ前置する（#686） |
@@ -200,6 +202,47 @@ pub fn issue2484_legacy() -> bool {
 /// [`issue2484_legacy`] の env 名
 pub const ISSUE2484_LEGACY_ENV: &str = "TAKO_2484_LEGACY";
 
+/// #2954 の A/B（`TAKO_2954_LEGACY=1`）。同一バイナリのまま修正前の器へ戻す: 器のペインへ PATH を
+/// 固定しない（= 器が組むレジストリの PATH）・`PSMUX_BARE_ENV` が立っていても素のペインのシェルを
+/// `--` の直接の argv で渡す（[`PsmuxBackend::wrap_spawn`]）。**ゲートはこの 1 か所**
+pub fn issue2954_legacy() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var(ISSUE2954_LEGACY_ENV).ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
+/// [`issue2954_legacy`] の env 名
+pub const ISSUE2954_LEGACY_ENV: &str = "TAKO_2954_LEGACY";
+
+/// psmux の逃げ道（psmux #167）の env 名。環境ブロックが大きすぎて `CreateProcessW` が err 87 で
+/// ペインを起こせない利用者が、ペインの env を最小限へ落とすために立てる
+pub const BARE_ENV: &str = "PSMUX_BARE_ENV";
+
+/// [`BARE_ENV`] の値が psmux の逃げ道を効かせるか（**純関数**。#2954）。
+/// psmux 3.3.7 の `apply_bare_env_if_set` と同じ読み方: `1` か、大小を問わない `true`
+pub fn bare_env_on(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// 器のサーバーが [`BARE_ENV`] を効かせて起きるか（#2954）。
+///
+/// サーバーは器のクライアントの env を継ぎ（`spawn_server_hidden` の `lpEnvironment = NULL`）、
+/// クライアントの env は tako の env に `options.env` を重ねたもの（`TerminalSession::spawn_in`）。
+/// だから `options.env` の明示（名前の大小を問わない）→ tako 自身の env の順に見る
+fn bare_env_requested(env: &[(String, String)]) -> bool {
+    match env
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(BARE_ENV))
+    {
+        Some((_, value)) => bare_env_on(Some(value)),
+        None => bare_env_on(std::env::var(BARE_ENV).ok().as_deref()),
+    }
+}
+
 /// 走っている器のサーバーへ conf を読ませ直す argv（#2484。**純関数**）。
 ///
 /// **psmux はセッション 1 本ごとに別のサーバー（プロセス）**で、`-t` の無い `source-file` は
@@ -305,6 +348,10 @@ impl SessionBackend for PsmuxBackend {
             disables_shell_prewarm: true,
             // `new-session … -- <argv>` は包みの pwsh を挟まずに起こす（psmux 3.2 から。#2484 の段 2）
             direct_inner_argv: true,
+            // ペインの PATH をレジストリの `Path` で丸ごと置き換える（3.3.7 の `get_base_env`。#2954 の実機:
+            // GUI の PATH の先頭に置いた偽の claude が器のペインへ届かない）。3.4.0（上流 #773）は継いだ値を
+            // 残すが、`-e` で同じ値を固定しても害は無いので版を問わず立てる
+            rebuilds_pane_path: true,
             label: "psmux",
         }
     }
@@ -322,6 +369,12 @@ impl SessionBackend for PsmuxBackend {
     /// 明示のコマンドは第 1 語を引用符で括らない 1 本の文字列（`quotes_program = false`。#881）、
     /// 素のペインのシェルは `--` の後ろへ argv のまま（`direct_inner_argv`。#2484 の段 2 = 包みの pwsh を挟まない）。
     ///
+    /// #2954: 器はペインの PATH をレジストリの `Path` で置き換える（`rebuilds_pane_path`）ので、器なしの
+    /// ペインと同じ PATH（`user_path::container_pane_path`）を `-e` で固定する。psmux の逃げ道
+    /// `PSMUX_BARE_ENV`（psmux #167）は包みの経路（`build_command`）でしか効かず、直接の argv
+    /// （`build_raw_command`）では見られないので、立っていれば素のペインのシェルも包ませる
+    /// （段 2 の pwsh 1 本の節約より、環境ブロックが大きすぎてペインを起こせない利用者の逃げ道を優先）。
+    ///
     /// 形は実測で全項目の反映を確認済み（`-e` 2 本・`-c`・conf の `history-limit`）。
     /// **`-D` は psmux では現状効かない**が、psmux が実装したときに tmux と同じ収束挙動へ
     /// 戻るよう残す。効かない前提の安全策はオーナー記録（下）であって、このフラグではない
@@ -335,11 +388,19 @@ impl SessionBackend for PsmuxBackend {
             );
         }
         let caps = self.capabilities();
+        let fixed_2954 = !issue2954_legacy();
+        let pane_path = if caps.rebuilds_pane_path && fixed_2954 {
+            crate::platform::user_path::container_pane_path(&options.env)
+        } else {
+            None
+        };
+        let bare_env = fixed_2954 && bare_env_requested(&options.env);
         crate::tmux_backend::wrap_options_for(
             options,
             &self.client,
             caps.quotes_program,
-            caps.direct_inner_argv && !issue2484_legacy(),
+            caps.direct_inner_argv && !issue2484_legacy() && !bare_env,
+            pane_path,
             &self.socket,
             session.as_str(),
         )
@@ -1302,6 +1363,21 @@ mod tests {
             histfile, expected_histfile,
             "検証プロセスの履歴の書き先がセッションへ固定されていない（#1253）"
         );
+        // #2954: 器はペインの PATH をレジストリで組み直すので、器なしのペインと同じ値を固定する。
+        // 値はこのテストのプロセスの PATH に依るので外して突き合わせる（A/B の腕では固定しない）
+        let pinned_path = crate::backend::strip_pane_path_env(&mut args);
+        let expected_path: Vec<String> = if issue2954_legacy() {
+            Vec::new()
+        } else {
+            crate::platform::user_path::container_pane_path(&options.env)
+                .map(|(k, v)| format!("{k}={v}"))
+                .into_iter()
+                .collect()
+        };
+        assert_eq!(
+            pinned_path, expected_path,
+            "器のペインへ器なしのペインと同じ PATH が固定されていない（#2954）"
+        );
         let mut expected: Vec<String> = [
             "-u",
             "-L",
@@ -1571,6 +1647,8 @@ mod tests {
             scrollback_lines: None,
         };
         let caps = b.capabilities();
+        // #2954: 逃げ道（PSMUX_BARE_ENV）が効く形なら素のペインのシェルも包ませる（本番の wrap_spawn と同じ判断）
+        let bare_env = !issue2954_legacy() && bare_env_requested(&options.env);
         let expect = crate::tmux_backend::wrap_options_for(
             options.clone(),
             if issue2484_legacy() {
@@ -1579,7 +1657,10 @@ mod tests {
                 bin
             },
             caps.quotes_program,
-            caps.direct_inner_argv && !issue2484_legacy(),
+            caps.direct_inner_argv && !issue2484_legacy() && !bare_env,
+            (!issue2954_legacy())
+                .then(|| crate::platform::user_path::container_pane_path(&options.env))
+                .flatten(),
             &crate::tmux_backend::socket_name(),
             s.as_str(),
         );
@@ -1594,6 +1675,127 @@ mod tests {
         assert_eq!(got_cmd.program, expect_cmd.program);
         assert_eq!(got_cmd.args, expect_cmd.args);
         b.release(&s);
+    }
+
+    /// #2954: 器（psmux 3.3.x）はペインの PATH をレジストリの `Path` で置き換えるので、器なしのペインと
+    /// 同じ PATH を `-e` で固定する。呼び手の明示の PATH（検証なら偽の CLI の置き場が先頭）がそのまま載り、
+    /// 素のペインのシェルでも明示のコマンド（agent のペイン）でも同じ。並びはセッションへ固定する env の最後
+    #[test]
+    fn issue2954_器のペインへ器なしのペインと同じpathを固定する() {
+        let b = backend();
+        let s = session("tako-295400000001");
+        let fake = "C:\\Users\\winuser\\fake-bin;C:\\Windows\\system32";
+        let agent = SpawnCommand {
+            program: "claude".into(),
+            args: vec!["--help".into()],
+        };
+        for command in [None, Some(agent)] {
+            let options = SpawnOptions {
+                command: command.clone(),
+                cwd: Some(PathBuf::from("C:\\work")),
+                env: vec![
+                    ("TAKO_PANE_ID".into(), "7".into()),
+                    ("Path".into(), fake.into()),
+                ],
+                scrollback_lines: None,
+            };
+            let args = b.wrap_spawn(options, &s).command.unwrap().args;
+            let pins: Vec<usize> = args
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| a.to_ascii_lowercase().starts_with("path="))
+                .map(|(at, _)| at)
+                .collect();
+            if issue2954_legacy() {
+                assert!(pins.is_empty(), "A/B の腕で PATH を固定した: {args:?}");
+                continue;
+            }
+            assert_eq!(pins.len(), 1, "{command:?}: {args:?}");
+            let at = pins[0];
+            assert_eq!(args[at], format!("Path={fake}"), "{command:?}");
+            assert_eq!(args[at - 1], "-e", "{command:?}: {args:?}");
+            assert_eq!(args[at + 1], "-c", "{command:?}: {args:?}");
+        }
+        b.owners.release(&s);
+    }
+
+    /// #2954: psmux の逃げ道 `PSMUX_BARE_ENV`（psmux #167）は包みの経路（`build_command`）でしか効かない。
+    /// 立っていれば素のペインのシェルも包ませ（#2484 の段 2 の前の形）、PATH の固定は外さない
+    #[test]
+    fn issue2954_bare_envが立っていれば素のペインのシェルも包みの経路で渡す() {
+        let b = backend();
+        let s = session("tako-295400000002");
+        let wrap = |bare: &str| {
+            let options = SpawnOptions {
+                command: None,
+                cwd: None,
+                env: vec![
+                    (BARE_ENV.into(), bare.into()),
+                    ("Path".into(), "C:\\a".into()),
+                ],
+                scrollback_lines: None,
+            };
+            b.wrap_spawn(options, &s).command.unwrap().args
+        };
+        let (off, on) = (wrap("0"), wrap("1"));
+        let pinned = |args: &[String]| args.iter().any(|a| a == "Path=C:\\a");
+        assert_eq!(pinned(&off), !issue2954_legacy(), "{off:?}");
+        assert_eq!(pinned(&on), !issue2954_legacy(), "{on:?}");
+        let direct = |args: &[String]| args.iter().any(|a| a == "--");
+        let Some(shell) = crate::shell_integration::pane_shell() else {
+            // unix は素のペインのシェルを器へ渡さない（器の default-shell）= 経路の差が argv に出ない
+            assert!(!direct(&off) && !direct(&on), "{off:?} / {on:?}");
+            b.owners.release(&s);
+            return;
+        };
+        assert_eq!(direct(&off), !issue2484_legacy(), "{off:?}");
+        if issue2954_legacy() {
+            assert_eq!(direct(&on), !issue2484_legacy(), "{on:?}");
+        } else {
+            assert!(
+                !direct(&on),
+                "PSMUX_BARE_ENV が立っているのに直接の argv で渡した（build_raw_command は見ない）: {on:?}"
+            );
+            assert_eq!(on.last(), Some(&inner_command(&shell)), "{on:?}");
+        }
+        b.owners.release(&s);
+    }
+
+    /// #2954: `PSMUX_BARE_ENV` の値は psmux（`apply_bare_env_if_set`）と同じ読み方。呼び手の明示は
+    /// 名前の大小を問わず、tako 自身の env より先に見る
+    #[test]
+    fn issue2954_bare_envの値はpsmuxと同じ読み方() {
+        for (value, on) in [
+            (Some("1"), true),
+            (Some("true"), true),
+            (Some("TRUE"), true),
+            (Some("True"), true),
+            (Some("0"), false),
+            (Some(""), false),
+            (Some("yes"), false),
+            (Some(" 1"), false),
+            (None, false),
+        ] {
+            assert_eq!(bare_env_on(value), on, "{value:?}");
+        }
+        assert!(bare_env_requested(&[("psmux_bare_env".into(), "1".into())]));
+        assert!(!bare_env_requested(&[(BARE_ENV.into(), "0".into())]));
+    }
+
+    /// #2954: 器の能力の申告（psmux は PATH を組み直す = true。tmux / 器なしは false）
+    #[test]
+    fn issue2954_pathを組み直すのはpsmuxだけ() {
+        assert!(backend().capabilities().rebuilds_pane_path);
+        assert!(
+            !crate::backend::TmuxBackend::new()
+                .capabilities()
+                .rebuilds_pane_path
+        );
+        assert!(
+            !crate::backend::NullBackend
+                .capabilities()
+                .rebuilds_pane_path
+        );
     }
 
     #[test]

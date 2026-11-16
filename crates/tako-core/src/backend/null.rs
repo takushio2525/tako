@@ -47,6 +47,8 @@ impl SessionBackend for NullBackend {
             keeps_empty_server: true,
             disables_shell_prewarm: false,
             direct_inner_argv: false,
+            // 器が無い = tako がペインを直接起こす（PATH は `user_path::pane_path` の 1 本。#2954）
+            rebuilds_pane_path: false,
             label: "none",
         }
     }
