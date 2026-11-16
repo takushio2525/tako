@@ -8,8 +8,19 @@ tako をソースからビルドする手順です。
 ## 前提条件
 
 - **Rust**（最新 stable）: https://rustup.rs/
+- **Node.js（npm）**（LTS 版。22 系・24 系で確かめています）: https://nodejs.org/
+  （Windows は `winget install --id OpenJS.NodeJS.LTS` でも入ります）。
+  リモート用のスマホ画面（PWA・`web/tako-remote`）をビルドしてバイナリに組み込むのに使います
 - **macOS**: Xcode Command Line Tools（`xcode-select --install`）
 - **tmux**（推奨）: `brew install tmux`
+
+:::note
+PWA のビルド出力（`web/tako-remote/dist/`）は Git に含めていないので、clone した直後のツリーには
+ありません。最初の `cargo build` がそれを見て `web/tako-remote` で `npm ci` と `npm run build` を
+自動で走らせます（その回だけビルドが数十秒延びます）。npm が見つからないとビルドはそこで止まり、
+エラーの 1 行目に次の一手が出ます。一度できた `dist/` は作り直さないので、PWA のソースを直したら
+`scripts/build-pwa.sh` で作り直してください。
+:::
 
 ## ソースの取得
 

@@ -57,8 +57,11 @@ winget install --id Git.Git
 winget install --id OpenJS.NodeJS.LTS
 ```
 
-Node.js が要るのは、リモート用 PWA（`web/tako-remote`）を `rust_embed` でバイナリに
-埋め込むため。**`dist` が無いと `tako-control` がコンパイルできない。**
+Node.js（npm）が要るのは、リモート用のスマホ画面（PWA・`web/tako-remote`）をビルドして
+`rust_embed` でバイナリに組み込むため。LTS 版（22 系・24 系で確かめている = #2930 以後）。
+clone 直後は `web/tako-remote/dist/` が無いので、最初の `cargo build` が `npm ci` と
+`npm run build` を自動で走らせる（#1309）。**npm が無いと `tako-control` のビルドがそこで止まる。**
+docs の「ビルド方法」（`docs/src/content/docs/development/building.md`）の前提条件と同じ言い方に揃えてある（#2943）。
 
 ## 4. リポジトリの取得
 
