@@ -2650,6 +2650,9 @@ struct TakoApp {
     /// 参照検索・呼び出し階層・型階層の結果（#1685。問い合わせたペインごとに 1 つ・閉じたら消す）。
     /// 右パネルの references ビューと CLI / MCP の `tako lsp results` 等が dispatch 経由でこの 1 つを読み書きする
     lsp_xref: tako_core::lsp::xref::XrefStore,
+    /// 言語サーバの帯（未導入など）の文の器のスクロール（#2751。ペインごと・帯の文の指紋つき = 文が
+    /// 変わったら頭へ戻す）。帯は描画（`&self`）の中で組むので `RefCell`。閉じたペインのぶんは消す
+    lsp_bar_scrolls: std::cell::RefCell<HashMap<PaneId, lsp_status_ui::BarScroll>>,
     /// 参照・階層の GUI の状態（問い合わせ中の印・子を問い合わせているノード）
     lsp_xref_ui: references_panel::XrefUi,
     /// ワークスペース横断検索の結果（#1694。最後に出した 1 回ぶん・閉じたら手放す）。
@@ -5449,6 +5452,7 @@ impl TakoApp {
             lsp_completion: lsp_completion_ui::LspCompletionUi::default(),
             lsp_hover: lsp_hover_ui::LspHoverUi::default(),
             lsp_xref: Default::default(),
+            lsp_bar_scrolls: Default::default(),
             lsp_xref_ui: Default::default(),
             workspace_search: Default::default(),
             search_ui: Default::default(),
@@ -12757,6 +12761,8 @@ impl TakoApp {
         self.preview_edits.remove(&pane_id);
         // #1685: そのペインで検索した参照・階層の結果も消す（保持件数を 0 へ戻す）
         self.lsp_xref.remove(pane_id);
+        // #2751: 帯の文の器のスクロール
+        self.lsp_bar_scrolls.get_mut().remove(&pane_id);
         self.remove_preview_image_cache(pane_id);
         self.preview_views.remove(&pane_id);
         self.preview_scroll_handles.remove(&pane_id);
@@ -34048,6 +34054,11 @@ mod self_test {
     mod tree_notice_2760;
     #[cfg(feature = "visual-test")]
     use tree_notice_2760::tree_notice_2760_visual;
+    /// #2751: 言語サーバの未導入の帯が狭いペインでも本文の行を押し出さないか（visual-test `lsp-band-2751`）
+    #[cfg(feature = "visual-test")]
+    mod lsp_band_2751;
+    #[cfg(feature = "visual-test")]
+    use lsp_band_2751::lsp_band_2751_visual;
     /// #1903: ステータスバーの 5h / 7d が mod の報告の値で描かれるか（visual-test `mod-limits`）
     #[cfg(feature = "visual-test")]
     mod mod_limits;
@@ -50623,6 +50634,11 @@ mod self_test {
                     tree_notice_2760_visual(any, window, cx).await;
                     visual_exit(0);
                 }
+                // #2751: 言語サーバの未導入の帯が狭いペインでも本文の行を押し出さないか
+                "lsp-band-2751" => {
+                    lsp_band_2751_visual(any, window, cx).await;
+                    visual_exit(0);
+                }
                 // #1903: ステータスバーの 5h / 7d が mod の報告の値で描かれ、古くなると戻るか
                 "mod-limits" => {
                     mod_limits_visual(any, window, cx).await;
@@ -50783,7 +50799,7 @@ mod self_test {
                          tasks-accordion / tasks-tick / tasks-offload / shelve-tab / no-emoji / editor-keys / \
                          run-command-truncate / run-dropdown-1733 / run-board-1952 / viewport-lines / jump-keys / search-case / goto-hover / \
                          large-file-edit / large-file-decor / external-change / editor-font / tree-move / \
-                         tree-clipboard / tree-multiselect / tree-keyboard-copy / tree-keys / tree-notice-2760 / completion / completion-real / lsp-context-menu / lsp-held-2048 / \
+                         tree-clipboard / tree-multiselect / tree-keyboard-copy / tree-keys / tree-notice-2760 / lsp-band-2751 / completion / completion-real / lsp-context-menu / lsp-held-2048 / \
                          lsp-context-menu-real / md-edit-resume / md-find-restore / hover / hover-real / \
                          hover-1893 / hover-loading / hover-loading-real / mod-limits / mod-bar / ino-highlight / \
                          syntax-alias / extra-syntax / net-resume / setup-deps-2433 / \
@@ -53208,6 +53224,8 @@ mod self_test {
             tree_keys_visual(any, window, cx).await;
             // #2760: ツリーの断りの通知の高さの上限と、パスの縮め
             tree_notice_2760_visual(any, window, cx).await;
+            // #2751: 言語サーバの未導入の帯が狭いペインでも本文の行を押し出さない
+            lsp_band_2751_visual(any, window, cx).await;
 
             // #932: ちらつきの機械検証。**最後に回す**（専用タブを作り、分割・
             // プレビュー・連続出力まで状態を動かすので、他の節の前提を壊さない）
