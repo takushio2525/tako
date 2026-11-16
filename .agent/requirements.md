@@ -421,6 +421,17 @@ FR-2.2.7 の環境変数解決のまま（誤ったペインへ副作用を起�
 
 - 検知は `tako-core::ports`（libproc + tty 突き合わせ、3 秒ポーリング）→ list / MCP の
   `listen_ports`。詳細は `architecture.md`「Layer 3」節
+- **Windows の器（psmux）のペインは器の中のシェルを根にする**（#2935）。Windows は「根のプロセスの子孫」で
+  ペイン配下を決める（#524）。根が PTY 直下の子（= 器のクライアント）だと、tako を起こし直して器へ再 attach
+  したペインでは器のサーバーが死んだ旧クライアントの子のまま残り（psmux はサーバーを最初のクライアントの子と
+  して起こす）、新しいクライアントの子孫に器の中が入らず `listen_ports` が `[]` のままだった。器の中のシェルの
+  pid は起こした直後に器へ 1 回聞く `tmux_backend::pane_facts` の `#{pane_pid}` を端末へ写したもの
+  （`TerminalSession::container_shell_pid`。3 秒の走査は器へ問い合わせない）で、判定は純関数
+  `procinfo::pid_tree_root`。器なしのペイン・器へまだ聞けていない間は PTY 直下の子のまま、器の内部ポートの
+  除外（#724）も変えない。macOS は器のペインの tty へ差し替え済み（`set_tty_name`）なので変わらない。
+  A/B `TAKO_2935_LEGACY=1`・単体 `procinfo::portable_tests::issue2935_*`・番犬
+  `issue2935_container_port_root_watchdog`・実機 `cargo test -p tako-core --test psmux_backend -- issue2935`
+  （psmux のある Windows だけで走る。CI のランナーに psmux は無い）
 - チップは検知ペイン下端のインライン表示（新規ポートごとに 1 件、却下でそのポートが
   消えるまで再提案しない）。承諾アクション = **Web ビューペイン生成**（FR-3.8。
   検知元ペインの右に開く。✅ 2026-07-13 #155 で外部ブラウザ `open` から差し替え。

@@ -134,6 +134,10 @@ role / title の設定・取得自体はセルフテスト（`tako title / role 
 - [ ] 「ブラウザで開く」で既定ブラウザに該当 URL が開き、チップが消える
 - [ ] 「×」で消え、同じサーバーが動いている間は再提案されない（再起動で再提案）
 - [ ] `tako portdetect off` でチップ・list の listen_ports が消え、再起動後も OFF が維持される
+- [ ] **Windows（psmux の器）**: 器つきのペインで tako を閉じて起こし直し（器へ再 attach）、そのペインで dev サーバーを
+      起こしても `tako list` の `listen_ports` に載りチップが出る（#2935。新しく分割したペイン・器なしのペインも今どおり。
+      器の内部ポートは出ない = #724）。器の単体の確認は `cargo test -p tako-core --test psmux_backend -- issue2935 --nocapture`
+      （`TAKO_2935_LEGACY=1` で取りこぼす旧い形）
 
 ## 集約センター（FR-2.10）
 
