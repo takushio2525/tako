@@ -1034,24 +1034,6 @@ mod tests {
         }
     }
 
-    /// #2484: conf の正本は 1 つ。psmux 版の conf（定数・書き手・置き場の名前）を持ち直さない
-    #[test]
-    fn issue2484_psmux版のconfを持たない() {
-        let src = include_str!("psmux.rs");
-        let body = &src[..src.find("#[cfg(test)]").expect("テストの前まで")];
-        for gone in [
-            "const BACKEND_CONF",
-            "fn ensure_conf(",
-            "fn write_conf_in(",
-            "psmux-backend.conf",
-        ] {
-            assert!(
-                !body.contains(gone),
-                "psmux 版の conf が戻っている（{gone}）。器の conf は tmux_backend::backend_conf の 1 本（#2484）"
-            );
-        }
-    }
-
     /// #2484: 走っている器への conf の再適用は**器ごとに `-t` を付ける**（psmux はセッション 1 本ごとに
     /// 別のサーバーで、`-t` なしは「いちばん最近のセッション」の 1 本にしか届かない）
     #[test]

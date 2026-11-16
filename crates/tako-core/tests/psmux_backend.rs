@@ -560,7 +560,8 @@ fn 本番が書くconfは警告なしで受理されwarm_offが効く() {
 }
 
 /// 器の待機サーバー（`<ソケット>____warm__`）のプロセス（#2484）。psmux は待機サーバーを
-/// `server -s __warm__ -L <ソケット>` で起こす（3.3.7 のソース）。Windows 以外は列挙の手段が無いので空
+/// `server -s __warm__ -L <ソケット>` で起こす（3.3.7 のソース）。呼び手は Windows だけのテスト
+#[cfg(windows)]
 fn warm_server_pids(socket: &str) -> Vec<u32> {
     tako_core::platform::procinfo::snapshot()
         .into_iter()

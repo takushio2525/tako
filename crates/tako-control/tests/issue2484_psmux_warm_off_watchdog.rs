@@ -331,7 +331,7 @@ impl SessionBackend for PsmuxBackend {
 }
 pub fn sync_conf_all(bin: &str, socket: &str, conf: &Path, kill_warm: bool) {
     for argv in source_conf_argvs(conf, &sessions) {}
-    let _ = run_with(bin, Some(&warm_server_socket(socket)), &["kill-server"]);
+    let _ = run_with(bin, Some(&warm_server_socket(socket)), &[STOP]);
 }
 "#;
     assert_eq!(check_psmux("p.rs", psmux), Vec::<String>::new());

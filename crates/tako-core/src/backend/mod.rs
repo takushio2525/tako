@@ -1165,13 +1165,17 @@ pub enum Binary {
 /// 見つかったバイナリ（プロセス内で 1 回だけ解決してキャッシュする）
 pub fn binary() -> &'static Binary {
     static BINARY: OnceLock<Binary> = OnceLock::new();
-    BINARY.get_or_init(|| {
-        let found = detect_binary();
-        if psmux::issue2484_legacy() {
-            return found;
-        }
-        pin_psmux_path(found, crate::platform::exe::pin_process_path)
-    })
+    BINARY.get_or_init(resolve_binary)
+}
+
+/// 器になれるバイナリを見つけ、psmux なら起こす形（絶対パス）へ寄せる（#2484。A/B
+/// `TAKO_2484_LEGACY=1` は見つけた名前のまま）。[`binary`] が 1 回だけ呼ぶ
+fn resolve_binary() -> Binary {
+    let found = detect_binary();
+    if psmux::issue2484_legacy() {
+        return found;
+    }
+    pin_psmux_path(found, crate::platform::exe::pin_process_path)
 }
 
 /// 見つけた psmux の実行ファイルを、起こす形（絶対パス）へ寄せる（#2484。**純関数**）。
