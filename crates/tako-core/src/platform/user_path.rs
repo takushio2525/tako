@@ -393,9 +393,65 @@ pub fn write(value: &UserPathValue) -> Result<(), String> {
     write_typed(value).map_err(UserPathError::into_ja)
 }
 
-/// [`write`] の型の口（#2365）
+/// [`write`] の型の口（#2365）。
+///
+/// **検証プロセスからは書かない**（#2959）。呼び手は先に [`skip_for_verification`] で飛ばして
+/// 知らせる（読みもしない）。ここは門を通り忘れた呼び手の最後の砦で、断りは
+/// [`UserPathError::VerificationProcess`]
 pub fn write_typed(value: &UserPathValue) -> Result<(), UserPathError> {
+    if skip_for_verification() {
+        return Err(UserPathError::VerificationProcess);
+    }
     imp::write(value)
+}
+
+/// `TAKO_2959_LEGACY=1` で #2959 前へ戻す（検証プロセスも本物のユーザー環境変数 Path を読み書きする）。
+/// 同一バイナリで A/B を取るための逃げ道
+pub fn legacy_2959() -> bool {
+    std::env::var("TAKO_2959_LEGACY").is_ok_and(|v| v == "1")
+}
+
+/// 本物のユーザー環境変数 Path に触ってはいけないか（**純粋関数**。#2959）。
+///
+/// `supported` = この OS にプロセスの外に永続する PATH がある（[`is_supported`] = Windows）、
+/// `verification` = 検証プロセス（[`crate::paths::is_verification_process`] = テスト・`TAKO_ISOLATED`・
+/// セルフテスト・visual-test）、`legacy` = A/B の旧アーム（[`legacy_2959`]）
+pub fn skip_for_verification_in(supported: bool, verification: bool, legacy: bool) -> bool {
+    supported && verification && !legacy
+}
+
+/// 検証プロセスは本物のユーザー環境変数 Path（`HKCU\Environment\Path`）を**読みも書きもしない**（#2959）。
+///
+/// レジストリの値は利用者のアカウント全体のもので、HOME / data dir を砂場へ向けても逃がせない
+/// （unix の同じ段は HOME 配下の profile へ書くので砂場に閉じる。外へ書くのは Windows だけだった）。
+/// 書き手（setup の PATH の段・`undo-path`・`tako setup undo`）はこれを最初に見て、通す / 外す対象の
+/// 置き場を知らせて飛ばす。判定の正本はこの 1 実装（材料は [`skip_for_verification_in`]）
+pub fn skip_for_verification() -> bool {
+    skip_for_verification_in(
+        is_supported(),
+        crate::paths::is_verification_process(),
+        legacy_2959(),
+    )
+}
+
+/// ユーザー環境変数 Path の読み書きの口（製品は [`Registry`]、テストは偽物。#2959）。
+/// 書き手の判断（追記・除去・確かめ）を、レジストリに触らずに macOS の `cargo test` から検査するための差し替え口
+pub trait Store {
+    fn read(&self) -> Result<UserPathValue, UserPathError>;
+    fn write(&self, value: &UserPathValue) -> Result<(), UserPathError>;
+}
+
+/// 本物のユーザー環境変数 Path（[`read_typed`] / [`write_typed`]）。
+/// 渡す呼び手は同じ呼び出しで [`skip_for_verification`] も渡す（番犬 `issue2959_user_path_verification_watchdog`）
+pub struct Registry;
+
+impl Store for Registry {
+    fn read(&self) -> Result<UserPathValue, UserPathError> {
+        read_typed()
+    }
+    fn write(&self, value: &UserPathValue) -> Result<(), UserPathError> {
+        write_typed(value)
+    }
 }
 
 /// 新しく開いたターミナルが見る PATH（マシン + ユーザー）。
@@ -421,6 +477,8 @@ pub enum UserPathError {
     Failed { code: i32, stderr: String },
     /// 読み出しスクリプトの出力に目印の 2 行が無い（`output` は前後の空白を落とした出力）
     BadOutput { output: String },
+    /// 検証プロセスから本物のユーザー環境変数 Path へ書こうとした（#2959。[`write_typed`] の最後の砦）
+    VerificationProcess,
 }
 
 impl UserPathError {
@@ -449,6 +507,16 @@ impl UserPathError {
             }
             (Self::BadOutput { output }, En) => {
                 format!("cannot interpret the output of reading the user PATH: {output:?}")
+            }
+            (Self::VerificationProcess, Ja) => {
+                "検証用の起動（TAKO_ISOLATED・セルフテスト・テスト）なので、利用者全体のレジストリの\
+                 ユーザー環境変数 Path へは書きません（#2959）"
+                    .to_string()
+            }
+            (Self::VerificationProcess, En) => {
+                "this is a verification run (TAKO_ISOLATED, a self-test, or a test), so tako does not \
+                 write the user Path variable, a registry value for the whole user account (#2959)"
+                    .to_string()
             }
         }
     }
@@ -1088,5 +1156,61 @@ C:\\Program Files\\Git\\cmd;C:\\Users\\winuser\\AppData\\Roaming\\npm";
             assert!(effective().is_err());
             assert!(write(&UserPathValue::new("x")).is_err());
         }
+    }
+
+    /// #2959: 門の 4 通り。本番（検証プロセスでない）と unix は修正前と同じ = 門は立たない
+    #[test]
+    fn issue2959_門は_windowsの検証プロセスだけで立ちab_の旧アームで外れる() {
+        // (supported, verification, legacy) → 触らない
+        let cases = [
+            ((true, true, false), true),   // Windows の検証プロセス（#2959 の対象）
+            ((true, false, false), false), // Windows の本番 = 修正前と同じく書く
+            ((true, false, true), false),
+            ((true, true, true), false), // A/B の旧アーム = #2959 前（検証プロセスも書く）
+            ((false, true, false), false), // unix = profile 経路（砂場の HOME に閉じる）
+            ((false, false, false), false),
+            ((false, true, true), false),
+            ((false, false, true), false),
+        ];
+        for ((supported, verification, legacy), want) in cases {
+            assert_eq!(
+                skip_for_verification_in(supported, verification, legacy),
+                want,
+                "supported={supported} verification={verification} legacy={legacy}"
+            );
+        }
+    }
+
+    /// #2959: テストバイナリは検証プロセス。Windows では門が立ち、最後の砦（[`write_typed`]）が断る。
+    /// unix では門は立たない（従来の `Unsupported` のまま）。
+    ///
+    /// 書き戻すのは**いま読んだ値そのもの**にする: 門が壊れていても利用者の Path は 1 文字も変わらない
+    /// （偽の値を書くと、壊れた版で走った Windows の開発機の Path を壊す）
+    #[test]
+    fn issue2959_テストプロセスからの書き込みは最後の砦が断る() {
+        assert!(crate::paths::is_verification_process());
+        if !is_supported() {
+            assert!(!skip_for_verification(), "unix では門は立たない");
+            assert_eq!(
+                write_typed(&UserPathValue::new("x")),
+                Err(UserPathError::Unsupported)
+            );
+            return;
+        }
+        if legacy_2959() {
+            return;
+        }
+        assert!(skip_for_verification());
+        let Ok(current) = read_typed() else {
+            return;
+        };
+        assert_eq!(
+            write_typed(&current),
+            Err(UserPathError::VerificationProcess)
+        );
+        assert_eq!(
+            Registry.write(&current),
+            Err(UserPathError::VerificationProcess)
+        );
     }
 }

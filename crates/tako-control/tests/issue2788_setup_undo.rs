@@ -265,6 +265,7 @@ impl Sandbox {
                 tako_dir: self.tako_dir.clone(),
                 store: Box::new(FakeUserPath(self.user_path.clone())),
             }),
+            user_path_skipped: None,
             ps_profiles: vec![home.join("Documents/PowerShell/profile.ps1")],
             caches: vec![
                 self.local.join("WebView2"),
@@ -573,4 +574,44 @@ fn issue2788_外を指すtakoのリンクも置き場で判定して外す() {
     );
     assert!(std::fs::symlink_metadata(bin.join("tako")).is_err());
     assert!(outside.exists(), "指す先に触れた");
+}
+
+/// #2959: 検証プロセスが触らなかった Windows の Path（利用者全体のレジストリ）は、読みもせずに
+/// 「触っていない」と日英で知らせる（`--dry-run` も同じ）。#2959 前は項目ごと黙って消えていた
+#[test]
+fn issue2959_検証プロセスが触らなかったpathは理由つきで知らせる() {
+    let scratch = ScratchDir::new("issue2959-undo-skip");
+    let targets = Targets {
+        verification: true,
+        user_path_skipped: Some(scratch.path().join("Programs").join("tako")),
+        ..Targets::default()
+    };
+    let before = snapshot(scratch.path());
+    for dry_run in [false, true] {
+        let report = setup_undo::run(&targets, dry_run);
+        assert_eq!(snapshot(scratch.path()), before);
+        assert_eq!(report.items.len(), 1, "{:#?}", report.items);
+        let item = &report.items[0];
+        assert_eq!(item.kind, Kind::UserPath);
+        assert_eq!(
+            item.outcome,
+            Outcome::Kept(KeepReason::VerificationRegistry)
+        );
+        assert!(
+            item.path.starts_with("HKCU\\Environment\\Path: "),
+            "{}",
+            item.path
+        );
+        assert_eq!(report.failed(), 0, "触らなかったのは失敗ではない");
+        for (lang, want) in [
+            (tako_core::i18n::Lang::Ja, "読みも書きもしません（#2959）"),
+            (tako_core::i18n::Lang::En, "neither reads nor writes"),
+        ] {
+            let lines = report.render_lines(lang).join("\n");
+            assert!(lines.contains(want), "[{lang:?}] {lines}");
+            let json = report.to_json(lang);
+            assert_eq!(json["items"][0]["reason"]["code"], "verification_registry");
+            assert_eq!(json["summary"]["kept"], 1);
+        }
+    }
 }

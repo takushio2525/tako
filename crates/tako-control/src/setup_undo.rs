@@ -25,7 +25,9 @@
 //! 冪等で、1 つ失敗しても残りは進め、何を外して何を残したかを [`Report`] で返す。
 //! 置き場は [`Targets`] に集めて渡す（製品は [`Targets::from_process`]、テストは砂場）。
 //! 検証プロセス（テスト・`TAKO_ISOLATED`・セルフテスト）は一時 dir の外へ書かない
-//! （`claude_mod_install::write_guard` と同じ番人）。
+//! （`claude_mod_install::write_guard` と同じ番人）。Windows の Path（利用者全体のレジストリ）は
+//! 読みもせず、触らなかったことを [`KeepReason::VerificationRegistry`] で知らせる（#2959。門は setup の
+//! PATH の段と同じ `user_path::skip_for_verification`）。
 
 use std::path::{Path, PathBuf};
 
@@ -88,6 +90,8 @@ pub enum KeepReason {
     InsideDataDir,
     /// 検証プロセスで一時 dir の外（書かない）
     OutsideSandbox,
+    /// 検証プロセスなので、利用者全体のレジストリ（ユーザー環境変数 Path）は読みも書きもしない（#2959）
+    VerificationRegistry,
 }
 
 impl KeepReason {
@@ -102,6 +106,7 @@ impl KeepReason {
             KeepReason::NotOurs => "not_ours",
             KeepReason::InsideDataDir => "inside_data_dir",
             KeepReason::OutsideSandbox => "outside_sandbox",
+            KeepReason::VerificationRegistry => "verification_registry",
         }
     }
 }
@@ -193,6 +198,9 @@ pub struct Targets {
     pub path_dirs: Vec<PathBuf>,
     /// Windows のユーザー環境変数 Path
     pub user_path: Option<UserPathTarget>,
+    /// 検証プロセスなので触らなかった tako の入れた先（Windows のユーザー環境変数 Path。#2959）。
+    /// レジストリは読まないので、在るかどうかは分からないまま「触っていない」と知らせる
+    pub user_path_skipped: Option<PathBuf>,
     /// 以前の版がシェル統合のブロックを書いた `$PROFILE`（Windows）
     pub ps_profiles: Vec<PathBuf>,
     /// 消すキャッシュの dir（Windows の WebView2）
@@ -228,12 +236,18 @@ impl Targets {
         };
         let placement = tako_core::tako_cli_path::plan_here(&home);
         if cfg!(windows) {
-            // 検証プロセスは本物のレジストリに触らない
-            if let Some(p) = placement.filter(|_| !verification) {
-                targets.user_path = Some(UserPathTarget {
-                    tako_dir: p.dir,
-                    store: Box::new(RegistryStore),
-                });
+            // 検証プロセスは本物のレジストリに触らない（#2788）。#2959 からは触らなかったことも知らせる
+            // （門は setup の PATH の段と同じ `user_path::skip_for_verification` の 1 実装）。
+            // 検証プロセス + `TAKO_2959_LEGACY=1` は #2959 前 = 触らず、知らせもしない
+            if let Some(p) = placement {
+                if user_path::skip_for_verification() {
+                    targets.user_path_skipped = Some(p.dir);
+                } else if !verification {
+                    targets.user_path = Some(UserPathTarget {
+                        tako_dir: p.dir,
+                        store: Box::new(RegistryStore),
+                    });
+                }
             }
             targets.ps_profiles = tako_core::shell_integration::legacy_blocks()
                 .into_iter()
@@ -349,6 +363,15 @@ pub fn run(t: &Targets, dry_run: bool) -> Report {
             agent: None,
             path: format!("HKCU\\Environment\\Path: {}", up.tako_dir.display()),
             outcome: undo_user_path(up, dry_run),
+        });
+    }
+    // #2959: 検証プロセスはレジストリを読みもしない（在るかどうかも見ない）。触らなかったことだけ知らせる
+    if let Some(dir) = &t.user_path_skipped {
+        items.push(Item {
+            kind: Kind::UserPath,
+            agent: None,
+            path: format!("HKCU\\Environment\\Path: {}", dir.display()),
+            outcome: Outcome::Kept(KeepReason::VerificationRegistry),
         });
     }
     // 5. 以前の版のシェル統合（Windows の $PROFILE）
@@ -886,6 +909,10 @@ impl UndoText {
                 KeepReason::OutsideSandbox => {
                     "検証用の起動なので、一時ディレクトリの外には書きません".into()
                 }
+                KeepReason::VerificationRegistry => {
+                    "検証用の起動なので、利用者全体のレジストリのユーザー環境変数 Path は読みも書きもしません（#2959）"
+                        .into()
+                }
             },
             (Self::Keep(reason), En) => match reason {
                 KeepReason::NotTakoCommand { command } => format!(
@@ -916,6 +943,10 @@ impl UndoText {
                 }
                 KeepReason::OutsideSandbox => {
                     "left untouched: a verification run does not write outside the temporary directory"
+                        .into()
+                }
+                KeepReason::VerificationRegistry => {
+                    "left untouched: a verification run neither reads nor writes the user Path variable, a registry value for the whole user account (#2959)"
                         .into()
                 }
             },

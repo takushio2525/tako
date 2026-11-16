@@ -682,7 +682,9 @@ fn print_bootstrap_human(action: &str, value: &serde_json::Value) {
         _ => {
             for key in ["profile_display", "dir_display", "change", "note"] {
                 if let Some(text) = value[key].as_str() {
-                    eprintln!("  {key}: {text}");
+                    // 複数行の注記（#2959 の検証プロセスの知らせ）は 2 行目から字下げをそろえる
+                    let pad = format!("\n  {}  ", " ".repeat(key.len()));
+                    eprintln!("  {key}: {}", text.replace('\n', &pad));
                 }
             }
         }
@@ -1185,6 +1187,16 @@ fn run_bootstrap_for(
                 )
             }
         };
+        // #2959: 検証プロセスはユーザー環境変数 Path（利用者全体のレジストリ）に触っていない。
+        // 通っていないのは事実なので「追加しました」とは言わず、理由と通す対象の置き場を残り作業にする
+        if result["change"].as_str() == Some(setup_bootstrap::USER_PATH_SKIPPED) {
+            let lang = tako_core::i18n::lang();
+            let note = result["note"].as_str().unwrap_or_default();
+            return stuck(
+                RemainingKind::AgentPath(target),
+                format!("{} {note}", setup_bootstrap::UserPathSkipText::tag_in(lang)),
+            );
+        }
         let profile = result["profile_display"].as_str().unwrap_or("(不明)");
         match result["change"].as_str() {
             Some("already_on_path") => eprintln!("  [OK] すでに使える状態です"),

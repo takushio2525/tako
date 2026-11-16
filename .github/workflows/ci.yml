@@ -550,6 +550,8 @@ jobs:
       # ユーザー環境変数 Path（HKCU）は足した後に読み戻して確かめ、最後に検査前へ戻す。
       # 全数より手前に名指しで置く（#1282 と同じ理由）。上のビルドの tako.exe を使うので追加の組み立ては無い。
       # **setup が Path を足さない / 外さない・agent を対話起動する・砂場の外へ書く形へ戻ったらここで落ちる**
+      # #2959: 段 7 で、検証プロセス（TAKO_ISOLATED=1）の setup・bootstrap path / undo-path・setup undo が Path を
+      # 変えないことと、同じバイナリの旧アーム（TAKO_2959_LEGACY=1）は書き足すこと（A/B）も見る
       - name: setup の通し検査（#2767。隔離した USERPROFILE / APPDATA と偽の claude.exe）
         shell: pwsh
         run: pwsh -File scripts/windows/test-setup-windows-2767.ps1
