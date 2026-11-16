@@ -8858,7 +8858,8 @@ fn agent_preflight(
 /// tako の実行ファイル（MCP の一時注入・起動コマンドに埋める）。
 ///
 /// 先取りの内側では background が引いた答えだけを使う（#1984）。答えが無ければ
-/// PATH の問い合わせ（unix はログインシェル）を飛ばした解決で済ませる
+/// PATH の問い合わせ（unix はログインシェル）を飛ばした解決で済ませる（インストーラーの
+/// 記録 = レジストリの読み取りは子プロセスを起こさないので飛ばさない。#2931）
 fn tako_binary() -> String {
     match probed(|p| p.tako_bin.clone()) {
         Probed::Answer(bin) => bin,
@@ -8867,6 +8868,7 @@ fn tako_binary() -> String {
             &|| None,
             std::env::current_exe().ok().as_deref(),
             &tako_cli_file_name(),
+            tako_install_location().as_deref(),
         ),
         Probed::Outside => resolve_tako_binary(),
     }
@@ -23862,43 +23864,108 @@ pub(crate) fn tako_cli_file_name() -> String {
     format!("tako{}", std::env::consts::EXE_SUFFIX)
 }
 
-/// tako CLI バイナリのパスを解決する。
-/// ① /Applications/tako.app（安定パス）
-/// ② 境界 B16 のコマンド解決（`which tako` 相当）
-/// ③ 実行中バイナリの隣（.app バンドル / zip 展開想定）
-/// ④ フォールバック "tako"
+/// A/B（`TAKO_2931_LEGACY=1`）: #2931 より前の判定順へ戻す = インストーラーの記録を見ない
+/// （入れた本体から走っていても PATH の別の `tako` が隣より先に勝つ）
+pub const LEGACY_2931_ENV: &str = "TAKO_2931_LEGACY";
+
+/// tako CLI バイナリのパスを解決する（MCP の登録先・起動コマンドに埋める実体パス）。
+///
+/// | 段 | 見るもの | 当たる形 |
+/// |---|---|---|
+/// | ① | `/Applications/tako.app`（[`STABLE_APP_BINARY`]） | macOS の入れた本体（cask / zip を /Applications へ置いた形） |
+/// | ② | 実行中の本体の隣。ただし**実行中の本体がインストーラーで入れた先に居るときだけ**（境界 B20 の記録と比べる = `install_info::runs_from_install_dir`。#2931） | Windows のインストーラーで入れた本体（`…\Programs\tako\`）。macOS は記録が無いので当たらない |
+/// | ③ | 境界 B16 のコマンド解決（`which tako` 相当） | 開発ビルド・ポータブル zip・`cargo install`・/Applications に無い macOS |
+/// | ④ | 実行中の本体の隣（入れた先かどうかを問わない） | PATH に無い zip 展開・開発ビルド（#898） |
+/// | ⑤ | 素の `tako` | どれも無い |
+///
+/// ② が無かった #2931 より前は、Windows に ① に当たる安定パスが無いので ③ の PATH が勝ち、
+/// PATH に残った古い開発ビルドの `tako.exe` が MCP に登録された。開発ビルド（`target\debug` /
+/// `target\release`）・ポータブル zip はインストーラーの入れた先の外に居るので ② に当たらず、
+/// 修正前と同じく ③ の PATH を使う（アプリ内更新の「インストーラーで入れた本体か」= #2434 と同じ答え）。
+/// A/B は [`LEGACY_2931_ENV`]
 pub fn resolve_tako_binary() -> String {
     resolve_tako_binary_with(
         &|p| std::path::Path::new(p).is_file(),
         &|| which("tako"),
         std::env::current_exe().ok().as_deref(),
         &tako_cli_file_name(),
+        tako_install_location().as_deref(),
     )
+}
+
+/// [`resolve_tako_binary_with`] の ② が比べる「インストーラーで入れた先」（境界 B20 の記録。#2931）。
+///
+/// macOS・記録の無い Windows（ポータブル zip・開発ビルドだけの機械）は `None` = ② に当たらない。
+/// A/B（[`LEGACY_2931_ENV`]）は記録を見ない = 修正前の判定順。**本番の呼び手はすべてここを通す**
+/// （番犬 `issue2931_installed_sibling_first_watchdog` が `resolve_tako_binary_with` の呼び出しを名指す）
+fn tako_install_location() -> Option<PathBuf> {
+    install_location_for_resolve(
+        legacy_2931(),
+        tako_core::platform::install_info::install_location,
+    )
+}
+
+/// [`LEGACY_2931_ENV`] が立っているか。要求のたびに読む（テストが `run_alone!` の子で切り替えられるよう、値を覚えない）
+fn legacy_2931() -> bool {
+    std::env::var_os(LEGACY_2931_ENV).is_some()
+}
+
+/// [`tako_install_location`] の判断（A/B の腕を env を触らずに検査できるよう、記録の読み取りを引数で受ける）
+fn install_location_for_resolve(
+    legacy: bool,
+    recorded: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if legacy {
+        return None;
+    }
+    recorded()
 }
 
 /// [`resolve_tako_binary`] の判定順（純粋関数。**macOS 上から Windows の形も検査できる**）。
 ///
-/// ③ を `cfg` ではなく `file_name` の引数で表すのが要点。旧実装は `dir.join("tako")`
-/// 決め打ちで、Windows の隣は `tako.exe` なので**常に空振り**していた（#898）
+/// 隣を `cfg` ではなく `file_name` の引数で表すのが要点。旧実装は `dir.join("tako")`
+/// 決め打ちで、Windows の隣は `tako.exe` なので**常に空振り**していた（#898）。
+/// 「入れた本体か」も `cfg` ではなく `install_location`（境界 B20 の記録）の引数で表す（#2931）
 fn resolve_tako_binary_with(
     is_file: &dyn Fn(&str) -> bool,
     resolve_in_path: &dyn Fn() -> Option<String>,
     current_exe: Option<&std::path::Path>,
     file_name: &str,
+    install_location: Option<&std::path::Path>,
 ) -> String {
+    // ① macOS の安定パス
     if is_file(STABLE_APP_BINARY) {
         return STABLE_APP_BINARY.to_string();
     }
-    if let Some(path) = resolve_in_path() {
-        return path;
-    }
-    if let Some(dir) = current_exe.and_then(std::path::Path::parent) {
-        let sibling = dir.join(file_name).display().to_string();
-        if is_file(&sibling) {
+    // ② 入れた本体の隣（#2931）: PATH に残った別の tako より、いま走っている入れた本体と同じ版を使う
+    let installed = current_exe.is_some_and(|exe| {
+        tako_core::platform::install_info::runs_from_install_dir(install_location, exe)
+    });
+    if installed {
+        if let Some(sibling) = existing_sibling(is_file, current_exe, file_name) {
             return sibling;
         }
     }
+    // ③ PATH
+    if let Some(path) = resolve_in_path() {
+        return path;
+    }
+    // ④ 隣（入れた先かどうかを問わない）
+    if let Some(sibling) = existing_sibling(is_file, current_exe, file_name) {
+        return sibling;
+    }
     "tako".to_string()
+}
+
+/// 実行中の本体の隣の `file_name`（在れば）
+fn existing_sibling(
+    is_file: &dyn Fn(&str) -> bool,
+    current_exe: Option<&std::path::Path>,
+    file_name: &str,
+) -> Option<String> {
+    let dir = current_exe.and_then(std::path::Path::parent)?;
+    let sibling = dir.join(file_name).display().to_string();
+    is_file(&sibling).then_some(sibling)
 }
 
 /// dispatch / MCP の回答 JSON を CLI の非対話 stdin 経路へ渡す。
@@ -52157,6 +52224,7 @@ tako | pane 2 [ compact ]       [-]
             &|| Some("/usr/local/bin/tako".to_string()),
             Some(std::path::Path::new("/tmp/bundle/tako-app")),
             "tako",
+            None,
         );
         assert_eq!(got, STABLE_APP_BINARY);
     }
@@ -52168,6 +52236,7 @@ tako | pane 2 [ compact ]       [-]
             &|| Some("/opt/homebrew/bin/tako".to_string()),
             Some(std::path::Path::new("/tmp/bundle/tako-app")),
             "tako",
+            None,
         );
         assert_eq!(got, "/opt/homebrew/bin/tako");
     }
@@ -52185,6 +52254,7 @@ tako | pane 2 [ compact ]       [-]
             &|| None,
             Some(&exe),
             "tako",
+            None,
         );
         assert_eq!(got, sibling);
     }
@@ -52204,21 +52274,196 @@ tako | pane 2 [ compact ]       [-]
         let files = only_files(&[sibling.as_str()]);
         // 新: 名前に拡張子が付いているので隣が見つかる
         assert_eq!(
-            resolve_tako_binary_with(&files, &|| None, Some(&exe), "tako.exe"),
+            resolve_tako_binary_with(&files, &|| None, Some(&exe), "tako.exe", None),
             sibling
         );
         // 旧（拡張子なし決め打ち）は空振りして裸の `tako` に落ちる = 直った差分の実証。
         // Windows の隣は `tako.exe` なので、旧実装はこの枝を必ず通っていた
         assert_eq!(
-            resolve_tako_binary_with(&files, &|| None, Some(&exe), "tako"),
+            resolve_tako_binary_with(&files, &|| None, Some(&exe), "tako", None),
             "tako"
         );
     }
 
     #[test]
     fn どれも無ければ裸のtako() {
-        let got = resolve_tako_binary_with(&only_files(&[]), &|| None, None, "tako");
+        let got = resolve_tako_binary_with(&only_files(&[]), &|| None, None, "tako", None);
         assert_eq!(got, "tako");
+    }
+
+    // --- #2931: 入れた本体の隣を PATH より先に使う（Windows の ① に当たる段）---
+    //
+    // 入れた先は Windows の形の文字列で持つ（`runs_from_install_dir` は文字列のまま Windows の流儀で
+    // 比べるので macOS の単体でも同じ判定になる）。exe と隣は**同じ `join` から作る**（`Path::join` の
+    // 区切りは実行中 OS のもの = #898 のテストと同じ罠を避ける）。PATH の答えは 11/16 の実機で
+    // 登録された「PATH に残った古い開発ビルド」の形
+
+    /// インストーラーの入れた先（`{localappdata}\Programs\tako` = `installer/windows/tako.iss` の既定）
+    const I2931_INSTALL: &str = r"C:\Users\winuser\AppData\Local\Programs\tako";
+    /// PATH で先に来る別の `tako.exe`（開発用の木に残った古いビルド）
+    const I2931_STALE_IN_PATH: &str = r"C:\Users\winuser\dev\tako\target\debug\tako.exe";
+
+    #[test]
+    fn issue2931_入れた本体から走っていればpathの別のtakoより隣を選ぶ() {
+        let install = std::path::Path::new(I2931_INSTALL);
+        let sibling = install.join("tako.exe").display().to_string();
+        let files = only_files(&[sibling.as_str(), I2931_STALE_IN_PATH]);
+        let in_path = || Some(I2931_STALE_IN_PATH.to_string());
+        // GUI（tako-app.exe）から: 設定画面の登録・MCP の `tako_setup_mcp`・起動コマンド
+        let gui = install.join("tako-app.exe");
+        assert_eq!(
+            resolve_tako_binary_with(&files, &in_path, Some(&gui), "tako.exe", Some(install)),
+            sibling,
+            "入れた本体（GUI）の隣ではなく PATH の別の tako.exe を選んだ（#2931 の不具合の形）"
+        );
+        // CLI（tako.exe）から: `tako setup` / `tako setup-mcp` を打った本体 = 隣は自分自身
+        let cli = install.join("tako.exe");
+        assert_eq!(
+            resolve_tako_binary_with(&files, &in_path, Some(&cli), "tako.exe", Some(install)),
+            sibling,
+            "入れた本体（CLI 自身）ではなく PATH の別の tako.exe を選んだ（#2931 の不具合の形）"
+        );
+    }
+
+    #[test]
+    fn issue2931_開発ビルドから走らせた形は今どおりpathを選ぶ() {
+        let install = std::path::Path::new(I2931_INSTALL);
+        let dev = std::path::Path::new(r"C:\Users\winuser\dev\tako-wt\target\debug");
+        let dev_sibling = dev.join("tako.exe").display().to_string();
+        let files = only_files(&[dev_sibling.as_str(), I2931_STALE_IN_PATH]);
+        let in_path = || Some(I2931_STALE_IN_PATH.to_string());
+        let exe = dev.join("tako-app.exe");
+        // 同じ機械にインストーラーの記録があっても、開発ビルドは入れた先の外 = PATH（修正前と同じ）
+        assert_eq!(
+            resolve_tako_binary_with(&files, &in_path, Some(&exe), "tako.exe", Some(install)),
+            I2931_STALE_IN_PATH,
+            "開発ビルドから走らせた形で PATH より隣を選んだ（修正前の振る舞いを壊した）"
+        );
+        // インストーラーの記録が無い機械（開発ビルドだけ）も PATH
+        assert_eq!(
+            resolve_tako_binary_with(&files, &in_path, Some(&exe), "tako.exe", None),
+            I2931_STALE_IN_PATH
+        );
+        // ポータブル zip を展開した先も入れた先の外 = PATH（アプリ内更新の判定 #2434 と同じ答え）
+        let zip = std::path::Path::new(r"C:\Users\winuser\Downloads\tako-windows-x86_64");
+        let zip_sibling = zip.join("tako.exe").display().to_string();
+        assert_eq!(
+            resolve_tako_binary_with(
+                &only_files(&[zip_sibling.as_str()]),
+                &in_path,
+                Some(&zip.join("tako-app.exe")),
+                "tako.exe",
+                Some(install),
+            ),
+            I2931_STALE_IN_PATH
+        );
+        // PATH に何も無ければ、開発ビルドでも今どおり隣（④ = #898）
+        assert_eq!(
+            resolve_tako_binary_with(&files, &|| None, Some(&exe), "tako.exe", Some(install)),
+            dev_sibling
+        );
+    }
+
+    #[test]
+    fn issue2931_入れた本体の隣が無ければpathへ落ちる() {
+        let install = std::path::Path::new(I2931_INSTALL);
+        let gui = install.join("tako-app.exe");
+        assert_eq!(
+            resolve_tako_binary_with(
+                &only_files(&[I2931_STALE_IN_PATH]),
+                &|| Some(I2931_STALE_IN_PATH.to_string()),
+                Some(&gui),
+                "tako.exe",
+                Some(install),
+            ),
+            I2931_STALE_IN_PATH,
+            "隣の tako.exe が無いのに隣のパスを返した（在るものだけを返す）"
+        );
+    }
+
+    /// macOS の形は修正前と同じ: ① が在れば ①、無ければ PATH（macOS はインストーラーの記録が無い = `None`）
+    #[test]
+    fn issue2931_macosの判定順は変わらない() {
+        let bundle = std::path::Path::new("/Users/testuser/Applications/tako.app/Contents/MacOS");
+        let sibling = bundle.join("tako").display().to_string();
+        let exe = bundle.join("tako-app");
+        let in_path = || Some("/opt/homebrew/bin/tako".to_string());
+        // ① が在る
+        assert_eq!(
+            resolve_tako_binary_with(
+                &only_files(&[STABLE_APP_BINARY, sibling.as_str()]),
+                &in_path,
+                Some(&exe),
+                "tako",
+                None,
+            ),
+            STABLE_APP_BINARY
+        );
+        // ① が在れば、記録があっても ① が先（② は ① の後ろ）
+        assert_eq!(
+            resolve_tako_binary_with(
+                &only_files(&[STABLE_APP_BINARY, sibling.as_str()]),
+                &in_path,
+                Some(&exe),
+                "tako",
+                Some(bundle),
+            ),
+            STABLE_APP_BINARY
+        );
+        // ① が無い（/Applications の外の .app）: 記録が無いので修正前と同じく PATH
+        assert_eq!(
+            resolve_tako_binary_with(
+                &only_files(&[sibling.as_str()]),
+                &in_path,
+                Some(&exe),
+                "tako",
+                None,
+            ),
+            "/opt/homebrew/bin/tako"
+        );
+        // 本番の口が macOS で記録を返さないこと（= macOS は ② に当たりえない）
+        if cfg!(target_os = "macos") {
+            assert_eq!(tako_core::platform::install_info::install_location(), None);
+        }
+    }
+
+    /// A/B（`TAKO_2931_LEGACY=1`）は記録を見ない = 入れた本体から走っていても修正前の順（PATH が先）
+    #[test]
+    fn issue2931_legacyは記録を見ずに修正前の順へ戻る() {
+        let install = std::path::Path::new(I2931_INSTALL);
+        let sibling = install.join("tako.exe").display().to_string();
+        let files = only_files(&[sibling.as_str(), I2931_STALE_IN_PATH]);
+        let in_path = || Some(I2931_STALE_IN_PATH.to_string());
+        let gui = install.join("tako-app.exe");
+        // 新: 記録を引く → 隣
+        let new = install_location_for_resolve(false, || Some(install.to_path_buf()));
+        assert_eq!(new.as_deref(), Some(install));
+        assert_eq!(
+            resolve_tako_binary_with(&files, &in_path, Some(&gui), "tako.exe", new.as_deref()),
+            sibling
+        );
+        // 旧: 記録を読まない（呼びもしない）→ PATH
+        let old = install_location_for_resolve(true, || {
+            panic!("A/B の旧の腕でインストーラーの記録を読んだ")
+        });
+        assert_eq!(old, None);
+        assert_eq!(
+            resolve_tako_binary_with(&files, &in_path, Some(&gui), "tako.exe", old.as_deref()),
+            I2931_STALE_IN_PATH
+        );
+    }
+
+    #[test]
+    fn issue2931_legacyのenvを要求のたびに読む() {
+        if tako_core::run_alone!(issue2931_legacyのenvを要求のたびに読む) {
+            return;
+        }
+        std::env::remove_var(LEGACY_2931_ENV);
+        assert!(!legacy_2931());
+        std::env::set_var(LEGACY_2931_ENV, "1");
+        assert!(legacy_2931());
+        // 旧の腕では本番の口も記録を返さない
+        assert_eq!(tako_install_location(), None);
     }
 
     /// 実行中の OS に合った実行ファイル名を組み立てていること

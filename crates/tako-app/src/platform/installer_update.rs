@@ -435,28 +435,9 @@ pub fn launch(
 
 /// 動いている exe がインストーラーで入れた先に居るか（#2434）。
 ///
-/// インストーラーは前回の入れた先へ上書きするので、別の場所の exe（ポータブル版・
-/// 開発ビルド）を更新すると「別の場所に新しい版が入り、動いている方は古いまま」になる。
-/// 比べ方は Windows のパスの流儀（大文字小文字を区別しない・`/` と `\` を同一視・
-/// 末尾の区切りを無視・`\\?\` を剥がす）
-pub fn runs_from_install_dir(install_location: Option<&Path>, exe: &Path) -> bool {
-    let Some(install) = install_location else {
-        return false;
-    };
-    // `Path::parent` は実行環境の区切りで切るので使わない（macOS の単体からも
-    // Windows のパスを同じ規則で比べられるよう、文字列のまま Windows の流儀で切る）
-    let norm = |p: &Path| {
-        let s = p.to_string_lossy().replace('/', "\\");
-        let s = s.strip_prefix(r"\\?\").unwrap_or(&s).to_string();
-        s.trim_end_matches('\\').to_lowercase()
-    };
-    let exe = norm(exe);
-    let Some((exe_dir, _)) = exe.rsplit_once('\\') else {
-        return false;
-    };
-    let install = norm(install);
-    !install.is_empty() && install == exe_dir
-}
+/// 判定の正本は境界 B20（`tako_core::platform::install_info::runs_from_install_dir`）。
+/// tako の CLI の解決（#2931）も同じ答えを使うので、ここは正本をそのまま通す
+pub use tako_core::platform::install_info::runs_from_install_dir;
 
 /// 起動し直す exe（今動いている tako-app）
 pub fn relaunch_target() -> Result<PathBuf, InstallerError> {
@@ -845,42 +826,19 @@ mod tests {
         }
     }
 
+    /// 判定の本体の検査は正本（`tako_core::platform::install_info`）へ移した（#2931）。
+    /// ここは更新の経路が正本を通していることだけを見る
     #[test]
-    fn インストーラーで入れた場所から動いているかを比べる() {
+    fn インストーラーで入れた場所の判定は境界b20の正本を通す() {
         let install = Path::new(r"C:\Users\testuser\AppData\Local\Programs\tako\");
-        for exe in [
-            r"C:\Users\testuser\AppData\Local\Programs\tako\tako-app.exe",
-            r"c:\USERS\testuser\APPDATA\local\programs\TAKO\tako-app.exe",
-            r"\\?\C:\Users\testuser\AppData\Local\Programs\tako\tako-app.exe",
-            "C:/Users/testuser/AppData/Local/Programs/tako/tako-app.exe",
-        ] {
-            assert!(
-                runs_from_install_dir(Some(install), Path::new(exe)),
-                "{exe}"
-            );
-        }
-        for exe in [
-            // ポータブル zip を展開した先
-            r"C:\Users\testuser\Downloads\tako-v0.8.39-windows-x86_64\tako-app.exe",
-            // 開発ビルド
-            r"C:\src\tako\target\debug\tako-app.exe",
-            // 入れた先の下の別フォルダ
-            r"C:\Users\testuser\AppData\Local\Programs\tako\sub\tako-app.exe",
-        ] {
-            assert!(
-                !runs_from_install_dir(Some(install), Path::new(exe)),
-                "{exe}"
-            );
-        }
-        // 記録が無い = インストーラーで入れていない
-        assert!(!runs_from_install_dir(
-            None,
-            Path::new(r"C:\x\tako-app.exe")
-        ));
-        assert!(!runs_from_install_dir(
-            Some(Path::new("")),
-            Path::new(r"C:\x\tako-app.exe")
-        ));
+        let exe = Path::new(r"C:\Users\testuser\AppData\Local\Programs\tako\tako-app.exe");
+        let dev = Path::new(r"C:\src\tako\target\debug\tako-app.exe");
+        assert_eq!(
+            runs_from_install_dir(Some(install), exe),
+            tako_core::platform::install_info::runs_from_install_dir(Some(install), exe)
+        );
+        assert!(runs_from_install_dir(Some(install), exe));
+        assert!(!runs_from_install_dir(Some(install), dev));
     }
 
     #[test]

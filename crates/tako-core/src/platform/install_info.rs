@@ -45,6 +45,38 @@ pub fn install_location() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
+/// 動いている exe がインストーラーで入れた先（[`install_location`]）に居るか（#2434 / #2931）。
+///
+/// 「インストーラーで入れた本体か」の判定の**正本**。アプリ内更新（別の場所の exe を更新すると
+/// 「別の場所に新しい版が入り、動いている方は古いまま」になる = #2434）と、tako の CLI の解決
+/// （入れた本体なら隣の `tako.exe` を PATH の別の `tako.exe` より先に使う = #2931）が同じ答えを使う。
+/// ポータブル zip・開発ビルドの exe は入れた先の外に居るので `false`（記録が無ければ常に `false` =
+/// macOS は常に `false`）。
+///
+/// 比べ方は Windows のパスの流儀（大文字小文字を区別しない・`/` と `\` を同一視・
+/// 末尾の区切りを無視・`\\?\` を剥がす）
+pub fn runs_from_install_dir(
+    install_location: Option<&std::path::Path>,
+    exe: &std::path::Path,
+) -> bool {
+    let Some(install) = install_location else {
+        return false;
+    };
+    // `Path::parent` は実行環境の区切りで切るので使わない（macOS の単体からも
+    // Windows のパスを同じ規則で比べられるよう、文字列のまま Windows の流儀で切る）
+    let norm = |p: &std::path::Path| {
+        let s = p.to_string_lossy().replace('/', "\\");
+        let s = s.strip_prefix(r"\\?\").unwrap_or(&s).to_string();
+        s.trim_end_matches('\\').to_lowercase()
+    };
+    let exe = norm(exe);
+    let Some((exe_dir, _)) = exe.rsplit_once('\\') else {
+        return false;
+    };
+    let install = norm(install);
+    !install.is_empty() && install == exe_dir
+}
+
 #[cfg(windows)]
 mod imp {
     /// Inno Setup が per-user インストールで作るアンインストールキー。
@@ -224,5 +256,53 @@ mod tests {
         }
         #[cfg(not(windows))]
         assert!(install_location().is_none());
+    }
+
+    /// #2434 で tako-app の `installer_update` に置いた検査を、正本と一緒に移した（#2931）
+    #[test]
+    fn インストーラーで入れた場所から動いているかを比べる() {
+        use std::path::Path;
+        let install = Path::new(r"C:\Users\testuser\AppData\Local\Programs\tako\");
+        for exe in [
+            r"C:\Users\testuser\AppData\Local\Programs\tako\tako-app.exe",
+            r"c:\USERS\testuser\APPDATA\local\programs\TAKO\tako-app.exe",
+            r"\\?\C:\Users\testuser\AppData\Local\Programs\tako\tako-app.exe",
+            "C:/Users/testuser/AppData/Local/Programs/tako/tako-app.exe",
+            // CLI 自身（`tako setup` を打った本体）も同じ置き場（#2931）
+            r"C:\Users\testuser\AppData\Local\Programs\tako\tako.exe",
+        ] {
+            assert!(
+                runs_from_install_dir(Some(install), Path::new(exe)),
+                "{exe}"
+            );
+        }
+        for exe in [
+            // ポータブル zip を展開した先
+            r"C:\Users\testuser\Downloads\tako-v0.8.39-windows-x86_64\tako-app.exe",
+            // 開発ビルド
+            r"C:\src\tako\target\debug\tako-app.exe",
+            r"C:\src\tako\target\release\tako.exe",
+            // 入れた先の下の別フォルダ
+            r"C:\Users\testuser\AppData\Local\Programs\tako\sub\tako-app.exe",
+        ] {
+            assert!(
+                !runs_from_install_dir(Some(install), Path::new(exe)),
+                "{exe}"
+            );
+        }
+        // 記録が無い = インストーラーで入れていない
+        assert!(!runs_from_install_dir(
+            None,
+            Path::new(r"C:\x\tako-app.exe")
+        ));
+        assert!(!runs_from_install_dir(
+            Some(Path::new("")),
+            Path::new(r"C:\x\tako-app.exe")
+        ));
+        // 区切りの無い exe（親の無いパス）は入れた先に居ない
+        assert!(!runs_from_install_dir(
+            Some(install),
+            Path::new("tako-app.exe")
+        ));
     }
 }
