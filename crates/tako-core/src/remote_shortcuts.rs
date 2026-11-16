@@ -6,7 +6,8 @@
 //!
 //! # 既定のショートカットを**ファイルに書かない**理由
 //!
-//! `~` / `~/Desktop` / `~/Downloads` は [`defaults_for`] が**毎回組む**。
+//! `~` / デスクトップ / ダウンロードは [`defaults_for`] が**毎回組む**（macOS / unix は
+//! `~/Desktop` / `~/Downloads`、Windows は Known Folder の置き場 = OneDrive へ移したデスクトップも出る。#2939）。
 //! 初回に書き込む形にすると、
 //!
 //! - ホームの位置が変わった環境（別マシンへ data dir を持ち込んだ・`HOME` を変えた）で
@@ -28,6 +29,7 @@ use std::path::{Path, PathBuf};
 
 use crate::load_issue::LoadIssue;
 use crate::paths;
+use crate::platform::known_folder::{self, KnownFolder};
 
 /// 登録できるショートカットの上限。UI の一覧が実用の範囲に収まればよく、
 /// 溢れさせない目的だけなので大きめに取る
@@ -285,11 +287,22 @@ impl ShortcutsFile {
     /// **既定のショートカットを指したときは専用の理由で断る**
     /// （「無い」と言うと、消えないのが不具合に見える）
     pub fn remove(&mut self, key: &str, home: Option<&Path>) -> Result<Shortcut, ShortcutError> {
+        self.remove_with(key, home, &FolderLookup::system())
+    }
+
+    /// [`remove`](Self::remove) の本体（既定かどうかを [`listing_with`](Self::listing_with) と
+    /// 同じ引き方で判定する = 一覧に既定として出る行は必ず「既定は消せない」で断る。#2939）
+    pub fn remove_with(
+        &mut self,
+        key: &str,
+        home: Option<&Path>,
+        lookup: &FolderLookup<'_>,
+    ) -> Result<Shortcut, ShortcutError> {
         let key_id = resolve_key(key);
         if let Some(at) = self.shortcuts.iter().position(|s| s.id == key_id) {
             return Ok(self.shortcuts.remove(at));
         }
-        if defaults_for(home).iter().any(|s| s.id == key_id) {
+        if defaults_with(home, lookup).iter().any(|s| s.id == key_id) {
             return Err(ShortcutError::Builtin);
         }
         Err(ShortcutError::UnknownShortcut)
@@ -300,10 +313,16 @@ impl ShortcutsFile {
     /// **既定が先**（`~` → Desktop → Downloads → 登録分の追加順）。
     /// 登録分に既定と同じパスが在れば、既定の側を落として二重に出さない
     pub fn listing(&self, home: Option<&Path>) -> Vec<Shortcut> {
+        self.listing_with(home, &FolderLookup::system())
+    }
+
+    /// [`listing`](Self::listing) の本体（既知フォルダの引き方を渡せるので、Windows の置き場を
+    /// どの OS のテストからも差し替えられる。#2939）
+    pub fn listing_with(&self, home: Option<&Path>, lookup: &FolderLookup<'_>) -> Vec<Shortcut> {
         let mut out = Vec::new();
         let user_ids: std::collections::HashSet<&str> =
             self.shortcuts.iter().map(|s| s.id.as_str()).collect();
-        for d in defaults_for(home) {
+        for d in defaults_with(home, lookup) {
             if !user_ids.contains(d.id.as_str()) {
                 out.push(d);
             }
@@ -358,26 +377,101 @@ fn display_name(name: Option<&str>, canon: &Path) -> String {
     cleaned.chars().take(MAX_NAME_CHARS).collect()
 }
 
-/// 既定のショートカット（**ホームを引数で受ける純粋関数**）。
+/// #2939 の A/B（同一バイナリで修正前 = Windows でも `<ホーム>\Desktop` / `<ホーム>\Downloads` の決め打ち）
+pub const LEGACY_ENV: &str = "TAKO_2939_LEGACY";
+
+fn legacy() -> bool {
+    std::env::var_os(LEGACY_ENV).is_some_and(|v| !v.is_empty())
+}
+
+/// 既定のショートカットに並べる既知フォルダ（並び順 = 画面の並び）
+const DEFAULT_FOLDERS: [(KnownFolder, &str); 2] = [
+    (KnownFolder::Desktop, "デスクトップ"),
+    (KnownFolder::Downloads, "ダウンロード"),
+];
+
+/// 既定のショートカットの置き場の引き方（#2939）。本番は [`FolderLookup::system`]、
+/// テストは OS の答え（`os_answer`）を差し替えて、Windows の置き場をどの OS からも再現する
+pub struct FolderLookup<'a> {
+    /// OS が答える既知フォルダの置き場（本番は境界 B39 [`known_folder::os_path`]。
+    /// macOS / unix は常に `None` = ホームの下の慣例の名前で組む）
+    pub os_answer: &'a dyn Fn(KnownFolder) -> Option<PathBuf>,
+    /// 検証プロセスか（[`paths::is_verification_process`]）。検証プロセスは `HOME` を砂場へ
+    /// 差し替えて動くが、OS の答えは差し替えに追従しない（本物の利用者の置き場を返す）。
+    /// なので渡されたホームが OS の利用者のプロファイルと同じとき（= 砂場へ差し替えていない）
+    /// だけ OS の答えを使い、違えば砂場のホームの下を見る
+    pub verification: bool,
+    /// [`LEGACY_ENV`]（OS の答えを見ない = 修正前）
+    pub legacy: bool,
+}
+
+impl FolderLookup<'static> {
+    /// 本番の引き方（境界 B39 の口・このプロセスの検証判定・A/B の env）
+    pub fn system() -> Self {
+        Self {
+            os_answer: &known_folder::os_path,
+            verification: paths::is_verification_process(),
+            legacy: legacy(),
+        }
+    }
+}
+
+impl FolderLookup<'_> {
+    /// 正規化済みの `home` に対して OS の答えを使ってよいか
+    fn os_answers_apply(&self, home: &Path) -> bool {
+        if self.legacy {
+            return false;
+        }
+        if !self.verification {
+            return true;
+        }
+        (self.os_answer)(KnownFolder::Profile)
+            .is_some_and(|profile| crate::platform::path::canonicalize_or_self(&profile) == home)
+    }
+
+    /// `home`（正規化済み）の既知フォルダの置き場。OS の答えを使えるならそれ、
+    /// 使えない・答えが無いならホームの下の慣例の名前
+    fn folder_under(&self, home: &Path, folder: KnownFolder, use_os: bool) -> Option<PathBuf> {
+        let os = if use_os {
+            (self.os_answer)(folder)
+        } else {
+            None
+        };
+        os.or_else(|| folder.home_relative().map(|rel| home.join(rel)))
+    }
+}
+
+/// 既定のショートカット（**ホームを引数で受ける**）。
 ///
-/// 実在するものだけを返すので、Desktop / Downloads を消している環境で
+/// 実在するものだけを返すので、デスクトップ / ダウンロードを消している環境で
 /// 「押しても開けない行」が並ばない。ホームを引数にしてあるのは、
-/// テストが `HOME` を書き換えずに（= 他のテストと干渉せずに）検査できるようにするため
+/// テストが `HOME` を書き換えずに（= 他のテストと干渉せずに）検査できるようにするため。
+/// デスクトップ / ダウンロードの置き場は Windows では Known Folder で引く（#2939。[`FolderLookup`]）
 pub fn defaults_for(home: Option<&Path>) -> Vec<Shortcut> {
+    defaults_with(home, &FolderLookup::system())
+}
+
+/// [`defaults_for`] の本体（既知フォルダの引き方を渡せる純粋関数。#2939）
+pub fn defaults_with(home: Option<&Path>, lookup: &FolderLookup<'_>) -> Vec<Shortcut> {
     let Some(home) = home else {
         return Vec::new();
     };
     // **登録分と同じ基準で正規化する**（#970 の 1 実装）。
     // ここを素のパスのままにすると、`add` 側は canonicalize 済みなので
     // **同じフォルダが「既定」と「登録分」の 2 行に分かれて出る**（id がパス由来のため）。
-    // 実測: ホームが symlink 越し（`/tmp` → `/private/tmp`）の環境で Downloads が二重に出た
+    // 実測: ホームが symlink 越し（`/tmp` → `/private/tmp`）の環境で Downloads が二重に出た。
+    // Known Folder の答えも同じ正規化を通す（#2939）
     let home = crate::platform::path::canonicalize_or_self(home);
     let mut out = Vec::new();
     if home.is_dir() {
         out.push(Shortcut::builtin(&home, "ホーム"));
     }
-    for (rel, label) in [("Desktop", "デスクトップ"), ("Downloads", "ダウンロード")] {
-        let p = crate::platform::path::canonicalize_or_self(&home.join(rel));
+    let use_os = lookup.os_answers_apply(&home);
+    for (folder, label) in DEFAULT_FOLDERS {
+        let Some(dir) = lookup.folder_under(&home, folder, use_os) else {
+            continue;
+        };
+        let p = crate::platform::path::canonicalize_or_self(&dir);
         if p.is_dir() {
             out.push(Shortcut::builtin(&p, label));
         }
@@ -630,5 +724,201 @@ mod tests {
         assert_eq!(file.add(&extra, None, 1), Err(ShortcutError::TooMany));
         assert_eq!(file.shortcuts.len(), MAX_SHORTCUTS);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2939 の機械の形: デスクトップを OneDrive へ移してあり（Known Folder Move）、
+    /// `<ホーム>/Desktop` は無い。ダウンロードはホームの下のまま
+    struct OneDriveHome {
+        _scratch: crate::test_residue::ScratchDir,
+        /// 素の（正規化前の）ホーム。OS のプロファイルの答えもこの綴りで返す
+        home: PathBuf,
+        /// OS が答えるデスクトップ（`<ホーム>/OneDrive/デスクトップ`）
+        desktop: PathBuf,
+    }
+
+    impl OneDriveHome {
+        fn new() -> Self {
+            let scratch = crate::test_residue::ScratchDir::new("issue2939");
+            let home = scratch.path().join("winuser");
+            let desktop = home.join("OneDrive").join("デスクトップ");
+            std::fs::create_dir_all(&desktop).expect("作れる");
+            std::fs::create_dir_all(home.join("Downloads")).expect("作れる");
+            assert!(!home.join("Desktop").exists(), "前提: ~/Desktop は無い");
+            Self {
+                _scratch: scratch,
+                home,
+                desktop,
+            }
+        }
+
+        /// Windows の Known Folder の答え（このホームの利用者として答える）
+        fn answer(&self, folder: KnownFolder) -> Option<PathBuf> {
+            match folder {
+                KnownFolder::Profile => Some(self.home.clone()),
+                KnownFolder::Desktop => Some(self.desktop.clone()),
+                KnownFolder::Downloads => Some(self.home.join("Downloads")),
+                KnownFolder::Documents => None,
+            }
+        }
+    }
+
+    fn names(list: &[Shortcut]) -> Vec<&str> {
+        list.iter().map(|s| s.name.as_str()).collect()
+    }
+
+    fn canon(p: &Path) -> String {
+        crate::platform::path::canonicalize_or_self(p)
+            .to_string_lossy()
+            .to_string()
+    }
+
+    #[test]
+    fn issue2939_onedriveへ移したデスクトップも既定に出る() {
+        let m = OneDriveHome::new();
+        let answer = |f| m.answer(f);
+        // cargo test は検証プロセス。渡したホームが OS のプロファイルと同じなので OS の答えを使う
+        let lookup = FolderLookup {
+            os_answer: &answer,
+            verification: true,
+            legacy: false,
+        };
+        let list = defaults_with(Some(&m.home), &lookup);
+        assert_eq!(names(&list), vec!["ホーム", "デスクトップ", "ダウンロード"]);
+        assert_eq!(
+            list[1].path,
+            canon(&m.desktop),
+            "OneDrive の下のデスクトップ"
+        );
+        assert!(list.iter().all(|s| s.builtin));
+
+        // A/B: 修正前（`TAKO_2939_LEGACY=1`）は `<ホーム>/Desktop` の実在だけを見るので出ない = #2939 の症状
+        let legacy = FolderLookup {
+            os_answer: &answer,
+            verification: true,
+            legacy: true,
+        };
+        assert_eq!(
+            names(&defaults_with(Some(&m.home), &legacy)),
+            vec!["ホーム", "ダウンロード"]
+        );
+    }
+
+    #[test]
+    fn issue2939_登録分と同じフォルダを足しても2行に分かれない() {
+        let m = OneDriveHome::new();
+        let answer = |f| m.answer(f);
+        let lookup = FolderLookup {
+            os_answer: &answer,
+            verification: false,
+            legacy: false,
+        };
+        let mut file = ShortcutsFile::default();
+        file.add(&m.desktop, Some("私の机"), 1).expect("足せる");
+        let listing = file.listing_with(Some(&m.home), &lookup);
+        assert_eq!(names(&listing), vec!["ホーム", "ダウンロード", "私の机"]);
+        let desk: Vec<&Shortcut> = listing
+            .iter()
+            .filter(|s| s.path == canon(&m.desktop))
+            .collect();
+        assert_eq!(
+            desk.len(),
+            1,
+            "Known Folder の答えと登録分が同じ正規化を通る（#970）"
+        );
+        assert!(!desk[0].builtin, "登録分が勝つ（消せる側を残す）");
+
+        // 登録分を消すと既定へ戻り、既定は「既定は消せない」で断る（一覧と同じ引き方で判定する）
+        file.remove_with(&m.desktop.to_string_lossy(), Some(&m.home), &lookup)
+            .expect("登録分は消せる");
+        assert_eq!(
+            file.remove_with(&m.desktop.to_string_lossy(), Some(&m.home), &lookup),
+            Err(ShortcutError::Builtin)
+        );
+        assert_eq!(
+            names(&file.listing_with(Some(&m.home), &lookup)),
+            vec!["ホーム", "デスクトップ", "ダウンロード"]
+        );
+    }
+
+    /// 検証プロセスは `HOME` を砂場へ差し替えて動くが、Known Folder は差し替えに追従せず本物の利用者の
+    /// 置き場を返す。渡されたホームが OS のプロファイルと違えば、砂場のホームの下を見る
+    #[test]
+    fn issue2939_検証プロセスは砂場のホームなら本物のデスクトップを見ない() {
+        let real = OneDriveHome::new();
+        let sandbox = crate::test_residue::ScratchDir::new("issue2939-sandbox");
+        let home = sandbox.path().join("home");
+        std::fs::create_dir_all(home.join("Desktop")).expect("作れる");
+        let answer = |f| real.answer(f);
+
+        let verification = FolderLookup {
+            os_answer: &answer,
+            verification: true,
+            legacy: false,
+        };
+        let list = defaults_with(Some(&home), &verification);
+        assert_eq!(names(&list), vec!["ホーム", "デスクトップ"]);
+        assert_eq!(list[1].path, canon(&home.join("Desktop")), "砂場の Desktop");
+
+        // 本番（検証プロセスでない）は、HOME を利用者が変えていても OS のデスクトップを出す
+        let production = FolderLookup {
+            os_answer: &answer,
+            verification: false,
+            legacy: false,
+        };
+        let list = defaults_with(Some(&home), &production);
+        assert_eq!(names(&list), vec!["ホーム", "デスクトップ", "ダウンロード"]);
+        assert_eq!(list[1].path, canon(&real.desktop));
+    }
+
+    /// OS が答えない既知フォルダ（API の失敗・macOS / unix）はホームの下の慣例の名前へ戻る
+    #[test]
+    fn issue2939_osが答えなければホームの下の慣例の名前() {
+        let scratch = crate::test_residue::ScratchDir::new("issue2939-none");
+        let home = scratch.path().join("home");
+        std::fs::create_dir_all(home.join("Desktop")).expect("作れる");
+        std::fs::create_dir_all(home.join("Downloads")).expect("作れる");
+        let profile_only = |f: KnownFolder| (f == KnownFolder::Profile).then(|| home.clone());
+        for verification in [false, true] {
+            let lookup = FolderLookup {
+                os_answer: &profile_only,
+                verification,
+                legacy: false,
+            };
+            let list = defaults_with(Some(&home), &lookup);
+            let paths: Vec<&str> = list.iter().map(|s| s.path.as_str()).collect();
+            assert_eq!(
+                paths,
+                vec![
+                    canon(&home).as_str(),
+                    canon(&home.join("Desktop")).as_str(),
+                    canon(&home.join("Downloads")).as_str(),
+                ],
+                "verification={verification}"
+            );
+        }
+    }
+
+    /// macOS / unix の既定は #2939 の前と同じ（`~/Desktop` / `~/Downloads`）。本番の引き方
+    /// （[`FolderLookup::system`]）の答えが、修正前（A/B の旧アーム）と一字一句同じ。
+    /// Windows の `cargo test` でも、一時 dir のホームは OS のプロファイルと違うので同じになる
+    #[test]
+    fn issue2939_一時dirのホームでは本番の引き方も修正前と同じ() {
+        let scratch = crate::test_residue::ScratchDir::new("issue2939-same");
+        let home = scratch.path().join("home");
+        std::fs::create_dir_all(home.join("Desktop")).expect("作れる");
+        std::fs::create_dir_all(home.join("Downloads")).expect("作れる");
+        let before = FolderLookup {
+            os_answer: &|_| None,
+            verification: false,
+            legacy: true,
+        };
+        let system = defaults_for(Some(&home));
+        assert_eq!(system, defaults_with(Some(&home), &before));
+        assert_eq!(
+            names(&system),
+            vec!["ホーム", "デスクトップ", "ダウンロード"]
+        );
+        assert_eq!(system[1].path, canon(&home.join("Desktop")));
+        assert_eq!(system[2].path, canon(&home.join("Downloads")));
     }
 }

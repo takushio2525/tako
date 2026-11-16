@@ -1195,69 +1195,15 @@ mod imp {
     /// 2 エディションぶん払うと体感できるほど遅くなる。`%USERPROFILE%\Documents` の決め打ちは
     /// OneDrive のフォルダーリダイレクトで外れる（実測: 検証機は `…\OneDrive\ドキュメント`）ので、
     /// それは API が答えないときの保険にだけ使う。PowerShell の答えとの一致は Windows の
-    /// テスト（`旧ブロックの置き場はpowershellが答える場所と一致する`）が見る
+    /// テスト（`旧ブロックの置き場はpowershellが答える場所と一致する`）が見る。
+    /// 既知フォルダを引く口は境界 B39 の 1 本（`platform::known_folder`。#2939 で寄せた）
     pub(super) fn documents_dir() -> Option<PathBuf> {
-        known_documents_dir().or_else(|| {
+        use crate::platform::known_folder::{self, KnownFolder};
+        known_folder::os_path(KnownFolder::Documents).or_else(|| {
             std::env::var_os("USERPROFILE")
                 .filter(|v| !v.is_empty())
                 .map(|home| PathBuf::from(home).join("Documents"))
         })
-    }
-
-    fn known_documents_dir() -> Option<PathBuf> {
-        use std::os::windows::ffi::OsStringExt;
-
-        #[repr(C)]
-        struct Guid {
-            data1: u32,
-            data2: u16,
-            data3: u16,
-            data4: [u8; 8],
-        }
-        // {FDD39AD0-238F-46AF-ADB4-6C85480369C7}
-        const FOLDERID_DOCUMENTS: Guid = Guid {
-            data1: 0xFDD3_9AD0,
-            data2: 0x238F,
-            data3: 0x46AF,
-            data4: [0xAD, 0xB4, 0x6C, 0x85, 0x48, 0x03, 0x69, 0xC7],
-        };
-        // `windows-sys` を足さず必要な関数だけ宣言する方針は `platform::install_info` と同じ
-        #[link(name = "shell32")]
-        unsafe extern "system" {
-            fn SHGetKnownFolderPath(
-                rfid: *const Guid,
-                dwflags: u32,
-                htoken: isize,
-                ppszpath: *mut *mut u16,
-            ) -> i32;
-        }
-        #[link(name = "ole32")]
-        unsafe extern "system" {
-            fn CoTaskMemFree(pv: *const std::ffi::c_void);
-        }
-
-        let mut raw: *mut u16 = std::ptr::null_mut();
-        // SAFETY: GUID と受け取り先は有効なポインタ。htoken = 0 は「このプロセスのユーザー」
-        let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_DOCUMENTS, 0, 0, &mut raw) };
-        let dir = if hr >= 0 && !raw.is_null() {
-            let mut len = 0usize;
-            // SAFETY: 成功時の raw は NUL 終端の UTF-16 文字列
-            let wide = unsafe {
-                while *raw.add(len) != 0 {
-                    len += 1;
-                }
-                std::slice::from_raw_parts(raw, len)
-            };
-            Some(PathBuf::from(std::ffi::OsString::from_wide(wide)))
-        } else {
-            None
-        };
-        // 受け取ったバッファは成否によらず返す（API の契約）
-        if !raw.is_null() {
-            // SAFETY: SHGetKnownFolderPath が CoTaskMemAlloc で確保したもの
-            unsafe { CoTaskMemFree(raw.cast()) };
-        }
-        dir.filter(|d| !d.as_os_str().is_empty())
     }
 }
 

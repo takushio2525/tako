@@ -732,6 +732,13 @@ jobs:
       # 動かないので全数より手前に名指しで置く（#1282 と同じ理由）。--nocapture は結果の行（TAKO2940_*）をログへ残すため
       - name: 検証起動の受け口が本番の固定名を取らないかの実行検査（#2940）
         run: cargo test -p tako-cli --test issue2940_isolated_pipe_name -- --nocapture
+      # #2939: 既知フォルダ（SHGetKnownFolderPath）も **macOS では 1 行も実行できない** FFI。境界 B39 の答えが
+      # .NET（[Environment]::GetFolderPath）とシェル（shell:Downloads）の答えと一致するか・#2432 の $PROFILE の
+      # 置き場（ドキュメント）が寄せた後も PowerShell の答えと一致するか・スマホのショートカットの既定が注入した
+      # OneDrive のデスクトップを出す（A/B の旧アームでは出さない）かを、全数より手前に名指しで置く（#1282 と
+      # 同じ理由）。--nocapture は結果の行（TAKO2939_*。値は出さず一致と在るかだけ）をログへ残すため
+      - name: 既知フォルダの実行検査（#2939。境界 B39 known_folder・ショートカットの既定・$PROFILE の置き場）
+        run: cargo test -p tako-core --lib -- platform::known_folder remote_shortcuts 旧ブロックの置き場はpowershellが答える場所と一致する --nocapture
       # #2791: Windows の codex / agy の導入代行を、公式の install.ps1 を本当に走らせて確かめる（製品の口
       # `tako setup bootstrap install --agent codex|agy` = MCP tako_setup_bootstrap と同じ経路）。導入の前後の
       # status・入った置き場・agy の取得物が残らない（起動片のスコープ）を、ポリシーなし / HKCU Restricted /
