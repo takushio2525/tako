@@ -9099,9 +9099,12 @@ fn host_refusal_index(r: &HostRefusal) -> usize {
         HostRefusal::DefaultFormatOnSave => 81,
         HostRefusal::DefaultAutoClose => 82,
         HostRefusal::DefaultNoMod => 83,
+        HostRefusal::UrlScriptScheme(_) => 84,
+        HostRefusal::UrlSchemeUnsupported(_) => 85,
+        HostRefusal::UrlUnparsable(_) => 86,
     }
 }
-const HOST_REFUSAL_VARIANTS: usize = 84;
+const HOST_REFUSAL_VARIANTS: usize = 87;
 
 /// (断り, #2365 より前に GUI が組んでいた日本語の固定文)。中身で腕を分けるもの
 /// （`LinkIndexOutOfRange` の total・`WebViewNotFound` の案内）は両方を載せる
@@ -9300,6 +9303,25 @@ fn host_refusal_table() -> Vec<(HostRefusal, String)> {
         (
             H::UrlHasControlChar("https://a\u{1}b".into()),
             "URL に制御文字が含まれています（NSURL が解釈できない）: https://a\u{1}b".into(),
+        ),
+        // #2937（#2365 より後に足した断り = 旧文は無いので新しい日本語）
+        (
+            H::UrlScriptScheme("javascript".into()),
+            "javascript: の URL は Web ビューで開かない（ページの外から任意のスクリプトを走らせる形になる）。\
+             開いているページで JavaScript を走らせるなら tako web eval '<式>'"
+                .into(),
+        ),
+        (
+            H::UrlSchemeUnsupported("mailto".into()),
+            "mailto: の URL は Web ビューで開けない（開ける scheme は http / https / file / data / about）。\
+             Web ページなら https:// から書く"
+                .into(),
+        ),
+        (
+            H::UrlUnparsable("https://a:b".into()),
+            "URL を解釈できない（Web ビュー（NSURL）が受け付けない形）: https://a:b。\
+             ホスト名とポート番号の書き方を確かめる（例: http://localhost:3000）"
+                .into(),
         ),
         // #2365 の続き（GUI 側）: 旧 `webview::detached_parent_error` と `video_player` の文
         (

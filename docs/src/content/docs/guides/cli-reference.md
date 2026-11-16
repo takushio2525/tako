@@ -960,6 +960,8 @@ tako video seek 90 --pane 4   # 90 秒地点へ
 
 URL をネイティブ Web ビューペイン（macOS = WKWebView）として開きます。ペイン内ではクリック・スクロール・文字入力を普通のブラウザ同様に行えます。`hide` でページを生かしたまま dock へ退避し、`show` で呼び戻せます。
 
+開ける URL は `http` / `https` / `file` / `data` / `about` です（`localhost:5173` のように scheme を省くと `http://` か `https://` を補います）。`javascript:` などそれ以外の URL や、Web ビューが解釈できない形（ポートが数字でない等）は開かずに理由を返します。開いているページで JavaScript を走らせるときは `tako web eval` を使います。
+
 ```bash
 tako web open http://localhost:5173 --right
 tako web list                                # 一覧

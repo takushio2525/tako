@@ -152,6 +152,8 @@ pub mod transcript;
 /// usage 分析（エピック #2192。S1 #2200 = 利用制限の観測とログインの鍵）
 pub mod usage;
 pub mod user_tasks;
+/// Web ビューへ渡す URL の正規化と検査の 1 実装（#334 / #2937。入口はすべてここを通る）
+pub mod web_url;
 /// Web ビューの生成中に tako が落ちた印（#724 の W4。次の起動で保留にする）
 pub mod webview_guard;
 pub mod welcome;

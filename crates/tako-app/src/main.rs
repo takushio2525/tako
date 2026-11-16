@@ -3248,6 +3248,8 @@ struct TakoApp {
     webview_address_bar: HashMap<u64, crate::text_field::TextField>,
     /// アドレスバー編集中の pane_id（同時に 1 つのみ）
     webview_address_bar_active: Option<PaneId>,
+    /// dock の URL 欄・アドレスバーで断った URL の理由（#2937。出し方は [`WebUrlRefusal`]）
+    webview_url_refusal: Option<WebUrlRefusal>,
     /// wry の親にする GPUI ウィンドウの生ハンドル（初回 render で採取）
     window_raw_handle: Option<webview::WindowHandleBox>,
     /// キー入力の宛先を Web ビューから GPUI へ戻した回数（#1481 の計器。診断専用）
@@ -4642,6 +4644,47 @@ impl RemoteNotice {
     }
 }
 
+/// Web ビューの URL を断った理由（#2937）。
+///
+/// 汎用のトーストが無いので、**打った場所**へ出す（dock = URL 欄の下・アドレスバー = 開いたままの
+/// バーの下の本文）。欄の文字列が断ったときのまま（`typed`）の間だけ出す = 打ち直し・貼り付け・
+/// 変換のどの経路で直しても消える。検査そのものは `webview::validate_url`（= `tako_control::web_url`）の 1 実装
+struct WebUrlRefusal {
+    place: WebUrlPlace,
+    typed: String,
+    reason: HostRefusal,
+}
+
+/// URL を打つ GUI の欄（#2937）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebUrlPlace {
+    /// Web ビュー dock の URL 欄（Enter・「開く」）
+    Dock,
+    /// Web ビューペインのアドレスバー（Enter）
+    AddressBar(PaneId),
+}
+
+/// アドレスバーで断った URL の理由を本文の位置に描く（#2937）。バーを編集中はネイティブの
+/// Web ビューを隠しているので、本文は GPUI が描く（エラーオーバーレイ #327 と同じ置き場）
+fn render_webview_url_refusal(pane_id: PaneId, text: &str, theme: &Theme) -> gpui::Div {
+    div()
+        .flex_1()
+        .bg(rgba(theme.background))
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .p(px(16.0))
+        .child(
+            div()
+                .id(("web-url-refusal", pane_id.as_u64()))
+                .max_w(px(420.0))
+                .text_size(px(12.0))
+                .text_color(hsla(theme.red))
+                .child(SharedString::from(text.to_string())),
+        )
+}
+
 /// リモートへの書き戻しの進行状態（#966）。
 ///
 /// GUI の ⌘S は「ローカルの写しへ書く（同期・即時）」→「リモートへ押し出す（背景）」の
@@ -5665,6 +5708,7 @@ impl TakoApp {
             webview_dock_url_focused: false,
             webview_address_bar: HashMap::new(),
             webview_address_bar_active: None,
+            webview_url_refusal: None,
             window_raw_handle: None,
             webview_key_focus_returns: 0,
             pending_webview_restore: Vec::new(),
@@ -19068,7 +19112,57 @@ impl TakoApp {
             .map(|field| field.text().to_string())
             .unwrap_or_default();
         self.discard_app_text_ime(AppTextInput::WebAddress);
+        // 閉じたバーの断り（#2937）は持ち越さない
+        if self
+            .webview_url_refusal
+            .as_ref()
+            .is_some_and(|r| r.place == WebUrlPlace::AddressBar(pane))
+        {
+            self.webview_url_refusal = None;
+        }
         Some((pane, text))
+    }
+
+    /// dock の URL 欄・アドレスバーに出す URL の断り（#2937）。その欄が画面に出ていて、
+    /// 文字列が断ったときのままの間だけ返す（[`WebUrlRefusal`]）
+    fn web_url_refusal_at(&self, place: WebUrlPlace) -> Option<&HostRefusal> {
+        let refusal = self
+            .webview_url_refusal
+            .as_ref()
+            .filter(|r| r.place == place)?;
+        let now = match place {
+            WebUrlPlace::Dock => self
+                .webview_dock_open
+                .then(|| self.webview_dock_url.text())?,
+            WebUrlPlace::AddressBar(pane) => {
+                if self.web_address_bar_editing() != Some(pane) {
+                    return None;
+                }
+                self.webview_address_bar.get(&pane.as_u64())?.text()
+            }
+        };
+        (now.trim() == refusal.typed).then_some(&refusal.reason)
+    }
+
+    /// GUI の欄で打たれた URL を正規化して検査する（#2937）。断ったら理由をその欄へ出す印を立てて
+    /// `None`、通れば正規化した URL を返す。検査は wry へ渡す直前（`webview.rs`）と同じ 1 実装
+    fn accept_typed_web_url(&mut self, place: WebUrlPlace, typed: &str) -> Option<String> {
+        let typed = typed.trim().to_string();
+        let normalized = webview::normalize_url(&typed);
+        match webview::validate_url(&normalized) {
+            Ok(()) => {
+                self.webview_url_refusal = None;
+                Some(normalized)
+            }
+            Err(reason) => {
+                self.webview_url_refusal = Some(WebUrlRefusal {
+                    place,
+                    typed,
+                    reason,
+                });
+                None
+            }
+        }
     }
 
     /// Web ビューのアドレスバーへ文字列を入れる（#1750。**挿入はここ 1 本**。4 経路は
@@ -23498,7 +23592,13 @@ impl TakoApp {
                     base.cursor(CursorStyle::Arrow)
                 }
             };
-        let body = if let Some((error_msg, failed_url)) = &error_state {
+        // #2937: アドレスバーで断った URL の理由（バーを開いたまま = ネイティブの Web ビューは隠れている）
+        let url_refusal = self
+            .web_url_refusal_at(WebUrlPlace::AddressBar(pane_id))
+            .map(|reason| reason.to_string());
+        let body = if let Some(text) = url_refusal {
+            render_webview_url_refusal(pane_id, &text, &theme)
+        } else if let Some((error_msg, failed_url)) = &error_state {
             self.render_webview_error_overlay(pane_id, error_msg, failed_url, &theme, cx)
         } else if phase != webview::WebViewPhase::Ready {
             self.render_webview_pending_body(pane_id, phase, &url, &theme, cx)
@@ -24376,6 +24476,21 @@ impl TakoApp {
         };
         match ks.key.as_str() {
             "enter" => {
+                let typed = self
+                    .webview_address_bar
+                    .get(&pane_id.as_u64())
+                    .map(|field| field.text().trim().to_string())
+                    .unwrap_or_default();
+                // #2937: 断る URL はバーを開いたまま、理由を本文へ出す（打ち直せる）。
+                // 修正前は閉じてから navigate の断りを捨てていた（何も起きないように見えた）
+                if !typed.is_empty()
+                    && self
+                        .accept_typed_web_url(WebUrlPlace::AddressBar(pane_id), &typed)
+                        .is_none()
+                {
+                    cx.notify();
+                    return true;
+                }
                 let url = self
                     .close_web_address_bar()
                     .map(|(_, url)| url)
@@ -24454,7 +24569,12 @@ impl TakoApp {
     /// URL を指定して Web ビューペインを開く（#207。dock UI からの共通入口）。
     /// create_webview + フォーカスペイン右分割で表示し、dock を閉じる
     fn open_webview_from_dock(&mut self, url: &str, cx: &mut Context<Self>) {
-        let normalized = webview::normalize_url(url);
+        // #2937: 断る URL は dock を開いたまま、理由を URL 欄の下へ出す（target=_blank は
+        // `process_pending_new_windows` が先に同じ検査で落とすのでここで断らない）
+        let Some(normalized) = self.accept_typed_web_url(WebUrlPlace::Dock, url) else {
+            cx.notify();
+            return;
+        };
         match self.create_webview(&normalized) {
             Ok(id) => {
                 self.webview_show_from_dock(id, cx);
@@ -24605,7 +24725,23 @@ impl TakoApp {
                 .border_color(hsla(theme.border_subtle))
                 .overflow_hidden()
                 .children(rows)
-                .child(self.render_webview_dock_url_input(&theme, cx)),
+                .child(self.render_webview_dock_url_input(&theme, cx))
+                // #2937: 断った URL の理由（欄の文字列が断ったときのままの間だけ）
+                .when_some(
+                    self.web_url_refusal_at(WebUrlPlace::Dock)
+                        .map(|reason| reason.to_string()),
+                    |d, text| {
+                        d.child(
+                            div()
+                                .id("webdock-url-refusal")
+                                .flex_none()
+                                .px(px(4.0))
+                                .text_size(px(11.0))
+                                .text_color(hsla(theme.red))
+                                .child(SharedString::from(text)),
+                        )
+                    },
+                ),
         )
     }
 
@@ -34096,6 +34232,12 @@ mod self_test {
     mod tree_notice_2760;
     #[cfg(feature = "visual-test")]
     use tree_notice_2760::tree_notice_2760_visual;
+    /// #2937: Web ビューが解釈できない・開かせるべきでない URL をどの入口でも断り、GUI が落ちないか
+    /// （visual-test `webview-url-2937`）
+    #[cfg(feature = "visual-test")]
+    mod webview_url_2937;
+    #[cfg(feature = "visual-test")]
+    use webview_url_2937::webview_url_2937_visual;
     /// #2751: 言語サーバの未導入の帯が狭いペインでも本文の行を押し出さないか（visual-test `lsp-band-2751`）
     #[cfg(feature = "visual-test")]
     mod lsp_band_2751;
@@ -50672,6 +50814,11 @@ mod self_test {
                     tree_notice_2760_visual(any, window, cx).await;
                     visual_exit(0);
                 }
+                // #2937: javascript: ほか Web ビューが解釈できない URL をどの入口でも断り、GUI が落ちない
+                "webview-url-2937" => {
+                    webview_url_2937_visual(any, window, cx).await;
+                    visual_exit(0);
+                }
                 // #2751: 言語サーバの未導入の帯が狭いペインでも本文の行を押し出さないか
                 "lsp-band-2751" => {
                     lsp_band_2751_visual(any, window, cx).await;
@@ -53264,6 +53411,8 @@ mod self_test {
             tree_notice_2760_visual(any, window, cx).await;
             // #2751: 言語サーバの未導入の帯が狭いペインでも本文の行を押し出さない
             lsp_band_2751_visual(any, window, cx).await;
+            // #2937: Web ビューが解釈できない URL をどの入口でも断り、GUI が落ちない
+            webview_url_2937_visual(any, window, cx).await;
 
             // #932: ちらつきの機械検証。**最後に回す**（専用タブを作り、分割・
             // プレビュー・連続出力まで状態を動かすので、他の節の前提を壊さない）

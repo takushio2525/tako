@@ -1606,38 +1606,20 @@ fn should_track_nav(url: &str) -> bool {
 }
 
 /// スキーム無しの入力を URL に正規化する（アドレスバー入力・CLI の省略記法）。
-/// ドットも空白も無い単語はそのまま https 扱いにせず検索はしない（ローカル開発が主用途）
+/// 本体は `tako_control::web_url::normalize` の 1 実装（#2937。scheme の付いた入力はそのまま返し、
+/// 開けない scheme は [`validate_url`] が名指しで断る）
 pub fn normalize_url(input: &str) -> String {
-    let s = input.trim();
-    if s.starts_with("http://")
-        || s.starts_with("https://")
-        || s.starts_with("file://")
-        || s.starts_with("data:")
-        || s.starts_with("about:")
-    {
-        return s.to_string();
-    }
-    // localhost:3000 / 127.0.0.1:8080 のような開発サーバー指定は http に倒す
-    if s.starts_with("localhost") || s.starts_with("127.0.0.1") || s.starts_with("0.0.0.0") {
-        return format!("http://{s}");
-    }
-    format!("https://{s}")
+    tako_control::web_url::normalize(input)
 }
 
-/// 正規化済み URL を wry へ渡す前に検証する。
-/// NSURL(string:) が nil を返す文字列（空白・制御文字を含む等）を弾き、
-/// wry 内部の unwrap による panic（#334）を防ぐ
+/// 正規化済み URL を wry へ渡す前に検証する。**wry へ URL を渡す 2 か所（[`WebViewEntry::build_view`] の
+/// `with_url`・[`WebViewEntry::navigate`] の `load_url`）の直前はどれもここを通る**
+/// （番犬 `issue2937_webview_url_guard_watchdog`）。
+/// 本体は `tako_control::web_url::check` の 1 実装: 形（空白・制御文字 = #334）・scheme の表
+/// （javascript: ほか = #2937）・wry と同じ NSURL の解釈（境界 B38 = #2937）を見て、
+/// wry 内部の unwrap による panic を防ぐ
 pub fn validate_url(url: &str) -> Result<(), HostRefusal> {
-    if url.is_empty() {
-        return Err(HostRefusal::UrlEmpty);
-    }
-    if url.chars().any(|c| c.is_ascii_whitespace()) {
-        return Err(HostRefusal::UrlHasWhitespace(url.to_string()));
-    }
-    if url.bytes().any(|b| b < 0x20) {
-        return Err(HostRefusal::UrlHasControlChar(url.to_string()));
-    }
-    Ok(())
+    tako_control::web_url::check(url)
 }
 
 #[cfg(test)]
@@ -1710,6 +1692,62 @@ mod tests {
     fn validate_url_はタブや改行を拒否する() {
         assert!(validate_url("https://example.com/\there").is_err());
         assert!(validate_url("https://example.com/\nhere").is_err());
+    }
+
+    #[test]
+    fn validate_url_は_javascript_を名指しで断る() {
+        // #2937: 修正前は normalize_url が `https://javascript:alert(2936)` にし、wry が NSURL の
+        // unwrap で GUI ごと abort した
+        let url = normalize_url("javascript:alert(2936)");
+        assert_eq!(url, "javascript:alert(2936)");
+        assert_eq!(
+            validate_url(&url),
+            Err(HostRefusal::UrlScriptScheme("javascript".into()))
+        );
+    }
+
+    #[test]
+    fn validate_url_は_nsurl_が解釈できない形を断る() {
+        // #2937: ポートが数字でない形は macOS の NSURL が nil を返す（wry の unwrap に届く形）
+        let got = validate_url("https://example.com:abc");
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                got,
+                Err(HostRefusal::UrlUnparsable("https://example.com:abc".into()))
+            );
+        } else {
+            // WebView2 は解釈できない URL を Err で返す（落ちない）ので確かめない
+            assert_eq!(got, Ok(()));
+        }
+    }
+
+    #[test]
+    fn 生成待ちのエントリはwryへ渡す前にjavascriptを断る() {
+        // CLI / MCP の `web open`・dock・起動時の復元はどれも `create_webview` → ここ（#2937）
+        let err = WebViewEntry::queued(WebViewId(1), "javascript:alert(1)")
+            .err()
+            .expect("javascript: の生成待ちを作ってしまった");
+        assert_eq!(
+            err,
+            HostRefusal::UrlScriptScheme("javascript".into()).to_string()
+        );
+        assert!(WebViewEntry::queued(WebViewId(2), "http://localhost:3000").is_ok());
+    }
+
+    #[test]
+    fn wryの無いエントリのnavigateもjavascriptを断りurlを変えない() {
+        // CLI / MCP の `web nav`・アドレスバー・保留（#724 の W4）の「開く」はここ（#2937）
+        let entry = WebViewEntry::held(WebViewId(3), "https://example.com");
+        assert_eq!(
+            entry.navigate("javascript:alert(1)"),
+            Err(HostRefusal::UrlScriptScheme("javascript".into()))
+        );
+        assert_eq!(entry.current_url(), "https://example.com");
+        assert_eq!(entry.phase(), WebViewPhase::Held);
+        // 今開ける形は通る（生成待ちへ戻り、URL が差し替わる）
+        assert_eq!(entry.navigate("localhost:5173"), Ok(()));
+        assert_eq!(entry.current_url(), "http://localhost:5173");
+        assert_eq!(entry.phase(), WebViewPhase::Queued);
     }
 
     #[test]

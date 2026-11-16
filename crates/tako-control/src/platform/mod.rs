@@ -28,6 +28,9 @@ pub mod power;
 pub mod process;
 /// マシンの混み具合（境界 B25。診断専用。#1073）
 pub mod sysload;
+/// Web ビュー（wry）が URL を解釈できるか（境界 B38。macOS = wry と同じ `NSURL URLWithString:` を
+/// 先に呼ぶ、Windows = 確かめない。#2937）
+pub mod webview_url;
 
 /// テスト専用: **機械全体で 1 つしかない状態**を触るテストを直列化する錠。
 ///
