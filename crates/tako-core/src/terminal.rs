@@ -497,6 +497,9 @@ pub struct TerminalSession {
     copy_mode: std::sync::Mutex<CopyModeGate>,
     /// PTY 直下の子プロセスの pid（#592。取得できない環境では None）
     child_pid: Option<u32>,
+    /// 器の中のシェルの pid（`#{pane_pid}`。#2935）。器なしのペインと、器へまだ聞けていない間は None。
+    /// 起こした直後に UI 層が器へ 1 回だけ聞いて入れる（`tmux_backend::pane_facts` の pid）
+    container_shell_pid: Option<u32>,
     /// スクロールバックの保持上限（行。Issue #818）。`Term` の設定と同じ値を
     /// 持つのは、上限を問い合わせるのに `Term` のロックを取りたくないため
     scrollback_lines: usize,
@@ -778,6 +781,7 @@ impl TerminalSession {
                 wheel_carry: std::sync::Mutex::new(0.0),
                 copy_mode: std::sync::Mutex::new(CopyModeGate::default()),
                 child_pid,
+                container_shell_pid: None,
                 scrollback_lines,
                 serial: NEXT_SESSION_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 exit_status: None,
@@ -909,6 +913,23 @@ impl TerminalSession {
     /// **プロセスの生存は保証しない**（終了後も残る）ので、生存前提の判定に使う側で確かめること
     pub fn child_pid(&self) -> Option<u32> {
         self.child_pid
+    }
+
+    /// 器の中のシェルの pid（#2935。器なし・まだ聞けていない間は None）。
+    ///
+    /// Windows の listen ポート検知（FR-2.4.2）はこれをキーの根にする（`ports::pane_key`）。
+    /// psmux は器のサーバーを**最初のクライアントの子**として起こすので、再 attach した
+    /// ペインでは器のサーバーが死んだ旧クライアントの子のまま残り、PTY 直下の子
+    /// （= 新しいクライアント）の子孫に器の中のプロセスが入らない。
+    /// [`Self::child_pid`] と同じく**生存は保証しない**
+    pub fn container_shell_pid(&self) -> Option<u32> {
+        self.container_shell_pid
+    }
+
+    /// 器の中のシェルの pid を入れる（#2935。[`Self::set_tty_name`] と同じく、UI 層が器へ
+    /// 聞いた答えを差し込む）。再 attach では端末ごと作り直すので、古い値は持ち越さない
+    pub fn set_container_shell_pid(&mut self, pid: Option<u32>) {
+        self.container_shell_pid = pid.filter(|&pid| pid != 0);
     }
 
     /// PTY 直下の子とその子孫を入れた Job（#2454）。ペインを閉じる（この端末を drop する）と

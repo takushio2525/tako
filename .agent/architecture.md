@@ -709,7 +709,10 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
     突き合わせで「ペイン配下」を判定 → `PROC_PIDLISTFDS` + `PROC_PIDFDSOCKETINFO` で
     LISTEN 中 TCP を列挙）。libc に無い `socket_fdinfo` 系は SDK ヘッダから転記し、
     **自プロセスで実際に listen するユニットテストで ABI を e2e 検証**している。
-    Windows: `GetExtendedTcpTable`（Phase 6）
+    Windows: `GetExtendedTcpTable` + Toolhelp32 の親子で「根のプロセスの子孫」を集める（#524）。
+    根は器なしなら PTY 直下の子、器（psmux）のペインなら器の中のシェル（#2935。再 attach したペインでは
+    器のサーバーが死んだ旧クライアントの子のまま残り、新しいクライアントの子孫に入らないため）。
+    器の中のシェルの pid は下の「tty 突き合わせの維持」と同じ 1 回の `list-panes` から採る
   - ポーリング方式（3 秒）。スキャンは background executor、結果は TerminalSession に保持し
     list / MCP の `listen_ports`（port / pid / process）として公開
 - 検知結果は**提案チップ**（「localhost:5173 をプレビューで開く？」）として UI に出すだけ。
@@ -896,9 +899,11 @@ tako mod / MCP tako_mod ──▶ ModHub を読んで行に組む（報告が無
   合わせて返す。統合の置き場は `options.env` には載らない（`TerminalSession::spawn` が
   **外側 PTY** の env へ足す）ので、正本から直接引くのが要点
 - **tty 突き合わせの維持**: ペイン配下プロセスの制御端末はバックエンドサーバー側の
-  ペイン tty になるため、spawn 後に `list-panes -t =<session> -F '#{pane_tty}'` で解決して
-  `TerminalSession::set_tty_name` で差し替える（listen ポート検知 FR-2.4.2 と
-  tmuxview FR-2.13.2 が引き続き機能する）
+  ペイン tty になるため、spawn 後に `list-panes -t =<session> -F '#{pane_tty}\t#{pane_pid}'`
+  （`tmux_backend::pane_facts`）で解決して `TerminalSession::set_tty_name` で差し替える
+  （listen ポート検知 FR-2.4.2 と tmuxview FR-2.13.2 が引き続き機能する）。同じ 1 回の答えの
+  `#{pane_pid}` は側路の書き手（#1199）と、Windows のポート検知の根
+  （`TerminalSession::set_container_shell_pid`。#2935）に使う
 
 ### スクロール制御（`tako-core::scroll`。2026-06-12 夜に方式転換）
 

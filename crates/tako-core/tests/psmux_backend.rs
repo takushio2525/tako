@@ -415,6 +415,157 @@ fn 器はクライアント切断後もattachで内容ごと戻る() {
     let _ = f.backend.kill(&name);
 }
 
+/// 画面の `TAKO-2935-PORT=<番号>` から番号を読む（打鍵のエコーは `'TAKO-2935' + '-PORT='` なので当たらない）
+#[cfg(windows)]
+fn port_marker(lines: &[String]) -> Option<u16> {
+    lines.iter().find_map(|line| {
+        let rest = &line[line.find("TAKO-2935-PORT=")? + "TAKO-2935-PORT=".len()..];
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok().filter(|&port| port != 0)
+    })
+}
+
+/// **#2935**: 器へ再 attach したペインでも、器の中で listen しているポートをそのペインのキーに集める。
+///
+/// psmux は器のサーバーを**最初のクライアントの子**として起こすので、クライアントを殺して
+/// 新しいクライアントで attach し直すと、サーバーは死んだ旧クライアントの子のまま残り、
+/// 新しいクライアント（= tako のペインの PTY 直下の子）は子を持たない（Windows 実機・psmux 3.3.7 の実測）。
+/// PTY 直下の子をキーの根にしていた #2935 の前は、ここで器の中の dev サーバーを取りこぼした。
+/// いまは器の中のシェル（本番は `tmux_backend::pane_facts` の `#{pane_pid}` = ここの `pane_pids` と同じ答え）を根にする。
+///
+/// `TAKO_2935_LEGACY=1` では旧い根（新しいクライアント）になり、取りこぼすことを確かめる（A/B）。
+/// **CI の Windows ランナーには psmux が無いのでスキップされる**（実機の確認手順。
+/// `cargo test -p tako-core --test psmux_backend -- issue2935 --nocapture`。行 `TAKO2935_*` に pid とポートが出る）
+#[cfg(windows)]
+#[test]
+fn issue2935_再attachしたペインでも器の中のlistenポートを検知する() {
+    use tako_core::platform::procinfo;
+
+    let f = fixture!("port2935");
+    let name = session("tako-m2port293501");
+    let base = SpawnOptions {
+        command: None,
+        cwd: Some(std::env::temp_dir()),
+        env: vec![],
+        scrollback_lines: None,
+    };
+
+    // 1 回目のクライアントで器を作り、中のシェルが打鍵を受けるまで待つ
+    let (mut first, mut rx1) =
+        tako_core::TerminalSession::spawn(80, 24, f.backend.wrap_spawn(base.clone(), &name))
+            .expect("psmux クライアントを spawn できる");
+    let ready = pump_until_typed(
+        &mut first,
+        &mut rx1,
+        MARKER_BASE,
+        b"Write-Output ('TAKO-2935' + '-READY')\r",
+        |line| line.contains("TAKO-2935-READY"),
+    );
+    assert!(
+        ready.ok,
+        "1 回目の器のシェルが動き出す。{}",
+        ready.diag("TAKO-2935-READY", &first.visible_lines().join("\n"))
+    );
+    let first_client = first.child_pid();
+    // クライアント破棄（tako の終了相当）。器はサーバー側に残る
+    drop(first);
+    let detached = wait_state(DETACH_BASE, || f.attached(&name) != Some(1));
+    assert!(
+        f.backend.exists(&name),
+        "クライアントが死んでも器は生きている。{}",
+        detached.diag(
+            "attached != Some(1)",
+            &format!("attached={:?}", f.attached(&name))
+        )
+    );
+
+    // 2 回目: 新しいクライアントで繋ぎ直す（tako を起こし直して器へ再 attach したのと同じ形）
+    let (mut second, mut rx2) =
+        tako_core::TerminalSession::spawn(80, 24, f.backend.wrap_spawn(base, &name))
+            .expect("再 attach の psmux クライアントを spawn できる");
+    let client = second.child_pid().expect("新しいクライアントの pid");
+
+    // 器の中のシェルの pid
+    let mut shells = Vec::new();
+    let got = wait_state(Duration::from_secs(8), || {
+        shells = f.backend.pane_pids(&name);
+        !shells.is_empty()
+    });
+    assert!(
+        got.ok,
+        "器の中のシェルの pid が取れる。{}",
+        got.diag("pane_pids が空でない", &format!("{shells:?}"))
+    );
+    let shell = shells[0];
+
+    // 器の中のシェルに loopback で listen させ、番号を画面へ出させる
+    let shown = pump_until_typed(
+        &mut second,
+        &mut rx2,
+        MARKER_BASE,
+        b"$takoL = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0); \
+          $takoL.Start(); Write-Output ('TAKO-2935' + '-PORT=' + $takoL.LocalEndpoint.Port)\r",
+        |line| port_marker(&[line.to_string()]).is_some(),
+    );
+    let port = port_marker(&second.visible_lines()).unwrap_or_else(|| {
+        panic!(
+            "器の中のシェルが listen した番号を出す。{}",
+            shown.diag("TAKO-2935-PORT=<番号>", &second.visible_lines().join("\n"))
+        )
+    });
+
+    // 形の前提（#2935 の再現になっているか）: 新しいクライアントの子孫に器の中のシェルが居ない
+    let procs = procinfo::snapshot();
+    let in_client_tree = procinfo::descendants_of(&procs, client).contains(&shell);
+    let server = procs.iter().find(|p| p.pid == shell).map(|p| p.ppid);
+    let server_parent = server.and_then(|s| procs.iter().find(|p| p.pid == s).map(|p| p.ppid));
+
+    let legacy =
+        std::env::var("TAKO_2935_LEGACY").is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "on"));
+    let key = tako_core::ports::pane_key(None, Some(client), Some(shell)).expect("キーが作れる");
+    let old_key = tako_core::ports::pane_key(None, Some(client), None).expect("旧いキーが作れる");
+    let has_port = |scanned: &std::collections::HashMap<u64, Vec<tako_core::ports::ListenPort>>,
+                    k: u64| {
+        scanned
+            .get(&k)
+            .is_some_and(|ports| ports.iter().any(|p| p.port == port))
+    };
+    // TCP テーブルへ載るまでの揺れに備えて状態で待つ（固定 sleep にしない）
+    let mut scanned = std::collections::HashMap::new();
+    let waited = wait_state(Duration::from_secs(10), || {
+        scanned = tako_core::ports::scan(&[key, old_key]);
+        legacy || has_port(&scanned, key)
+    });
+    println!(
+        "TAKO2935_REATTACH legacy={legacy} first_client={first_client:?} client={client} shell={shell} \
+         server={server:?} server_parent={server_parent:?} in_client_tree={in_client_tree} port={port} \
+         key={key} found={} old_key={old_key} old_found={} waited={:.1}s",
+        has_port(&scanned, key),
+        has_port(&scanned, old_key),
+        waited.waited.as_secs_f64(),
+    );
+    assert!(
+        !in_client_tree,
+        "形の前提が崩れた: 再 attach した新しいクライアント（{client}）の子孫に器の中のシェル（{shell}）が居る \
+         （server={server:?} server_parent={server_parent:?}）。psmux の起こし方が変わったなら #2935 の見立てを見直すこと"
+    );
+    assert!(
+        !has_port(&scanned, old_key),
+        "旧い根（新しいクライアント {client}）で器の中の :{port} が見えている = #2935 の形になっていない: {scanned:?}"
+    );
+    if legacy {
+        assert_eq!(key, old_key, "TAKO_2935_LEGACY=1 では旧い根に戻る");
+    } else {
+        assert!(
+            has_port(&scanned, key),
+            "再 attach したペインのキー（器の中のシェル {shell}）に器の中の :{port} が集まらない（#2935）。{}",
+            waited.diag(&format!(":{port}"), &format!("{scanned:?}"))
+        );
+    }
+    drop(second);
+    let _ = f.backend.kill(&name);
+}
+
 /// **旧の固定窓**（`TAKO_1114_LEGACY=1` の A/B アーム）。
 ///
 /// 「プロンプト待ち 60 回 × 100ms → 打つ → マーカー待ち 60 回」を最大 6 周する形。

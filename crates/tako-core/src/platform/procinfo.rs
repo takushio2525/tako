@@ -20,9 +20,13 @@
 //! プロセスを列挙する公開 API も無い。そこで **PTY 直下の子プロセス
 //! （`TerminalSession::child_pid`）の子孫**で判定する。
 //!
-//! どちらの方式も「永続化バックエンド（tmux / psmux）越しに起動されたプロセス」は
-//! 拾えない（器のサーバープロセス配下に移るため）。この制限は macOS と同じで、
-//! Windows 固有の縮退ではない。
+//! 器（tmux / psmux）に包まれたペインは、配下のプロセスが器のサーバーの下で動くので
+//! **器の中のシェルを根にする**。macOS は UI 層が器のペインの tty へ差し替える
+//! （`TerminalSession::set_tty_name`）。Windows は器の中のシェルの pid
+//! （`TerminalSession::container_shell_pid`）を根にする（#2935）: psmux は器のサーバーを
+//! 最初のクライアントの子として起こすので、新しく立てたペインならクライアントの子孫に
+//! 入るが、再 attach したペインではサーバーが死んだ旧クライアントの子のまま残り、
+//! 新しいクライアントの子孫に器の中が 1 つも入らない。
 //!
 //! ## 実行中プロセスの実行ファイルパス（#936）
 //!
@@ -753,11 +757,12 @@ pub fn agent_process_count(procs: &[ProcEntry]) -> usize {
 //
 // ペイン配下のプロセスが LISTEN している TCP ポートを列挙する。「ペイン配下」の決め方は
 // OS で違う: macOS は**制御端末（tty）の一致**（`macos.rs` の libproc）、Windows（#524）は
-// tty の概念が無いため **PTY 直下の子プロセスの子孫**（ポートの列挙は `GetExtendedTcpTable`、
+// tty の概念が無いため **根のプロセスの子孫**（根は器のペインなら器の中のシェル = #2935、
+// 器なしなら PTY 直下の子。ポートの列挙は `GetExtendedTcpTable`、
 // 親子関係と名前は Toolhelp32 スナップショット = 下の `imp` の Windows の腕）。Linux は未対応で空を返す。
 //
 // **ペインを指すキーはプラットフォームで実体が違う**（macOS = 制御端末の rdev、
-// Windows = 子 pid）。呼び出し側に `cfg` を書かせないため、キーの作成は
+// Windows = 根の pid）。呼び出し側に `cfg` を書かせないため、キーの作成は
 // `pane_key()` に閉じ込め、以後は不透明な `u64` として扱う。
 //
 // 公開の名前は `crate::ports` が re-export している（呼び出し側の綴り `ports::scan` 等はそのまま）。
@@ -791,43 +796,91 @@ pub fn tty_rdev(tty_name: &str) -> Option<u64> {
     std::fs::metadata(tty_name).ok().map(|m| m.rdev())
 }
 
-/// Windows に tty の概念は無い（ペインの特定は `pane_key` が子 pid で行う）
+/// Windows に tty の概念は無い（ペインの特定は `pane_key` が根の pid で行う）
 #[cfg(not(unix))]
 pub fn tty_rdev(_tty_name: &str) -> Option<u64> {
     None
 }
 
-/// ペイン配下を指すスキャンキーを作る（#524）。
+/// #2935 の A/B（`TAKO_2935_LEGACY=1`）。同一バイナリのまま、Windows のポート検知のキーの根を
+/// 修正前の PTY 直下の子（器のペインでは器のクライアント）へ戻す。**ゲートはこの 1 か所**
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn issue2935_legacy() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_2935_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
+/// ペイン配下を指すスキャンキーを作る（#524 / #2935）。
 ///
 /// 中身の意味はプラットフォームで違い、**呼び出し側は解釈してはいけない**:
-/// macOS は制御端末の rdev、Windows は PTY 直下の子プロセスの pid。
+/// macOS は制御端末の rdev（器のペインは UI 層が器のペインの tty へ差し替え済み）、
+/// Windows は子孫を集める根の pid（[`pid_tree_root`]）。
 /// `scan()` へ渡すキーはここでしか作らない。
 ///
-/// どちらの材料も取れなければ `None`（そのペインはスキャン対象から外れるだけ）
-pub fn pane_key(tty_name: Option<&str>, child_pid: Option<u32>) -> Option<u64> {
+/// `container_shell_pid` は器の中のシェルの pid（`TerminalSession::container_shell_pid`。
+/// 器なし・まだ聞けていない間は `None`）。macOS は tty の側で器を辿れているので使わない。
+///
+/// どの材料も取れなければ `None`（そのペインはスキャン対象から外れるだけ）
+pub fn pane_key(
+    tty_name: Option<&str>,
+    child_pid: Option<u32>,
+    container_shell_pid: Option<u32>,
+) -> Option<u64> {
     // 実装選択は `let` への cfg で行う。`return` で書くと、有効な分岐が末尾に
     // 来ないぶん clippy の `needless_return` に当たる（macOS の `-D warnings` が落ちる）
     #[cfg(target_os = "macos")]
     let key = {
-        let _ = child_pid;
+        let _ = (child_pid, container_shell_pid);
         tty_name.and_then(tty_rdev)
     };
     #[cfg(windows)]
     let key = {
         let _ = tty_name;
-        // pid 0 は System Idle Process。ペインの子として返ることは無いが、
-        // 万一 0 が来たら全プロセスを配下と誤認しかねないので弾く
-        child_pid.filter(|&pid| pid != 0).map(u64::from)
+        pid_tree_root(child_pid, container_shell_pid, issue2935_legacy())
     };
     #[cfg(not(any(target_os = "macos", windows)))]
     let key = {
-        let _ = (tty_name, child_pid);
+        let _ = (tty_name, child_pid, container_shell_pid);
         None
     };
     key
 }
 
-/// Windows 版（#524）。キーは PTY 直下の子 pid で、その**子孫**が LISTEN している
+/// 子孫で「ペイン配下」を決める OS（Windows）のキーの根（純関数。#524 / #2935）。
+///
+/// **器の中のシェルが分かっていればそれを根にする**。psmux は器のサーバーを最初の
+/// クライアントの子として起こすので、tako を起こし直して器へ再 attach したペインでは、
+/// サーバーが死んだ旧クライアントの子のまま残り、新しいクライアント（= PTY 直下の子）は
+/// 子を持たない。PTY 直下の子を根にすると、そのペインの dev サーバーはどのキーの子孫にも
+/// 入らない（#2935 の症状）。新しく立てたペインでも器の中のシェルはクライアントの子孫
+/// なので、根を寄せても拾うものは変わらない（器のサーバー自身の LISTEN は
+/// [`group_by_root`] が落とす = #724。シェルを根にすればそもそも子孫に入らない）。
+///
+/// 器なしのペイン・器へまだ聞けていない間・`legacy`（`TAKO_2935_LEGACY=1`）は
+/// PTY 直下の子を根にする（#2935 の前と同じ）。
+///
+/// pid 0 は System Idle Process。ペインの子として返ることは無いが、万一 0 が来たら
+/// 全プロセスを配下と誤認しかねないので弾く（0 の器のシェルは無いものとして扱う）
+#[cfg_attr(not(windows), allow(dead_code))]
+fn pid_tree_root(
+    child_pid: Option<u32>,
+    container_shell_pid: Option<u32>,
+    legacy: bool,
+) -> Option<u64> {
+    let container = container_shell_pid
+        .filter(|_| !legacy)
+        .filter(|&pid| pid != 0);
+    container
+        .or(child_pid.filter(|&pid| pid != 0))
+        .map(u64::from)
+}
+
+/// Windows 版（#524）。キーは根の pid（[`pid_tree_root`]）で、その**子孫**が LISTEN している
 /// TCP ポートを集める。プロセス一覧と TCP テーブルはキーの数によらず 1 回ずつしか
 /// 取らない（3 秒毎に走るため、ペイン数に比例して重くしない）
 #[cfg(windows)]
@@ -853,8 +906,9 @@ pub fn scan(_keys: &[u64]) -> HashMap<u64, Vec<ListenPort>> {
 ///
 /// psmux はクライアント↔サーバー間の IPC に **TCP ループバック**を使い、
 /// サーバーを**クライアントの子プロセス**として 1 セッションに 1 個起動する。
-/// クライアント = ペインの PTY 直下の子（`pane_key` の材料）なので、
-/// 器つきのペインは**例外なく** 1 個の偽 listen ポートを持つことになる。
+/// クライアント = ペインの PTY 直下の子なので、根がクライアントのとき（器のシェルを
+/// まだ聞けていない間・`TAKO_2935_LEGACY=1`。[`pid_tree_root`]）、新しく立てた器つきの
+/// ペインは**例外なく** 1 個の偽 listen ポートを持つことになる。
 ///
 /// そこで所有プロセスが器そのものなら結果から落とす。**子孫の走査自体は止めない**
 /// （器の下で動いている本物の dev サーバーは引き続き拾いたいため）
@@ -2744,9 +2798,237 @@ mod portable_tests {
 
     #[test]
     fn pane_keyは材料が無ければnone() {
-        assert!(pane_key(None, None).is_none());
+        assert!(pane_key(None, None, None).is_none());
         // 子 pid 0（System Idle Process）は配下判定の材料にしない
-        assert!(pane_key(None, Some(0)).is_none());
+        assert!(pane_key(None, Some(0), None).is_none());
+        assert!(pane_key(None, None, Some(0)).is_none());
+    }
+
+    // ── #2935: 器へ再 attach したペインのキーの根 ─────────────────────────────
+    //
+    // 形は Windows 実機（psmux 3.3.7・11/16）で採ったプロセスの親子をそのまま写す:
+    //
+    //   tako-app (新)
+    //   ├─ tmux.exe（クライアント）new-session -A … ← 新しく立てたペイン
+    //   │   └─ tmux.exe server
+    //   │        └─ pwsh → pwsh → node.exe (:8766)
+    //   └─ tmux.exe（クライアント）new-session -A … ← 再 attach したペイン（子が無い）
+    //   tmux.exe server  parent=旧クライアント（もう居ない）
+    //      └─ pwsh → pwsh → node.exe (:8765)
+    //
+    // psmux は名前を `tmux.exe` で名乗る（winget / scoop の導入）。器の内部ポート（#724）も
+    // サーバーごとに 1 本ずつ LISTEN させておく
+
+    /// 新しい tako-app
+    const APP: u32 = 1000;
+    /// 新しく立てたペインのクライアント・サーバー・中のシェル・dev サーバー
+    const FRESH_CLIENT: u32 = 2000;
+    const FRESH_SERVER: u32 = 2100;
+    const FRESH_SHELL: u32 = 2200;
+    const FRESH_NODE: u32 = 2400;
+    /// 再 attach したペインのクライアント（子が無い）・死んだ旧クライアント・サーバー・中のシェル・dev サーバー
+    const REATTACH_CLIENT: u32 = 3000;
+    const DEAD_OLD_CLIENT: u32 = 13088;
+    const REATTACH_SERVER: u32 = 3100;
+    const REATTACH_SHELL: u32 = 3200;
+    const REATTACH_NODE: u32 = 3400;
+    /// 器なしの直接ペイン（PTY 直下がシェル）
+    const DIRECT_SHELL: u32 = 4000;
+    const DIRECT_NODE: u32 = 4100;
+
+    fn reattach_shape() -> (Vec<ProcEntry>, Vec<TcpListenEntry>) {
+        let procs = vec![
+            proc(APP, 1, "tako-app.exe"),
+            proc(FRESH_CLIENT, APP, "tmux.exe"),
+            proc(FRESH_SERVER, FRESH_CLIENT, "tmux.exe"),
+            proc(FRESH_SHELL, FRESH_SERVER, "pwsh.exe"),
+            proc(FRESH_SHELL + 100, FRESH_SHELL, "pwsh.exe"),
+            proc(FRESH_NODE, FRESH_SHELL + 100, "node.exe"),
+            proc(REATTACH_CLIENT, APP, "tmux.exe"),
+            // 旧クライアントはもう居ないので在籍表に載らない（ppid だけが残る）
+            proc(REATTACH_SERVER, DEAD_OLD_CLIENT, "tmux.exe"),
+            proc(REATTACH_SHELL, REATTACH_SERVER, "pwsh.exe"),
+            proc(REATTACH_SHELL + 100, REATTACH_SHELL, "pwsh.exe"),
+            proc(REATTACH_NODE, REATTACH_SHELL + 100, "node.exe"),
+            proc(DIRECT_SHELL, APP, "pwsh.exe"),
+            proc(DIRECT_NODE, DIRECT_SHELL, "node.exe"),
+        ];
+        let listeners = vec![
+            // 器のサーバーの IPC（#724。拾ってはいけない）
+            listener(FRESH_SERVER, 63836),
+            listener(REATTACH_SERVER, 63901),
+            // 器の中・直接ペインの本物の dev サーバー
+            listener(FRESH_NODE, 8766),
+            listener(REATTACH_NODE, 8765),
+            listener(DIRECT_NODE, 5173),
+        ];
+        (procs, listeners)
+    }
+
+    fn ports_of(grouped: &HashMap<u64, Vec<ListenPort>>, key: u64) -> Vec<u16> {
+        grouped
+            .get(&key)
+            .map(|ports| ports.iter().map(|p| p.port).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn issue2935_再attachしたペインでも器の中のdevサーバーのポートが集まる() {
+        let (procs, listeners) = reattach_shape();
+        let key = pid_tree_root(Some(REATTACH_CLIENT), Some(REATTACH_SHELL), false)
+            .expect("器のシェルが分かっていればキーになる");
+        assert_eq!(
+            key,
+            u64::from(REATTACH_SHELL),
+            "器のペインのキーの根は器の中のシェル（PTY 直下の子 = 新しいクライアントは子を持たない）"
+        );
+        let grouped = group_by_root(&procs, &listeners, &[key]);
+        assert_eq!(
+            ports_of(&grouped, key),
+            vec![8765],
+            "再 attach したペインの dev サーバー（:8765）がそのペインに集まり、器の内部ポートは混ざらない（#2935 / #724）"
+        );
+        assert_eq!(grouped[&key][0].pid, REATTACH_NODE as i32);
+        assert_eq!(grouped[&key][0].process, "node.exe");
+    }
+
+    #[test]
+    fn issue2935_旧い根では再attachしたペインのdevサーバーを取りこぼす() {
+        // A/B の旧アーム（`TAKO_2935_LEGACY=1`）= 修正前の形。#2935 の症状がこの形で再現することを固定する
+        let (procs, listeners) = reattach_shape();
+        let key = pid_tree_root(Some(REATTACH_CLIENT), Some(REATTACH_SHELL), true)
+            .expect("旧アームでも PTY 直下の子がキーになる");
+        assert_eq!(key, u64::from(REATTACH_CLIENT));
+        let grouped = group_by_root(&procs, &listeners, &[key]);
+        assert!(
+            ports_of(&grouped, key).is_empty(),
+            "旧い根（新しいクライアント）は子を持たないので、器の中の :8765 はどのキーにも入らない: {grouped:?}"
+        );
+    }
+
+    #[test]
+    fn issue2935_新しく立てたペインは根を寄せても今どおり拾う() {
+        let (procs, listeners) = reattach_shape();
+        let new_key = pid_tree_root(Some(FRESH_CLIENT), Some(FRESH_SHELL), false).unwrap();
+        let old_key = pid_tree_root(Some(FRESH_CLIENT), Some(FRESH_SHELL), true).unwrap();
+        // 器のシェルを聞けていない間（起こした直後の 1 回目の問い合わせまで）も今どおり
+        let before_facts = pid_tree_root(Some(FRESH_CLIENT), None, false).unwrap();
+        assert_eq!(before_facts, u64::from(FRESH_CLIENT));
+        let grouped = group_by_root(&procs, &listeners, &[new_key, old_key]);
+        assert_eq!(ports_of(&grouped, new_key), vec![8766]);
+        assert_eq!(
+            ports_of(&grouped, old_key),
+            vec![8766],
+            "クライアントを根にしても器の内部ポート（:63836）は #724 の除外で落ちる"
+        );
+        assert_eq!(
+            ports_of(
+                &group_by_root(&procs, &listeners, &[before_facts]),
+                before_facts
+            ),
+            vec![8766]
+        );
+    }
+
+    #[test]
+    fn issue2935_器なしの直接ペインは今どおりpty直下の子が根() {
+        let (procs, listeners) = reattach_shape();
+        for legacy in [false, true] {
+            let key = pid_tree_root(Some(DIRECT_SHELL), None, legacy).unwrap();
+            assert_eq!(key, u64::from(DIRECT_SHELL), "legacy={legacy}");
+            let grouped = group_by_root(&procs, &listeners, &[key]);
+            assert_eq!(ports_of(&grouped, key), vec![5173], "legacy={legacy}");
+        }
+    }
+
+    #[test]
+    fn issue2935_全ペインを1回で走査しても互いのポートが混ざらない() {
+        // tako-app の 3 秒の走査はペインのキーをまとめて 1 回で渡す
+        let (procs, listeners) = reattach_shape();
+        let keys: Vec<u64> = [
+            (Some(FRESH_CLIENT), Some(FRESH_SHELL)),
+            (Some(REATTACH_CLIENT), Some(REATTACH_SHELL)),
+            (Some(DIRECT_SHELL), None),
+        ]
+        .into_iter()
+        .map(|(child, shell)| pid_tree_root(child, shell, false).unwrap())
+        .collect();
+        let grouped = group_by_root(&procs, &listeners, &keys);
+        assert_eq!(ports_of(&grouped, keys[0]), vec![8766]);
+        assert_eq!(ports_of(&grouped, keys[1]), vec![8765]);
+        assert_eq!(ports_of(&grouped, keys[2]), vec![5173]);
+        assert_eq!(grouped.len(), 3);
+    }
+
+    #[test]
+    fn issue2935_器のシェルがpid0なら無いものとしてpty直下の子へ戻る() {
+        assert_eq!(
+            pid_tree_root(Some(REATTACH_CLIENT), Some(0), false),
+            Some(u64::from(REATTACH_CLIENT))
+        );
+        assert_eq!(pid_tree_root(Some(0), Some(0), false), None);
+        assert_eq!(pid_tree_root(None, None, false), None);
+        // 器のシェルだけ分かっている（PTY 直下の子が取れない環境）ならそれを根にする
+        assert_eq!(
+            pid_tree_root(None, Some(REATTACH_SHELL), false),
+            Some(u64::from(REATTACH_SHELL))
+        );
+        assert_eq!(pid_tree_root(None, Some(REATTACH_SHELL), true), None);
+    }
+
+    #[test]
+    fn issue2935_器のシェルが先に死んでいても壊れない() {
+        // 走査とペイン終了のレース: 器のシェルが在籍表から消えていたら、そのキーは空になるだけ
+        let (mut procs, listeners) = reattach_shape();
+        procs.retain(|p| p.pid != REATTACH_SHELL);
+        let key = pid_tree_root(Some(REATTACH_CLIENT), Some(REATTACH_SHELL), false).unwrap();
+        let grouped = group_by_root(&procs, &listeners, &[key]);
+        // 消えたシェルの子は ppid で辿れる（Windows の ppid は親が死んでも書き換わらない）。
+        // panic せず、器の内部ポートも混ざらない
+        assert_eq!(ports_of(&grouped, key), vec![8765]);
+        // 中身ごと居なくなった（器が終わった）なら空になるだけ
+        procs.retain(|p| p.ppid != REATTACH_SHELL && p.ppid != REATTACH_SHELL + 100);
+        assert!(group_by_root(&procs, &listeners, &[key]).is_empty());
+    }
+
+    /// macOS のキーは制御端末の rdev で、器の中のシェルの pid は使わない（#2935 は Windows だけを変える）
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn issue2935_macosのキーは器のシェルのpidに依らない() {
+        // 実在する tty（/dev/tty は誰でも stat できる）で rdev を作る
+        let rdev = tty_rdev("/dev/tty").expect("/dev/tty の rdev が取れる");
+        for shell in [None, Some(REATTACH_SHELL), Some(0)] {
+            assert_eq!(
+                pane_key(Some("/dev/tty"), Some(REATTACH_CLIENT), shell),
+                Some(rdev),
+                "shell={shell:?}"
+            );
+            assert_eq!(pane_key(None, Some(REATTACH_CLIENT), shell), None);
+        }
+    }
+
+    /// Windows の `pane_key` が器のシェルを根にする（`pid_tree_root` の配線。A/B の env が無い CI で走る）
+    #[cfg(windows)]
+    #[test]
+    fn issue2935_windowsのpane_keyは器のシェルを根にする() {
+        if issue2935_legacy() {
+            // A/B の旧アームで回しているときは旧い根であることを見る
+            assert_eq!(
+                pane_key(None, Some(REATTACH_CLIENT), Some(REATTACH_SHELL)),
+                Some(u64::from(REATTACH_CLIENT))
+            );
+            return;
+        }
+        assert_eq!(
+            pane_key(None, Some(REATTACH_CLIENT), Some(REATTACH_SHELL)),
+            Some(u64::from(REATTACH_SHELL)),
+            "器のペインは器の中のシェルが根（#2935）"
+        );
+        assert_eq!(
+            pane_key(None, Some(DIRECT_SHELL), None),
+            Some(u64::from(DIRECT_SHELL)),
+            "器なしのペインは PTY 直下の子が根（#524 のまま）"
+        );
     }
 
     /// 実機の検知 e2e。**自分で listen して自分で検知する**ので、
@@ -2806,7 +3088,7 @@ mod portable_tests {
     fn scanは自プロセスをrootにすると自分のlistenを拾う() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
-        let key = pane_key(None, Some(std::process::id())).expect("自 pid がキーになる");
+        let key = pane_key(None, Some(std::process::id()), None).expect("自 pid がキーになる");
         let scanned = scan(&[key]);
         let ports = scanned.get(&key).expect("自プロセスのポートが取れない");
         let mine = ports

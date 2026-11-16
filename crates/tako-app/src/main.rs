@@ -7866,8 +7866,10 @@ impl TakoApp {
         // listen ポート検知（FR-2.4.2）。ペイン配下の LISTEN 中 TCP ポートを 3 秒毎に
         // 拾って list / MCP へ公開し、新規ポートには提案チップを立てる（FR-2.4.3）。
         // 「ペイン配下」の判定材料は OS で違う（macOS = 制御端末の rdev、
-        // Windows = PTY 直下の子 pid の子孫）ので、材料の解釈は `ports::pane_key` に
-        // 任せてここでは不透明キーとして扱う（#524）。スキャンはバックグラウンドで行う
+        // Windows = 根の pid の子孫。器のペインの根は器の中のシェル = #2935）ので、材料の解釈は
+        // `ports::pane_key` に任せてここでは不透明キーとして扱う（#524）。スキャンはバックグラウンドで行う。
+        // 器の中のシェルの pid は起こした直後に器へ 1 回聞いた値の写し（下の `pane_facts` の
+        // リトライ）で、この 3 秒の走査は器へ問い合わせない
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_secs(3)).await;
             let Ok(pane_keys) = this.update(cx, |app: &mut TakoApp, _| {
@@ -7877,8 +7879,11 @@ impl TakoApp {
                 app.terminals
                     .iter()
                     .filter_map(|(pane, session)| {
-                        let key =
-                            tako_core::ports::pane_key(session.tty_name(), session.child_pid())?;
+                        let key = tako_core::ports::pane_key(
+                            session.tty_name(),
+                            session.child_pid(),
+                            session.container_shell_pid(),
+                        )?;
                         Some((*pane, key))
                     })
                     .collect::<Vec<_>>()
@@ -11272,7 +11277,10 @@ impl TakoApp {
         .detach();
         // バックエンド構成では配下プロセスの制御端末は tmux サーバー側のペイン tty になる。
         // ポート検知（FR-2.4.2）と tmuxview（FR-2.13.2）の突き合わせ先をそちらへ差し替える
-        // （セッション起動直後はまだ取れないことがあるためバックグラウンドでリトライ）
+        // （セッション起動直後はまだ取れないことがあるためバックグラウンドでリトライ）。
+        // #2935: 器の中のシェルの pid も同じ 1 回の問い合わせから端末へ写す（Windows の
+        // ポート検知の根。再 attach したペインでは器のサーバーが PTY 直下の子の子孫に居ない）
+        let serial = source.serial;
         if let Some(name) = backend_session {
             let socket = tako_core::tmux_backend::socket_name();
             cx.spawn(async move |this, cx| {
@@ -11296,6 +11304,14 @@ impl TakoApp {
                         // そのペインの cwd 追従とコマンド状態が黙って死ぬ）
                         if let Some(pid) = facts.pid {
                             app.set_osc_sink_writer(pane_id, pid);
+                            // #2935: この端末（張り替え後の別の端末ではない）にだけ写す
+                            if let Some(session) = app
+                                .terminals
+                                .get_mut(&pane_id)
+                                .filter(|s| s.serial() == serial)
+                            {
+                                session.set_container_shell_pid(Some(pid));
+                            }
                         }
                         let sink_armed = app
                             .osc_sinks
@@ -11305,7 +11321,8 @@ impl TakoApp {
                             (&facts.tty, app.terminals.get_mut(&pane_id))
                         {
                             session.set_tty_name(Some(tty.clone()));
-                            return !sink_armed; // tty は解決済み → 側路が張れたら終了
+                            // tty は解決済み → 側路が張れて器のシェルの pid も分かったら終了
+                            return !sink_armed || facts.pid.is_none();
                         }
                         true // 未解決 → リトライ
                     });
