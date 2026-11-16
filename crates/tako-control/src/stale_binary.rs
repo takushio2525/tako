@@ -269,7 +269,7 @@ fn version_from_segments(segments: &[String]) -> Option<String> {
 /// `<binary> --version` で版を読む（パスにも版リソースにも版が無いときの最終手段）。
 ///
 /// **上限つき**で待つ（#2951）: 上限は [`bounded_claude_version`] の `claude --version` と同じ
-/// `probe::probe_timeout()`（既定 15 秒・env `TAKO_PROBE_TIMEOUT_SECS`）。打ち切ったら子を孫まで止め
+/// `probe::probe_timeout()`（既定 15 秒・env `TAKO_SETUP_PROBE_TIMEOUT_SECS`）。打ち切ったら子を孫まで止め
 /// （#2942 の門番 `agent_probe::output_within`。打ち切りの知らせも門番が出す）、版は空 = 取れない扱い。
 /// A/B の `TAKO_2951_LEGACY=1` は修正前と同じく上限なし（返らない CLI で呼び手のスレッドが戻らない）
 fn extract_version_via_cli(binary: &Path) -> String {

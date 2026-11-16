@@ -28,7 +28,7 @@ export TAKO_LANG=ja
 
 # **本番 GUI を指す env を最初に落とす**（#1449 / #1450 で本番にペインが漏れた実例が 2 件）
 unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_ORCHESTRATOR_ROLE TAKO_MCP_URL \
-  CLAUDE_CODE_PLUGIN_DIRS TAKO_CLI TAKO_2951_LEGACY TAKO_PROBE_TIMEOUT_SECS TAKO_AUTH_PROBE_TIMEOUT_SECS \
+  CLAUDE_CODE_PLUGIN_DIRS TAKO_CLI TAKO_2951_LEGACY TAKO_SETUP_PROBE_TIMEOUT_SECS TAKO_AUTH_PROBE_TIMEOUT_SECS \
   TAKO_IPC_TIMEOUT_SECS TAKO_PERF_LOG CLAUDE_CONFIG_DIR TAKO_TMUX_SOCKET
 unset CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ID CLAUDECODE
 
@@ -319,7 +319,7 @@ phase_cli() {
 
   # 返らない codex（上限を 3 秒へ・--json）
   set_flags hang-codex
-  run_case hang-json 60 TAKO_PROBE_TIMEOUT_SECS=3 -- setup models --agent codex --json
+  run_case hang-json 60 TAKO_SETUP_PROBE_TIMEOUT_SECS=3 -- setup models --agent codex --json
   check_eq "返らない codex（3 秒・--json）: 返る" "0" "$HUNG"
   check_eq "返らない codex（3 秒・--json）: 終了コード 0" "0" "$RC"
   if within "$ELAPSED" 3 8; then pass "返らない codex: 上限の 3 秒で返る（${ELAPSED} 秒）"; else fail "返らない codex: 経過 ${ELAPSED} 秒（上限 3 秒）"; fi
@@ -352,7 +352,7 @@ phase_cli() {
 
   # エッジ: codex と agy が両方返らない → 全系統は並べて聞くので全体は上限 1 回ぶん
   set_flags hang-codex hang-agy
-  run_case hang-all 60 TAKO_PROBE_TIMEOUT_SECS=3 -- setup models --json
+  run_case hang-all 60 TAKO_SETUP_PROBE_TIMEOUT_SECS=3 -- setup models --json
   check_eq "両方返らない（全系統）: 返る" "0" "$HUNG"
   check_eq "両方返らない: codex / agy とも timed_out" "timed_out/timed_out" \
     "$(jf agents/1/failure/kind < "$TMP/out/hang-all.out")/$(jf agents/2/failure/kind < "$TMP/out/hang-all.out")"
@@ -365,7 +365,7 @@ phase_cli() {
 
   # エッジ: 上限の env に 0 を渡しても外れない（既定の 15 秒へ落ちる）
   set_flags hang-codex
-  run_case hang-zero 60 TAKO_PROBE_TIMEOUT_SECS=0 -- setup models --agent codex --json
+  run_case hang-zero 60 TAKO_SETUP_PROBE_TIMEOUT_SECS=0 -- setup models --agent codex --json
   check_eq "上限の env が 0: 返る（無制限にならない）" "0" "$HUNG"
   check_eq "上限の env が 0: 既定の 15 秒で打ち切る" "15" "$(jf agents/0/failure/unconfirmed/waited_secs < "$TMP/out/hang-zero.out")"
   expect_no_fakes "上限の env が 0"
@@ -428,6 +428,13 @@ start_app() {
   APP_PID="$ISOLATED_GUI_PID"
   wait_isolated_gui "$TMP/app-${name}.log" || return 1
 }
+# 最初のタブの最初のペインの ID（`tako list` の JSON。stale binary の状態はペインを指して聞く）
+first_pane() {
+  local sock="$TAKO_DATA_DIR/tako.sock"
+  [ -f "$TAKO_DATA_DIR/tako.sock.path" ] && sock="$(cat "$TAKO_DATA_DIR/tako.sock.path")"
+  run_case "$1" 30 TAKO_SOCKET="$sock" TAKO_TOKEN="$(cat "$TAKO_DATA_DIR/token")" -- list
+  jf tabs/0/panes/0/id < "$TMP/out/$1.out"
+}
 stop_app() {
   kill_fakes
   stop_isolated_gui "$APP_PID"
@@ -437,7 +444,7 @@ stop_app() {
 phase_gui() {
   echo "== gui: MCP tako_setup_models / tako_stale_binary（GUI の上限は注入で 3 秒）"
   set_flags
-  start_app gui TAKO_PROBE_TIMEOUT_SECS=3 || return
+  start_app gui TAKO_SETUP_PROBE_TIMEOUT_SECS=3 || return
 
   set_flags hang-codex
   mcp_call tako_setup_models '{"agent":"codex"}' gui-models 60
@@ -448,21 +455,35 @@ phase_gui() {
   expect_no_fakes "MCP models"
 
   # stale binary: 器のペインの版の確かめ（パスに版が無い偽の claude = `claude --version` が最終手段）
+  local pane
+  pane="$(first_pane gui-list)"
+  echo "    対象のペイン: ${pane}"
   set_flags hang-claude
-  mcp_call tako_stale_binary '{"action":"status"}' gui-stale 60
+  mcp_call tako_stale_binary "{\"action\":\"status\",\"pane\":${pane}}" gui-stale 60
   check_eq "MCP stale_binary・返らない claude --version: 返る" "0" "$HUNG"
   echo "    経過 ${ELAPSED} 秒（上限 3 秒）"
   echo "    要点: $(perl -MJSON::PP -0ne 'my $d = eval { JSON::PP->new->utf8->decode($_) } or exit; print JSON::PP->new->canonical->encode({ map { $_ => $d->{$_} } grep { exists $d->{$_} } qw(stale reason current_version spawned_version) })' "$TMP/out/gui-stale.out")"
   check_eq "MCP stale_binary: 版は空（取れない扱い）" "" "$(jf current_version < "$TMP/out/gui-stale.out")"
-  check_eq "MCP stale_binary: 偽物の子と孫の pid を記録した（2 個）" "2" "$(fakes_recorded)"
+  # 状態の照会は今の claude の版を 2 回読む（`resolve_current_claude_binary` の覚えの中と応答の欄）ので、
+  # 返らない `--version` は 2 回起き、全体は上限 × 2。どちらも子と孫の組で止まる
+  local recorded
+  recorded="$(fakes_recorded)"
+  if [ "$recorded" -ge 2 ] && [ $((recorded % 2)) -eq 0 ]; then
+    pass "MCP stale_binary: 偽物の子と孫の組の pid を記録した（${recorded} 個）"
+  else
+    fail "MCP stale_binary: 偽物の pid の記録が子と孫の組になっていない（${recorded} 個）"
+  fi
+  if within "$ELAPSED" 3 8; then pass "MCP stale_binary: 上限 3 秒 × 2 回の内で返る（${ELAPSED} 秒）"; else fail "MCP stale_binary: 経過 ${ELAPSED} 秒"; fi
   expect_no_fakes "MCP stale_binary"
   stop_app
 
   echo "== gui legacy: TAKO_2951_LEGACY=1 の GUI"
   set_flags
-  start_app gui-legacy TAKO_2951_LEGACY=1 TAKO_PROBE_TIMEOUT_SECS=3 || return
+  start_app gui-legacy TAKO_2951_LEGACY=1 TAKO_SETUP_PROBE_TIMEOUT_SECS=3 || return
+  local pane
+  pane="$(first_pane gui-legacy-list)"
   set_flags hang-claude
-  mcp_call tako_stale_binary '{"action":"status"}' gui-legacy-stale "$LEGACY_WAIT"
+  mcp_call tako_stale_binary "{\"action\":\"status\",\"pane\":${pane}}" gui-legacy-stale "$LEGACY_WAIT"
   check_eq "MCP stale_binary・A/B: ${LEGACY_WAIT} 秒待っても返らない" "1" "$HUNG"
   stop_app
 }

@@ -698,7 +698,7 @@ fn first_meaningful_line(text: &str) -> Option<String> {
 /// 実環境から取る。CLI の探索は #983 の [`agent_cli::locate`]（境界 B16 経由）。
 ///
 /// 一覧コマンドは**上限つき**で待つ（#2951）: 上限は setup の問い合わせと同じ `probe::probe_timeout()`
-/// （既定 15 秒・env `TAKO_PROBE_TIMEOUT_SECS`。`claude mcp list` の実測 5.26 秒の約 3 倍・`agy models` の
+/// （既定 15 秒・env `TAKO_SETUP_PROBE_TIMEOUT_SECS`。`claude mcp list` の実測 5.26 秒の約 3 倍・`agy models` の
 /// 実測 3.0 秒 = #2255 の 5 倍）。打ち切ったら子を孫まで止め、[`CatalogFailure::TimedOut`] で返す
 /// （#2942 の門番 `agent_probe::output_within`）。A/B の `TAKO_2951_LEGACY=1` は修正前と同じく上限なし
 pub fn catalog(agent: WorkerAgent) -> ModelCatalog {
