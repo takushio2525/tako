@@ -111,18 +111,10 @@ fn collect_rs(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
     }
 }
 
-/// 行が関数の頭（`fn 名前(`）か。クロージャ（`move |…|`）は関数ではない
+/// 行が関数の頭（`fn 名前(`）か。判定は共有ヘルパの 1 実装（#1496。`pub(crate) fn` / `async fn` も頭と見る）。
+/// クロージャ（`move |…|`）は関数ではない
 fn is_fn_head(line: &str) -> bool {
-    let t = line.trim_start();
-    let t = t
-        .strip_prefix("pub(crate) ")
-        .or_else(|| t.strip_prefix("pub(super) "))
-        .or_else(|| t.strip_prefix("pub "))
-        .unwrap_or(t);
-    let t = t.strip_prefix("async ").unwrap_or(t);
-    let t = t.strip_prefix("unsafe ").unwrap_or(t);
-    let t = t.strip_prefix("const ").unwrap_or(t);
-    t.starts_with("fn ")
+    tako_core::source_scan::fn_head_name(line).is_some()
 }
 
 /// 0 始まりの行 `at` を含む関数の頭の行（0 始まり）

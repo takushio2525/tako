@@ -53382,10 +53382,10 @@ mod self_test {
             tree_keys_visual(any, window, cx).await;
             // #2760: ツリーの断りの通知の高さの上限と、パスの縮め
             tree_notice_2760_visual(any, window, cx).await;
-            // #2937: Web ビューが解釈できない URL をどの入口でも断り、GUI が落ちない
-            webview_url_2937_visual(any, window, cx).await;
             // #2751: 言語サーバの未導入の帯が狭いペインでも本文の行を押し出さない
             lsp_band_2751_visual(any, window, cx).await;
+            // #2937: Web ビューが解釈できない URL をどの入口でも断り、GUI が落ちない
+            webview_url_2937_visual(any, window, cx).await;
 
             // #932: ちらつきの機械検証。**最後に回す**（専用タブを作り、分割・
             // プレビュー・連続出力まで状態を動かすので、他の節の前提を壊さない）
