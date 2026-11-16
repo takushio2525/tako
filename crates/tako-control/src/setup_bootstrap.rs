@@ -280,7 +280,8 @@ pub struct BootstrapState {
     pub step: Step,
     pub plan: InstallPlan,
     /// 認証の問い合わせを上限で打ち切った（= 未認証ではなく**確かめられなかった**。#2255）。
-    /// 上限を持つのは環境診断の経路（[`status_all_within`]）だけで、setup の経路は常に `None`
+    /// #2942 から環境診断の外（`tako setup bootstrap`・MCP `tako_setup_bootstrap`・`tako setup`）も
+    /// 上限つきで聞くので、どの経路でも立ちうる（`None` なのは A/B の旧経路 `TAKO_2942_LEGACY=1` だけ）
     pub auth_timeout: Option<tako_core::probe::TimeoutNotice>,
     /// 実行ファイルの検出（ログインシェルの `command -v`）を上限で打ち切った（#1533）。
     /// 立っていて `binary` が無ければ、未導入ではなく**導入済みかを確かめられなかった**
@@ -311,6 +312,15 @@ impl BootstrapState {
             Step::Path => self.path_timeout.as_ref().or(self.locate_timeout.as_ref()),
             Step::Auth | Step::Ready => None,
         }
+    }
+
+    /// 段が「ログイン」なのは、認証の問い合わせを上限で打ち切ったせいか（#2255 / #2942）。
+    /// `Some` なら未ログインではなく**確かめられなかった**ので、呼び手はログインへ人を送らない。
+    /// 文面は環境診断と同じ `HealthText::AuthUnknown`（「認証: 不明（N 秒で応答なし）」）
+    pub fn auth_unconfirmed(&self) -> Option<&tako_core::probe::TimeoutNotice> {
+        (self.step == Step::Auth)
+            .then_some(self.auth_timeout.as_ref())
+            .flatten()
     }
 
     /// このタブでは引けないが、tako の新しいタブなら引ける（#2428）。
@@ -347,6 +357,9 @@ impl BootstrapState {
             "next_step_description": self.step_description(),
             // #1532 / #1533: 段がログインシェルの打ち切りで決まっている（null = 確かめた答え）
             "next_step_unconfirmed": self.step_unconfirmed().map(timeout_json),
+            // #2255 / #2942: 認証の問い合わせを上限で打ち切った（`authenticated: false` は未ログインでは
+            // なく**確かめられなかった**。null = 確かめた答え）。形は `next_step_unconfirmed` と同じ
+            "auth_unconfirmed": self.auth_timeout.as_ref().map(timeout_json),
             "install_plan": self.plan.to_json(),
             "deps": deps_json(),
             "homebrew": homebrew_json(),
@@ -611,15 +624,35 @@ pub struct AuthState {
 /// 認証済みか。**メールアドレスや組織名は読み捨てる**（診断ログへ個人情報を出さないため）。
 ///
 /// claude だけ exit code では判断できない（未ログインでも 0 を返しうるので
-/// `loggedIn` を見る）。他の 2 系統は exit code が判定そのもの
+/// `loggedIn` を見る）。他の 2 系統は exit code が判定そのもの。
+/// 問い合わせは上限つき（[`auth_state_bounded`]。打ち切ったら false = 確かめられなかった）
 pub fn is_authenticated_for(agent: AgentKind, binary: &str) -> bool {
-    auth_state_for(agent, binary).authenticated
+    auth_state_bounded(agent, binary).0.authenticated
 }
 
-/// 認証の有無とプラン名（上限なしで待つ = setup の経路。出力の解釈は `auth_state_from` の 1 か所）。
+/// 認証の有無とプラン名を**上限つきで**問い合わせる（環境診断の外の既定の口。#2942）。
 ///
-/// 環境診断（`tako check-health` / `tako setup --check`）からは呼ばない。返らない CLI が
-/// 1 つあると診断ごと固まる（#2255）ので、あちらは [`auth_state_within`] を通す
+/// 上限は環境診断と同じ `probe::auth_probe_timeout()`（既定 10 秒・env `TAKO_AUTH_PROBE_TIMEOUT_SECS`）。
+/// 打ち切ったら子を孫ごと止めて、戻り値の 2 つ目に知らせを入れる（未認証ではなく**確かめられなかった**）。
+/// `tako setup bootstrap status` / `status-all`・MCP `tako_setup_bootstrap`・`tako setup` の検出と
+/// 導入の段はみなここを通る（#2942 前は上限なしの [`auth_state_for`] で、返らない claude で
+/// 何も出さずに固まった）。A/B の旧経路（`TAKO_2942_LEGACY=1`）だけ上限なしで待つ
+pub fn auth_state_bounded(
+    agent: AgentKind,
+    binary: &str,
+) -> (AuthState, Option<tako_core::probe::TimeoutNotice>) {
+    if tako_core::probe::issue2942_legacy() {
+        return (auth_state_for(agent, binary), None);
+    }
+    auth_state_within(agent, binary, tako_core::probe::auth_probe_timeout())
+}
+
+/// 認証の有無とプラン名を**上限なしで**待つ（出力の解釈は `auth_state_from` の 1 か所）。
+///
+/// **A/B の旧経路の腕（`TAKO_2255_LEGACY=1` / `TAKO_2942_LEGACY=1`）だけが呼ぶ**。返らない CLI が
+/// 1 つあると呼び手ごと固まる（環境診断 = #2255・`tako setup bootstrap` = #2942）。既定の口は
+/// [`auth_state_bounded`] / [`auth_state_within`]。番犬
+/// `crates/tako-control/tests/issue2942_bootstrap_auth_probe_watchdog.rs` が A/B の腕の外の呼び手を名指す
 pub fn auth_state_for(agent: AgentKind, binary: &str) -> AuthState {
     // #1261: 問い合わせの起動は正本の門番を通す。テストプロセスでは 1 つも起こさない
     // （実 CLI は起動しただけで `~/.gemini` / `~/.codex/tmp` / `~/.claude.json` を作る）
@@ -631,7 +664,7 @@ pub fn auth_state_for(agent: AgentKind, binary: &str) -> AuthState {
     auth_state_from(agent, output)
 }
 
-/// [`auth_state_for`] の**待ちに上限を持つ**版（環境診断の経路。#2255）。
+/// [`auth_state_for`] の**待ちに上限を持つ**版（上限を呼び手が決める。#2255 / #2942）。
 ///
 /// 上限を超えたら子を kill して「確かめられなかった」を返す（戻り値の 2 つ目。未認証とは区別する）。
 /// 門番（#1261）と打ち切りの知らせ（#1503）は `agent_probe::output_within` が持つ
@@ -851,18 +884,19 @@ fn unknown_shell_refusal(home: &Path, dirs: &[PathBuf]) -> SetupRefusal {
     }
 }
 
-/// いまの導入状況を調べる（読み取りだけ。副作用なし）。認証の問い合わせは上限なしで待つ
-/// （setup の経路。環境診断は [`status_for_within`]）
+/// いまの導入状況を調べる（読み取りだけ。副作用なし）。認証の問い合わせは上限つき
+/// （[`auth_state_bounded`] = 環境診断と同じ上限。#2942）で、打ち切ったら
+/// [`BootstrapState::auth_timeout`] が立つ
 pub fn status_for(agent: AgentKind) -> Result<BootstrapState, String> {
     status_for_typed(agent).map_err(SetupRefusal::into_ja)
 }
 
 /// [`status_for`] の型の口（断りを表示言語で返す dispatch の `tako_setup_bootstrap` が使う。#2365）
 pub fn status_for_typed(agent: AgentKind) -> Result<BootstrapState, SetupRefusal> {
-    status_with(agent, |binary| (auth_state_for(agent, binary), None))
+    status_with(agent, |binary| auth_state_bounded(agent, binary))
 }
 
-/// [`status_for`] の認証の問い合わせを `budget` で打ち切る版（環境診断の経路。#2255）
+/// [`status_for`] の認証の問い合わせを `budget` で打ち切る版（上限を呼び手が決める。#2255）
 pub fn status_for_within(
     agent: AgentKind,
     budget: std::time::Duration,
@@ -959,15 +993,35 @@ pub fn choose_target(states: &[(AgentKind, Result<BootstrapState, String>)]) -> 
 /// 3 系統ぶんの導入状況（**面倒を見る系統だけ**。`TAKO_989_LEGACY=1` なら claude だけ）。
 ///
 /// 読めなかった系統は落とさず理由つきで並べる（無言で消えると
-/// 「なぜ出てこないのか」が追えない）
+/// 「なぜ出てこないのか」が追えない）。
+///
+/// 認証の問い合わせは環境診断と同じ上限で、**系統を並べて**聞く（[`status_all_within`]。#2942）。
+/// 返らない CLI があっても全体は上限 1 回ぶんで返る。A/B の旧経路（`TAKO_2942_LEGACY=1`）だけ
+/// 修正前の形（[`status_all_legacy`] = 上限なしで 1 系統ずつ）
 pub fn status_all() -> Vec<(AgentKind, Result<BootstrapState, String>)> {
+    if tako_core::probe::issue2942_legacy() {
+        return status_all_legacy();
+    }
+    status_all_within(tako_core::probe::auth_probe_timeout())
+}
+
+/// 認証の問い合わせを**上限なしで 1 系統ずつ**待つ導入状況（#2255 / #2942 の前の形）。
+///
+/// **A/B の旧経路の腕だけが呼ぶ**（環境診断の `TAKO_2255_LEGACY=1` と、[`status_all`] の
+/// `TAKO_2942_LEGACY=1`）。返らない CLI が 1 つあると呼び手ごと固まる
+pub fn status_all_legacy() -> Vec<(AgentKind, Result<BootstrapState, String>)> {
     bootstrap_agents()
         .into_iter()
-        .map(|agent| (agent, status_for(agent)))
+        .map(|agent| {
+            let state = status_with(agent, |binary| (auth_state_for(agent, binary), None))
+                .map_err(SetupRefusal::into_ja);
+            (agent, state)
+        })
         .collect()
 }
 
-/// [`status_all`] の環境診断版（#2255）: 認証の問い合わせを `budget` で打ち切り、**系統を並べて**聞く。
+/// 3 系統ぶんの導入状況の、上限を呼び手が決める版（環境診断 = #2255。[`status_all`] もここを通る = #2942）:
+/// 認証の問い合わせを `budget` で打ち切り、**系統を並べて**聞く。
 ///
 /// 1 系統ずつ待つと、返らない CLI が 3 つあれば上限の 3 倍待つ。並べれば全部が返らなくても
 /// 認証の確認の全体は `budget`（+ 起動と後始末）で終わる。並びは [`bootstrap_agents`] のまま返す
@@ -3235,6 +3289,53 @@ mod tests {
         let mut missing = auth_state(true, false);
         missing.binary = None;
         assert!(!missing.needs_new_tab_in(true));
+    }
+
+    // --- 認証の問い合わせの打ち切り（#2942）---
+
+    fn auth_notice(secs: u64) -> tako_core::probe::TimeoutNotice {
+        tako_core::probe::TimeoutNotice {
+            label: "claude auth status --json".to_string(),
+            waited_secs: secs,
+        }
+    }
+
+    #[test]
+    fn 認証の打ち切りはログインの段のときだけ段を確かめられなかったと言う() {
+        // 打ち切った = 段が「ログイン」に見えているのは確かめられなかったせい
+        let mut state = auth_state(true, true);
+        state.auth_timeout = Some(auth_notice(10));
+        assert_eq!(state.auth_unconfirmed(), Some(&auth_notice(10)));
+        // 打ち切っていない = 確かめた答え（本当に未ログイン）
+        assert_eq!(auth_state(true, true).auth_unconfirmed(), None);
+        // PATH の段なら段は認証で決まっていない（段の事実は PATH に無いこと）
+        state.step = Step::Path;
+        assert_eq!(state.auth_unconfirmed(), None);
+        // ログインシェルの打ち切り（#1532 / #1533）とは混ぜない
+        state.step = Step::Auth;
+        assert_eq!(state.step_unconfirmed(), None);
+    }
+
+    #[test]
+    fn 認証の打ち切りはjsonのauth_unconfirmedに載る() {
+        let mut state = auth_state(true, true);
+        state.auth_timeout = Some(auth_notice(4));
+        let json = state.to_json();
+        assert_eq!(json["authenticated"], false);
+        assert_eq!(
+            json["auth_unconfirmed"]["label"],
+            "claude auth status --json"
+        );
+        assert_eq!(json["auth_unconfirmed"]["waited_secs"], 4);
+        // 段の打ち切り（ログインシェル）の欄とは別
+        assert!(json["next_step_unconfirmed"].is_null());
+        // 確かめた答えなら null（キーは常にある = MCP の読み手が欄の有無で迷わない）
+        let json = auth_state(true, true).to_json();
+        assert!(json
+            .as_object()
+            .expect("object")
+            .contains_key("auth_unconfirmed"));
+        assert!(json["auth_unconfirmed"].is_null());
     }
 
     #[test]

@@ -19,7 +19,7 @@
 //! 2. [`診断の経路は上限つきの認証確認を通る`] — 禁止だけでなく**寄せ先も縛る**（#1496 の 2 本立て）。
 //!    認証の確認ごと消しても 1 は緑なので、上限つきの口（`agent_probe::output_within`）へ届くこと・
 //!    上限が `probe::auth_probe_timeout()` から来ることを見る
-//! 3. [`修正前の形を名指しできる`] — 修正前の `status_all()` へ戻す・診断の関数へ直書きする・
+//! 3. [`修正前の形を名指しできる`] — 修正前の形（上限なしで 1 系統ずつ = `status_all_legacy()`）へ戻す・診断の関数へ直書きする・
 //!    上限つきの関数を上限なしの口で包み直す、の 3 つの注入を 1 が名指しすること（同じテストの中の A/B）
 //!
 //! ## 相方
@@ -194,11 +194,12 @@ fn 診断の経路は上限つきの認証確認を通る() {
         graph.callees(bounded).contains(&gate),
         "{SETUP_BOOTSTRAP} の `auth_state_within` が上限つきの口 `agent_probe::output_within` を呼んでいない（#2255）"
     );
-    // 上限なしの組み立て（setup の経路）は A/B の旧経路の腕からしか呼ばない
-    let unbounded = one_fn(&graph, SETUP_BOOTSTRAP, "status_all");
+    // 上限なしの組み立て（修正前の形 = 1 系統ずつ上限なし）は A/B の旧経路の腕からしか呼ばない。
+    // #2942 で setup の既定の `status_all` も上限つきになり、上限なしの形は `status_all_legacy` へ分けた
+    let unbounded = one_fn(&graph, SETUP_BOOTSTRAP, "status_all_legacy");
     assert!(
         !reach.contains_key(&unbounded),
-        "{DIAGNOSTICS} の `collect` から上限なしの `status_all` へ届く（#2255）。\n\
+        "{DIAGNOSTICS} の `collect` から上限なしの `status_all_legacy` へ届く（#2255）。\n\
          呼んでよいのは `if tako_core::probe::issue2255_legacy() {{` の腕だけ"
     );
     let collect_hits = graph.hits(entry, "auth_probe_timeout()");
@@ -209,9 +210,11 @@ fn 診断の経路は上限つきの認証確認を通る() {
     // 門番そのものが渡された上限で待ち、打ち切りを知らせる（素通しだと 1 は緑のまま症状が戻る）
     let def = &graph.fns[gate];
     let body = &graph.sources[def.file].code[def.body.0..=def.body.1];
+    // #2942 から製品の既定の経路は子にグループを率いさせる版（打ち切ったら孫まで畳む）。
+    // 上限なしではないことは同じなので、ここでは渡された上限で待つことだけを見る
     for needle in [
         "blocked()",
-        "tako_core::probe::output_with_timeout(program, args, budget)",
+        "tako_core::probe::output_with_timeout_grouped(program, args, budget)",
         "timeout_notice()",
     ] {
         assert!(
@@ -241,24 +244,25 @@ fn 修正前の形を名指しできる() {
         }
     };
 
-    // ① 修正前: 診断が上限なしの `status_all()` を A/B のゲートの外で呼ぶ
-    // （#1622 で導入状況は `collect_with` へ渡すクロージャになった。中身の形は同じ）
+    // ① 修正前: 診断が上限なしの組み立て（1 系統ずつ）を A/B のゲートの外で呼ぶ
+    // （#1622 で導入状況は `collect_with` へ渡すクロージャになった。中身の形は同じ。
+    // #2942 で上限なしの形は `status_all` から `status_all_legacy` へ名前を分けた）
     let d = inject(
         &diagnostics,
-        "    let bootstrap = || {\n        if tako_core::probe::issue2255_legacy() {\n            crate::setup_bootstrap::status_all()\n        } else {\n            crate::setup_bootstrap::status_all_within(tako_core::probe::auth_probe_timeout())\n        }\n    };",
-        "    let bootstrap = || crate::setup_bootstrap::status_all();",
+        "    let bootstrap = || {\n        if tako_core::probe::issue2255_legacy() {\n            crate::setup_bootstrap::status_all_legacy()\n        } else {\n            crate::setup_bootstrap::status_all_within(tako_core::probe::auth_probe_timeout())\n        }\n    };",
+        "    let bootstrap = || crate::setup_bootstrap::status_all_legacy();",
         "①",
     );
     let hits = unbounded_calls(&graph_with(&[(DIAGNOSTICS, &d)]));
     expect_named(
-        "① 修正前の status_all()",
+        "① 修正前の status_all_legacy()",
         hits.clone(),
         &format!("{SETUP_BOOTSTRAP}:"),
     );
     expect_named(
-        "① 道筋に status_all → status_for → auth_state_for",
+        "① 道筋に status_all_legacy → auth_state_for",
         hits,
-        "→ `status_all`",
+        "→ `status_all_legacy`",
     );
 
     // ② 診断の関数へ上限なしの口を直書きする

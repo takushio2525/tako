@@ -81,7 +81,13 @@ pub fn output_with_timeout(program: &str, args: &[&str]) -> tako_core::probe::Ou
 /// [`output_with_timeout`] の上限を呼び手が決める版（#2255）。
 ///
 /// 環境診断の認証確認（`setup_bootstrap::auth_state_within`）は setup の probe より短い上限
-/// （`probe::auth_probe_timeout`）で打ち切る。門番・知らせの出し方は [`output_with_timeout`] と同じ
+/// （`probe::auth_probe_timeout`）で打ち切る。門番・知らせの出し方は [`output_with_timeout`] と同じ。
+///
+/// **打ち切ったら孫まで止める**（#2942）: 子に自分のプロセスグループを率いさせ、待ちの 1 実装が
+/// グループごと畳む（`probe::output_with_timeout_grouped`。unix。Windows は入れ物 = Job Object が
+/// 止める = #2462）。直接の子だけを kill すると、`claude` の包み（シェル → `node`）や
+/// `claude mcp list` が起こす MCP サーバが孤児として残る。A/B（`TAKO_2942_LEGACY=1`）は修正前と同じく
+/// 親のグループで起こす（unix は直接の子だけを kill = 孫が残る）
 pub fn output_within(
     program: &str,
     args: &[&str],
@@ -93,7 +99,11 @@ pub fn output_within(
             reason: "検証プロセスからの問い合わせは禁じられています（#1261）".to_string(),
         };
     }
-    let outcome = tako_core::probe::output_with_timeout(program, args, budget);
+    let outcome = if tako_core::probe::issue2942_legacy() {
+        tako_core::probe::output_with_timeout(program, args, budget)
+    } else {
+        tako_core::probe::output_with_timeout_grouped(program, args, budget)
+    };
     if let Some(notice) = outcome.timeout_notice() {
         eprintln!("  {notice}");
     }
