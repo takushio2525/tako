@@ -395,14 +395,14 @@ hanging_calls() {
   local phase="$1" expect="$2" limit="$3"
   set_flags hang-claude-mcp
   mcp_start tako_setup_mcp '{"agent":"claude"}' "$phase-mcp-hang"
-  list_during "$phase・返らない claude（setup-mcp）" "$expect" "$limit"
+  list_during "${phase}・返らない claude（setup-mcp）" "$expect" "$limit"
   kill_fakes
   mcp_wait 30
   check_eq "$phase: 返らない claude: 偽物を落とすと MCP が返る" "0" "$MCP_HUNG"
 
   set_flags hang-setup
   mcp_start tako_setup '{}' "$phase-run-hang"
-  list_during "$phase・返らない tako setup（setup）" "$expect" "$limit"
+  list_during "${phase}・返らない tako setup（setup）" "$expect" "$limit"
   mcp_wait 30
   check_eq "$phase: 返らない tako setup: 上限で MCP が返る" "0" "$MCP_HUNG"
   check_eq "$phase: 返らない tako setup: timed_out（応答の形は #1503 のまま）" "true/4" \
@@ -411,7 +411,7 @@ hanging_calls() {
   set_flags hang-git
   rm -rf "${SHARE_DIR:?}"
   mcp_start tako_config_share "{\"action\":\"init\",\"path\":\"$SHARE_DIR\"}" "$phase-share-hang"
-  list_during "$phase・返らない git（config share）" "$expect" "$limit"
+  list_during "${phase}・返らない git（config share）" "$expect" "$limit"
   kill_fakes
   mcp_wait 30
   check_eq "$phase: 返らない git: 偽物を落とすと MCP が返る" "0" "$MCP_HUNG"
