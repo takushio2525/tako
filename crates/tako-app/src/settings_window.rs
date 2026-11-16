@@ -2979,16 +2979,20 @@ impl SettingsWindow {
                     txt::setup_mcp_register(),
                     BtnKind::Normal,
                     cx.listener(|this, _, _, cx| {
-                        this.run_with_message(
-                            Request::SetupMcp {
-                                scope: None,
-                                pane: None,
-                                // 対象は絞らない = claude + 導入済みの codex / agy（#979）
-                                agent: None,
-                            },
-                            txt::msg_mcp_registered().to_string(),
-                            cx,
-                        );
+                        // #2961: `claude mcp add` ほかを UI スレッドで待たない（IPC の受け口と同じ
+                        // `prepare_offload` → background → 着地。A/B の `TAKO_2961_LEGACY=1` は同期の dispatch）
+                        let request = Request::SetupMcp {
+                            scope: None,
+                            pane: None,
+                            // 対象は絞らない = claude + 導入済みの codex / agy（#979）
+                            agent: None,
+                        };
+                        this.dispatch_off_ui(request, cx, |this, result, _cx| {
+                            this.message = Some(match result {
+                                Ok(_) => (txt::msg_mcp_registered().to_string(), false),
+                                Err(e) => (e, true),
+                            });
+                        });
                     }),
                 ),
             ))

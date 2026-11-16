@@ -13231,7 +13231,11 @@ fn setup_dispatch_lines() -> Vec<(usize, &'static str)> {
     let mut out = Vec::new();
     let mut inside = false;
     for (line, code) in all.iter().copied() {
-        if code.contains("Request::SetupMcp {") || code.contains("Request::SetupChanges =>") {
+        // 始まりは `dispatch_inner` の同期の腕の字面（#2961 で `prepare_offload` にも `Request::SetupMcp {`
+        // の腕ができたので、ガードの無い形だけを印にする）
+        if code.contains("Request::SetupMcp { scope, pane, agent } =>")
+            || code.contains("Request::SetupChanges =>")
+        {
             inside = true;
         }
         // 次の分岐の頭で止める（頭の行は範囲に入れない）
@@ -13243,7 +13247,8 @@ fn setup_dispatch_lines() -> Vec<(usize, &'static str)> {
         }
     }
     // 分岐の外へ出した応答の 1 実装（同期の腕と background のジョブが通る）も範囲に入れる
-    // （#2433 の `setup_deps_reply`・#2956 の `setup_bootstrap_reply` / `setup_models_reply`）
+    // （#2433 の `setup_deps_reply`・#2956 の `setup_bootstrap_reply` / `setup_models_reply`・
+    // #2961 の `setup_mcp_prepare` / `setup_mcp_reply` / `setup_run_reply`）
     for head in [
         "pub fn setup_mcp_typed(",
         "pub fn setup_mcp_agents(",
@@ -13251,6 +13256,9 @@ fn setup_dispatch_lines() -> Vec<(usize, &'static str)> {
         "fn setup_deps_reply(",
         "fn setup_bootstrap_reply(",
         "fn setup_models_reply(",
+        "fn setup_mcp_prepare(",
+        "fn setup_mcp_reply(",
+        "fn setup_run_reply(",
     ] {
         out.extend(front_scope_lines(DISPATCH_SRC, Some(head)).unwrap_or_default());
     }
@@ -13285,6 +13293,15 @@ fn setup系の番犬の境界() {
     assert!(
         has("fn run_setup_cli_within("),
         "子の tako setup は範囲の中"
+    );
+    // #2961: 分岐の外へ出した応答の 1 実装も範囲の中（`prepare_offload` の腕から範囲を始めない）
+    assert!(
+        has("SetupRefusal::AnswersMalformed("),
+        "tako setup の答えの検査（`setup_run_reply`）は範囲の中"
+    );
+    assert!(
+        !has("if !sync_arm_offload_legacy()"),
+        "`prepare_offload` の腕は範囲の外（そこの setup-mcp の腕から範囲が始まっていない）"
     );
     assert!(!has("Request::VideoPlayback {"), "動画の分岐は範囲の外");
     assert!(

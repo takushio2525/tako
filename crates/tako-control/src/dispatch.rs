@@ -7095,6 +7095,15 @@ pub enum OffloadJob {
     /// モデル一覧の実取得（`tako_setup_models`。#2956）。`codex debug models` / `agy models` を UI スレッドで
     /// 待たない。workspace に触らないのでそのまま background から応答する
     SetupModels(Box<Request>),
+    /// MCP の登録（`tako_setup_mcp`。#2961）。`claude mcp add` ほか・tako の実行ファイルの解決（ログインシェル）を
+    /// UI スレッドで待たない。UI スレッドでは project スコープのペインの cwd だけを写す（[`setup_mcp_prepare`]）
+    SetupMcp(Box<SetupMcpJob>),
+    /// `tako setup` の実行（`tako_setup`。#2961）。子プロセスの `tako setup`（上限 `setup_run_timeout`）を
+    /// UI スレッドで待たない。workspace に触らないのでそのまま background から応答する
+    SetupRun(Box<Request>),
+    /// AI 系設定の共有（`tako_config_share`。#2961）。git（init / commit / push / pull）を UI スレッドで待たない。
+    /// workspace に触らないのでそのまま background から応答する
+    ConfigShare(Box<Request>),
     /// tmux 一覧（#1984）。UI スレッドでは tako のペインとの対応表だけを写し、
     /// `tmux list-sessions` ほか（ソケットごとに数本）は background で起こす
     TmuxList {
@@ -8189,6 +8198,19 @@ pub fn prepare_offload(
         models @ Request::SetupModels { .. } if !setup_query_offload_legacy() => {
             Some(Ok(OffloadJob::SetupModels(Box::new(models.clone()))))
         }
+        // #2961: MCP の登録（`claude mcp add` ほか）・`tako setup` の子プロセス・設定共有の git を UI スレッドで待たない
+        // （#2956 の番犬が洗い出した同期の腕の残り）。UI スレッドで写すのは project スコープのペインの cwd だけ。
+        // 書き込みは錠で届いた順に 1 本ずつ。A/B の `TAKO_2961_LEGACY=1` は修正前と同じ `None` = UI スレッドで同期に答える
+        Request::SetupMcp { scope, pane, agent } if !sync_arm_offload_legacy() => Some(
+            setup_mcp_prepare(host, scope.as_deref(), *pane, agent.clone())
+                .map(|job| OffloadJob::SetupMcp(Box::new(job))),
+        ),
+        run @ Request::SetupRun { .. } if !sync_arm_offload_legacy() => {
+            Some(Ok(OffloadJob::SetupRun(Box::new(run.clone()))))
+        }
+        share @ Request::ConfigShare { .. } if !sync_arm_offload_legacy() => {
+            Some(Ok(OffloadJob::ConfigShare(Box::new(share.clone()))))
+        }
         Request::TmuxList { socket } if !tako_core::probe::issue1984_legacy() => {
             Some(Ok(OffloadJob::TmuxList {
                 ctx: collect_tmux_context(host),
@@ -8291,10 +8313,20 @@ pub fn setup_query_offload_legacy() -> bool {
     )
 }
 
-/// `tako_setup_bootstrap` の書き込み（`dry_run` でない `install`・`path`・`undo-path`）を 1 本ずつにする錠（#2956）。
-/// UI スレッドで答えていた間は届いた順に 1 本ずつ走っていた。background へ出した後も、公式インストーラの
-/// 同時実行や同じ rc ファイルへの PATH の書き足しが重ならないよう順序を保つ（確かめ・計画は錠を取らない）
-static SETUP_BOOTSTRAP_WRITE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// setup の書き込みを 1 本ずつにする錠（#2956 / #2961）。対象は `tako_setup_bootstrap` の書き込み（`dry_run` でない
+/// `install`・`path`・`undo-path`）・`tako_setup_mcp` の登録・`tako_setup`（子の `tako setup` 全体）。
+/// UI スレッドで答えていた間はこれらが届いた順に 1 本ずつ走っていた。background へ出した後も、公式インストーラの
+/// 同時実行・同じ rc ファイルへの PATH の書き足し・同じエージェントの設定ファイルへの MCP の登録が重ならないよう
+/// 順序を保つ（確かめ・計画は錠を取らない）。子の `tako setup` は GUI へ IPC を投げないので、錠を持ったまま子を
+/// 待っても待ち合いにはならない
+static SETUP_WRITE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// [`SETUP_WRITE_SERIAL`] を取る（前の持ち手が panic していても順序だけは保つ）
+fn setup_write_serial() -> std::sync::MutexGuard<'static, ()> {
+    SETUP_WRITE_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// `tako_setup_bootstrap` の応答（同期の腕と background の腕 = [`OffloadJob::SetupBootstrap`] が通る 1 実装。#2956）。
 /// 読み取り・書き込みともプロセス内で完結する（アプリ状態に依存しない）。導入は利用者が終わりを待つと分かって
@@ -8324,11 +8356,7 @@ fn setup_bootstrap_reply(request: &Request) -> Result<Value, DispatchError> {
         "install" => !dry_run,
         _ => false,
     };
-    let _serial = writes.then(|| {
-        SETUP_BOOTSTRAP_WRITE_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    });
+    let _serial = writes.then(setup_write_serial);
     match action {
         "status" => crate::setup_bootstrap::status_for_typed(target)
             .map(|s| s.to_json())
@@ -8387,6 +8415,148 @@ fn setup_models_reply(request: &Request) -> Result<Value, DispatchError> {
             .collect::<Vec<_>>(),
         "apply_command": ReplyNote::ModelsApplyCommand.to_string(),
     }))
+}
+
+/// #2961 の A/B の env（`1` = 修正前と同じく、#2956 の番犬が洗い出した同期の腕（`SetupMcp` / `SetupRun` /
+/// `ConfigShare` ほか）を UI スレッドの同期の腕で答える）
+pub const SYNC_ARM_OFFLOAD_LEGACY_ENV: &str = "TAKO_2961_LEGACY";
+
+/// #2961 の腕を background へ出さず、修正前と同じく UI スレッドで待つか（**門はここ 1 か所**）。
+/// 要求のたびに読む（テストが `run_alone!` の子で切り替えられるよう、値を覚えない）
+pub fn sync_arm_offload_legacy() -> bool {
+    matches!(
+        std::env::var(SYNC_ARM_OFFLOAD_LEGACY_ENV).ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
+/// `tako_setup_mcp` の background の仕事（#2961。[`setup_mcp_prepare`] が UI スレッドで作る）
+pub struct SetupMcpJob {
+    agent: Option<String>,
+    scope: McpScope,
+    /// 応答の `scope` 欄（要求の綴り。省略は `global`）
+    scope_label: String,
+}
+
+/// `tako_setup_mcp` の準備（同期の腕と `prepare_offload` が通る 1 実装。#2961）。workspace を読むのは
+/// project スコープのペインの cwd（キャッシュ済みの値）だけで、外部プロセスは起こさない
+fn setup_mcp_prepare(
+    host: &dyn ControlHost,
+    scope: Option<&str>,
+    pane: Option<u64>,
+    agent: Option<String>,
+) -> Result<SetupMcpJob, DispatchError> {
+    let scope_label = scope.unwrap_or("global");
+    let scope = match scope_label {
+        "project" => {
+            let (_, target) = resolve_pane(host.workspace(), pane)?;
+            let cwd = host
+                .session(target)
+                .and_then(|s| s.cwd())
+                .ok_or_else(|| Reason::CwdUnavailable.operation())?;
+            McpScope::Project(cwd.to_path_buf())
+        }
+        _ => McpScope::User,
+    };
+    Ok(SetupMcpJob {
+        agent,
+        scope,
+        scope_label: scope_label.to_string(),
+    })
+}
+
+/// `tako_setup_mcp` の応答（同期の腕と background の腕 = [`OffloadJob::SetupMcp`] が通る 1 実装。#2961）。
+/// 登録は書き込みなので [`SETUP_WRITE_SERIAL`] の内側で 1 本ずつ
+fn setup_mcp_reply(job: &SetupMcpJob) -> Result<Value, DispatchError> {
+    let _serial = setup_write_serial();
+    setup_mcp_agents(job.agent.as_deref(), &job.scope, &job.scope_label)
+}
+
+/// #2961 の検証専用の注入の env（[`setup_run_binary`]。検証プロセスでだけ読む）
+pub const ISSUE2961_INJECT_SETUP_BIN_ENV: &str = "TAKO_2961_INJECT_SETUP_BIN";
+
+/// `tako_setup` が起こす tako の実行ファイル（[`resolve_tako_binary`]）。
+///
+/// **検証プロセス（`TAKO_ISOLATED` 等。`tako_core::paths::is_verification_process`）でだけ**、
+/// `TAKO_2961_INJECT_SETUP_BIN` が指す偽物へ差し替えられる: 隔離 GUI でも `resolve_tako_binary` は
+/// /Applications の本物を選ぶので、そのままでは返らない子を作れず、本物の `tako setup`（導入器まで起こす）を
+/// 砂場で走らせることになる。本番の GUI は env があっても読まない（`scripts/test-sync-arm-offload-2961.sh`）
+fn setup_run_binary() -> String {
+    setup_run_binary_with(
+        tako_core::paths::is_verification_process(),
+        || std::env::var_os(ISSUE2961_INJECT_SETUP_BIN_ENV),
+        resolve_tako_binary,
+    )
+}
+
+/// [`setup_run_binary`] の判断（env と実行ファイルの解決を引数で受ける = テストが本物を引かずに検査できる）。
+/// env は検証プロセスのときだけ読む（本番の GUI では読みもしない）。空は差し替えない
+fn setup_run_binary_with(
+    verification: bool,
+    injected: impl FnOnce() -> Option<std::ffi::OsString>,
+    resolve: impl FnOnce() -> String,
+) -> String {
+    if verification {
+        if let Some(bin) = injected().filter(|bin| !bin.is_empty()) {
+            return bin.to_string_lossy().into_owned();
+        }
+    }
+    resolve()
+}
+
+/// `tako_setup` の応答（同期の腕と background の腕 = [`OffloadJob::SetupRun`] が通る 1 実装。#2961）。
+/// 子の `tako setup` は上限 `setup_run_timeout` で打ち切る（応答の上限 `default_reply_timeout` は持たない）。
+/// setup の書き込みなので [`SETUP_WRITE_SERIAL`] の内側で 1 本ずつ
+fn setup_run_reply(request: &Request) -> Result<Value, DispatchError> {
+    let Request::SetupRun { answers } = request else {
+        unreachable!("setup_run_reply は SetupRun だけを受ける");
+    };
+    let answers_value = answers.clone().unwrap_or_else(|| serde_json::json!({}));
+    let parsed: crate::setup::SetupAnswers = serde_json::from_value(answers_value)
+        .map_err(|e| SetupRefusal::AnswersMalformed(e.to_string()).invalid())?;
+    parsed.validate_typed().map_err(SetupRefusal::invalid)?;
+    let answers_json = serde_json::to_string(&parsed)
+        .map_err(|e| SetupRefusal::AnswersEncode(e.to_string()).operation())?;
+    let tako_bin = setup_run_binary();
+    let _serial = setup_write_serial();
+    run_setup_cli(&tako_bin, &answers_json)
+}
+
+/// `tako_config_share` の書き込み（git の init / commit / push / pull・配線の付け外し）を 1 本ずつにする錠（#2961）。
+/// UI スレッドで答えていた間は届いた順に 1 本ずつ走っていた。同じ共有リポジトリへの git が重ならないよう
+/// background へ出した後も順序を保つ（status / list は錠を取らない）
+static CONFIG_SHARE_WRITE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `tako_config_share` の応答（同期の腕と background の腕 = [`OffloadJob::ConfigShare`] が通る 1 実装。#2961）。
+/// git の push / pull はネットワーク・認証まで待つので応答の上限は持たない（`default_reply_timeout`。#1991 の
+/// git の書き込みと同じ扱い）
+fn config_share_reply(request: &Request) -> Result<Value, DispatchError> {
+    let Request::ConfigShare {
+        action,
+        target,
+        path,
+        remote,
+        message,
+        no_push,
+    } = request
+    else {
+        unreachable!("config_share_reply は ConfigShare だけを受ける");
+    };
+    let action = action.as_deref().unwrap_or("status");
+    let writes = !matches!(action, "status" | "list");
+    let _serial = writes.then(|| {
+        CONFIG_SHARE_WRITE_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    });
+    dispatch_config_share(
+        action,
+        target.as_deref(),
+        path.as_deref(),
+        remote.as_deref(),
+        message.as_deref(),
+        *no_push,
+    )
 }
 
 impl OffloadJob {
@@ -8616,6 +8786,10 @@ impl OffloadJob {
             // #2956: 同期の腕（`Request::SetupBootstrap` / `Request::SetupModels`）と同じ関数
             OffloadJob::SetupBootstrap(request) => setup_bootstrap_reply(&request),
             OffloadJob::SetupModels(request) => setup_models_reply(&request),
+            // #2961: 同期の腕（`Request::SetupMcp` / `Request::SetupRun` / `Request::ConfigShare`）と同じ関数
+            OffloadJob::SetupMcp(job) => setup_mcp_reply(&job),
+            OffloadJob::SetupRun(request) => setup_run_reply(&request),
+            OffloadJob::ConfigShare(request) => config_share_reply(&request),
             OffloadJob::UsageShow { query, shown } => crate::usage::usage_payload(
                 &query,
                 crate::usage::Refresh::Budget(crate::usage::MCP_REFRESH_BUDGET),
@@ -12729,20 +12903,10 @@ fn dispatch_inner(
             limit,
         ),
 
+        // GUI では `prepare_offload` が background へ出す（#2961。`claude mcp add` ほかを UI スレッドで待たない）
         Request::SetupMcp { scope, pane, agent } => {
-            let scope_str = scope.as_deref().unwrap_or("global");
-            let mcp_scope = match scope_str {
-                "project" => {
-                    let (_, target) = resolve_pane(host.workspace(), pane)?;
-                    let cwd = host
-                        .session(target)
-                        .and_then(|s| s.cwd())
-                        .ok_or_else(|| Reason::CwdUnavailable.operation())?;
-                    McpScope::Project(cwd.to_path_buf())
-                }
-                _ => McpScope::User,
-            };
-            setup_mcp_agents(agent.as_deref(), &mcp_scope, scope_str)
+            let job = setup_mcp_prepare(host, scope.as_deref(), pane, agent)?;
+            setup_mcp_reply(&job)
         }
 
         Request::VideoPlayback { pane, action } => {
@@ -12926,22 +13090,8 @@ fn dispatch_inner(
             focus,
         ),
 
-        // #513: AI 系設定の git ベース共有
-        Request::ConfigShare {
-            action,
-            target,
-            path,
-            remote,
-            message,
-            no_push,
-        } => dispatch_config_share(
-            action.as_deref().unwrap_or("status"),
-            target.as_deref(),
-            path.as_deref(),
-            remote.as_deref(),
-            message.as_deref(),
-            no_push,
-        ),
+        // #513: AI 系設定の git ベース共有。GUI では `prepare_offload` が background へ出す（#2961。git を UI スレッドで待たない）
+        request @ Request::ConfigShare { .. } => config_share_reply(&request),
 
         Request::OrchestratorLayout {
             policy,
@@ -13446,16 +13596,8 @@ fn dispatch_inner(
         // （#2956。`codex debug models` / `agy models` を UI スレッドで待たない）
         request @ Request::SetupModels { .. } => setup_models_reply(&request),
 
-        Request::SetupRun { answers } => {
-            let answers_value = answers.clone().unwrap_or_else(|| serde_json::json!({}));
-            let parsed: crate::setup::SetupAnswers = serde_json::from_value(answers_value)
-                .map_err(|e| SetupRefusal::AnswersMalformed(e.to_string()).invalid())?;
-            parsed.validate_typed().map_err(SetupRefusal::invalid)?;
-            let answers_json = serde_json::to_string(&parsed)
-                .map_err(|e| SetupRefusal::AnswersEncode(e.to_string()).operation())?;
-            let tako_bin = resolve_tako_binary();
-            run_setup_cli(&tako_bin, &answers_json)
-        }
+        // GUI では `prepare_offload` が background へ出す（#2961。子の `tako setup` を UI スレッドで待たない）
+        request @ Request::SetupRun { .. } => setup_run_reply(&request),
 
         // #2788: tako が外へ書いた連携を外し、data dir は残す（CLI `tako setup undo` と同じ 1 実装）。
         // ファイルの読み書きだけでプロセス内で完結し、GUI の状態には触らない
@@ -60067,6 +60209,138 @@ tako | pane 2 [ compact ]       [-]
             // 同期の腕は今も答える（応答の形は変えていない）
             let _ = dispatch(&mut host, request, PaneOrigin::Cli);
         }
+    }
+
+    /// #2961 で突き合わせる setup 系の要求（外部プロセスを起こさない形 = 子・git・CLI を起こす前の断り）
+    fn issue2961_setup_requests() -> Vec<Request> {
+        let share = |action: &str| Request::ConfigShare {
+            action: Some(action.into()),
+            target: None,
+            path: None,
+            remote: None,
+            message: None,
+            no_push: false,
+        };
+        vec![
+            // 未知の系統は分類済みの断り（tako の実行ファイルの解決も `claude mcp add` も起こさない）
+            Request::SetupMcp {
+                scope: None,
+                pane: None,
+                agent: Some("gemini".into()),
+            },
+            // 答えの形が違う（子の `tako setup` を起こす前に断る）
+            Request::SetupRun {
+                answers: Some(json!("not-an-object")),
+            },
+            // 未知の action・link の対象が無い（git を起こさない）
+            share("nope"),
+            share("link"),
+        ]
+    }
+
+    /// #2961: `SetupMcp` / `SetupRun` / `ConfigShare` は準備（UI スレッド）で background のジョブになり、
+    /// UI スレッドへの続きを作らずに同期の腕と同じ応答を返す
+    #[test]
+    fn issue2961_setup系の同期の腕はbackgroundから同じ応答を返す() {
+        let mut host = MockHost::new();
+        for request in issue2961_setup_requests() {
+            let job = match prepare_offload(&mut host, &request) {
+                Some(Ok(job)) => job,
+                Some(Err(e)) => {
+                    panic!("{request:?} の準備が断った（断りは background の応答で返す）: {e:?}")
+                }
+                None => panic!("{request:?} を UI スレッドの同期の腕で答えている（#2961）"),
+            };
+            let expected_job = match &request {
+                Request::SetupMcp { .. } => matches!(job, OffloadJob::SetupMcp(_)),
+                Request::SetupRun { .. } => matches!(job, OffloadJob::SetupRun(_)),
+                _ => matches!(job, OffloadJob::ConfigShare(_)),
+            };
+            assert!(expected_job, "{request:?} が別のジョブになっている");
+            let offloaded = match job.run_staged() {
+                OffloadOutcome::Reply(reply) => reply,
+                OffloadOutcome::OnUi(_) => {
+                    panic!("{request:?} の続きを UI スレッドへ戻している（#2961）")
+                }
+            };
+            assert!(offloaded.is_err(), "{request:?} は断りで終わる形のはず");
+            let synced = dispatch(&mut host, request.clone(), PaneOrigin::Mcp);
+            assert_eq!(
+                format!("{offloaded:?}"),
+                format!("{synced:?}"),
+                "{request:?} の background の応答が同期の腕と違う"
+            );
+        }
+    }
+
+    /// #2961: project スコープの setup-mcp は、ペインの cwd を準備（UI スレッド）で写す。解けないペインは
+    /// 準備で同期の腕と同じ断りを返す（background へ出さない）
+    #[test]
+    fn issue2961_projectスコープのsetup_mcpは準備でペインを解く() {
+        let mut host = MockHost::new();
+        let request = Request::SetupMcp {
+            scope: Some("project".into()),
+            pane: Some(tako_core::unused_id::pane().as_u64()),
+            agent: None,
+        };
+        let prepared = match prepare_offload(&mut host, &request) {
+            Some(Err(e)) => e,
+            Some(Ok(_)) => panic!("解けないペインの setup-mcp をジョブにしている"),
+            None => panic!("SetupMcp が準備を通っていない"),
+        };
+        let synced = dispatch(&mut host, request, PaneOrigin::Mcp).unwrap_err();
+        assert_eq!(format!("{prepared:?}"), format!("{synced:?}"));
+    }
+
+    /// #2961 の A/B: `TAKO_2961_LEGACY=1` は修正前と同じく同期の腕（UI スレッドで待つ）
+    #[test]
+    fn issue2961_legacyはsetup系を同期の腕で答える() {
+        if tako_core::run_alone!(issue2961_legacyはsetup系を同期の腕で答える) {
+            return;
+        }
+        let mut host = MockHost::new();
+        std::env::remove_var(SYNC_ARM_OFFLOAD_LEGACY_ENV);
+        assert!(!sync_arm_offload_legacy());
+        for request in issue2961_setup_requests() {
+            assert!(
+                prepare_offload(&mut host, &request).is_some(),
+                "{request:?}"
+            );
+        }
+        std::env::set_var(SYNC_ARM_OFFLOAD_LEGACY_ENV, "1");
+        assert!(sync_arm_offload_legacy());
+        for request in issue2961_setup_requests() {
+            assert!(
+                prepare_offload(&mut host, &request).is_none(),
+                "A/B なのに {request:?} を background へ出している"
+            );
+            // 同期の腕は今も答える（応答の形は変えていない）
+            assert!(dispatch(&mut host, request, PaneOrigin::Cli).is_err());
+        }
+    }
+
+    /// #2961: setup の実行ファイルの差し替え（`TAKO_2961_INJECT_SETUP_BIN`）は検証プロセスでだけ効き、
+    /// 本番では env を読みもしない。空は差し替えない
+    #[test]
+    fn issue2961_setupの実行ファイルの注入は検証プロセスだけ() {
+        let fake = || Some(std::ffi::OsString::from("/nonexistent/fake-tako"));
+        let resolved = || "/resolved/tako".to_string();
+        assert_eq!(
+            setup_run_binary_with(true, fake, resolved),
+            "/nonexistent/fake-tako"
+        );
+        assert_eq!(
+            setup_run_binary_with(false, || panic!("本番では注入の env を読まない"), resolved),
+            "/resolved/tako"
+        );
+        assert_eq!(
+            setup_run_binary_with(true, || Some(std::ffi::OsString::new()), resolved),
+            "/resolved/tako"
+        );
+        assert_eq!(
+            setup_run_binary_with(true, || None, resolved),
+            "/resolved/tako"
+        );
     }
 
     /// #1984: UI スレッドの同期の dispatch で子プロセスを待っていた要求だけが background へ出る。
