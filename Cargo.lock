@@ -6837,6 +6837,7 @@ name = "tako-cli"
 version = "0.8.40"
 dependencies = [
  "clap",
+ "futures",
  "serde",
  "serde_json",
  "serde_yaml",

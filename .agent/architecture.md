@@ -564,12 +564,26 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
   規則 ⑥・ペインを開く dispatch が persist.log へ長さの理由だけを 1 行）。多重化の無い Windows（B26）は
   ControlPath を渡さないので上限を掛けない（第一候補のまま = 修正前と同じ答え）
 
-- **TODO(Phase 6): Windows named pipe**。`IpcServer::start` と CLI の transport は
-  `#[cfg(windows)]` でスタブ化済み（サーバー起動失敗でもアプリは IPC なしで継続する）。
-  実装時の検討事項:
-  - パイプ名規約（`\\.\pipe\tako-<pid>` 想定）を `TAKO_SOCKET` に入れる
-  - アクセス制御: UDS の 0600 に相当する DACL（同一ユーザー限定）+ トークン認証の二段
-  - ConPTY 環境での env 注入は alacritty_terminal の `tty::Options::env` 依存のため実機確認
+- **Windows の本体の受け口（名前付きパイプ）の名前（#2940）**: 決め方は
+  `tako_core::ipc_socket::plan_pipe_name`（純関数。env を読む入口は `pipe_name_plan_from_env` だけで、
+  `ipc.rs` の `windows_imp::preferred_pipe_name` が呼ぶ）。パイプ名の名前空間はマシン全体で 1 つなので、
+  unix（data dir ごとのソケット）と違い、名前に data dir が入らないと別の data dir の tako どうしが取り合う。
+  | 起動 | 名前 |
+  |---|---|
+  | 本番 | 固定名 `\\.\pipe\tako-<ユーザー>`（再起動をまたいで同じ。変えない） |
+  | 検証プロセス（`paths::is_verification_process` = `TAKO_ISOLATED` / visual-test / テスト） | data dir ごとの名前 `\\.\pipe\tako-<ユーザー>.<data dir の 16 桁>`（data dir が決まらなければ一時名） |
+  | セカンダリ・単体テスト・セルフテスト | pid 入りの一時名 `\\.\pipe\tako-<ユーザー>-<pid>-<連番>` |
+
+  `<ユーザー>` は `USERNAME` から英数字と `-` / `_` だけを残したもの（`pipe_user_tag`）なので、区切りの `.` を
+  含む検証の名前は**どの利用者の固定名・一時名とも一致しない**。data dir ごとに安定なので、同じ data dir で
+  起こし直した検証の GUI は同じ名前に戻る（psmux は update-environment が効かず、器のペインのシェルの
+  `TAKO_SOCKET` は起こした時の値のまま = #1886）。同じ data dir の 2 本目は先客が名前を持っているので一時名へ
+  逃げる（`FILE_FLAG_FIRST_PIPE_INSTANCE` の失敗 = 固定名と同じ扱い）。長さは 95 文字まで（利用者名を 64 文字で
+  切る。上限 256）。CLI は discovery（control.json）に書いた実際の名前で繋ぐので名前の決め方を知らない。
+  修正前は検証起動の GUI も固定名を取り、隔離の GUI が先に立つと本番の GUI が一時名へ逃げ、本番の器のペインの
+  シェル（固定名の `TAKO_SOCKET`）から叩いた CLI が隔離の GUI へ繋がった。A/B は `TAKO_2940_LEGACY=1`、
+  番犬は `issue2940_verification_pipe_name_watchdog`、実経路は `crates/tako-cli/tests/issue2940_isolated_pipe_name.rs`。
+  アクセス制御は既定 DACL（同一ユーザー）+ トークン認証の二段（`platform::named_pipe`）
 
 ### Layer 2: 内蔵 MCP サーバー → ✅ 実装済み（Phase 3、2026-06-11）
 

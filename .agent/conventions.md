@@ -5531,6 +5531,7 @@ OS で分岐すると「macOS だけ通る道」が増えて、この等価性�
 |---|---|---|
 | 外部エージェントの設定（`.claude.json` / `config.toml` / `settings.json`） | `<temp>/tako-agent-config-<pid>/` | `orchestrator::agent_config_home()` / `claude_tui::env_config_dir()` |
 | シェル履歴 | 同上の `shell_history` | `terminal.rs` の PTY env + `backend::session_pinned_pairs` の `-e` |
+| IPC の受け口（Windows の名前付きパイプ。#2940） | `\\.\pipe\tako-<ユーザー>.<data dir の 16 桁>`（本番の固定名 `\\.\pipe\tako-<ユーザー>` を取らない） | `ipc_socket::pipe_name_plan_from_env` → `plan_pipe_name` |
 
 - **`config dir` を明示する引数（#558）は隔離しない**。テストが一時ディレクトリを
   指して書き先を確かめる経路と、アカウント指定の spawn がここに乗っている

@@ -117,9 +117,14 @@ impl SocketPlan {
 /// `/a/b` と `/a/b/` が別のソケットにならないよう、区切りの揺れは
 /// `Path::components` で正規化してからハッシュする
 pub fn short_name(data_dir: &Path) -> String {
+    format!("tako-{:016x}.sock", data_dir_hash(data_dir))
+}
+
+/// data dir ごとに安定した 64 ビットの値（[`short_name`] と #2940 の [`verification_pipe_name`] が共有）。
+/// 区切りの揺れ（末尾の区切り。Windows では `/` と `\` も）は `Path::components` で正規化してからハッシュする
+fn data_dir_hash(data_dir: &Path) -> u64 {
     let normalized: PathBuf = data_dir.components().collect();
-    let key = normalized.as_os_str().as_encoded_bytes();
-    format!("tako-{:016x}.sock", crate::fnv::fnv1a64(key))
+    crate::fnv::fnv1a64(normalized.as_os_str().as_encoded_bytes())
 }
 
 /// 置き場を決める（**純関数**。env も実ファイルも見ないので、
@@ -959,6 +964,139 @@ pub fn pipe() -> Option<PipeInstances> {
     PIPE.lock().ok().and_then(|s| s.clone())
 }
 
+// ---------------------------------------------------------------------------
+// Windows の本体の受け口（名前付きパイプ）の名前（#2940）
+//
+// パイプ名の名前空間はマシン全体で 1 つなので、unix の「data dir ごとのソケットのパス」
+// （[`plan`]）と違い、名前に data dir が入っていないと別の data dir の tako どうしが同じ名前を
+// 取り合う。#2940 の前は、検証起動の GUI（`TAKO_ISOLATED=1` と専用の置き場）が本番の GUI と
+// 同じ固定名 `\\.\pipe\tako-<ユーザー>` を取っていた（隔離の GUI が先に立つと本番の GUI が
+// 一時名へ逃げ、本番の器のペインのシェルが持つ固定名の `TAKO_SOCKET` が隔離の GUI へ繋がる）。
+//
+// 決め方（[`plan_pipe_name`] の 1 実装。OS も env も見ない純関数 = macOS で Windows の形を検査できる）:
+//
+// | 起動 | 名前 |
+// |---|---|
+// | セカンダリ・単体テスト・セルフテスト（`prefer_temp`） | pid 入りの一時名 `tako-<ユーザー>-<pid>-<連番>`（修正前と同じ） |
+// | 検証プロセス（`paths::is_verification_process`） | data dir ごとの名前 `tako-<ユーザー>.<data dir の 16 桁>` |
+// | 検証プロセスで data dir が決まらない | 一時名 |
+// | 本番 | 固定名 `tako-<ユーザー>`（修正前と同じ） |
+//
+// 検証プロセスの名前の区切り `.` は利用者名の正規化（[`pipe_user_tag`]）が必ず落とす文字なので、
+// **どの利用者の固定名・一時名とも一致しない**（番犬 `issue2940_verification_pipe_name_watchdog`）。
+// data dir ごとに安定なので、同じ data dir で起こし直した検証の GUI は同じ名前に戻る（器のペインの
+// シェルが持つ `TAKO_SOCKET` がそのまま効く = unix の `<data_dir>/tako.sock` と同じ性質）。
+// 同じ data dir で 2 本目が立つと名前は先客が持っているので、2 本目は一時名へ逃げる（固定名と同じ扱い）。
+// 長さ: 頭 `\\.\pipe\tako-` 14 + 利用者名 64 文字まで + `.` + 16 = 95 文字まで
+// （UTF-16 でも 159 単位まで。パイプ名の上限は 256）
+// ---------------------------------------------------------------------------
+
+/// 名前付きパイプの名前の頭
+pub const PIPE_PREFIX: &str = r"\\.\pipe\";
+
+/// 検証プロセスの名前に載せる利用者名の上限（文字。パイプ名全体の上限 256 文字に収める）
+pub const PIPE_USER_MAX_CHARS: usize = 64;
+
+/// 検証プロセスの名前の区切り。[`pipe_user_tag`] が必ず落とす文字（固定名・一時名に現れない）
+pub const VERIFICATION_PIPE_SEP: char = '.';
+
+/// 名前に載せる利用者名（`USERNAME` の値。英数字と `-` / `_` だけを残す。無ければ `user`）
+pub fn pipe_user_tag(username: Option<&str>) -> String {
+    username
+        .unwrap_or("user")
+        .chars()
+        .filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
+        .collect()
+}
+
+/// いまのプロセスの利用者名（[`pipe_user_tag`] へ `USERNAME` を渡したもの）
+pub fn env_pipe_user_tag() -> String {
+    pipe_user_tag(std::env::var("USERNAME").ok().as_deref())
+}
+
+/// 本番の GUI の固定名（`\\.\pipe\tako-<ユーザー>`。再起動をまたいで同じ = unix の固定ソケットに相当）
+pub fn fixed_pipe_name(user_tag: &str) -> String {
+    format!("{PIPE_PREFIX}tako-{user_tag}")
+}
+
+/// pid 入りの一時名（セカンダリ・テスト・セルフテスト・名前の先客が居たときの逃げ先）
+pub fn temp_pipe_name(user_tag: &str, pid: u32, seq: u32) -> String {
+    format!("{PIPE_PREFIX}tako-{user_tag}-{pid}-{seq}")
+}
+
+/// 検証プロセスの data dir ごとの名前（`\\.\pipe\tako-<ユーザー>.<data dir の 16 桁>`）
+pub fn verification_pipe_name(user_tag: &str, data_dir: &Path) -> String {
+    let user: String = user_tag.chars().take(PIPE_USER_MAX_CHARS).collect();
+    format!(
+        "{PIPE_PREFIX}tako-{user}{VERIFICATION_PIPE_SEP}{:016x}",
+        data_dir_hash(data_dir)
+    )
+}
+
+/// 本体の受け口の名前の決まり方（[`plan_pipe_name`] の結果）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipeNamePlan {
+    /// pid 入りの一時名（連番を持つ呼び手が [`temp_pipe_name`] で作る）
+    Temp,
+    /// 本番の固定名（[`fixed_pipe_name`]）
+    Fixed(String),
+    /// 検証プロセスの data dir ごとの名前（[`verification_pipe_name`]）
+    Verification(String),
+}
+
+/// [`plan_pipe_name`] の入力（env を読むのは [`pipe_name_plan_from_env`] だけ）
+#[derive(Debug, Clone, Copy)]
+pub struct PipeNameInputs<'a> {
+    /// [`pipe_user_tag`] を通した利用者名
+    pub user_tag: &'a str,
+    /// 検証プロセスの data dir（決まらなければ `None`）
+    pub data_dir: Option<&'a Path>,
+    /// 一時名を使う（セカンダリ・単体テスト・セルフテスト）
+    pub prefer_temp: bool,
+    /// 検証プロセスか（`paths::is_verification_process` の判定）
+    pub verification: bool,
+    /// #2940 の A/B（修正前 = 検証プロセスも固定名）
+    pub legacy: bool,
+}
+
+/// 本体の受け口の名前を決める（**純関数**。表は上の節の説明）
+pub fn plan_pipe_name(inputs: PipeNameInputs<'_>) -> PipeNamePlan {
+    if inputs.prefer_temp {
+        return PipeNamePlan::Temp;
+    }
+    if inputs.verification && !inputs.legacy {
+        return match inputs.data_dir {
+            Some(dir) => PipeNamePlan::Verification(verification_pipe_name(inputs.user_tag, dir)),
+            None => PipeNamePlan::Temp,
+        };
+    }
+    PipeNamePlan::Fixed(fixed_pipe_name(inputs.user_tag))
+}
+
+/// #2940 の A/B。`TAKO_2940_LEGACY=1` で修正前（検証プロセスの GUI も本番の固定名を取る）へ戻す
+pub fn legacy_2940() -> bool {
+    std::env::var("TAKO_2940_LEGACY").is_ok_and(|v| v == "1")
+}
+
+/// env を読む入口（Windows の本体の受け口 = `tako-control` の `ipc.rs` が呼ぶ）。
+/// `prefer_temp` はセカンダリ（と呼び手の単体テスト）。セルフテスト（`TAKO_SELF_TEST`）はここで足す
+pub fn pipe_name_plan_from_env(prefer_temp: bool) -> PipeNamePlan {
+    let prefer_temp = prefer_temp || std::env::var_os("TAKO_SELF_TEST").is_some();
+    let verification = crate::paths::is_verification_process();
+    let legacy = legacy_2940();
+    // data dir を引くのは名前に使うときだけ（一時名・本番の固定名は data dir に依らない）
+    let data_dir = (!prefer_temp && verification && !legacy)
+        .then(crate::paths::data_dir)
+        .flatten();
+    plan_pipe_name(PipeNameInputs {
+        user_tag: &env_pipe_user_tag(),
+        data_dir: data_dir.as_deref(),
+        prefer_temp,
+        verification,
+        legacy,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1534,5 +1672,177 @@ mod tests {
         if let Ok(mut slot) = PIPE.lock() {
             *slot = None;
         }
+    }
+
+    // ===== #2940: Windows の本体の受け口の名前（純関数なので macOS でも Windows の形を見る） =====
+
+    /// 検証の data dir の例（Windows の形と unix の形）
+    const WIN_DATA: &str = r"C:\Users\winuser\AppData\Local\Temp\tako-iso-b2\data";
+    const UNIX_DATA: &str = "/tmp/tako-iso-b2/data";
+
+    fn inputs<'a>(
+        user_tag: &'a str,
+        data_dir: Option<&'a Path>,
+        prefer_temp: bool,
+        verification: bool,
+        legacy: bool,
+    ) -> PipeNameInputs<'a> {
+        PipeNameInputs {
+            user_tag,
+            data_dir,
+            prefer_temp,
+            verification,
+            legacy,
+        }
+    }
+
+    #[test]
+    fn issue2940_本番のguiは今どおり固定名() {
+        for data in [None, Some(Path::new(WIN_DATA))] {
+            for legacy in [false, true] {
+                assert_eq!(
+                    plan_pipe_name(inputs("winuser", data, false, false, legacy)),
+                    PipeNamePlan::Fixed(r"\\.\pipe\tako-winuser".into()),
+                    "data_dir={data:?} legacy={legacy}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn issue2940_セカンダリとセルフテストは今どおり一時名() {
+        for verification in [false, true] {
+            for legacy in [false, true] {
+                assert_eq!(
+                    plan_pipe_name(inputs(
+                        "winuser",
+                        Some(Path::new(WIN_DATA)),
+                        true,
+                        verification,
+                        legacy
+                    )),
+                    PipeNamePlan::Temp,
+                    "verification={verification} legacy={legacy}"
+                );
+            }
+        }
+        assert_eq!(
+            temp_pipe_name("winuser", 4242, 0),
+            r"\\.\pipe\tako-winuser-4242-0"
+        );
+    }
+
+    #[test]
+    fn issue2940_検証プロセスはdata_dirごとの名前で本番の固定名にならない() {
+        let data = Path::new(WIN_DATA);
+        let PipeNamePlan::Verification(name) =
+            plan_pipe_name(inputs("winuser", Some(data), false, true, false))
+        else {
+            panic!("検証プロセスが data dir ごとの名前になっていない");
+        };
+        assert_ne!(name, fixed_pipe_name("winuser"));
+        let hex = name
+            .strip_prefix(r"\\.\pipe\tako-winuser.")
+            .unwrap_or_else(|| panic!("形が違う: {name}"));
+        assert!(
+            hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{name}"
+        );
+        // data dir が決まらなければ一時名（本番の固定名へは倒さない）
+        assert_eq!(
+            plan_pipe_name(inputs("winuser", None, false, true, false)),
+            PipeNamePlan::Temp
+        );
+    }
+
+    #[test]
+    fn issue2940_ab_の腕は検証プロセスも固定名() {
+        assert_eq!(
+            plan_pipe_name(inputs(
+                "winuser",
+                Some(Path::new(WIN_DATA)),
+                false,
+                true,
+                true
+            )),
+            PipeNamePlan::Fixed(r"\\.\pipe\tako-winuser".into())
+        );
+    }
+
+    #[test]
+    fn issue2940_同じdata_dirは同じ名前で違うdata_dirは違う名前() {
+        let a = verification_pipe_name("winuser", Path::new(UNIX_DATA));
+        assert_eq!(
+            a,
+            verification_pipe_name("winuser", Path::new("/tmp/tako-iso-b2/data/")),
+            "末尾の区切りで名前が変わる"
+        );
+        assert_eq!(a, verification_pipe_name("winuser", Path::new(UNIX_DATA)));
+        assert_ne!(
+            a,
+            verification_pipe_name("winuser", Path::new("/tmp/tako-iso-b1/data"))
+        );
+        assert_ne!(
+            a,
+            verification_pipe_name("otheruser", Path::new(UNIX_DATA)),
+            "利用者が違えば名前も違う（名前空間はマシン全体で 1 つ）"
+        );
+    }
+
+    #[test]
+    fn issue2940_検証の名前はどの利用者の固定名とも一時名とも一致しない() {
+        let data = Path::new(WIN_DATA);
+        // 利用者名の正規化を通した名前の例（区切りの `.` を名前に入れた利用者も正規化で落ちる）
+        let raw_users = [
+            None,
+            Some("winuser"),
+            Some(""),
+            Some("win.user"),
+            Some(r"DOMAIN\winuser"),
+            Some("山田"),
+            Some("winuser-0123456789abcdef"),
+            Some("winuser.0123456789abcdef"),
+        ];
+        let tags: Vec<String> = raw_users.iter().map(|u| pipe_user_tag(*u)).collect();
+        for tag in &tags {
+            assert!(
+                !tag.contains(VERIFICATION_PIPE_SEP),
+                "正規化が区切りを残した: {tag}"
+            );
+        }
+        for v_tag in &tags {
+            let verification = verification_pipe_name(v_tag, data);
+            for other in &tags {
+                assert_ne!(
+                    verification,
+                    fixed_pipe_name(other),
+                    "固定名と一致: {other}"
+                );
+                assert_ne!(
+                    verification,
+                    temp_pipe_name(other, 4242, 0),
+                    "一時名と一致: {other}"
+                );
+            }
+        }
+        assert_eq!(pipe_user_tag(None), "user");
+        assert_eq!(pipe_user_tag(Some(r"DOMAIN\win.user")), "DOMAINwinuser");
+    }
+
+    #[test]
+    fn issue2940_長い利用者名でもパイプ名の上限に収まる() {
+        let long = "山".repeat(300);
+        let name = verification_pipe_name(&long, Path::new(WIN_DATA));
+        assert!(
+            name.encode_utf16().count() <= 256,
+            "{}",
+            name.encode_utf16().count()
+        );
+        assert_eq!(
+            name.chars().count(),
+            PIPE_PREFIX.len() + "tako-".len() + PIPE_USER_MAX_CHARS + 1 + 16
+        );
+        // 本番の固定名の形は変えない（利用者名を切らない = 修正前と同じ）
+        assert_eq!(fixed_pipe_name(&long), format!(r"\\.\pipe\tako-{long}"));
     }
 }
