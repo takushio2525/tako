@@ -657,7 +657,7 @@
       "status": "pending",
       "note_ja": "#1038 で serve の中継先をループバック TCP へ変えたので、`unix socket serve target is not supported on Windows` で止まる原因は無くなった。ただし Windows 実機での通し（setup の 4 段目 → デーモン起動 → スマホからの接続）は未実測（#971）",
       "evidence": "measured",
-      "evidence_detail": "#937 の Windows 11 実測（2026-11-16・0.8.40）: `tako remote shortcuts` の一覧・add・remove の往復は通る（登録分は足せて消せる）。既定は `~\\Desktop` の実在だけを見るので、OneDrive へ移したデスクトップは既定に出ない（#2939）。スマホからの閲覧には daemon が要る（#971）"
+      "evidence_detail": "#937 の Windows 11 実測（2026-11-16・0.8.40）: `tako remote shortcuts` の一覧・add・remove の往復は通る（登録分は足せて消せる）。既定は `~\\Desktop` の実在だけを見ていたので、OneDrive へ移したデスクトップが既定に出なかった → #2939 で既定のデスクトップ・ダウンロードを Known Folder（`SHGetKnownFolderPath`・境界 B39）から引くようにした（CI の Windows ジョブが Known Folder の答えと .NET / シェルの答えの一致を見る。OneDrive へ移した実機での再測は #2939）。スマホからの閲覧には daemon が要る（#971）"
     },
     {
       "key": "tako_remote_start",

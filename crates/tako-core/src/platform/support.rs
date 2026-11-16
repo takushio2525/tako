@@ -1505,7 +1505,7 @@ pub const MATRIX: &[Feature] = &[
             issue: 971,
         },
         windows_evidence: Evidence::Measured(
-            "#937 の Windows 11 実測（2026-11-16・0.8.40）: `tako remote shortcuts` の一覧・add・remove の往復は通る（登録分は足せて消せる）。既定は `~\\Desktop` の実在だけを見るので、OneDrive へ移したデスクトップは既定に出ない（#2939）。スマホからの閲覧には daemon が要る（#971）",
+            "#937 の Windows 11 実測（2026-11-16・0.8.40）: `tako remote shortcuts` の一覧・add・remove の往復は通る（登録分は足せて消せる）。既定は `~\\Desktop` の実在だけを見ていたので、OneDrive へ移したデスクトップが既定に出なかった → #2939 で既定のデスクトップ・ダウンロードを Known Folder（`SHGetKnownFolderPath`・境界 B39）から引くようにした（CI の Windows ジョブが Known Folder の答えと .NET / シェルの答えの一致を見る。OneDrive へ移した実機での再測は #2939）。スマホからの閲覧には daemon が要る（#971）",
         ),
     },
     Feature {

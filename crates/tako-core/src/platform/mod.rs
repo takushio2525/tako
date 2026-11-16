@@ -32,6 +32,9 @@ pub mod job;
 /// cargo の共有 jobserver の fifo（境界 B31。#1998）
 pub mod jobserver;
 pub mod keys;
+/// 既知フォルダ（デスクトップ・ダウンロード・ドキュメント・プロファイル）の OS が答える置き場
+/// （境界 B39。Windows は `SHGetKnownFolderPath`・macOS / unix は答えない。#2939）
+pub mod known_folder;
 pub mod locale;
 /// 8.3 の短い形を長い形へ戻す（境界 B34。#2843）
 pub mod long_path;
