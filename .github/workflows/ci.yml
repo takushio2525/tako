@@ -725,6 +725,13 @@ jobs:
         run: |
           cargo test -p tako-core --test issue2936_gui_stdio -- --nocapture
           cargo test -p tako-app --bin tako-app -- stdio::tests::issue2936 --nocapture
+      # #2940: 検証起動（TAKO_ISOLATED=1 + 専用の置き場）の本体の受け口が本番の固定名（\\.\pipe\tako-<ユーザー>）を取らず、
+      # data dir ごとの名前で立つか・GUI と同じ discovery::write で書いた名前へビルドした tako が届くかを、GUI と同じ口
+      # （IpcServer::start）で見る。同じ data dir の 2 本目が一時名へ逃げて 1 本目が生きたままなことと、A/B
+      # （TAKO_2940_LEGACY=1 は固定名に決まる。固定名は張らない）も同じ回で見る。名前付きパイプは macOS では 1 行も
+      # 動かないので全数より手前に名指しで置く（#1282 と同じ理由）。--nocapture は結果の行（TAKO2940_*）をログへ残すため
+      - name: 検証起動の受け口が本番の固定名を取らないかの実行検査（#2940）
+        run: cargo test -p tako-cli --test issue2940_isolated_pipe_name -- --nocapture
       # #2791: Windows の codex / agy の導入代行を、公式の install.ps1 を本当に走らせて確かめる（製品の口
       # `tako setup bootstrap install --agent codex|agy` = MCP tako_setup_bootstrap と同じ経路）。導入の前後の
       # status・入った置き場・agy の取得物が残らない（起動片のスコープ）を、ポリシーなし / HKCU Restricted /

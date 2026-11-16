@@ -2,7 +2,8 @@
 //!
 //! トランスポート（`.agent/architecture.md` プラットフォーム抽象 / 抽象境界 B3）:
 //! - unix: Unix domain socket（パーミッション 0600 + セッション毎ランダムトークン）
-//! - windows: named pipe（`\\.\pipe\tako-<ユーザー>`。実体は
+//! - windows: named pipe（本番は `\\.\pipe\tako-<ユーザー>`、検証プロセスは data dir ごとの名前 =
+//!   #2940。決め方は `tako_core::ipc_socket::plan_pipe_name`。実体は
 //!   `platform::named_pipe`、既定 DACL + トークンの二段防御）
 //!
 //! 1 行 1 JSON の接続処理はトランスポート非依存（`conn` モジュール）で、
@@ -437,20 +438,16 @@ mod windows_imp {
     use super::{accept_stop_pair, conn, IncomingRequest, IpcServer};
     use crate::platform::named_pipe;
 
-    /// PID + 連番の一時パイプ名（テスト・セルフテスト・セカンダリモード用）
+    /// PID + 連番の一時パイプ名（テスト・セルフテスト・セカンダリモード用）。
+    /// パイプ名の名前空間はマシン全体で共有のため、ユーザー名で分離する（形は tako-core の 1 実装）
     fn temp_pipe_name() -> String {
         static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        format!(r"\\.\pipe\tako-{}-{}-{seq}", user_tag(), std::process::id())
-    }
-
-    /// パイプ名の名前空間はマシン全体で共有のため、ユーザー名で分離する
-    fn user_tag() -> String {
-        std::env::var("USERNAME")
-            .unwrap_or_else(|_| "user".into())
-            .chars()
-            .filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
-            .collect()
+        tako_core::ipc_socket::temp_pipe_name(
+            &tako_core::ipc_socket::env_pipe_user_tag(),
+            std::process::id(),
+            seq,
+        )
     }
 
     /// 立たなかった理由を記録して、そのまま呼び出し元へ返す（#1441）
@@ -467,12 +464,16 @@ mod windows_imp {
         e
     }
 
-    /// 再起動をまたいで安定するパイプ名（unix の固定ソケットパスに相当）
+    /// 本体の受け口の名前。**決め方を tako-core の外へ書かない**（#2940）: 本番は再起動をまたいで
+    /// 安定する固定名（unix の固定ソケットパスに相当）、検証プロセスは data dir ごとの名前
+    /// （本番の固定名を取らない）、セカンダリ・単体テスト・セルフテストは一時名。表と理由は
+    /// `tako_core::ipc_socket::plan_pipe_name`（番犬 `issue2940_verification_pipe_name_watchdog`）
     fn preferred_pipe_name(prefer_temp: bool) -> String {
-        if prefer_temp || cfg!(test) || std::env::var_os("TAKO_SELF_TEST").is_some() {
-            return temp_pipe_name();
+        use tako_core::ipc_socket::PipeNamePlan;
+        match tako_core::ipc_socket::pipe_name_plan_from_env(prefer_temp || cfg!(test)) {
+            PipeNamePlan::Temp => temp_pipe_name(),
+            PipeNamePlan::Fixed(name) | PipeNamePlan::Verification(name) => name,
         }
-        format!(r"\\.\pipe\tako-{}", user_tag())
     }
 
     pub(super) fn start(
@@ -481,8 +482,8 @@ mod windows_imp {
         prefer_temp_socket: bool,
     ) -> std::io::Result<IpcServer> {
         let mut name = preferred_pipe_name(prefer_temp_socket);
-        // 固定名が既に占有されている（先行インスタンス生存）なら一時名へフォールバック
-        // （unix の「固定ソケットへ接続可能なら一時パス」と同じ方針）
+        // 固定名（検証プロセスは data dir ごとの名前 = 同じ data dir の 2 本目）が既に占有されている
+        // （先行インスタンス生存）なら一時名へフォールバック（unix の「固定ソケットへ接続可能なら一時パス」と同じ方針）
         let first = match named_pipe::create_server_instance(&name, true) {
             Ok(instance) => instance,
             Err(_) if !prefer_temp_socket => {

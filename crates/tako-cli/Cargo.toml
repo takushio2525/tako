@@ -32,6 +32,11 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 serde = { workspace = true }
 
+[dev-dependencies]
+# 結合テストで GUI と同じ口（`tako_control::IpcServer`）の受け口を張り、UI スレッドの代わりに
+# 要求の channel を読む（#2940。tako-control が既に使っている crate なので依存の木は増えない）
+futures.workspace = true
+
 # アイコン / バージョン情報リソースの埋め込み（#587。build.rs 参照）。
 # cfg(windows) を付けて macOS のビルドグラフに載せない
 [target.'cfg(windows)'.build-dependencies]

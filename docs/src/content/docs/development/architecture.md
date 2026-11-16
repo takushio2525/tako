@@ -46,7 +46,7 @@ IPC サーバーと操作ディスパッチ。
 - **dispatch**: 全操作の一元化ハブ。CLI・MCP・UI の全経路がここを通る
 - **protocol**: リクエスト/レスポンスの型定義
 - **mcp**: MCP エンジン（トランスポート非依存。Streamable HTTP + stdio ブリッジ）
-- **ipc**: JSON-RPC + トークン認証。トランスポートは OS で分かれ、unix は Unix domain socket（パーミッション 0600）、Windows は named pipe（`\\.\pipe\tako-<ユーザー>`。既定 DACL + トークンの二段防御）
+- **ipc**: JSON-RPC + トークン認証。トランスポートは OS で分かれ、unix は Unix domain socket（パーミッション 0600）、Windows は named pipe（`\\.\pipe\tako-<ユーザー>`。検証起動の tako は本番の名前を取らず、データディレクトリごとの名前を使う。既定 DACL + トークンの二段防御）
 
 ### tako-app
 
