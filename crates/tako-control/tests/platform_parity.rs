@@ -2651,7 +2651,7 @@ fn ファイルのメタデータのunix拡張の直呼びが境界の外に増�
              fn my_MetadataExt_like(m: &Metadata) -> bool { m.file_type().is_symlink() }\n\
              fn g(p: &Path) { let _ = std::fs::symlink_metadata(p); let _ = std::os::unix::fs::lchown(p, None, None); }\n\
              fn h(t: &Path, l: &Path) { let _ = crate::platform::fs_meta::make_symlink(t, l); \
-             let _ = tako_core::platform::fs_meta::identity(&m); }\n\
+             let _ = tako_core::platform::fs_meta::identity(p, &m); }\n\
              use std::os::unix::fsx::symlink;\n\
              #[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        \
              use std::os::unix::fs::{PermissionsExt, symlink};\n    }\n}\n",

@@ -419,19 +419,21 @@ type Stamp = Option<(u64, SystemTime, u64)>;
 
 fn stamp_of(path: &Path) -> Stamp {
     let m = std::fs::metadata(path).ok()?;
-    Some((m.len(), m.modified().unwrap_or(UNIX_EPOCH), ino_of(&m)))
+    Some((
+        m.len(),
+        m.modified().unwrap_or(UNIX_EPOCH),
+        identity_of(path, &m).1,
+    ))
 }
 
-/// inode（境界 B37 の同一性）。**同一性を持たない OS（Windows = `None`）は 0** で埋める =
-/// 比べると常に等しい = 比較に使わない（大きさ・更新時刻・読んだ位置だけで見る）。
-/// 0 で埋めるのは索引の欄（`dev` / `ino`）が `u64` で永続されるため
-fn ino_of(m: &std::fs::Metadata) -> u64 {
-    tako_core::platform::fs_meta::identity(m).map_or(0, |id| id.ino)
-}
-
-/// ボリューム（境界 B37 の同一性）。Windows = `None` は 0（[`ino_of`] と同じ理由）
-fn dev_of(m: &std::fs::Metadata) -> u64 {
-    tako_core::platform::fs_meta::identity(m).map_or(0, |id| id.dev)
+/// `(ボリューム, inode)`（境界 B37 の同一性。Windows はボリュームのシリアルとファイル ID = #2921）。
+/// **同一性を取れないとき（`None`）は 0** で埋める = 比べると常に等しい = 比較に使わない
+/// （大きさ・更新時刻・読んだ位置だけで見る）。0 で埋めるのは索引の欄（`dev` / `ino`）が `u64` で
+/// 永続されるため。#2921 より前の Windows の索引は 0 の行を持つので、実値に変わった最初の更新で
+/// 1 回だけ読み直す（数え済みの応答は鍵で飛ばす = 数は変わらない）。
+/// Windows はハンドルを開いて問い合わせるので、1 ファイルにつき 1 回だけ呼ぶ
+fn identity_of(path: &Path, m: &std::fs::Metadata) -> (u64, u64) {
+    tako_core::platform::fs_meta::identity(path, m).map_or((0, 0), |id| (id.dev, id.ino))
 }
 
 /// `dir` の下（深さ `max_depth` まで）の `*.jsonl` を `visit` へ渡す
@@ -684,10 +686,11 @@ impl Indexer {
             walk_jsonl(&root.dir.join("projects"), MAX_DEPTH, &mut |path, meta| {
                 let key =
                     core_index::hex64(core_index::fnv64(&["transcript", &path.to_string_lossy()]));
+                let (dev, ino) = identity_of(&path, meta);
                 out.push(Found {
                     len: meta.len(),
-                    dev: dev_of(meta),
-                    ino: ino_of(meta),
+                    dev,
+                    ino,
                     path,
                     key,
                     origin: Origin::Claude(i),
@@ -714,10 +717,11 @@ impl Indexer {
                             &name,
                         ]));
                         if keys.insert(key.clone()) {
+                            let (dev, ino) = identity_of(&path, meta);
                             out.push(Found {
                                 len: meta.len(),
-                                dev: dev_of(meta),
-                                ino: ino_of(meta),
+                                dev,
+                                ino,
                                 path,
                                 key,
                                 origin: Origin::Codex(i),
@@ -2039,6 +2043,111 @@ mod tests {
                 assert!(!text.contains(needle), "{} に {needle:?}", file.display());
             }
         }
+    }
+
+    /// #2921: #2921 より前の Windows の索引は `dev` / `ino` を 0 で書いていた（境界 B37 の同一性が
+    /// `None`）。実値に変わった最初の更新で全ファイルを 1 回だけ読み直すが、数え済みの応答
+    /// （claude は応答の鍵・codex は累積）は数え直さない。読み位置へ実値が書き戻され、2 回目は
+    /// 読み直さない = 形の変わらない永続ファイル（`u64` の欄）なのでマイグレーションは要らない。
+    /// どの OS でも同じ形を作れる（実値で作った索引の行を 0 へ戻す）ので OS を問わず走らせる
+    #[test]
+    fn issue2921_同一性が0の索引を実値で読み直しても数え直さない() {
+        let env = Env::new("2921-zero-identity");
+        let s1 = env.transcript("-home-testuser-dev-alpha", "s1.jsonl");
+        write(
+            &s1,
+            &[
+                user("s1"),
+                assistant("msg_a", "s1", &T1, OPUS, [2, 120, 10, 0, 100], ALPHA),
+                assistant("msg_b", "s1", &T2, OPUS, [1, 7, 0, 3, 200], ALPHA),
+            ],
+            "",
+        );
+        let s2 = env.transcript("-home-testuser-dev-beta", "s2.jsonl");
+        write(
+            &s2,
+            &[assistant(
+                "msg_d",
+                "s2",
+                &T1,
+                OPUS,
+                [5, 5, 0, 0, 5],
+                "/home/testuser/dev/beta",
+            )],
+            "",
+        );
+        std::fs::create_dir_all(env.codex_home()).unwrap();
+        std::fs::write(
+            env.codex_home().join("auth.json"),
+            format!(
+                r#"{{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{{"id_token":"{BODY}","access_token":"{BODY}","refresh_token":"{BODY}","account_id":"{CODEX_ACCOUNT}"}}}}"#
+            ),
+        )
+        .unwrap();
+        let start = (now_ms() / 1000) as i64 - 2 * 86_400;
+        let rollout = env.rollout(
+            "sessions/2026/10/16",
+            "rollout-2026-10-16T00-00-00-thread-z.jsonl",
+        );
+        write(
+            &rollout,
+            &[
+                codex_meta("thread-z", start),
+                codex_turn(start + 1, "gpt-5.5"),
+                codex_tc(start + 60, [1000, 400, 50], 1.0, start + 7 * 86_400),
+                codex_tc(start + 3600, [5000, 3000, 300], 3.0, start + 7 * 86_400 + 1),
+            ],
+            "",
+        );
+        let first = env.update(&mut env.codex_indexer());
+        assert_eq!(
+            (first.files, first.read_files, first.responses),
+            (3, 3, 5),
+            "前提: claude 3 応答 + codex 2 応答"
+        );
+        let totals = env.totals();
+        let observations = codex_rows(&env).len();
+        assert_eq!(observations, 2);
+
+        // #2921 前の Windows の索引を作る: 読み位置の行の dev / ino を 0 にする
+        let cursor = env.usage().join(CURSOR_FILE);
+        let (rows, bad) = read_all::<CursorRow>(&cursor);
+        assert_eq!(bad, 0);
+        assert!(
+            rows.iter().all(|r| r.dev != 0 || r.ino != 0),
+            "前提: 今の索引は実値で書いている: {rows:?}"
+        );
+        let zeroed: Vec<String> = rows
+            .into_iter()
+            .map(|r| {
+                serde_json::to_string(&CursorRow {
+                    dev: 0,
+                    ino: 0,
+                    ..r
+                })
+                .unwrap()
+            })
+            .collect();
+        std::fs::write(&cursor, zeroed.join("\n") + "\n").unwrap();
+
+        // 実値に変わった最初の更新: 3 本とも 1 回読み直すが、何も数え直さない
+        let reread = env.update(&mut env.codex_indexer());
+        assert_eq!(reread.read_files, 3, "0 の行のファイルを読み直していない");
+        assert_eq!(
+            (reread.responses, reread.codex_observations),
+            (0, 0),
+            "読み直しで数え直した"
+        );
+        assert_eq!(env.totals(), totals, "合計が変わった（二重に数えた）");
+        assert_eq!(codex_rows(&env).len(), observations, "観測が増えた");
+        // 読み位置へ実値が書き戻され、2 回目は読み直さない
+        let again = env.update(&mut env.codex_indexer());
+        assert_eq!(
+            (again.read_files, again.bytes_read, again.responses),
+            (0, 0, 0),
+            "実値が読み位置へ書き戻されていない（毎回読み直す）"
+        );
+        assert_eq!(env.totals(), totals);
     }
 
     fn files_under(dir: &Path) -> Vec<PathBuf> {

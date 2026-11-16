@@ -640,6 +640,15 @@ jobs:
       # --nocapture は戻り方と所要の行（TAKO2774_*）をログへ残すため
       - name: 名前付きパイプの読み取りの上限の実行検査（#2774。remote daemon → GUI）
         run: cargo test -p tako-control --lib -- platform::named_pipe remote::tests::issue2774 --nocapture
+      # #2921: ファイルの同一性（GetFileInformationByHandleEx の FileIdInfo）・状態変更時刻（FileBasicInfo の
+      # ChangeTime）・置き換え保存（ReplaceFileW）も **macOS では 1 行も実行できない** FFI。同じ大きさ・更新時刻の
+      # まま差し替えたファイルを見分けるか・保存の途中の失敗で元のファイルが残るか（旧アームでは欠けるか）・
+      # 他のハンドルが開いているときの扱い・usage の索引と remote daemon の世代が実値で動くかを、
+      # 全数より手前に名指しで置く（#1282 と同じ理由）。--nocapture は結果の行（TAKO2921_*）をログへ残すため
+      - name: ファイルの同一性・置き換え保存の実行検査（#2921。境界 B37 fs_meta）
+        run: cargo test -p tako-core --lib platform::fs_meta -- --nocapture
+      - name: 同一性の呼び手の実行検査（#2921。usage の索引・remote daemon の世代）
+        run: cargo test -p tako-control --lib -- usage::index::tests::issue2921 remote_generation::tests --nocapture
       # #2790: エージェント CLI の導入代行の起こし方を、グループポリシーで実行ポリシーを強制した状態
       # （HKLM MachinePolicy = AllSigned / HKCU UserPolicy = Restricted。5.1 と pwsh 7 の両方の置き場）で
       # 実際に回す。新しい形（本文をテキストで読む -EncodedCommand）は偽の install.ps1 が走って印が残り、

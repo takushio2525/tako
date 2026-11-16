@@ -683,20 +683,19 @@ fn 実ファイルの差し替えを旧版と判定する() {
         "current",
         "{judge_at}: 読み直しただけで旧版と言っている"
     );
-    if cfg!(unix) {
-        assert_eq!(
-            swapped.tag(),
-            "replaced",
-            "{judge_at}: 同じパスのまま差し替わった実行ファイルを旧版と言えていない\
-             （パスの文字列で比べる形へ戻っている疑い。#2518）"
-        );
-        let status = serde_json::json!({
-            "running": true,
-            "serve_generation": status_field(swapped, &exe.display().to_string(), 1),
-        });
-        assert!(
-            renewable_in_status(&status),
-            "{judge_at}: 差し替わった旧版を立て直し対象と読めていない: {status}"
-        );
-    }
+    // unix は inode、Windows はファイル ID（#2921）で見分ける
+    assert_eq!(
+        swapped.tag(),
+        "replaced",
+        "{judge_at}: 同じパスのまま差し替わった実行ファイルを旧版と言えていない\
+         （パスの文字列で比べる形へ戻っている疑い。#2518）"
+    );
+    let status = serde_json::json!({
+        "running": true,
+        "serve_generation": status_field(swapped, &exe.display().to_string(), 1),
+    });
+    assert!(
+        renewable_in_status(&status),
+        "{judge_at}: 差し替わった旧版を立て直し対象と読めていない: {status}"
+    );
 }
