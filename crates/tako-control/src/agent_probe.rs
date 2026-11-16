@@ -48,11 +48,30 @@ pub fn blocked() -> bool {
     tako_core::paths::is_test_process() && !tako_core::paths::issue944_legacy()
 }
 
-/// エージェント CLI を問い合わせ目的で起こす。
+/// #2951 の A/B の env（`1` = 修正前と同じく、モデル一覧（`codex debug models` / `agy models`）と
+/// stale binary の版（`claude --version`）を上限なしの [`run`] で待つ）
+pub const ISSUE2951_LEGACY_ENV: &str = "TAKO_2951_LEGACY";
+
+/// #2951 の A/B が立っているか（**門はここ 1 か所**）。呼ばれるたびに読む（テストが `run_alone!` の子で
+/// 切り替えられるよう、値を覚えない）。呼び手は `if crate::agent_probe::issue2951_legacy() {` の形で置く
+/// （番犬が A/B の旧経路の腕として読む形）
+pub fn issue2951_legacy() -> bool {
+    matches!(
+        std::env::var(ISSUE2951_LEGACY_ENV).ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
+/// エージェント CLI を問い合わせ目的で起こす（**上限なし**）。
 ///
 /// 禁じられているときは**プロセスを 1 つも作らずに** `None` を返す
 /// （CLI が入っていない CI と同じ「取得できない」経路へ倒れるので、
-/// 結果もローカル / CI で揃う）。#586 のコンソール窓抑止もここで一度だけ当てる
+/// 結果もローカル / CI で揃う）。#586 のコンソール窓抑止もここで一度だけ当てる。
+///
+/// **製品の既定の経路では使わない**（#2942 / #2951）: 返らない CLI が 1 つあると呼び手ごと固まる。
+/// 呼んでよいのは A/B の旧経路の腕（`TAKO_2942_LEGACY` / `TAKO_2255_LEGACY` の認証・`TAKO_2951_LEGACY` の
+/// モデル一覧と版）だけで、番犬 `issue2951_agent_probe_unbounded_watchdog` が腕の外の呼び手を名指す。
+/// 問い合わせは [`output_with_timeout`] / [`output_within`] を通す
 pub fn run(cmd: &mut std::process::Command) -> Option<std::process::Output> {
     if blocked() {
         return None;

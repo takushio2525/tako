@@ -113,6 +113,14 @@ pub enum CatalogFailure {
     CommandFailed { detail: String },
     /// 出力が想定の形でなかった（上流の書式変更）
     ParseFailed { detail: String },
+    /// 一覧コマンドが上限の秒数で返らなかったので打ち切った（#2951。子は孫まで止めた）。
+    /// 「無い」「失敗した」とは言わず「確かめられなかった」と言う（#1503 の「無言にしない」）
+    TimedOut {
+        /// 何を待ったか（`probe::label` = 実行ファイル名 + 引数。パスは含めない = #927）
+        label: String,
+        /// 何秒待ったか
+        waited_secs: u64,
+    },
 }
 
 impl CatalogFailure {
@@ -124,6 +132,7 @@ impl CatalogFailure {
             Self::NoListCommand => "no_list_command",
             Self::CommandFailed { .. } => "command_failed",
             Self::ParseFailed { .. } => "parse_failed",
+            Self::TimedOut { .. } => "timed_out",
         }
     }
 
@@ -197,6 +206,27 @@ impl CatalogFailure {
                     lang,
                 )
             }
+            Self::TimedOut { label, waited_secs } => {
+                let head = Note::new(
+                    "のモデル一覧（`{label}`）が {secs} 秒で応答しなかったので打ち切りました（一覧は確かめられませんでした）",
+                    "'s model list (`{label}`) did not answer within {secs} seconds and was stopped (the list could not be confirmed)",
+                );
+                let next = Note::new(
+                    "次の一手: 同じコマンドを手で実行して止まる理由（ログイン・ネットワーク）を確かめる。モデルは指定せず CLI の既定に任せても起動できる",
+                    "Next: run the same command by hand to see why it stalls (sign-in, network). You can also leave the model unset so the CLI default applies",
+                );
+                join3(
+                    &format!(
+                        "{name} CLI{}",
+                        head.text_in(lang)
+                            .replace("{label}", label)
+                            .replace("{secs}", &waited_secs.to_string())
+                    ),
+                    next.text_in(lang),
+                    "",
+                    lang,
+                )
+            }
         }
     }
 
@@ -207,6 +237,10 @@ impl CatalogFailure {
         });
         if let Self::NotInstalled(err) = self {
             value["install"] = err.to_json();
+        }
+        // 何を何秒待って打ち切ったか（`tako_setup_bootstrap` の `auth_unconfirmed` と同じ形 = #2942）
+        if let Self::TimedOut { label, waited_secs } = self {
+            value["unconfirmed"] = json!({ "label": label, "waited_secs": waited_secs });
         }
         value
     }
@@ -305,6 +339,46 @@ pub struct CommandRun {
     pub success: bool,
     pub stdout: String,
     pub stderr: String,
+}
+
+/// 一覧コマンドの実行の結末（[`catalog_with`] へ注入する形。#2951）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// 終わった（成否は [`CommandRun::success`]）
+    Ran(CommandRun),
+    /// 上限の秒数で返らなかったので打ち切った（子は孫まで止めた）
+    TimedOut { label: String, waited_secs: u64 },
+    /// 起動できなかった（検証プロセスの門番 = #1261 を含む）
+    NotStarted,
+}
+
+/// `Option<CommandRun>`（#2951 前の注入の形）をそのまま渡せるようにする。`None` は起動できなかった
+impl From<Option<CommandRun>> for RunOutcome {
+    fn from(run: Option<CommandRun>) -> Self {
+        run.map_or(Self::NotStarted, Self::Ran)
+    }
+}
+
+/// 待ちの結末（[`tako_core::probe::Outcome`]）を一覧コマンドの結末へ
+impl From<tako_core::probe::Outcome> for RunOutcome {
+    fn from(outcome: tako_core::probe::Outcome) -> Self {
+        match outcome {
+            tako_core::probe::Outcome::Done {
+                status,
+                stdout,
+                stderr,
+            } => Self::Ran(CommandRun {
+                success: status.success(),
+                stdout: String::from_utf8_lossy(&stdout).to_string(),
+                stderr: String::from_utf8_lossy(&stderr).to_string(),
+            }),
+            tako_core::probe::Outcome::TimedOut { label, waited, .. } => Self::TimedOut {
+                label,
+                waited_secs: waited.as_secs(),
+            },
+            tako_core::probe::Outcome::Failed { .. } => Self::NotStarted,
+        }
+    }
 }
 
 /// 系統ごとの effort 語彙。**正本は [`WorkerAgent::effort_options`]**（起動時に実際に
@@ -498,12 +572,15 @@ fn looks_unauthenticated(text: &str) -> bool {
 }
 
 /// 取得の本体。**実行だけを注入可能にして判断は純粋関数側に置く**
-pub fn catalog_with(
+pub fn catalog_with<R>(
     agent: WorkerAgent,
     locate: impl FnOnce(WorkerAgent) -> Result<String, AgentCliError>,
-    run: impl FnOnce(&str, &[&str]) -> Option<CommandRun>,
+    run: impl FnOnce(&str, &[&str]) -> R,
     claude_config_json: Option<&str>,
-) -> ModelCatalog {
+) -> ModelCatalog
+where
+    R: Into<RunOutcome>,
+{
     let efforts = agent_efforts(agent);
     let list_command = catalog_command(agent);
 
@@ -545,16 +622,30 @@ pub fn catalog_with(
         };
     };
 
-    let Some(output) = run(&path, args) else {
-        return ModelCatalog {
-            agent,
-            list_command,
-            models: Vec::new(),
-            efforts,
-            failure: Some(CatalogFailure::CommandFailed {
-                detail: "コマンドを起動できなかった".into(),
-            }),
-        };
+    let output = match run(&path, args).into() {
+        RunOutcome::Ran(output) => output,
+        RunOutcome::NotStarted => {
+            return ModelCatalog {
+                agent,
+                list_command,
+                models: Vec::new(),
+                efforts,
+                failure: Some(CatalogFailure::CommandFailed {
+                    detail: "コマンドを起動できなかった".into(),
+                }),
+            };
+        }
+        // #2951: 上限の秒数で返らなかった。「無い」「失敗した」とは言わず確かめられなかったと返す
+        // （並べられる候補は、一覧コマンドが失敗したときと同じく同梱のものだけ = codex / agy は無い）
+        RunOutcome::TimedOut { label, waited_secs } => {
+            return ModelCatalog {
+                agent,
+                list_command,
+                models: Vec::new(),
+                efforts,
+                failure: Some(CatalogFailure::TimedOut { label, waited_secs }),
+            };
+        }
     };
     if !output.success {
         let detail = first_meaningful_line(&output.stderr)
@@ -604,7 +695,12 @@ fn first_meaningful_line(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// 実環境から取る。CLI の探索は #983 の [`agent_cli::locate`]（境界 B16 経由）
+/// 実環境から取る。CLI の探索は #983 の [`agent_cli::locate`]（境界 B16 経由）。
+///
+/// 一覧コマンドは**上限つき**で待つ（#2951）: 上限は setup の問い合わせと同じ `probe::probe_timeout()`
+/// （既定 15 秒・env `TAKO_SETUP_PROBE_TIMEOUT_SECS`。`claude mcp list` の実測 5.26 秒の約 3 倍・`agy models` の
+/// 実測 3.0 秒 = #2255 の 5 倍）。打ち切ったら子を孫まで止め、[`CatalogFailure::TimedOut`] で返す
+/// （#2942 の門番 `agent_probe::output_within`）。A/B の `TAKO_2951_LEGACY=1` は修正前と同じく上限なし
 pub fn catalog(agent: WorkerAgent) -> ModelCatalog {
     catalog_with(
         agent,
@@ -612,12 +708,15 @@ pub fn catalog(agent: WorkerAgent) -> ModelCatalog {
         |path, args| {
             // #1261: 問い合わせの起動は正本の門番を通す（#586 のコンソール窓抑止もそこで当たる）。
             // テストプロセスでは実 codex / agy を起こさない
-            let output = crate::agent_probe::run(std::process::Command::new(path).args(args))?;
-            Some(CommandRun {
-                success: output.status.success(),
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            })
+            if crate::agent_probe::issue2951_legacy() {
+                let output = crate::agent_probe::run(std::process::Command::new(path).args(args));
+                return RunOutcome::from(output.map(|output| CommandRun {
+                    success: output.status.success(),
+                    stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                    stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                }));
+            }
+            RunOutcome::from(crate::agent_probe::output_with_timeout(path, args))
         },
         claude_config_json().as_deref(),
     )
@@ -633,9 +732,35 @@ fn claude_config_json() -> Option<String> {
     None
 }
 
-/// 全系統ぶん（`tako setup models` の既定表示 / MCP の一覧）
+/// 全系統ぶん（`tako setup models` の既定表示 / MCP の一覧）。並びは [`WorkerAgent::ALL`]。
+///
+/// 系統ごとの一覧コマンドは**並べて聞く**（#2951）: 返らない codex と agy が揃っても全体は上限 1 回ぶん
+/// （1 系統ずつなら上限 × 2）。#2255 の `setup_bootstrap::status_all_within` と同じ形。
+/// A/B の `TAKO_2951_LEGACY=1` は修正前と同じく 1 系統ずつ
 pub fn catalog_all() -> Vec<ModelCatalog> {
-    WorkerAgent::ALL.into_iter().map(catalog).collect()
+    if crate::agent_probe::issue2951_legacy() {
+        return WorkerAgent::ALL.into_iter().map(catalog).collect();
+    }
+    std::thread::scope(|scope| {
+        let probes: Vec<_> = WorkerAgent::ALL
+            .into_iter()
+            .map(|agent| (agent, scope.spawn(move || catalog(agent))))
+            .collect();
+        probes
+            .into_iter()
+            .map(|(agent, probe)| {
+                probe.join().unwrap_or_else(|_| ModelCatalog {
+                    agent,
+                    list_command: catalog_command(agent),
+                    models: Vec::new(),
+                    efforts: agent_efforts(agent),
+                    failure: Some(CatalogFailure::CommandFailed {
+                        detail: "一覧の取得の途中で落ちました（#2951）".into(),
+                    }),
+                })
+            })
+            .collect()
+    })
 }
 
 #[cfg(test)]
@@ -838,7 +963,7 @@ mod tests {
         assert_eq!(json["live"], true);
         assert_eq!(json["source"], "cli");
         // 失敗して 0 件のときは builtin と言わない（何も並べていないのだから）
-        let empty = catalog_with(WorkerAgent::Agy, found, |_, _| None, None);
+        let empty = catalog_with(WorkerAgent::Agy, found, |_, _| None::<CommandRun>, None);
         assert_eq!(empty.source_label(), "none");
         assert_eq!(
             catalog_with(WorkerAgent::Claude, found, never_run, None).source_label(),
@@ -860,8 +985,72 @@ mod tests {
 
     #[test]
     fn 起動できなければcommand_failed() {
-        let catalog = catalog_with(WorkerAgent::Agy, found, |_, _| None, None);
+        let catalog = catalog_with(WorkerAgent::Agy, found, |_, _| None::<CommandRun>, None);
         assert_eq!(catalog.failure.unwrap().kind(), "command_failed");
+    }
+
+    /// #2951: 一覧コマンドが上限の秒数で返らなければ、「無い」「失敗した」と言わず確かめられなかったと返す
+    #[test]
+    fn 一覧コマンドが上限で返らなければtimed_outで確かめられなかったと返す() {
+        let timed_out = |_: &str, _: &[&str]| RunOutcome::TimedOut {
+            label: "codex debug models".into(),
+            waited_secs: 15,
+        };
+        let catalog = catalog_with(WorkerAgent::Codex, found, timed_out, None);
+        let failure = catalog.failure.clone().expect("打ち切りは失敗として載る");
+        assert_eq!(failure.kind(), "timed_out");
+        assert!(catalog.models.is_empty(), "確かめていない一覧を並べない");
+        assert!(!catalog.is_live());
+        assert_eq!(catalog.source_label(), "none");
+        let json = catalog.to_json();
+        assert_eq!(json["failure"]["kind"], "timed_out");
+        assert_eq!(
+            json["failure"]["unconfirmed"],
+            json!({ "label": "codex debug models", "waited_secs": 15 }),
+            "何を何秒待ったか（#2942 の auth_unconfirmed と同じ形）"
+        );
+        let ja = failure.message_in(WorkerAgent::Codex, Lang::Ja);
+        assert!(
+            ja.contains("`codex debug models`）が 15 秒で応答しなかった")
+                && ja.contains("確かめられませんでした"),
+            "{ja}"
+        );
+        assert!(
+            !ja.contains("ログインしていない"),
+            "未ログインと言わない: {ja}"
+        );
+        let en = failure.message_in(WorkerAgent::Codex, Lang::En);
+        assert!(
+            en.contains("did not answer within 15 seconds")
+                && en.contains("could not be confirmed"),
+            "{en}"
+        );
+        // 実取得できた形は今までどおり（打ち切りの腕が他の形を食わない）
+        assert!(catalog_with(WorkerAgent::Codex, found, run_ok(CODEX_FIXTURE), None).is_live());
+    }
+
+    /// #2951: 待ちの結末（`probe::Outcome`）の写し替え。打ち切りは秒、起動できないは NotStarted
+    #[test]
+    fn 待ちの結末を一覧コマンドの結末へ写す() {
+        let timed_out = tako_core::probe::Outcome::TimedOut {
+            label: "agy models".into(),
+            waited: std::time::Duration::from_millis(15_200),
+            stdout: b"partial".to_vec(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(
+            RunOutcome::from(timed_out),
+            RunOutcome::TimedOut {
+                label: "agy models".into(),
+                waited_secs: 15,
+            }
+        );
+        let failed = tako_core::probe::Outcome::Failed {
+            label: "agy models".into(),
+            reason: "検証プロセスからの問い合わせは禁じられています（#1261）".into(),
+        };
+        assert_eq!(RunOutcome::from(failed), RunOutcome::NotStarted);
+        assert_eq!(RunOutcome::from(None::<CommandRun>), RunOutcome::NotStarted);
     }
 
     #[test]
@@ -880,6 +1069,10 @@ mod tests {
             },
             CatalogFailure::ParseFailed {
                 detail: "detail".into(),
+            },
+            CatalogFailure::TimedOut {
+                label: "codex debug models".into(),
+                waited_secs: 15,
             },
         ];
         for failure in &failures {

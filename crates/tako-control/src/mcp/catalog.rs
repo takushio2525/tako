@@ -3332,7 +3332,7 @@ pub fn tools() -> Vec<Value> {
                 （opus / sonnet / fable）+ ローカルキャッシュを返す（failure.kind = no_list_command）。\
                 各モデルの efforts が受け付ける effort 語彙（codex はモデルごとに違う）なので effort はここから選ぶ。\
                 failure.kind = cli_not_found（未導入・install に導入手順）/ not_authenticated / \
-                no_list_command / command_failed / parse_failed。**反映はこのツールではしない**: \
+                no_list_command / command_failed / parse_failed / timed_out。**反映はこのツールではしない**: \
                 tako_orchestrator_profiles の model / effort へ書く（apply_command が形を示す）。",
             "inputSchema": {
                 "type": "object",
