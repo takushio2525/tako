@@ -852,7 +852,7 @@ tako mod / MCP tako_mod ──▶ ModHub を読んで行に組む（報告が無
   既定書式は先頭行タイムスタンプ = **時刻表示**を含み、スクロール中に謎の時計として
   見える実機バグ (2) の正体だった。位置は tako 側スクロールバーが示す）。
   **conf はサーバー起動時にしか読まれない**ため、稼働中サーバーへは起動時に
-  `tmux_backend::sync_conf`（`source-file`）で再適用する（下記の罠）。
+  `backend().sync_config()`（tmux は `tmux_backend::sync_conf` = `source-file`・psmux は器ごと。#2484）で再適用する（下記の罠）。
   **中身は器の能力で出し分ける**（#974）: 行ごとに `Directive::needs` で
   「書くために器へ求める能力」を宣言し、`tmux_backend::backend_conf(caps)` が
   `BackendCapabilities` を見て組む（器の実装名で分岐しない）。psmux 3.3.7 は
@@ -864,8 +864,39 @@ tako mod / MCP tako_mod ──▶ ModHub を読んで行に組む（報告が無
   #28 の前提。false の器のペインは修飾付き Enter を `ESC CR` で送る = #729・下記「修飾付きキー」）と
   `suppresses_copy_mode_indicator` で、どちらも `tako persist` /
   MCP の `backend` 応答に出る。拒否される設定の正本は
-  `backend::psmux::UNKNOWN_OPTIONS`（実測で拒否されたものだけ。psmux 版 conf に
-  無いだけの `default-terminal` / `escape-time` は psmux が受理するので含めない）
+  `backend::psmux::UNKNOWN_OPTIONS`（実測で拒否されたものだけ。`default-terminal` /
+  `escape-time` は psmux も受理して解釈するので含めない: psmux 3.3.7 のソースでは
+  `default-terminal` がペインの子の `TERM` を決め、`escape-time` は prefix キーの後の待ちにだけ使う
+  = `prefix None` の tako では効かない。どちらも #2484 で現状のまま残すと決めた）
+- **器の conf の正本は 1 つ**（#2484）: psmux 版の conf（`backend::psmux::BACKEND_CONF` と
+  `psmux-backend.conf` の書き手）は消し、`set -g warm off` を本番の conf の行の表へ能力
+  `disables_shell_prewarm` つきで載せた（tmux は false = 書かない）。psmux は既定でサーバーごとに
+  次のペイン用の pwsh（warm pane）と待機サーバー（`<ソケット>____warm__`）を先に起こすが、`-f` で起こす
+  tako の器は待機サーバーを拾わない（psmux の仕様）ので丸ごと無駄だった（Windows 実機: 器 2 本で
+  pwsh 10 本 → 4 本・private 291 MB → 115 MB）。書き手（`tmux_backend::write_conf_in`）は
+  **内容が同じなら書かない**（#1314 の判断を寄せた。Windows では `-f` で読んでいる器のサーバーが
+  置換先を開いていると rename が失敗し、器が conf 無し = `warm on` で起きる）。
+  **走っている器への再適用は器ごと**: psmux はセッション 1 本ごとに別のサーバーで、`-t` の無い
+  `source-file` は「いちばん最近のセッション」の 1 本にしか届かない。GUI は
+  `backend().sync_config()` を呼び、psmux の腕（`PsmuxBackend::sync_config`）は器ごとに `-t` を付けて
+  読ませてから、修正前に立った待機サーバーを `-L <ソケット>__ kill-server`（ポートファイルの名前が
+  `<ソケット>____` で始まるサーバー = 待機サーバーだけ）で落とす。`warm off` を読んだサーバーは
+  自分の warm pane を畳む。tmux の腕は従来どおり `tmux_backend::sync_conf`
+- **器のクライアントは器の他の操作と同じ実行ファイル**（#2484）: `PsmuxBackend` の client は
+  `backend::binary()` の `bin`（PATH で見つけた素の名前は境界 B16 の `exe::pin_process_path` で
+  絶対パスへ寄せる = `TAKO_PSMUX_BIN` の指定も spawn に効く）。#885〜#2484 は `tmux::tmux_bin()`
+  （psmux が配る `tmux.exe` を素の名前で）だった。tmux の器は従来どおり `tmux::tmux_bin()`
+- **素のペインのシェルは psmux の包みの pwsh を挟まない**（#2484 の段 2。能力 `direct_inner_argv`）:
+  psmux は `new-session` のコマンドを必ず `pwsh -NoLogo -Command "<cmd>"` で包む（`default-shell` も
+  見ない）ので、統合つきの `pwsh -NoExit -EncodedCommand …`（#2432）は包みの pwsh の子として起き、
+  器 1 本に pwsh が 2 本だった。psmux 3.2 以降は `new-session … -- <プログラム> <引数>…` を包まずに
+  `CreateProcess` へ渡すので、素のペインのシェルはこの形で渡す（`tmux_backend::inner_args`）。
+  **明示のコマンドは従来どおり包ませる**（包みの pwsh が `.cmd` / `.ps1` のシムの解決と `$PROFILE` の
+  環境を担っている）。A/B は `TAKO_2484_LEGACY=1`（warm off・クライアント・段 2・器ごとの再適用・
+  絶対パスへの寄せ・書き手の「同じなら書かない」をまとめて修正前へ戻す）。番犬は
+  `crates/tako-control/tests/issue2484_psmux_warm_off_watchdog.rs`、実機の結合テストは
+  `crates/tako-core/tests/psmux_backend.rs` の `本番が書くconfは警告なしで受理されwarm_offが効く` /
+  `走っている器へ後からwarm_offを届けて待機サーバーを落とす` / `素のペインのシェルは包みのpwshを挟まずに起きる`
 - **最後のセッションが消えても器のサーバーを残す**（#2741。`exit-empty off` = `tmux_backend::exit_empty_conf`）:
   tmux の既定（`exit-empty on`）では、最後のセッションが消えたサーバーは「終わる」と決めてからプロセスが
   消えるまで待ち受けのソケットを開いたままにし、その間に繋いだ器のペインのクライアントが

@@ -670,57 +670,17 @@ fn killは前方一致する別の器を巻き込まない() {
     let _ = f.backend.kill(&long);
 }
 
-/// **要件 5**: conf が実際に適用され、`warm off` が効いている。
-/// あわせて **psmux が知らないオプションを持ち込んでいない**ことも確かめる
-/// （知らない行が 1 つでもあると `psmux: N config warning(s):` がペインに出る＝
-/// ユーザーの画面が汚れる）
+/// **要件 5** + #974 + #2484: **本番の spawn 経路が実際に書く conf**（`tmux_backend::backend_conf` が
+/// 器の能力で組む 1 本。#2484 で psmux 版の conf はこれへ寄せた）を実 psmux に食わせて、
+/// 警告が 1 行も出ないこと・`warm off` が効いていること・器が解する設定が届いていることを確かめる
+/// （知らない行が 1 つでもあると `psmux: N config warning(s):` がペインに出る = ユーザーの画面が汚れる）
 #[test]
-fn confは警告なしで受理されwarm_offが効く() {
-    let f = fixture!("conf");
-    let Some(conf) = tako_core::backend::psmux::ensure_conf() else {
-        eprintln!("skip: data_dir が無い環境");
-        return;
-    };
-    let mut cmd = Command::new(&f.bin);
-    cmd.args(["-L", &f.socket, "-f"]).arg(&conf).args([
-        "new-session",
-        "-d",
-        "-s",
-        "tako-m2conf00001",
-    ]);
-    let text = psmux_ctl::wait_bounded(&mut cmd, psmux_ctl::BASE).text;
-    assert!(
-        !text.contains("warning") && !text.contains("unknown option"),
-        "conf に psmux が知らないオプションがある（ペインへ警告が出る）: {text}"
-    );
-    let (ok, warm) = f.raw(&["show-options", "-g", "warm"]);
-    assert!(ok, "show-options が動く: {warm}");
-    assert!(
-        warm.contains("warm off"),
-        "warm off が適用されていない（1 セッションあたり pwsh が 1 本余計に常駐する）: {warm}"
-    );
-    let (_, limit) = f.raw(&["show-options", "-g", "history-limit"]);
-    assert!(
-        limit.contains("10000"),
-        "history-limit が反映されない: {limit}"
-    );
-}
-
-/// #974: **本番の spawn 経路が実際に書く conf**（`tmux_backend::backend_conf` が
-/// 器の能力で組むもの）を実 psmux に食わせて、警告が 1 行も出ないことを確かめる。
-///
-/// 上の `confは警告なしで受理されwarm_offが効く` は psmux 版 conf
-/// （`backend::psmux::ensure_conf`）を見ているが、**本番のペイン spawn
-/// （#885 から `PsmuxBackend::wrap_spawn` → `tmux_backend::wrap_options_for`）が書くのは
-/// こちら**なので、こちらの中身を確かめないと #974 の再発を実機で検出できない
-/// （psmux 版 conf を本番へ寄せるかは #2484）
-#[test]
-fn 本番が書くconfも警告なしで受理される() {
+fn 本番が書くconfは警告なしで受理されwarm_offが効く() {
     use tako_core::backend::SessionBackend;
 
-    let f = fixture!("conf974");
+    let f = fixture!("conf2484");
     let conf_body = tako_core::tmux_backend::backend_conf(&f.backend.capabilities());
-    let path = std::env::temp_dir().join(format!("tako-974-{}.conf", std::process::id()));
+    let path = std::env::temp_dir().join(format!("tako-2484-{}.conf", std::process::id()));
     std::fs::write(&path, &conf_body).expect("conf を書ける");
 
     let mut cmd = Command::new(&f.bin);
@@ -728,7 +688,7 @@ fn 本番が書くconfも警告なしで受理される() {
         "new-session",
         "-d",
         "-s",
-        "tako-m2conf974x",
+        "tako-m2conf2484",
     ]);
     let text = psmux_ctl::wait_bounded(&mut cmd, psmux_ctl::BASE).text;
     let _ = std::fs::remove_file(&path);
@@ -736,13 +696,177 @@ fn 本番が書くconfも警告なしで受理される() {
         !text.contains("warning") && !text.contains("unknown option"),
         "本番が書く conf に psmux が知らないオプションがある\n出力: {text}\nconf:\n{conf_body}"
     );
-    // 落としたのは 4 行だけで、器が解する設定はちゃんと届いている
-    let (ok, limit) = f.raw(&["show-options", "-g", "history-limit"]);
-    assert!(ok, "show-options が動く: {limit}");
+    let (ok, warm) = f.raw(&["show-options", "-g", "warm"]);
+    assert!(ok, "show-options が動く: {warm}");
+    assert!(
+        warm.contains("warm off"),
+        "warm off が適用されていない（器ごとに pwsh が余計に常駐する）: {warm}"
+    );
+    // 落としたのは #974 の 4 行だけで、器が解する設定はちゃんと届いている
+    let (_, limit) = f.raw(&["show-options", "-g", "history-limit"]);
     assert!(
         limit.contains("10000"),
         "history-limit が反映されない（削りすぎ）: {limit}"
     );
+}
+
+/// 器の待機サーバー（`<ソケット>____warm__`）のプロセス（#2484）。psmux は待機サーバーを
+/// `server -s __warm__ -L <ソケット>` で起こす（3.3.7 のソース）。呼び手は Windows だけのテスト
+#[cfg(windows)]
+fn warm_server_pids(socket: &str) -> Vec<u32> {
+    tako_core::platform::procinfo::snapshot()
+        .into_iter()
+        .filter(|p| {
+            tako_core::platform::procinfo::command_line(p.pid).is_some_and(|line| {
+                line.contains("__warm__")
+                    && line
+                        .split_whitespace()
+                        .any(|w| w.trim_matches('"') == socket)
+            })
+        })
+        .map(|p| p.pid)
+        .collect()
+}
+
+/// #2484: **修正前から走っている器**（`warm off` の無い conf で起きた = 待機サーバーと warm pane が居る）へ
+/// 本番の再適用（`PsmuxBackend::sync_config`）を撃つと、器ごとに `warm off` が届き、残っていた
+/// 待機サーバーが消え、**器そのものは生きたまま**であること
+#[cfg(windows)]
+#[test]
+fn 走っている器へ後からwarm_offを届けて待機サーバーを落とす() {
+    use tako_core::backend::SessionBackend;
+
+    let f = fixture!("sync2484");
+    // 修正前の本番の conf = warm off の行だけが無いもの
+    let before: String = tako_core::tmux_backend::backend_conf(&f.backend.capabilities())
+        .lines()
+        .filter(|l| *l != "set -g warm off")
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let path = std::env::temp_dir().join(format!("tako-2484-before-{}.conf", std::process::id()));
+    std::fs::write(&path, &before).expect("conf を書ける");
+    let names = [session("tako-m2sync24841"), session("tako-m2sync24842")];
+    for name in &names {
+        let mut cmd = Command::new(&f.bin);
+        cmd.args(["-L", &f.socket, "-f"]).arg(&path).args([
+            "new-session",
+            "-d",
+            "-s",
+            name.as_str(),
+        ]);
+        let ran = psmux_ctl::wait_bounded(&mut cmd, psmux_ctl::BASE);
+        assert!(ran.ok, "修正前の conf で器を作れる: {}", ran.text);
+    }
+    let _ = std::fs::remove_file(&path);
+    let mut warm = Vec::new();
+    let appeared = wait_state(Duration::from_secs(15), || {
+        warm = warm_server_pids(&f.socket);
+        !warm.is_empty()
+    });
+    assert!(
+        appeared.ok,
+        "修正前の conf の器が待機サーバーを立てない（psmux の warm の挙動が変わった = この検査の前提が崩れた）。{}",
+        appeared.diag("待機サーバーが居る", &format!("{warm:?}"))
+    );
+    for name in &names {
+        let (_, warm) = f.raw(&["-t", name.as_str(), "show-options", "-g", "warm"]);
+        assert!(!warm.contains("warm off"), "前提: まだ warm は on: {warm}");
+    }
+
+    // 本番の再適用は背景のスレッドで撃つ（器の数だけ CLI を起こすので GUI の起動を待たせない）。
+    // 固定時間で待たず、器ごとに warm off が読めるまで状態で待つ（#1114）
+    f.backend.sync_config();
+    let warm_of = |name: &SessionRef| {
+        f.raw(&["-t", name.as_str(), "show-options", "-g", "warm"])
+            .1
+    };
+    let mut seen = Vec::new();
+    let applied = wait_state(Duration::from_secs(15), || {
+        seen = names.iter().map(&warm_of).collect();
+        seen.iter().all(|w| w.contains("warm off"))
+    });
+    assert!(
+        applied.ok,
+        "器ごとに warm off が届いていない（-t なしの再適用は器 1 本にしか届かない）。{}",
+        applied.diag("全部の器で warm off", &format!("{seen:?}"))
+    );
+    for name in &names {
+        assert!(f.backend.exists(name), "再適用で器 {name} を落とした");
+    }
+    let gone = wait_state(Duration::from_secs(10), || {
+        warm = warm_server_pids(&f.socket);
+        warm.is_empty()
+    });
+    assert!(
+        gone.ok,
+        "待機サーバーが残っている。{}",
+        gone.diag("待機サーバーが居ない", &format!("{warm:?}"))
+    );
+    for name in &names {
+        let _ = f.backend.kill(name);
+    }
+}
+
+/// #2484 の段 2: 本番の組み立て（`wrap_spawn`）で開いた素のペインのシェルは、psmux の包みの pwsh
+/// （`pwsh -NoLogo -Command "<cmd>"`）を挟まずに器のサーバーの直下で起きる = 器 1 本あたりの pwsh が 1 本。
+/// 素のペインのシェルを明示するのは Windows（統合を起動引数で読ませる。#2432）だけ
+#[cfg(windows)]
+#[test]
+fn 素のペインのシェルは包みのpwshを挟まずに起きる() {
+    let f = fixture!("direct2484");
+    let name = session("tako-m2direct2484");
+    let base = SpawnOptions {
+        command: None,
+        cwd: Some(std::env::temp_dir()),
+        env: vec![],
+        scrollback_lines: None,
+    };
+    let (term, _rx) = tako_core::TerminalSession::spawn(80, 24, f.backend.wrap_spawn(base, &name))
+        .expect("psmux クライアントを spawn できる");
+    let mut pids = Vec::new();
+    let got = wait_state(Duration::from_secs(15), || {
+        pids = f.backend.pane_pids(&name);
+        !pids.is_empty()
+    });
+    assert!(
+        got.ok,
+        "器の中のシェルの pid が取れない。{}",
+        got.diag("pid", &format!("{pids:?}"))
+    );
+    let procs = tako_core::platform::procinfo::snapshot();
+    let name_of = |pid: u32| {
+        procs
+            .iter()
+            .find(|p| p.pid == pid)
+            .map(|p| p.name.to_ascii_lowercase())
+            .unwrap_or_default()
+    };
+    let shell = pids[0];
+    let parent = procs
+        .iter()
+        .find(|p| p.pid == shell)
+        .map(|p| p.ppid)
+        .unwrap_or(0);
+    eprintln!(
+        "TAKO_2484_DIRECT: shell pid {shell} ({}) の親 {parent} ({}) / 器のクライアントの起動: {:?}",
+        name_of(shell),
+        name_of(parent),
+        tako_core::platform::procinfo::command_line(parent)
+    );
+    let is_powershell = |n: &str| n.starts_with("pwsh") || n.starts_with("powershell");
+    if tako_core::backend::psmux::issue2484_legacy() {
+        assert!(
+            is_powershell(&name_of(parent)),
+            "A/B: 包みの pwsh の中で起きる"
+        );
+    } else {
+        assert!(
+            !is_powershell(&name_of(parent)),
+            "素のペインのシェルの親が PowerShell = 包みの pwsh を挟んでいる（器 1 本に pwsh 2 本）"
+        );
+    }
+    drop(term);
+    let _ = f.backend.kill(&name);
 }
 
 /// **要件 2**: `show-environment` が名前指定を無視して全変数を返しても、

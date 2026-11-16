@@ -95,6 +95,8 @@ impl SessionBackend for TmuxBackend {
             keeps_exit_output: true,
             // conf の `exit-empty off` で、最後のセッションが消えてもサーバーを残す（#2741）
             keeps_empty_server: true,
+            disables_shell_prewarm: false,
+            direct_inner_argv: false,
             label: "tmux",
         }
     }

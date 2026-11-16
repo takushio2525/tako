@@ -25,7 +25,9 @@
 //! | `pane_tty` が実在しない `/dev/pty1` を返す | [`SessionBackend::pane_tty`] は `None` を返す |
 //! | `list-clients -F` が書式指定を無視（クライアント PID が取れない） | [`super::owner`] のオーナー記録で代替（#177 の強奪ガード） |
 //! | `new-session -D` が他クライアントを切り離さない | 同上。**器に収束を期待しない** |
-//! | 既定の warm pane 先読みが 1 セッションあたり pwsh を 1 本余計に常駐させる | psmux 版 conf に `set -g warm off`（+243MB → +131MB/session）。**本番の spawn の conf にはまだ無い**（#2484） |
+//! | 既定の warm（warm pane + `<ソケット>____warm__` の待機サーバー）が器ごとに pwsh を余計に常駐させる（`-f` の器は待機サーバーを拾わない） | 本番の conf に能力 `disables_shell_prewarm` で `set -g warm off`（#2484。器 2 本で pwsh 10 本 → 4 本）。走っている器へは [`PsmuxBackend::sync_config`] が器ごとに読ませ、残った待機サーバーを落とす |
+//! | `new-session` のコマンドを必ず `pwsh -NoLogo -Command "<cmd>"` で包む（器 1 本に pwsh 2 本） | 素のペインのシェルは `-- <argv>` で包まずに渡す（能力 `direct_inner_argv`。#2484 の段 2） |
+//! | `-t` なしのコマンドは「いちばん最近のセッション」のサーバー 1 本にしか届かない（セッションごとに別サーバー） | conf の再適用は器ごとに `-t` を付ける（[`source_conf_argvs`]） |
 //! | 器の中のシェルは tako の ConPTY の子ではない（コードページ固定が届かない） | [`SessionBackend::pane_pids`] で器へ `#{pane_pid}` を尋ね、器の内側にも B19 の固定を当てる（#659） |
 //! | ホイールで copy mode に入り、滞在中の打鍵をシェルへ渡さない | `#{pane_in_mode}` で確かめてから、解除キー `q` を打鍵と同じ PTY へ前置する（#686） |
 //! | `bind-key -T copy-mode …` が無反応（キーテーブル未実装。`list-keys -T copy-mode` が空） | conf での解決を諦め、上記の in-band 解除を採る |
@@ -54,23 +56,16 @@ use crate::terminal::{SpawnCommand, SpawnOptions};
 /// これ以外は [`behavior_probe`] で器として使えるかを確かめてから採用する
 pub const VERIFIED_VERSION: &str = "3.3.7";
 
-/// psmux バックエンドの設定。**psmux が知らないオプションを 1 つでも書くと
-/// `psmux: N config warning(s):` がペインへ出る**（実測）。表示の汚染はそのまま
-/// ユーザーの目に入るので、ここには実測で受理を確認したものだけを置く。
-///
-/// tmux 版（`tmux_backend::BACKEND_CONF`）から落としたもの:
-/// `extended-keys` / `extended-keys-format` / `copy-mode-position-format` /
-/// `default-terminal` / `terminal-features`（いずれも psmux が知らない or 未確認）。
-/// `escape-time` も外してある（psmux は ConPTY 直結で tmux の ESC 曖昧性回避が要らない）
 /// **psmux 3.3.7 が知らない設定オプション**（#974 の実機実測）。
 ///
 /// 書くと 1 行につき 1 件の `psmux: N config warning(s):` が**ペインの出力へ**混ざる。
 /// 警告が出るだけで設定は効かないので、器へ渡す conf を組む側
 /// （`tmux_backend::backend_conf`）はこれらを能力で落とす。
 ///
-/// **「psmux 版 conf に無い設定」とは別物**である点に注意: `default-terminal` /
-/// `escape-time` は下の [`BACKEND_CONF`] にも無いが、psmux は警告を出さずに受理する
-/// （#974 の実測で警告は 4 行だけだった）。ここには**実測で拒否されたものだけ**を置く
+/// ここには**実測で拒否されたものだけ**を置く。`default-terminal` / `escape-time` は psmux も
+/// 受理して解釈する（#974 の実測で警告は 4 行だけ。#2484 で 3.3.7 のソースを読んだ:
+/// `default-terminal` はペインの子の `TERM` を決め、`escape-time` は prefix キーの後の待ちに
+/// だけ使う = `prefix None` の tako では効かない）ので含めない
 pub const UNKNOWN_OPTIONS: &[&str] = &[
     "extended-keys",
     "extended-keys-format",
@@ -78,29 +73,15 @@ pub const UNKNOWN_OPTIONS: &[&str] = &[
     "copy-mode-position-format",
 ];
 
-const BACKEND_CONF: &str = "\
-# tako psmux バックエンド設定（自動生成。手で編集しない。tako-core::backend::psmux）
-set -g status off
-set -g prefix None
-set -g mouse on
-set -g history-limit 10000
-set -g warm off
-set -g allow-passthrough on
-set -g focus-events on
-set -g set-clipboard on
-set -g update-environment 'TAKO_SOCKET TAKO_TOKEN TAKO_MCP_URL CLAUDE_CODE_PLUGIN_DIRS TAKO_CLI'
-";
-
 pub struct PsmuxBackend {
     /// psmux 実行ファイル（[`super::binary`] が解決したもの）
     bin: String,
     /// ペインの PTY に起こす器のクライアントの実行ファイル（[`SessionBackend::wrap_spawn`]）。
     ///
-    /// 本番（[`Self::new`]）は `tmux::tmux_bin()` = psmux が配る `tmux.exe`。#885 まで本番の
-    /// spawn は `tmux_backend::wrap_options` を直接呼んでいて、Windows の実機で確かめてきたのは
-    /// この形なので、wrap_spawn を本番へ通すにあたって argv を変えないためにそのまま引き継ぐ
-    /// （他の操作と同じ `bin` へ寄せるかは実機の確認が要るので #885 では扱わない）。
-    /// [`Self::with_parts`]（検証）は `bin` そのもの
+    /// **器の他の操作と同じ `bin`**（#2484。[`super::binary`] が絶対パスへ寄せたもの = `TAKO_PSMUX_BIN`
+    /// の指定も効く）。#885〜#2484 の本番は `tmux::tmux_bin()`（psmux が配る `tmux.exe` を素の名前
+    /// `tmux` で）を起こしていて、器の操作（`psmux`）とクライアントで別の名前・別の解決を通っていた。
+    /// A/B（[`issue2484_legacy`]）はその形へ戻す
     client: String,
     /// 専用サーバーのソケット名（`-L`）。tmux 版と同じ解決を使う
     /// （`TAKO_TMUX_SOCKET` = `TAKO_ISOLATED` の一括隔離が psmux にもそのまま効く）
@@ -116,8 +97,13 @@ pub struct PsmuxBackend {
 
 impl PsmuxBackend {
     pub fn new(bin: String, version: String) -> Self {
+        let client = if issue2484_legacy() {
+            crate::tmux::tmux_bin().to_string()
+        } else {
+            bin.clone()
+        };
         Self {
-            client: crate::tmux::tmux_bin().to_string(),
+            client,
             ..Self::with_parts(
                 bin,
                 version,
@@ -164,13 +150,6 @@ impl PsmuxBackend {
         session.as_str()
     }
 
-    fn command(&self) -> Command {
-        let mut command = Command::new(&self.bin);
-        crate::platform::process::no_console_window(&mut command);
-        command.args(["-L", self.socket.as_str()]);
-        command
-    }
-
     /// psmux CLI 実行。サーバー未起動（`no server running`）はエラー文字列で返す
     fn run(&self, args: &[&str]) -> Result<String, String> {
         run_with(&self.bin, Some(&self.socket), args)
@@ -203,90 +182,83 @@ fn run_with(bin: &str, socket: Option<&str>, args: &[&str]) -> Result<String, St
     }
 }
 
-/// psmux が受理することを実バイナリで確かめてある conf の中身
-/// （統合テスト `psmux_backend::confは警告なしで受理されwarm_offが効く` が検証する）。
-///
-/// `pub` なのは統合テストが「この conf を psmux が警告なしで受理するか」を
-/// 実バイナリで確かめるため（未知のオプションが 1 行でもあるとペインに警告が出る）
-pub fn verified_conf() -> &'static str {
-    BACKEND_CONF
+/// #2484 の A/B（`TAKO_2484_LEGACY=1`）。同一バイナリのまま修正前の器へ戻す:
+/// conf に `warm off` を書かない（[`crate::tmux_backend`] の `conf_body`）・器のクライアントは
+/// `tmux::tmux_bin()`（[`PsmuxBackend::new`]）・素のペインのシェルは包みの pwsh の中で起こす
+/// （[`PsmuxBackend::wrap_spawn`]）・走っている器への conf の再適用は 1 本だけ（[`PsmuxBackend::sync_config`]）・
+/// psmux の実行ファイルを絶対パスへ寄せない（[`super::binary`]）。**ゲートはこの 1 か所**
+pub fn issue2484_legacy() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var(ISSUE2484_LEGACY_ENV).ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
 }
 
-/// 専用 conf の置き場でのファイル名（置き場は [`data_dir`]）
-const CONF_FILE_NAME: &str = "psmux-backend.conf";
+/// [`issue2484_legacy`] の env 名
+pub const ISSUE2484_LEGACY_ENV: &str = "TAKO_2484_LEGACY";
 
-/// 専用 conf をデータディレクトリへ書き出し、そのパスを返す（内容が変わっていれば
-/// 上書き = バージョン更新追従）。書けない環境では `None` を返す。
+/// 走っている器のサーバーへ conf を読ませ直す argv（#2484。**純関数**）。
 ///
-/// **本番のペインの spawn はこの conf を使わない**（#885 から `wrap_spawn` は本番の conf =
-/// `tmux_backend::ensure_conf` を使う）。使うのは `PsmuxBackend::sync_config` と検証で、
-/// 本番へ入れるかは #2484 で扱う
-pub fn ensure_conf() -> Option<PathBuf> {
-    write_conf_in(&data_dir()?, BACKEND_CONF).ok()
+/// **psmux はセッション 1 本ごとに別のサーバー（プロセス）**で、`-t` の無い `source-file` は
+/// 「いちばん最近のセッション」のサーバー 1 本にしか届かない（3.3.7 のソース: `-t` が無ければ
+/// `resolve_routing_target`）。#2484 まで本番は `-t` なしで 1 回だけ撃っていたので、GUI の再起動で
+/// conf の変更が届くのは器 1 本だけだった。器ごとに `-t <器>` を付けて読ませる
+pub(crate) fn source_conf_argvs(conf: &Path, sessions: &[SessionInfo]) -> Vec<Vec<String>> {
+    sessions
+        .iter()
+        .map(|info| {
+            vec![
+                "-t".to_string(),
+                info.session.as_str().to_string(),
+                "source-file".to_string(),
+                conf.display().to_string(),
+            ]
+        })
+        .collect()
 }
 
-/// conf を `dir` へ**原子的に**置き、そのパスを返す（#1314）。
+/// 器のソケットの待機サーバー（`<ソケット>____warm__`）**だけ**を宛先にするソケット名（#2484。**純関数**）。
 ///
-/// **一時ファイル → rename で差し替える**。#885 までの `PsmuxBackend::wrap_spawn` はペインを
-/// spawn するたびにここを通っていたので、複数ペイン・複数インスタンス（本番 GUI + 隔離 GUI +
-/// テスト）が重なると「書き手が truncate している最中の conf」を、別ペインが起動した
-/// psmux サーバーが `-f` で読みうる。読ませると器は既定設定（status on / warm on /
-/// history-limit 既定）で立ち上がり、ステータスバーが出る・warm pane が pwsh を
-/// 1 本余計に常駐させる（#519 の実測で +112MB/session）。rename は同一ディレクトリ内で
-/// 原子的なので、読み手は常に完全な conf を見る。tmux 側の
-/// [`crate::tmux_backend`] `write_conf_in`（#625）と同じ作法。
+/// `warm off` を読ませても、それより前に立った待機サーバーは消えない（psmux は待機サーバーを
+/// 自分では畳まない）。tako は器を `-f <conf>` で起こすので psmux は待機サーバーを拾わず
+/// （3.3.7: 独自の conf では拾わない）、残ると pwsh 2 本ぶん（実測 WS 約 200 MB）が再起動まで居座る。
 ///
-/// **内容が同じなら書かない**（[`conf_needs_write`]）。`BACKEND_CONF` は定数なので
-/// 2 回目以降の spawn は読むだけで終わり、差し替えの窓そのものが消える。Windows では
-/// rename 先を別プロセスが `FILE_SHARE_DELETE` 無しで開いていると置換に失敗しうるので、
-/// 「最終パスに触らずに済ませる回」を増やす意味もある（失敗時の縮退は修正前と同じ =
-/// `None` を返して `-f` を付けない）
-fn write_conf_in(dir: &Path, body: &str) -> std::io::Result<PathBuf> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
+/// psmux の `kill-server` は `-L <名>` を「ポートファイルの名前が `<名>__` で始まるサーバー」と読む
+/// （3.3.7 のソース）。器のサーバーは `<ソケット>__<器>`（器は `tako-` で始まる）、待機サーバーは
+/// `<ソケット>____warm__` なので、`-L <ソケット>__` は待機サーバーにだけ当たる（器の名前は `__` で始まらない）。
+/// psmux が名前の付け方を変えたときは何にも当たらない側へ倒れる
+pub(crate) fn warm_server_socket(socket: &str) -> String {
+    format!("{socket}__")
+}
 
-    std::fs::create_dir_all(dir)?;
-    let path = dir.join(CONF_FILE_NAME);
-    if legacy_direct_write() {
-        // #1314 の A/B。修正前（最終パスへ毎回直書き）をそのまま再現する
-        std::fs::write(&path, body)?;
-        return Ok(path);
+/// `list-sessions -F` の書式（[`parse_sessions`] が読む 3 列。[`PsmuxBackend::list`] と [`sync_conf_all`] が共有する）
+const LIST_SESSIONS_FORMAT: &str = "#{session_name}\t#{session_attached}\t#{session_activity}";
+
+/// 走っている器へ conf を器ごとに読ませ、`kill_warm` なら残った待機サーバーを落とす（#2484。
+/// [`PsmuxBackend::sync_config`] が背景のスレッドで呼ぶ本体。返るのは全部撃ち終えた後なので、
+/// 結合テストは直にこれを呼んで終わりを待つ）
+pub fn sync_conf_all(bin: &str, socket: &str, conf: &Path, kill_warm: bool) {
+    let sessions = parse_sessions(
+        &run_with(
+            bin,
+            Some(socket),
+            &["list-sessions", "-F", LIST_SESSIONS_FORMAT],
+        )
+        .unwrap_or_default(),
+    );
+    for argv in source_conf_argvs(conf, &sessions) {
+        let _ = run_with(
+            bin,
+            Some(socket),
+            &argv.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
     }
-    if !conf_needs_write(&path, body) {
-        return Ok(path);
+    if kill_warm {
+        let _ = run_with(bin, Some(&warm_server_socket(socket)), &["kill-server"]);
     }
-    let tmp = dir.join(conf_tmp_name(
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed),
-    ));
-    std::fs::write(&tmp, body)?;
-    if let Err(e) = std::fs::rename(&tmp, &path) {
-        // 置き場に tmp のゴミを残さない（#638 と同じ後始末）
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(path)
-}
-
-/// 置いてある conf が `body` と違う（= 書き直す必要がある）か。読めない・不在は
-/// 「違う」へ倒す。tmp → rename しか書き手が居ないので、ここで読めるのは常に
-/// 完全な内容（途中状態と比べて誤判定する余地がない）
-fn conf_needs_write(path: &Path, body: &str) -> bool {
-    !std::fs::read(path).is_ok_and(|cur| cur == body.as_bytes())
-}
-
-/// conf の tmp 名。**書き込み 1 回ごと**に固有にする（pid + 連番）。プロセス単位までしか
-/// 分けないと、同一プロセスの書き手同士が同じ tmp を奪い合い、A が rename したあとに
-/// B が**本番ファイルになった同じ inode** へ書く（#638 で実測）。data_dir は
-/// プライマリ / セカンダリでも共有されうるので pid も併記する
-fn conf_tmp_name(pid: u32, seq: u64) -> String {
-    format!("{CONF_FILE_NAME}.{pid}.{seq}.tmp")
-}
-
-/// #1314 の A/B。`TAKO_1314_LEGACY=1` で**同一バイナリのまま**修正前
-/// （最終パスへ毎回直書き）へ戻す
-fn legacy_direct_write() -> bool {
-    std::env::var_os("TAKO_1314_LEGACY").is_some_and(|v| !v.is_empty())
 }
 
 impl SessionBackend for PsmuxBackend {
@@ -328,6 +300,11 @@ impl SessionBackend for PsmuxBackend {
             // `exit-empty` を持つか・最後のセッションが消えた後の隙間があるかを Windows 実機で確かめていない（#2741）。
             // 知らない行を conf へ書くとペインの出力へ警告が混ざる（#974）ので、実測までは書かない
             keeps_empty_server: false,
+            // 既定の warm（warm pane + 待機サーバー）を `set -g warm off` で止められる（#2484 の実機実測:
+            // 器 2 本で pwsh 10 本 → 4 本。受理は警告なし = 結合テスト `本番が書くconfは警告なしで受理されwarm_offが効く`）
+            disables_shell_prewarm: true,
+            // `new-session … -- <argv>` は包みの pwsh を挟まずに起こす（psmux 3.2 から。#2484 の段 2）
+            direct_inner_argv: true,
             label: "psmux",
         }
     }
@@ -336,15 +313,14 @@ impl SessionBackend for PsmuxBackend {
         SessionRef::new(candidate).ok()
     }
 
-    /// `<client> -u -L <socket> -f <conf> new-session -A -D -s <name> [-e K=V]… [-c cwd] [command]`
+    /// `<client> -u -L <socket> -f <conf> new-session -A -D -s <name> [-e K=V]… [-c cwd] [command | -- argv…]`
     ///
     /// **組み立ては tmux 版と同じ 1 実装**（`tmux_backend::wrap_options_for`）。本番のペインの
-    /// spawn は #885 からここを通る（`backend::wrap_spawn_for_pane`）。#885 まではここに psmux 版の
-    /// 組み立て（psmux 版 conf = `BACKEND_CONF`・クライアント = `bin`）を持っていたが、本番は
-    /// それを通らず tmux 版を直接呼んでいたので、**本番が Windows の実機で走らせてきた形を正にした**:
-    /// conf は器の能力で組む本番の conf（#974）、クライアントは [`Self::new`] の `client`。
-    /// psmux 版 conf にだけある `warm off` を本番へ入れるかは実機の確認が要るので別に扱う（#2484）。
-    /// 内側コマンドの書き方だけはこの器の能力（`quotes_program = false`。#881）で決める。
+    /// spawn は #885 からここを通る（`backend::wrap_spawn_for_pane`）。conf は器の能力で組む本番の
+    /// conf（#974。#2484 で `warm off` もここへ寄せ、psmux 版の conf は消した）、クライアントは
+    /// 器の他の操作と同じ `bin`（#2484）。内側コマンドの書き方はこの器の能力で決める:
+    /// 明示のコマンドは第 1 語を引用符で括らない 1 本の文字列（`quotes_program = false`。#881）、
+    /// 素のペインのシェルは `--` の後ろへ argv のまま（`direct_inner_argv`。#2484 の段 2 = 包みの pwsh を挟まない）。
     ///
     /// 形は実測で全項目の反映を確認済み（`-e` 2 本・`-c`・conf の `history-limit`）。
     /// **`-D` は psmux では現状効かない**が、psmux が実装したときに tmux と同じ収束挙動へ
@@ -358,10 +334,12 @@ impl SessionBackend for PsmuxBackend {
                  （psmux は -D で切り離せないため、両方のクライアントが残る）"
             );
         }
+        let caps = self.capabilities();
         crate::tmux_backend::wrap_options_for(
             options,
             &self.client,
-            self.capabilities().quotes_program,
+            caps.quotes_program,
+            caps.direct_inner_argv && !issue2484_legacy(),
             &self.socket,
             session.as_str(),
         )
@@ -410,11 +388,7 @@ impl SessionBackend for PsmuxBackend {
 
     fn list(&self) -> Vec<SessionInfo> {
         let out = self
-            .run(&[
-                "list-sessions",
-                "-F",
-                "#{session_name}\t#{session_attached}\t#{session_activity}",
-            ])
+            .run(&["list-sessions", "-F", LIST_SESSIONS_FORMAT])
             .unwrap_or_default();
         parse_sessions(&out)
     }
@@ -570,14 +544,29 @@ impl SessionBackend for PsmuxBackend {
         let _ = self.run(&["set-environment", "-t", self.target(session), name, value]);
     }
 
+    /// 走っている器へ本番の conf（`tmux_backend::ensure_conf`）を読ませ直す（#2484）。
+    ///
+    /// 器はセッション 1 本ごとに別のサーバーなので、器ごとに `-t` を付けて読ませる
+    /// （[`source_conf_argvs`]）。`warm off` を読んだサーバーは自分の warm pane を畳む（3.3.7 のソース:
+    /// `warm` の設定の処理が warm pane の子を kill する）ので、修正前から走っている器の先読みもここで消える。
+    /// その後で、それより前に立った待機サーバーを落とす（[`warm_server_socket`]。器のサーバーには当たらない）。
+    ///
+    /// **背景のスレッドで撃つ**: 器の数だけ psmux の CLI を起こす（1 回 25〜180 ms の実測 = #866）ので、
+    /// GUI の起動の流れ（呼び手）で待つと起動が器の数に比例して遅れる。conf の中身は書いてから
+    /// スレッドへ渡す（`ensure_conf` はここで呼ぶ）。終わりを待つのは検証だけ（[`sync_conf_all`]）。
+    ///
+    /// A/B（[`issue2484_legacy`]）は修正前の形 = 本番の `tmux_backend::sync_conf`（`-t` なしで 1 回・その場で）
     fn sync_config(&self) {
-        let Some(conf) = ensure_conf() else { return };
-        let _ = self
-            .command()
-            .arg("source-file")
-            .arg(&conf)
-            .output()
-            .map(|_| ());
+        if issue2484_legacy() {
+            crate::tmux_backend::sync_conf(&self.socket);
+            return;
+        }
+        let conf = crate::tmux_backend::ensure_conf();
+        let (bin, socket) = (self.bin.clone(), self.socket.clone());
+        let kill_warm = self.capabilities().disables_shell_prewarm;
+        let _ = std::thread::Builder::new()
+            .name("tako-psmux-sync-conf".into())
+            .spawn(move || sync_conf_all(&bin, &socket, &conf, kill_warm));
     }
 
     /// **採取だけ**を持つ（#519）。psmux の `capture-pane` / `display-message` は
@@ -1027,24 +1016,80 @@ mod tests {
         );
     }
 
-    /// **要件 5**: conf に `set -g warm off` がある（常駐 +243MB → +131MB / session）。
-    /// あわせて **psmux が知らないオプションを持ち込まない**ことも固定する
+    /// **要件 5**（#2484 で本番の conf へ寄せた）: この器へ書く conf（`tmux_backend::backend_conf` が
+    /// 器の能力で組む 1 本）に `set -g warm off` があり、psmux が知らない設定は 1 つも無い
     /// （知らない行が 1 つでもあると `psmux: N config warning(s):` がペインに出る）
     #[test]
     fn confはwarm_offを含み未知のオプションを含まない() {
+        let conf = crate::tmux_backend::backend_conf(&backend().capabilities());
         assert!(
-            BACKEND_CONF.contains("set -g warm off"),
-            "warm off が無いと 1 セッションあたり pwsh が 1 本余計に常駐する"
+            conf.lines().any(|l| l == "set -g warm off"),
+            "warm off が無いと器ごとに pwsh が余計に常駐する:\n{conf}"
         );
         for unknown in UNKNOWN_OPTIONS {
             assert!(
-                !BACKEND_CONF.contains(unknown),
+                !conf.contains(unknown),
                 "psmux が知らない設定 {unknown} が conf に残っている（ペインへ警告が出る）"
             );
         }
-        // psmux が受理はする（#974 の実測で警告に出ない）が、この conf では
-        // 保守的に外しているもの。落とす理由が違うので正本の列挙とは分けておく
-        assert!(!BACKEND_CONF.contains("default-terminal"));
+    }
+
+    /// #2484: 走っている器への conf の再適用は**器ごとに `-t` を付ける**（psmux はセッション 1 本ごとに
+    /// 別のサーバーで、`-t` なしは「いちばん最近のセッション」の 1 本にしか届かない）
+    #[test]
+    fn issue2484_confの再適用は器ごとに宛先を付ける() {
+        let info = |name: &str| SessionInfo {
+            session: session(name),
+            attached: false,
+            last_activity: 0,
+        };
+        let conf = Path::new("C:\\data\\tmux-backend.conf");
+        let argvs = source_conf_argvs(
+            conf,
+            &[info("tako-aaaaaaaaaaaa"), info("tako-bbbbbbbbbbbb")],
+        );
+        assert_eq!(
+            argvs,
+            vec![
+                vec![
+                    "-t",
+                    "tako-aaaaaaaaaaaa",
+                    "source-file",
+                    "C:\\data\\tmux-backend.conf"
+                ],
+                vec![
+                    "-t",
+                    "tako-bbbbbbbbbbbb",
+                    "source-file",
+                    "C:\\data\\tmux-backend.conf"
+                ],
+            ]
+        );
+        assert!(
+            source_conf_argvs(conf, &[]).is_empty(),
+            "器が無ければ何も撃たない"
+        );
+    }
+
+    /// #2484: 待機サーバーだけを宛先にするソケット名。psmux の `kill-server -L <名>` は
+    /// 「ポートファイルの名前が `<名>__` で始まるサーバー」を落とす（3.3.7 のソース）ので、
+    /// 器のサーバー（`<ソケット>__tako-…`）には当たらず待機サーバー（`<ソケット>____warm__`）にだけ当たる
+    #[test]
+    fn issue2484_待機サーバーの宛先は器のサーバーに当たらない() {
+        let prefix = |socket: &str| format!("{}__", warm_server_socket(socket));
+        for socket in ["tako", "tako-iso-123"] {
+            let p = prefix(socket);
+            assert!(
+                format!("{socket}____warm__").starts_with(&p),
+                "{socket}: 待機サーバーに当たる"
+            );
+            assert!(
+                !format!("{socket}__tako-0123456789ab").starts_with(&p),
+                "{socket}: 器のサーバーに当たった"
+            );
+        }
+        // 別のソケットの待機サーバーにも当たらない
+        assert!(!"tako-iso-123____warm__".starts_with(&prefix("tako")));
     }
 
     /// **要件 2**: `show-environment` が全変数を返しても目的の 1 本を取り出せる
@@ -1280,9 +1325,21 @@ mod tests {
         ]
         .map(String::from)
         .to_vec();
-        // #2432: Windows の素のペインは統合を読ませた既定シェルを内側コマンドで明示する
-        // （psmux の default-shell は引数なしの pwsh を起こすため）。unix は None = 付かない
-        expected.extend(crate::shell_integration::pane_shell().map(|shell| inner_command(&shell)));
+        // #2432: Windows の素のペインは統合を読ませた既定シェルを明示する
+        // （psmux の default-shell は引数なしの pwsh を起こすため）。unix は None = 付かない。
+        // #2484 の段 2: 包みの pwsh を挟ませないよう `--` の後ろへ argv のまま渡す
+        // （A/B の TAKO_2484_LEGACY=1 では従来の 1 本の文字列）
+        expected.extend(
+            crate::shell_integration::pane_shell()
+                .into_iter()
+                .flat_map(|shell| {
+                    if issue2484_legacy() {
+                        vec![inner_command(&shell)]
+                    } else {
+                        crate::backend::direct_inner_argv(&shell)
+                    }
+                }),
+        );
         assert_eq!(args, expected);
         // env / cwd は素通しで in-process の PTY へ渡る
         assert_eq!(wrapped.env, options.env);
@@ -1499,46 +1556,43 @@ mod tests {
         other.release(&s);
     }
 
-    /// #885: 本番（[`PsmuxBackend::new`]）の組み立ては、#885 まで本番の Windows が走らせてきた形
-    /// （`tmux_backend::wrap_options` の直呼び）とバイト等価。クライアントも `tmux_bin()` のまま
+    /// #2484: 本番（[`PsmuxBackend::new`]）の器のクライアントは器の他の操作と同じ実行ファイル
+    /// （[`super::binary`] が解決したもの）。#885〜#2484 は `tmux::tmux_bin()`（素の名前の `tmux`）だった。
+    /// それ以外の組み立て（-L / -f / new-session / -e / -c / 内側）は本番の 1 実装のまま
     #[test]
-    fn 本番のpsmuxの組み立ては885前の本番の直呼びとバイト等価() {
-        let b = PsmuxBackend::new("psmux".into(), VERIFIED_VERSION.into());
-        let s = session("tako-885000000003");
-        let socket = crate::tmux_backend::socket_name();
+    fn issue2484_本番の器のクライアントはbackendの解決した実行ファイル() {
+        let bin = "C:\\Users\\winuser\\psmux\\psmux.exe";
+        let b = PsmuxBackend::new(bin.into(), VERIFIED_VERSION.into());
+        let s = session("tako-248400000001");
         let options = SpawnOptions {
             command: None,
             cwd: Some(PathBuf::from("C:\\work")),
-            env: vec![
-                ("TAKO_PANE_ID".into(), "7".into()),
-                ("TAKO_TOKEN".into(), "secret".into()),
-                ("TAKO_TAB_ID".into(), "3".into()),
-            ],
+            env: vec![("TAKO_PANE_ID".into(), "7".into())],
             scrollback_lines: None,
         };
-        // #885 前の本番 = 大域の器（本番の Windows では psmux そのもの）の書き方で組む直呼び。
-        // 器の無いテスト機では大域の書き方が違うので、本番の Windows の書き方（psmux）で組む
-        let before = if crate::backend::capabilities().quotes_program
-            == b.capabilities().quotes_program
-            || crate::shell_integration::pane_shell().is_none()
-        {
-            crate::tmux_backend::wrap_options(options.clone(), &socket, s.as_str())
-        } else {
-            crate::tmux_backend::wrap_options_for(
-                options.clone(),
-                crate::tmux::tmux_bin(),
-                b.capabilities().quotes_program,
-                &socket,
-                s.as_str(),
-            )
-        };
-        let after = b.wrap_spawn(options, &s);
-        let (before_cmd, after_cmd) = (before.command.unwrap(), after.command.unwrap());
-        assert_eq!(after_cmd.program, crate::tmux::tmux_bin());
-        assert_eq!(after_cmd.program, before_cmd.program);
-        assert_eq!(after_cmd.args, before_cmd.args);
-        assert_eq!(after.env, before.env);
-        assert_eq!(after.cwd, before.cwd);
+        let caps = b.capabilities();
+        let expect = crate::tmux_backend::wrap_options_for(
+            options.clone(),
+            if issue2484_legacy() {
+                crate::tmux::tmux_bin()
+            } else {
+                bin
+            },
+            caps.quotes_program,
+            caps.direct_inner_argv && !issue2484_legacy(),
+            &crate::tmux_backend::socket_name(),
+            s.as_str(),
+        );
+        let got = b.wrap_spawn(options, &s);
+        let (got_cmd, expect_cmd) = (got.command.unwrap(), expect.command.unwrap());
+        if !issue2484_legacy() {
+            assert_eq!(
+                got_cmd.program, bin,
+                "器のクライアントが backend の解決と揃っていない"
+            );
+        }
+        assert_eq!(got_cmd.program, expect_cmd.program);
+        assert_eq!(got_cmd.args, expect_cmd.args);
         b.release(&s);
     }
 
@@ -1556,236 +1610,5 @@ mod tests {
         assert!(!b.is_orphan_candidate(&info("tako-view-x"), &empty));
         let protected: HashSet<SessionRef> = [session("tako-dddddddddddd")].into_iter().collect();
         assert!(!b.is_orphan_candidate(&info("tako-dddddddddddd"), &protected));
-    }
-
-    // ---- #1314: conf の書き込みが原子的であること ----
-
-    /// テスト用一時ディレクトリの後始末。**一時ディレクトリ配下であることを検証してから**
-    /// 消す（変数名の取り違えで実ファイルを消す事故を構造的に防ぐ）
-    fn remove_temp_dir(dir: &Path) {
-        assert!(
-            dir.starts_with(std::env::temp_dir()),
-            "一時ディレクトリ以外を削除しようとしている: {}",
-            dir.display()
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// このテスト専用の空の置き場（pid + 用途で分ける）
-    fn conf_test_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("tako-1314-{tag}-{}", std::process::id()));
-        remove_temp_dir(&dir);
-        dir
-    }
-
-    /// 置き場に残っている tmp ファイルの一覧（書き終えたあとは 0 件が正しい）
-    fn tmp_leftovers(root: &Path) -> Vec<String> {
-        let Ok(entries) = std::fs::read_dir(root) else {
-            return Vec::new();
-        };
-        let mut left: Vec<String> = entries
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.ends_with(".tmp"))
-            .collect();
-        left.sort();
-        left
-    }
-
-    /// #1314: tmp 名は**書き込み 1 回ごと**に分かれ、本番ファイルと同じ置き場に収まる
-    /// （rename が原子的である条件 = 同一ディレクトリ内であること）
-    #[test]
-    fn confのtmp名は書き込みごとに固有で同じ置き場に収まる() {
-        let first = conf_tmp_name(42, 0);
-        let second = conf_tmp_name(42, 1);
-        assert_ne!(first, second, "書き込みごとに tmp 名が変わること");
-        assert_ne!(
-            conf_tmp_name(42, 0),
-            conf_tmp_name(43, 0),
-            "別プロセス同士も分かれること（data_dir は共有されうる）"
-        );
-        assert!(first.starts_with(CONF_FILE_NAME), "{first}");
-        assert!(first.ends_with(".tmp"), "{first}");
-        assert_ne!(first, CONF_FILE_NAME, "本番ファイル名と衝突しないこと");
-        assert!(!first.contains(std::path::MAIN_SEPARATOR), "{first}");
-    }
-
-    /// #1314 の再現 + 回帰。同一プロセス内で 8 スレッドが同じ conf へ書き、
-    /// 読み手が本番ファイルを読み続ける。最終パスへ直書き（truncate + write）すると、
-    /// 読み手は「空」や「書きかけ」= どちらの本文でもない途中状態を観測する。
-    /// psmux はこれを `-f` で読むと既定設定で立ち上がる（status バーが出る / warm on）。
-    ///
-    /// **待ちは状態待ち**（書き手の完了フラグ）で、実時間の比較はしない。
-    /// A/B: `TAKO_1314_LEGACY=1` を付けるとこのテストが FAILED になる
-    #[test]
-    fn 並行書き込みでもconfの途中状態が読まれない() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        use std::sync::{Arc, Mutex};
-
-        const THREADS: usize = 8;
-        const WRITES: usize = 200;
-
-        let root = conf_test_dir("race");
-        std::fs::create_dir_all(&root).expect("置き場を作る");
-
-        // 長短 2 種類の本文。**長さが違う**ことが要点で、短い側が長い側の上に書かれると
-        // 末尾が残って「どちらの本文でもない内容」になる = 途中状態を観測できる。
-        // 長い側は実際の conf（BACKEND_CONF）より十分大きくして truncate の窓を広げる
-        let long = "set -g history-limit 50000\n".repeat(2048);
-        let short = "set -g warm off\n".to_string();
-        let valid = [long.clone(), short.clone()];
-
-        let done = Arc::new(AtomicBool::new(false));
-        let torn = Arc::new(Mutex::new(Vec::<String>::new()));
-        let write_errors = Arc::new(Mutex::new(Vec::<String>::new()));
-        let reads = Arc::new(AtomicUsize::new(0));
-
-        let reader = {
-            let path = root.join(CONF_FILE_NAME);
-            let done = Arc::clone(&done);
-            let torn = Arc::clone(&torn);
-            let reads = Arc::clone(&reads);
-            let valid = valid.clone();
-            std::thread::spawn(move || {
-                while !done.load(Ordering::Relaxed) {
-                    // 不在（1 回目の rename より前）は異常ではないので読めた回だけ数える
-                    if let Ok(seen) = std::fs::read_to_string(&path) {
-                        reads.fetch_add(1, Ordering::Relaxed);
-                        if !valid.contains(&seen) {
-                            let mut g = torn.lock().expect("torn");
-                            if g.len() < 8 {
-                                // 全文は出さない。長さと先頭だけで形が分かる
-                                let head: String = seen.chars().take(16).collect();
-                                g.push(format!("len={} head={head:?}", seen.len()));
-                            }
-                        }
-                    }
-                }
-            })
-        };
-
-        let writers: Vec<_> = (0..THREADS)
-            .map(|i| {
-                let root = root.clone();
-                // 半々で長短を書く。どちらの上書き方向も起こす必要がある
-                let body = if i % 2 == 0 {
-                    long.clone()
-                } else {
-                    short.clone()
-                };
-                let write_errors = Arc::clone(&write_errors);
-                std::thread::spawn(move || {
-                    for _ in 0..WRITES {
-                        if let Err(e) = write_conf_in(&root, &body) {
-                            let mut g = write_errors.lock().expect("write_errors");
-                            if g.len() < 8 {
-                                g.push(format!("{e}"));
-                            }
-                        }
-                    }
-                })
-            })
-            .collect();
-
-        for w in writers {
-            w.join().expect("書き手の合流");
-        }
-        done.store(true, Ordering::Relaxed);
-        reader.join().expect("読み手の合流");
-
-        let torn = torn.lock().expect("torn").clone();
-        let errors = write_errors.lock().expect("write_errors").clone();
-        let reads = reads.load(Ordering::Relaxed);
-
-        // 読み手が 1 度も読めていないと検査が空回りする（検出力の確認）
-        assert!(reads > 0, "読み手が本番ファイルを 1 度も読めていない");
-        assert!(
-            torn.is_empty() && errors.is_empty(),
-            "並行書き込みが競合した（読み手は {reads} 回読んだ）: \
-             読み手が観測した途中状態={torn:?} / 書き込みの失敗={errors:?}"
-        );
-        assert!(
-            tmp_leftovers(&root).is_empty(),
-            "tmp が置き場に残っている: {:?}",
-            tmp_leftovers(&root)
-        );
-        let last = std::fs::read_to_string(root.join(CONF_FILE_NAME)).expect("最終状態を読む");
-        assert!(valid.contains(&last), "最終内容がどちらの本文でもない");
-
-        remove_temp_dir(&root);
-    }
-
-    /// #1314 の周辺条件: 置き場が無くても作って置ける・置いたパスは `-f` に渡せる形
-    #[test]
-    fn confは置き場が無くても作って置ける() {
-        // 親ごと存在しない深い置き場（data_dir の初回起動と同じ状況）
-        let base = conf_test_dir("mkdir");
-        let root = base.join("nested").join("data");
-        let path = write_conf_in(&root, BACKEND_CONF).expect("置き場ごと作って書ける");
-        assert_eq!(path, root.join(CONF_FILE_NAME));
-        assert_eq!(
-            std::fs::read_to_string(&path).expect("読み戻せる"),
-            BACKEND_CONF
-        );
-        assert!(tmp_leftovers(&root).is_empty(), "tmp が残っている");
-
-        // 内容が変わったら（= バージョン更新）ちゃんと追従する
-        let next = format!("{BACKEND_CONF}set -g status off\n");
-        write_conf_in(&root, &next).expect("上書きできる");
-        assert_eq!(std::fs::read_to_string(&path).expect("読み戻せる"), next);
-
-        remove_temp_dir(&base);
-    }
-
-    /// #1314: 内容が同じなら書き直さない（`BACKEND_CONF` は定数なので 2 回目以降の
-    /// spawn は読むだけで終わる）。判断そのものを固定する
-    #[test]
-    fn 同じ内容のconfは書き直さない() {
-        let root = conf_test_dir("skip");
-        std::fs::create_dir_all(&root).expect("置き場を作る");
-        let path = root.join(CONF_FILE_NAME);
-
-        assert!(conf_needs_write(&path, BACKEND_CONF), "不在なら書く");
-        write_conf_in(&root, BACKEND_CONF).expect("1 回目");
-        assert!(
-            !conf_needs_write(&path, BACKEND_CONF),
-            "同じ内容なら書かない"
-        );
-        assert!(
-            conf_needs_write(&path, "set -g warm off\n"),
-            "内容が変わったら書く"
-        );
-
-        remove_temp_dir(&root);
-    }
-
-    /// #1314: 「書かない」が実際に最終パスへ触っていないことを、置き場を読み取り専用に
-    /// して確かめる（書こうとすれば tmp の作成で失敗する）。権限で検査するので unix 限定
-    #[cfg(unix)]
-    #[test]
-    fn 同じ内容なら読み取り専用の置き場でも成功する() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = conf_test_dir("readonly");
-        std::fs::create_dir_all(&root).expect("置き場を作る");
-        write_conf_in(&root, BACKEND_CONF).expect("1 回目は書ける");
-
-        let restore = std::fs::metadata(&root).expect("属性").permissions();
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555))
-            .expect("置き場を読み取り専用にする");
-
-        // root 権限では権限検査が効かない。効いていない環境では検出力が無いので飛ばす
-        let enforced = std::fs::write(root.join("probe.tmp"), b"x").is_err();
-        if enforced {
-            write_conf_in(&root, BACKEND_CONF)
-                .expect("同じ内容なら最終パスにも tmp にも触らないので成功する");
-            assert!(
-                write_conf_in(&root, "set -g warm off\n").is_err(),
-                "内容が違えば書こうとして失敗するはず（検出力の確認）"
-            );
-        }
-
-        std::fs::set_permissions(&root, restore).expect("属性を戻す");
-        remove_temp_dir(&root);
     }
 }

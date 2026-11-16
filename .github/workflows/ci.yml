@@ -608,9 +608,10 @@ jobs:
       # #1314: psmux は **Windows でしか動かない器**。conf の差し替えは NTFS の rename
       # 意味論（開かれている置換先・`FILE_SHARE_DELETE`）に依存するので、
       # この器のテストも**全数より手前**に名指しで置く（#1282 と同じ理由）。
+      # #2484 で conf の書き手は本番の 1 本（tmux_backend）へ寄せたので、その差し替えのテストも名指しする。
       # テストバイナリは上のステップで作ってあるので追加の所要は数秒
-      - name: psmux バックエンドの実行検査（#1314。conf の原子的な差し替えを含む）
-        run: cargo test -p tako-core --lib backend::psmux
+      - name: psmux バックエンドの実行検査（#1314 / #2484。conf の原子的な差し替えを含む）
+        run: cargo test -p tako-core --lib -- backend::psmux tmux_backend::tests::conf差し替え中も読み手は完全な内容しか見ない tmux_backend::tests::同じ内容のconfは書き直さない
       # #1599: プロセスの停止（`OpenProcess` + `TerminateProcess`）も **macOS では 1 行も
       # 実行できない** FFI。自分で起こした子を実際に止めるか・正体の違う pid を撃たないか・
       # remote の停止の芯と admin API の shutdown を、全数より手前に名指しで置く（#1282 と同じ理由）

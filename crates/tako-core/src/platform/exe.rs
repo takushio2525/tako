@@ -423,6 +423,29 @@ fn pin_in_path_list(
 #[cfg(unix)]
 const SPAWNP_DEFAULT_PATH: &str = "/usr/bin:/bin";
 
+/// 見つけた後も**起こし続ける**外部コマンドの名前を、このプロセスが今それを起こしたら当たる
+/// 実行ファイルの絶対パスへ寄せる（#2484。器 = psmux の実行ファイル）。子を起こさない。
+///
+/// [`find_in_process_path`] と違って **Windows でも引く**。器のクライアントはペインを開くたびに
+/// 素の名前で起こされ、`CreateProcessW` はアプリの置き場・カレントディレクトリ・PATH を順に探す
+/// （プロセスのコマンドラインも素の名前のまま = どの実行ファイルが器を起こしたかが読めない）。
+/// Windows の腕は PATH を `PATHEXT` と組み合わせて見る（[`find`] から PATH の外の保険の置き場を
+/// 除いたもの = 素の名前で起こしたときと同じ場所）。パスを渡されたら Windows は `PATHEXT` だけ補い、
+/// unix はそのまま（`None`）。空の名前・見つからないときは `None`（呼び手は受け取った名前のまま使う）
+pub fn pin_process_path(name: &str) -> Option<String> {
+    #[cfg(unix)]
+    {
+        find_in_process_path(name)
+    }
+    #[cfg(not(unix))]
+    {
+        if name.is_empty() {
+            return None;
+        }
+        imp::find_on_process_path(name)
+    }
+}
+
 /// [`find_in_process_path`] の判定本体（env とファイルシステムを引数で受ける）
 #[cfg(unix)]
 fn find_in_path_list(
@@ -687,6 +710,18 @@ mod imp {
         super::find_in_windows_path(name, &dirs, &pathext(), &user_install_dirs(), &|p| {
             std::path::Path::new(p).is_file()
         })
+    }
+
+    /// [`super::pin_process_path`] の Windows の腕（#2484）。このプロセスの PATH だけを見る
+    /// （PATH の外の保険の置き場 = [`user_install_dirs`] は見ない。素の名前で起こしたときに当たる場所に揃える）
+    pub fn find_on_process_path(name: &str) -> Option<String> {
+        super::find_in_windows_path(
+            name,
+            &split_path_list(std::env::var_os("PATH")),
+            &pathext(),
+            &[],
+            &|p| std::path::Path::new(p).is_file(),
+        )
     }
 
     /// Windows の探索は PATH の走査だけ（子プロセスを起こさない）なので待ちが無い
