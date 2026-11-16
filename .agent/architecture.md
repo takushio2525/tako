@@ -1482,6 +1482,60 @@ wry の版を変えたら W1 / W2 の根拠を読み直す（番犬が Cargo.loc
   分類の 1 か所を通る）と `issue2431_求めるwebview2の版はwryの既定と同じ`（Cargo.lock の webview2-com の
   版で止め、registry に実ソースがあれば対象の版・既定・表示の形を確かめる）
 
+### Windows の合成と子窓（#2429）
+
+gpui_windows（rev `cafbf4b`）は既定で DirectComposition の合成を使う。トップレベルに
+`WS_EX_NOREDIRECTIONBITMAP` を立て（`window.rs:472`）、合成のターゲットを `CreateTargetForHwnd(hwnd, true)`
+（`directx_renderer.rs:901`）で作る。第 2 引数 `topmost = TRUE` は合成の木を**子窓より上**に重ねる意味なので、
+WebView2 の子 HWND（`WRY_WEBVIEW` → `Chrome_WidgetWin_*`）は gpui の swap chain の下に入り、tako が不透明に
+塗るペインの本文に覆われる。`web list` は `state: ready`・`visible: true`・`attached: true` で、クリックは
+ページへ届く（HWND の当たり判定）のに中身が見えない（11/16 の実機。同じバイナリに env だけ渡す A/B で確定）。
+
+- **手当て**: gpui を作る前に `GPUI_DISABLE_DIRECT_COMPOSITION=1` を立てる（Zed が RDP / 一部の GPU 向けに持つ
+  正規の逃げ道）。swap chain が HWND 直結（`CreateSwapChainForHwnd`・flip sequential）になり、子窓は DWM が
+  上に重ねる。gpui がこの env を読むのは platform を作る 1 回だけ（`platform.rs:167` → 窓ごとに同じ値を渡す）
+  なので、`main` の最初（#2570 の env の整理の直後・最初のスレッドの前）で立て、`application()` の直後に外す
+  （ペインの子 = シェル・別の gpui アプリへ tako の内部の選択を渡さない）。判断は境界 B11
+  `platform::webview_host::prepare_compositor` の 1 か所で、persist.log へ 1 行残す
+- **利用者の値を上書きしない**: 外から `GPUI_DISABLE_DIRECT_COMPOSITION` が渡されていれば（切らない `0` も）
+  そのまま従う。空・空白だけは渡していないのと同じ
+- **全画面の描画に効く**（Web ビューを使わない利用者にも）。tako は窓の透過・ぼかし
+  （`WindowBackgroundAppearance`）を使っていないので、DirectComposition でしか出せない見た目は失わない。
+  描画の費用・リサイズ・窓の枠と影・表示倍率 125% の実測は Issue #2429 の記録
+- 採らなかった手: (b) Web ビューの矩形を gpui のすべての層で α = 0 に抜く（`topmost = TRUE` のままでは描く
+  すべての要素が守る必要があり手が大きい）、(c) gpui の側で `topmost = FALSE` にする（合成の木が子窓の下へ
+  入るので最も素直だが、fork か上流への変更が要る = 上流への提案として残す）、(d) WebView2 を所有付きの
+  ポップアップ窓に載せる（窓の移動・Z 順・活性化を tako が追う必要がある）
+- A/B は `TAKO_2429_LEGACY=1`（切らない = 修正前）。番犬は `issue2429_windows_webview_watchdog`
+  （立てる位置・外す位置・env を扱うのは境界だけ・A/B の口が 1 か所）
+
+### Windows のキー入力の宛先（#2430）
+
+macOS の #1481 と同じ症状が Windows でも起きていた: ページをクリックすると Win32 の focus が WebView2 の
+子窓（別プロセスの `Chrome_WidgetWin_1`）へ移り、ターミナルのペインをクリックしても打鍵がページへ流れ続ける。
+gpui_windows のマウス押下は `SetCapture` だけで `SetFocus` を呼ばず（`events.rs:417`）、`WM_MOUSEACTIVATE` も
+`SetActiveWindow` だけ（`events.rs:44`）なので、窓がすでに活性なら宛先は動かない。#1481 の戻し
+（`return_webview_key_focus`）は、Windows の `key_monitor` が空で常に「Web ビューは持っていない」と答えて
+いたので入口で抜けていた。
+
+- **読む**: gpui の窓のスレッドの宛先（`GetGUIThreadInfo` の `hwndFocus`）が gpui の窓の子孫（`IsChild`）なら
+  Web ビュー側。WebView2 の子窓は親子関係で入力の状態を共有するので UI スレッドから読める
+- **戻す**: `SetFocus(gpui の窓)`。wry 0.57.1 の Windows の `focus_parent`（`webview2/mod.rs:1678`）と同じで、
+  実機で「タブを切り替えて戻す」（= `sync_frame(None)` の `focus_parent`）が効くことを確かめた経路。
+  gpui_windows は `WM_SETFOCUS` / `WM_KILLFOCUS` を扱わないので活性の状態は動かない
+- 腕は境界 B11 `platform::webview_host`（`win32_child_holds_key_focus` / `win32_return_key_focus` /
+  `win32_key_focus_owner`）。`webview.rs` の公開口（`webview_holds_key_focus` / `return_key_focus_to_app` /
+  `key_focus_owner`）は親の窓のハンドルが Win32 かで振り分ける（OS を名指さない。`attached` と同じ形）。
+  macOS の腕（AppKit の `key_monitor`）は動かしていない
+- 呼ぶ場所は #1481 のまま（`clear_text_input_focus` と破棄の直前）。セルフテスト項目 71 の #1481 群を
+  Windows でも走らせ、宛先の素性は `Zed::Window@HWND`（tako）/ `Chrome_…@HWND`（ページ）で読む。
+  WebView2 の `MoveFocus`（ページのクリック相当）はブラウザのプロセスで着地するので、前提の「ページへ
+  移った」と 2 枚目への寄せ直しは状態を待って確かめる。「戻った」は宛先そのものが在ることまで見る
+  （宛先が無い `@0x0` を戻ったと読まない）
+- A/B は `TAKO_2430_LEGACY=1`（宛先を読まず戻さない = 修正前）。番犬は `issue2429_windows_webview_watchdog`
+  （宛先の 3 つの口が Win32 の親を境界の腕へ振り分ける・腕が実体を読む・項目 71 / 155 に Windows の
+  無条件スキップが戻っていない）
+
 ## AI 誘導・注釈レイヤ（FR-2.6、後段フェーズ）
 
 ペイン上のハイライト・指し示しは **GPUI の描画だけで完結する見込み**（deferred / overlay 描画、
