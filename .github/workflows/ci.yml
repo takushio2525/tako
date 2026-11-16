@@ -715,6 +715,15 @@ jobs:
       # --nocapture は結果の行（TAKO2828_*）をログへ残すため
       - name: 導入代行の失敗の文に CR が残らないかの実行検査（#2828）
         run: cargo test -p tako-control --test issue2828_install_crlf_windows -- --nocapture
+      # #2936: GUI のプロセスの出力（器の取り合いの警告 = backend::psmux の wrap_spawn と、tako-app の代表の
+      # eprintln!）を、書けない標準エラー（読み手を閉じたパイプ = ERROR_NO_DATA・読み取り専用のハンドル =
+      # ERROR_ACCESS_DENIED = 実機で GUI が落ちた os error 5）の子で走らせ、GUI の規則で走り切ること・
+      # TAKO_2936_LEGACY=1（修正前の形）は同じ場面で panic すること・使える標準エラーへは新旧で同じバイト列を
+      # 書くことを見る。外部に依らないので毎回走る。--nocapture は結果の行（TAKO2936_STDIO）をログへ残すため
+      - name: 書けない標準エラーで GUI の出力が落ちないかの実行検査（#2936）
+        run: |
+          cargo test -p tako-core --test issue2936_gui_stdio -- --nocapture
+          cargo test -p tako-app --bin tako-app -- stdio::tests::issue2936 --nocapture
       # #2791: Windows の codex / agy の導入代行を、公式の install.ps1 を本当に走らせて確かめる（製品の口
       # `tako setup bootstrap install --agent codex|agy` = MCP tako_setup_bootstrap と同じ経路）。導入の前後の
       # status・入った置き場・agy の取得物が残らない（起動片のスコープ）を、ポリシーなし / HKCU Restricted /

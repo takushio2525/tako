@@ -137,7 +137,8 @@ fn 標準エラーも閉じていても_終了コードはそのまま() {
 /// 後ろへ動くと、それより前に宣言したモジュール（`setup.rs`）は黙って std の版へ戻る。
 ///
 /// #1805 で CLI の経路で走るライブラリ側（tako-core / tako-control）と tako-cli の lib
-/// （MCP ブリッジ・IPC クライアント）の根にも同じ差し替えを置いたので、4 つの根を同じ規則で見る
+/// （MCP ブリッジ・IPC クライアント）の根にも同じ差し替えを置いた。#2936 で GUI（tako-app）の根にも
+/// 置いた（GUI の規則 = 書けない標準エラーで落ちない）ので、5 つの根を同じ規則で見る
 #[test]
 fn 出力マクロの宣言が他のmodより先にある() {
     let crates = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
@@ -146,6 +147,7 @@ fn 出力マクロの宣言が他のmodより先にある() {
         "tako-cli/src/lib.rs",
         "tako-control/src/lib.rs",
         "tako-core/src/lib.rs",
+        "tako-app/src/main.rs",
     ] {
         let src = std::fs::read_to_string(format!("{crates}/{root}"))
             .unwrap_or_else(|e| panic!("crates/{root} を読めない: {e}"));
