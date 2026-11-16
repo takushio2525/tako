@@ -2173,6 +2173,17 @@ lid-guard.json が使う）:
   `TAKO_2663_LEGACY=1`、注入は `TAKO_2663_INJECT_HOLD_MS`（PTY の読み手がロックを持ったまま止まる。検証プロセスだけ）、
   実経路は `scripts/test-mod-dispatch-offload-2663.sh`（FR-2.42.56）。`tako list` 自身も UI スレッドで各ペインの
   端末のロックを取る（スクロールの位置・alt screen の印）のは残っている
+- **エージェント CLI の導入（`tako_setup_bootstrap`）とモデル一覧（`tako_setup_models`）も UI スレッドで待たない**（#2956）:
+  状態の確かめは認証の問い合わせ（`claude auth status` ほか。上限 `auth_probe_timeout` = 既定 10 秒）とログインシェルの PATH の
+  読み取り、`install` は公式インストーラ、モデル一覧は `codex debug models` / `agy models` を待つ。以前は `prepare_offload` の
+  腕が無く、IPC の受け口が UI スレッドの同期の dispatch で待っていた（隔離 GUI の perf.log で `dispatch:SetupBootstrap` 3089ms =
+  #2942 の上限 3 秒の注入・修正前の上限なしでは返らない CLI で無期限）。`SetupDeps`（#2433）と同じく、アプリの状態に依存しない
+  ので要求だけを写して `OffloadJob::SetupBootstrap` / `OffloadJob::SetupModels` へ包み、`run_reply` が同期の腕と同じ
+  `setup_bootstrap_reply` / `setup_models_reply` で background から応答する。UI スレッドで 1 本ずつだった書き込み（`dry_run` でない
+  `install`・`path`・`undo-path`）の順序は錠 `SETUP_BOOTSTRAP_WRITE_SERIAL` で保つ。#1984 の番犬は集約点の `dispatch` を辿らない
+  ので、番犬 `issue2956_setup_dispatch_offload_watchdog.rs` が `dispatch_inner` の腕のうち `prepare_offload` が出さない要求の腕を
+  入口に呼び出しを辿り、#1984 の葉（`RAW` + `GRAPH_LEAVES` を本文から読む）へ届く行を file:line で名指す（今ある残りは理由つきで
+  `KNOWN`）。A/B は `TAKO_2956_LEGACY=1`（UI スレッドで同期に答える）
 - **照会 1 回の中では `ps` / `tmux list-panes -a` を 1 回だけ起こす**（#1968）: 状態照会は
   `has_running_children` と claude / codex / agy の会話 ID 解決が**それぞれ** `ps` と
   `tmux list-panes -a` を起こしていた（報告 1 回で `ps` 3 本）。`agents::with_shared_scan` の

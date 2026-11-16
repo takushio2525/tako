@@ -2549,7 +2549,9 @@ const GRAPH_SYNC_ARMS: &[(&str, &str)] = &[(
      （`TAKO_1989_LEGACY=1`）用",
 )];
 
-/// 辿らない集約点（右は理由）
+/// 辿らない集約点（右は理由）。`prepare_offload` が出さない要求の同期の腕から届く待ちは
+/// `issue2956_setup_dispatch_offload_watchdog.rs` が腕ごとに辿って見る（この番犬の葉 `RAW` / `GRAPH_LEAVES` を
+/// 本文から読むので、ここの配列の頭の形を変えたら向こうも追うこと）
 const GRAPH_STOPS: &[(&str, &str)] = &[
     (
         "dispatch",

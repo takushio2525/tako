@@ -7088,6 +7088,13 @@ pub enum OffloadJob {
     /// `--version`）と導入器（brew / winget。UAC の確認を待つこともある）を UI スレッドで待たない。
     /// workspace に触らないのでそのまま background から応答する
     SetupDeps(Box<Request>),
+    /// エージェント CLI のゼロスタート導入（`tako_setup_bootstrap`。#2956）。状態の確かめ（認証の問い合わせ =
+    /// 上限 `auth_probe_timeout`・ログインシェルの PATH の読み取り）と導入（公式インストーラ）が外部プロセスを
+    /// 待つので UI スレッドで待たない。workspace に触らないのでそのまま background から応答する
+    SetupBootstrap(Box<Request>),
+    /// モデル一覧の実取得（`tako_setup_models`。#2956）。`codex debug models` / `agy models` を UI スレッドで
+    /// 待たない。workspace に触らないのでそのまま background から応答する
+    SetupModels(Box<Request>),
     /// tmux 一覧（#1984）。UI スレッドでは tako のペインとの対応表だけを写し、
     /// `tmux list-sessions` ほか（ソケットごとに数本）は background で起こす
     TmuxList {
@@ -8172,6 +8179,16 @@ pub fn prepare_offload(
         deps @ Request::SetupDeps { .. } if !crate::setup_deps::legacy_2433() => {
             Some(Ok(OffloadJob::SetupDeps(Box::new(deps.clone()))))
         }
+        // #2956: エージェント CLI の導入の状態の確かめ（認証の問い合わせ・ログインシェルの PATH）・導入（公式
+        // インストーラ）とモデル一覧の実取得（`codex debug models` / `agy models`）を UI スレッドで待たない
+        // （#2942 の修正後で 1 回最大 10 秒、修正前は返らない CLI で無期限に GUI が止まった）。アプリの状態に
+        // 依存しないので写すのは要求だけ。A/B の `TAKO_2956_LEGACY=1` は修正前と同じ `None` = UI スレッドで同期に答える
+        bootstrap @ Request::SetupBootstrap { .. } if !setup_query_offload_legacy() => {
+            Some(Ok(OffloadJob::SetupBootstrap(Box::new(bootstrap.clone()))))
+        }
+        models @ Request::SetupModels { .. } if !setup_query_offload_legacy() => {
+            Some(Ok(OffloadJob::SetupModels(Box::new(models.clone()))))
+        }
         Request::TmuxList { socket } if !tako_core::probe::issue1984_legacy() => {
             Some(Ok(OffloadJob::TmuxList {
                 ctx: collect_tmux_context(host),
@@ -8258,6 +8275,118 @@ fn setup_deps_reply(request: &Request) -> Result<Value, DispatchError> {
         }
         .invalid()),
     }
+}
+
+/// #2956 の A/B の env（`1` = 修正前と同じく `SetupBootstrap` / `SetupModels` を UI スレッドの同期の腕で答える）
+pub const SETUP_QUERY_OFFLOAD_LEGACY_ENV: &str = "TAKO_2956_LEGACY";
+
+/// `SetupBootstrap` / `SetupModels` を background へ出さず、修正前と同じく UI スレッドで待つか（#2956 の A/B。
+/// **門はここ 1 か所**）。要求のたびに読む（テストが `run_alone!` の子で切り替えられるよう、値を覚えない）
+pub fn setup_query_offload_legacy() -> bool {
+    matches!(
+        std::env::var(SETUP_QUERY_OFFLOAD_LEGACY_ENV)
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
+/// `tako_setup_bootstrap` の書き込み（`dry_run` でない `install`・`path`・`undo-path`）を 1 本ずつにする錠（#2956）。
+/// UI スレッドで答えていた間は届いた順に 1 本ずつ走っていた。background へ出した後も、公式インストーラの
+/// 同時実行や同じ rc ファイルへの PATH の書き足しが重ならないよう順序を保つ（確かめ・計画は錠を取らない）
+static SETUP_BOOTSTRAP_WRITE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `tako_setup_bootstrap` の応答（同期の腕と background の腕 = [`OffloadJob::SetupBootstrap`] が通る 1 実装。#2956）。
+/// 読み取り・書き込みともプロセス内で完結する（アプリ状態に依存しない）。導入は利用者が終わりを待つと分かって
+/// 撃つ要求なので、応答の上限は持たない（`protocol::default_reply_timeout`）
+fn setup_bootstrap_reply(request: &Request) -> Result<Value, DispatchError> {
+    let Request::SetupBootstrap {
+        action,
+        agent,
+        dry_run,
+        reason,
+    } = request
+    else {
+        unreachable!("setup_bootstrap_reply は SetupBootstrap だけを受ける");
+    };
+    let action = action.as_deref().unwrap_or("status");
+    // 対象の系統。**省略時は claude**（#868 からの既定を変えない）。
+    // 未知の名前は黙って claude にしない（別の系統を入れてしまうため）
+    let target = match agent.as_deref() {
+        Some(name) => {
+            crate::setup_bootstrap::parse_agent_typed(name).map_err(SetupRefusal::invalid)?
+        }
+        None => tako_core::platform::agent_install::AgentKind::Claude,
+    };
+    let dry_run = dry_run.unwrap_or(false);
+    let writes = match action {
+        "path" | "undo-path" => true,
+        "install" => !dry_run,
+        _ => false,
+    };
+    let _serial = writes.then(|| {
+        SETUP_BOOTSTRAP_WRITE_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    });
+    match action {
+        "status" => crate::setup_bootstrap::status_for_typed(target)
+            .map(|s| s.to_json())
+            .map_err(SetupRefusal::operation),
+        // 3 系統ぶんを一度に（`tako setup --check` と同じ材料。#989）
+        "status-all" => Ok(crate::setup_bootstrap::status_all_json()),
+        "install" => crate::setup_bootstrap::install_for_typed(
+            target,
+            crate::setup_bootstrap::InstallOptions {
+                dry_run,
+                // GUI 内 dispatch には端末が無いので出力は捕捉して応答へ載せる
+                interactive: false,
+            },
+        )
+        .map_err(SetupRefusal::operation),
+        "path" => {
+            crate::setup_bootstrap::ensure_path_for_typed(target).map_err(SetupRefusal::operation)
+        }
+        "undo-path" => {
+            crate::setup_bootstrap::undo_path_for_typed(target).map_err(SetupRefusal::operation)
+        }
+        // 自動導入が通らないときの引き継ぎ計画（#1057。**読み取り専用**）。
+        // 実際に相手を起こすのは端末を持つ側（CLI）か、AI なら
+        // `tako_orchestrator_spawn` / `tako_run` の仕事
+        "handoff" => crate::setup_bootstrap::handoff_plan_for_typed(target, reason.as_deref())
+            .map_err(SetupRefusal::operation),
+        other => Err(Reason::UnknownValue {
+            key: "action",
+            got: other.to_string(),
+            allowed: "status / status-all / install / path / undo-path / handoff".into(),
+        }
+        .invalid()),
+    }
+}
+
+/// `tako_setup_models` の応答（同期の腕と background の腕 = [`OffloadJob::SetupModels`] が通る 1 実装。#2956）。
+/// 読み取り専用・プロセス内完結（アプリ状態に依存しない）。実取得は各 CLI の一覧コマンドで、
+/// 選んだ値の反映は `OrchestratorProfiles`（--model / --effort）が担当する（#1002）
+fn setup_models_reply(request: &Request) -> Result<Value, DispatchError> {
+    let Request::SetupModels { agent } = request else {
+        unreachable!("setup_models_reply は SetupModels だけを受ける");
+    };
+    use crate::agent_models;
+    let catalogs = match agent.as_deref() {
+        None | Some("") | Some("all") => agent_models::catalog_all(),
+        Some(name) => {
+            let kind = crate::orchestrator::agent::WorkerAgent::parse_typed(name)
+                .map_err(ConfigError::invalid)?;
+            vec![agent_models::catalog(kind)]
+        }
+    };
+    Ok(serde_json::json!({
+        "agents": catalogs
+            .iter()
+            .map(agent_models::ModelCatalog::to_json)
+            .collect::<Vec<_>>(),
+        "apply_command": ReplyNote::ModelsApplyCommand.to_string(),
+    }))
 }
 
 impl OffloadJob {
@@ -8484,6 +8613,9 @@ impl OffloadJob {
             OffloadJob::Queue(request) => crate::queue::answer(&request),
             // #2433: 同期の腕（`Request::SetupDeps`）と同じ関数
             OffloadJob::SetupDeps(request) => setup_deps_reply(&request),
+            // #2956: 同期の腕（`Request::SetupBootstrap` / `Request::SetupModels`）と同じ関数
+            OffloadJob::SetupBootstrap(request) => setup_bootstrap_reply(&request),
+            OffloadJob::SetupModels(request) => setup_models_reply(&request),
             OffloadJob::UsageShow { query, shown } => crate::usage::usage_payload(
                 &query,
                 crate::usage::Refresh::Budget(crate::usage::MCP_REFRESH_BUDGET),
@@ -13301,81 +13433,18 @@ fn dispatch_inner(
             crate::setup::changes_status_typed().map_err(SetupRefusal::operation)
         }
 
-        Request::SetupBootstrap {
-            action,
-            agent,
-            dry_run,
-            reason,
-        } => {
-            // 読み取り・書き込みともプロセス内で完結する（アプリ状態に依存しない）
-            let action = action.as_deref().unwrap_or("status");
-            // 対象の系統。**省略時は claude**（#868 からの既定を変えない）。
-            // 未知の名前は黙って claude にしない（別の系統を入れてしまうため）
-            let target = match agent.as_deref() {
-                Some(name) => crate::setup_bootstrap::parse_agent_typed(name)
-                    .map_err(SetupRefusal::invalid)?,
-                None => tako_core::platform::agent_install::AgentKind::Claude,
-            };
-            match action {
-                "status" => crate::setup_bootstrap::status_for_typed(target)
-                    .map(|s| s.to_json())
-                    .map_err(SetupRefusal::operation),
-                // 3 系統ぶんを一度に（`tako setup --check` と同じ材料。#989）
-                "status-all" => Ok(crate::setup_bootstrap::status_all_json()),
-                "install" => crate::setup_bootstrap::install_for_typed(
-                    target,
-                    crate::setup_bootstrap::InstallOptions {
-                        dry_run: dry_run.unwrap_or(false),
-                        // GUI 内 dispatch には端末が無いので出力は捕捉して応答へ載せる
-                        interactive: false,
-                    },
-                )
-                .map_err(SetupRefusal::operation),
-                "path" => crate::setup_bootstrap::ensure_path_for_typed(target)
-                    .map_err(SetupRefusal::operation),
-                "undo-path" => crate::setup_bootstrap::undo_path_for_typed(target)
-                    .map_err(SetupRefusal::operation),
-                // 自動導入が通らないときの引き継ぎ計画（#1057。**読み取り専用**）。
-                // 実際に相手を起こすのは端末を持つ側（CLI）か、AI なら
-                // `tako_orchestrator_spawn` / `tako_run` の仕事
-                "handoff" => {
-                    crate::setup_bootstrap::handoff_plan_for_typed(target, reason.as_deref())
-                        .map_err(SetupRefusal::operation)
-                }
-                other => Err(Reason::UnknownValue {
-                    key: "action",
-                    got: other.to_string(),
-                    allowed: "status / status-all / install / path / undo-path / handoff".into(),
-                }
-                .invalid()),
-            }
-        }
+        // エージェント CLI のゼロスタート導入。プロセス内で完結する（#868 / #989）。
+        // GUI では `prepare_offload` が background へ出す（#2956。認証の問い合わせ・ログインシェル・
+        // 公式インストーラを UI スレッドで待たない）
+        request @ Request::SetupBootstrap { .. } => setup_bootstrap_reply(&request),
 
         // 依存の検出と brew / winget での導入。プロセス内で完結する（#88 / #1057）。
         // GUI では `prepare_offload` が background へ出す（#2433。winget / brew の導入を UI スレッドで待たない）
         request @ Request::SetupDeps { .. } => setup_deps_reply(&request),
 
-        Request::SetupModels { agent } => {
-            // 読み取り専用・プロセス内完結（アプリ状態に依存しない）。
-            // 実取得は各 CLI の一覧コマンドで、選んだ値の反映は
-            // `OrchestratorProfiles`（--model / --effort）が担当する（#1002）
-            use crate::agent_models;
-            let catalogs = match agent.as_deref() {
-                None | Some("") | Some("all") => agent_models::catalog_all(),
-                Some(name) => {
-                    let kind = crate::orchestrator::agent::WorkerAgent::parse_typed(name)
-                        .map_err(ConfigError::invalid)?;
-                    vec![agent_models::catalog(kind)]
-                }
-            };
-            Ok(serde_json::json!({
-                "agents": catalogs
-                    .iter()
-                    .map(agent_models::ModelCatalog::to_json)
-                    .collect::<Vec<_>>(),
-                "apply_command": ReplyNote::ModelsApplyCommand.to_string(),
-            }))
-        }
+        // モデル一覧の実取得（#1002）。GUI では `prepare_offload` が background へ出す
+        // （#2956。`codex debug models` / `agy models` を UI スレッドで待たない）
+        request @ Request::SetupModels { .. } => setup_models_reply(&request),
 
         Request::SetupRun { answers } => {
             let answers_value = answers.clone().unwrap_or_else(|| serde_json::json!({}));
@@ -59909,6 +59978,95 @@ tako | pane 2 [ compact ]       [-]
             "A/B なのに background へ出している"
         );
         assert!(dispatch(&mut host, respond, PaneOrigin::Cli).is_err());
+    }
+
+    /// #2956 で突き合わせる要求（認証の問い合わせ・ログインシェル・CLI の一覧を起こさない形。
+    /// テストプロセスでは門番 `agent_probe` が問い合わせを起こさない = #1261）
+    fn issue2956_requests() -> Vec<Request> {
+        vec![
+            // 未知の系統は分類済みの断り（黙って claude にしない）
+            Request::SetupBootstrap {
+                action: Some("status".into()),
+                agent: Some("gemini".into()),
+                dry_run: None,
+                reason: None,
+            },
+            // 未知の action
+            Request::SetupBootstrap {
+                action: Some("nope".into()),
+                agent: None,
+                dry_run: None,
+                reason: None,
+            },
+            Request::SetupModels {
+                agent: Some("gemini".into()),
+            },
+            // claude は一覧コマンドを持たない（静的リスト + 取得不可の明示）
+            Request::SetupModels {
+                agent: Some("claude".into()),
+            },
+        ]
+    }
+
+    /// #2956: `SetupBootstrap` / `SetupModels` は準備（UI スレッド）で background のジョブになり、
+    /// UI スレッドへの続きを作らずに同期の腕と同じ応答を返す
+    #[test]
+    fn issue2956_setupのbootstrapとmodelsはbackgroundから同期の腕と同じ応答を返す() {
+        let mut host = MockHost::new();
+        for request in issue2956_requests() {
+            let job = match prepare_offload(&mut host, &request) {
+                Some(Ok(job)) => job,
+                Some(Err(e)) => {
+                    panic!("{request:?} の準備が断った（断りは background の応答で返す）: {e:?}")
+                }
+                None => panic!("{request:?} を UI スレッドの同期の腕で答えている（#2956）"),
+            };
+            let expected_job = match &request {
+                Request::SetupBootstrap { .. } => matches!(job, OffloadJob::SetupBootstrap(_)),
+                _ => matches!(job, OffloadJob::SetupModels(_)),
+            };
+            assert!(expected_job, "{request:?} が別のジョブになっている");
+            let offloaded = match job.run_staged() {
+                OffloadOutcome::Reply(reply) => reply,
+                OffloadOutcome::OnUi(_) => {
+                    panic!("{request:?} の続きを UI スレッドへ戻している（#2956）")
+                }
+            };
+            let synced = dispatch(&mut host, request.clone(), PaneOrigin::Mcp);
+            assert_eq!(
+                format!("{offloaded:?}"),
+                format!("{synced:?}"),
+                "{request:?} の background の応答が同期の腕と違う"
+            );
+        }
+    }
+
+    /// #2956 の A/B: `TAKO_2956_LEGACY=1` は修正前と同じく同期の腕（UI スレッドで待つ）
+    #[test]
+    fn issue2956_legacyはsetupのbootstrapとmodelsを同期の腕で答える() {
+        if tako_core::run_alone!(issue2956_legacyはsetupのbootstrapとmodelsを同期の腕で答える)
+        {
+            return;
+        }
+        let mut host = MockHost::new();
+        std::env::remove_var(SETUP_QUERY_OFFLOAD_LEGACY_ENV);
+        assert!(!setup_query_offload_legacy());
+        for request in issue2956_requests() {
+            assert!(
+                prepare_offload(&mut host, &request).is_some(),
+                "{request:?}"
+            );
+        }
+        std::env::set_var(SETUP_QUERY_OFFLOAD_LEGACY_ENV, "1");
+        assert!(setup_query_offload_legacy());
+        for request in issue2956_requests() {
+            assert!(
+                prepare_offload(&mut host, &request).is_none(),
+                "A/B なのに {request:?} を background へ出している"
+            );
+            // 同期の腕は今も答える（応答の形は変えていない）
+            let _ = dispatch(&mut host, request, PaneOrigin::Cli);
+        }
     }
 
     /// #1984: UI スレッドの同期の dispatch で子プロセスを待っていた要求だけが background へ出る。
