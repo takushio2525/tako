@@ -26,6 +26,10 @@ use serde_json::{json, Value};
 /// A/B: #1485 前へ戻す（「起動していた」を覚えず、GUI 起動時に何もしない）。
 /// 立てると再起動後に `running: false` のままになる = Issue の症状そのもの
 pub const LEGACY_ENV: &str = "TAKO_1485_LEGACY";
+/// A/B: #2929 前の判断の順（意図より先に OS を見る）へ戻す。
+/// 立てると記録が無くても未対応 OS（Windows）で `unsupported` になり、GUI を起動するたびに
+/// 通知欄へ赤字が出る = Issue の症状そのもの
+pub const LEGACY_2929_ENV: &str = "TAKO_2929_LEGACY";
 /// 検証用: 各試行の待ちを固定の秒数へ上書きする（下限 1 秒）。
 /// tailscaled を落として上げ直す実測を現実的な時間で回すため
 pub const BACKOFF_SECS_ENV: &str = "TAKO_1485_BACKOFF_SECS";
@@ -47,6 +51,11 @@ pub const ATTEMPTS_MAX: u32 = 5;
 /// #1485 前の挙動を再現するか
 pub fn legacy_mode() -> bool {
     std::env::var(LEGACY_ENV).is_ok_and(|v| v == "1" || v == "true" || v == "on")
+}
+
+/// #2929 前の判断の順を再現するか（[`LEGACY_2929_ENV`]。値の読み方は [`legacy_mode`] と揃える）
+pub fn legacy_2929_mode() -> bool {
+    std::env::var(LEGACY_2929_ENV).is_ok_and(|v| v == "1" || v == "true" || v == "on")
 }
 
 /// この環境で試す回数（env で上書き可能。検証用）
@@ -103,7 +112,9 @@ pub enum AutostartSkip {
     NotDesired,
     /// daemon は既に動いている（多重起動しない）
     AlreadyRunning,
-    /// この OS では daemon を起動できない（Windows は unix ソケット前提。#971）
+    /// 起動していた記録が在るのに、この OS では daemon を起動できない
+    /// （Windows は unix ソケット前提。#971）。**記録が無ければこれにはならない**
+    /// （[`NotDesired`](Self::NotDesired) が先に返る。#2929）
     Unsupported,
     /// A/B で自動復帰を切っている（`TAKO_1485_LEGACY=1`）
     Disabled,
@@ -141,7 +152,9 @@ impl AutostartSkip {
     ///
     /// **出すのは「戻すつもりだったのに戻せなかった」ときだけ**。
     /// `NotDesired` は設定どおりの正常な動きなので、GUI を起動するたびに
-    /// 「リモートは起動しません」と出すことになり邪魔にしかならない
+    /// 「リモートは起動しません」と出すことになり邪魔にしかならない。
+    /// `Unsupported` を常に出してよいのは、[`autostart_decision`] が記録の無い環境で
+    /// それを返さないから（#2929）
     pub fn is_noteworthy(self) -> bool {
         matches!(self, Self::Unsupported)
     }
@@ -161,22 +174,33 @@ pub struct AutostartInput {
     pub supported: bool,
     /// A/B（`TAKO_1485_LEGACY=1`）
     pub legacy: bool,
+    /// A/B（`TAKO_2929_LEGACY=1`）: 意図より先に OS を見る #2929 前の順
+    pub legacy_2929: bool,
 }
 
 /// daemon を立て直すか、立て直さないならなぜかを返す（#1485）。
 ///
-/// 順序は「人が読んで納得する順」= A/B → OS → 意図 → 現況。
+/// 順序は「人が読んで納得する順」= A/B → 意図 → OS → 現況。
 /// **`legacy` を最初に見る**のは、A/B を立てた検証で「立てたのに理由が
-/// `not-desired` に化ける」のを避けるため（アームの効きが読めなくなる）
+/// `not-desired` に化ける」のを避けるため（アームの効きが読めなくなる）。
+///
+/// **意図を OS より先に見る**（#2929）。`Unsupported` は通知欄へ出す理由
+/// （[`AutostartSkip::is_noteworthy`]）なので、OS を先に見ると記録の無い利用者
+/// （= リモートを一度も使っていない人）にも未対応 OS（Windows）では GUI を起動するたびに
+/// 赤字が出ていた。記録があるのに起動できないときは、今どおり `Unsupported` で知らせる
 pub fn autostart_decision(input: &AutostartInput) -> Result<(), AutostartSkip> {
     if input.legacy {
         return Err(AutostartSkip::Disabled);
     }
-    if !input.supported {
+    // A/B（`TAKO_2929_LEGACY=1`）: #2929 前の順 = 意図より先に OS を見る
+    if input.legacy_2929 && !input.supported {
         return Err(AutostartSkip::Unsupported);
     }
     if !input.desired {
         return Err(AutostartSkip::NotDesired);
+    }
+    if !input.supported {
+        return Err(AutostartSkip::Unsupported);
     }
     // 旧版のまま動いている daemon は「既に起動している」に数えない（#2518）。
     // install も GUI の再起動も daemon を入れ替えないので、ここで見送ると旧版が残り続ける。
@@ -218,6 +242,7 @@ pub fn probe() -> Result<(), AutostartSkip> {
         daemon_stale: crate::remote_generation::renewable_in_status(&status),
         supported: platform_supported(),
         legacy: legacy_mode(),
+        legacy_2929: legacy_2929_mode(),
     })
 }
 
@@ -414,6 +439,7 @@ mod tests {
             daemon_stale: false,
             supported: true,
             legacy: false,
+            legacy_2929: false,
         }
     }
 
@@ -445,7 +471,7 @@ mod tests {
         let mut i = input(true, true);
         i.daemon_stale = true;
         assert_eq!(autostart_decision(&i), Ok(()));
-        // 意図が無い・A/B・未対応 OS は旧版でも起こさない（順序は #1485 のまま）
+        // 意図が無い・A/B・未対応 OS は旧版でも起こさない（順序は #1485 / #2929 のまま）
         i.desired = false;
         assert_eq!(autostart_decision(&i), Err(AutostartSkip::NotDesired));
         i.desired = true;
@@ -479,6 +505,76 @@ mod tests {
         let mut i = input(true, false);
         i.supported = false;
         assert_eq!(autostart_decision(&i), Err(AutostartSkip::Unsupported));
+        // 記録があるのに戻せない = 通知欄へ出す（#2929 の後も変えない）
+        assert!(autostart_decision(&i).unwrap_err().is_noteworthy());
+    }
+
+    /// #2929: 記録が無いなら未対応 OS（Windows）でも `not-desired` で黙る。
+    /// OS を先に見ていたので、リモートを一度も使っていない利用者にも GUI を起動するたびに
+    /// 「この OS ではリモート daemon を起動できません」が赤字で出ていた
+    #[test]
+    fn 記録が無ければ未対応osでも黙る() {
+        for (running, stale) in [(false, false), (true, false), (true, true)] {
+            let mut i = input(false, running);
+            i.daemon_stale = stale;
+            i.supported = false;
+            let got = autostart_decision(&i);
+            assert_eq!(
+                got,
+                Err(AutostartSkip::NotDesired),
+                "running={running} stale={stale}"
+            );
+            assert!(
+                !got.unwrap_err().is_noteworthy(),
+                "記録の無い環境の見送りを通知欄へ出している（running={running} stale={stale}）"
+            );
+        }
+    }
+
+    /// 記録の有無 × OS の 4 通りの表（#2929）。対応 OS の側は #1485 / #2518 のまま
+    #[test]
+    fn 記録とosの四通りの表() {
+        for (desired, supported, want) in [
+            (false, false, Err(AutostartSkip::NotDesired)),
+            (true, false, Err(AutostartSkip::Unsupported)),
+            (false, true, Err(AutostartSkip::NotDesired)),
+            (true, true, Ok(())),
+        ] {
+            let mut i = input(desired, false);
+            i.supported = supported;
+            assert_eq!(
+                autostart_decision(&i),
+                want,
+                "desired={desired} supported={supported}"
+            );
+        }
+    }
+
+    /// A/B（`TAKO_2929_LEGACY=1`）は「記録が無い・未対応 OS」の 1 マスだけを #2929 前の
+    /// `unsupported` へ戻し、他のどの入力の答えも変えない（アームが効く範囲を固定する）
+    #[test]
+    fn abは記録が無い未対応osの一マスだけを戻す() {
+        for bits in 0..16u8 {
+            let base = AutostartInput {
+                desired: bits & 1 != 0,
+                daemon_running: bits & 2 != 0,
+                daemon_stale: bits & 4 != 0,
+                supported: bits & 8 != 0,
+                legacy: false,
+                legacy_2929: false,
+            };
+            let armed = AutostartInput {
+                legacy_2929: true,
+                ..base
+            };
+            let (now, before) = (autostart_decision(&base), autostart_decision(&armed));
+            if !base.desired && !base.supported {
+                assert_eq!(now, Err(AutostartSkip::NotDesired), "{base:?}");
+                assert_eq!(before, Err(AutostartSkip::Unsupported), "{armed:?}");
+            } else {
+                assert_eq!(now, before, "A/B が対象外の入力の答えを変えた: {base:?}");
+            }
+        }
     }
 
     /// A/B は**いちばん先**に見る。`desired` が無い環境でアームを立てたときに
@@ -490,19 +586,24 @@ mod tests {
             (false, false, true),
             (true, true, true),
             (true, false, false),
+            (false, false, false),
         ] {
-            let i = AutostartInput {
-                desired,
-                daemon_running: running,
-                daemon_stale: false,
-                supported,
-                legacy: true,
-            };
-            assert_eq!(
-                autostart_decision(&i),
-                Err(AutostartSkip::Disabled),
-                "desired={desired} running={running} supported={supported}"
-            );
+            // #2929 の A/B を同時に立てても #1485 の A/B が先
+            for legacy_2929 in [false, true] {
+                let i = AutostartInput {
+                    desired,
+                    daemon_running: running,
+                    daemon_stale: false,
+                    supported,
+                    legacy: true,
+                    legacy_2929,
+                };
+                assert_eq!(
+                    autostart_decision(&i),
+                    Err(AutostartSkip::Disabled),
+                    "desired={desired} running={running} supported={supported} legacy_2929={legacy_2929}"
+                );
+            }
         }
     }
 
