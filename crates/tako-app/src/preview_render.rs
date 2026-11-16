@@ -1992,7 +1992,7 @@ impl TakoApp {
         // #1944: 言語サーバの状態（取得中 / 起動中 / 読み込み中 / 動作中）と、未導入・失敗の帯
         let lsp_badge = self.lsp_status_badge(pane_id);
         let lsp_badge_shown = lsp_badge.is_some();
-        let lsp_bar = self.render_lsp_status_bar(pane_id, &theme, cx);
+        let lsp_bar = self.render_lsp_status_bar(pane_id, f32::from(area.size.height), &theme, cx);
         // #1686: 名前の変更の欄（右クリックメニューの「名前の変更…」で開く）
         let rename_bar = self.render_lsp_rename_bar(pane_id, &theme, cx);
         // キャレット位置はコード行を組むときに `render_preview_code_line` が
