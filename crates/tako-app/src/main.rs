@@ -33660,6 +33660,12 @@ fn main() {
     // 資源の走査が読む値）はプロセスの中で書き換えても変わらず、GUI 自身と子を起こしたペインのプロセスとして
     // 数えるため。戻るのは起こし直さないとき（何も外していない・A/B・起こし直した後・Windows）と失敗だけ
     let reexec_error = tako_core::host_env::reexec_if_stripped(&inherited_env);
+    // #2429: Windows では gpui を作る前に DirectComposition を切る（合成の木が子窓より上に重なり、
+    // Web ビュー（WebView2 の子 HWND）の中身を覆うため）。gpui がこの env を読むのは platform を作る
+    // 1 回だけなので `application()` の直後に外す（ペインの子へ渡さない）。利用者が外から渡した値は
+    // 上書きしない。判断と理由は境界 B11 `platform::webview_host`。**スレッドを起こす前**（env の
+    // 書き換えは別スレッドの読みと競る）。A/B は `TAKO_2429_LEGACY=1`
+    let compositor = platform::webview_host::prepare_compositor();
     // Issue #168: メインスレッド・ストール診断。重い区間（dispatch / render /
     // save_layout 等）の 2 秒超え継続を drop を待たず perf.log に記録する
     // #782: ここ（GUI プロセスのメインスレッド）を基準に、以後 perf_span は
@@ -33824,6 +33830,12 @@ fn main() {
         }
     }
     let app = application().with_assets(file_icons::TakoAssets);
+    // #2429: platform を作り終えた（env は読まれた）ので、tako が立てた分だけ外す。
+    // 記録は隔離の置き場が決まった後のここで persist.log へ
+    compositor.after_platform_created();
+    if let Some(line) = compositor.log_line() {
+        persist_diag(&line);
+    }
     // Dock クリックでウインドウ再表示（#312。赤ボタン close 後にプロセスが
     // 生存している状態で Dock アイコンをクリックすると呼ばれる。ウインドウが
     // 無ければ保存済みレイアウトから復元して新規ウインドウを開く）
@@ -36236,14 +36248,10 @@ mod self_test {
         });
 
         // --- 2. Web ビューのアドレスバー ---
-        // Windows の WebView2 は data: URL で落ちていた（項目 71 と同じ事情 = #724 症状②。
-        // 手当ては入ったが実機で未確認なので対象外のまま）
-        if cfg!(target_os = "windows") {
-            println!(
-                "TAKO_SELF_TEST_SKIPPED: 155 のアドレスバー（Web ビューが WebView2 側の非巻き戻し \
-                 panic で落ちていた。#724 の手当ては実機で未確認）"
-            );
-        } else {
+        // Windows の WebView2 は data: URL で落ちていた（項目 71 と同じ事情 = #724 症状②）。
+        // 手当て（#724）と wry 0.57（#2445）の後、実機（11/16）で同じ流れが落ちないことを
+        // 確かめたので Windows でも走らせる（#2429 / #2430）
+        {
             focus_origin(window, cx);
             // ツリーを畳み、幅の広い右のペインを**下へ**割って開く（アドレスバーに 20 桁強が
             // 入る幅を取る。狭いと短い入力でも前側を `…` で詰める側に入り、読みのぶん
@@ -76876,14 +76884,10 @@ mod self_test {
             //     unwrap しており、`data:` URL では `InvalidUri(Empty)` で panic する。
             //     しかもコールバック内なので**巻き戻せず abort** する（#724 症状②。
             //     実測スタックは Issue へ記録）。#724 で ipc を付けない（W2）・生成を App の
-            //     借用の外へ出す（W1）手当てを入れ、wry 0.57（#2445）で上流も unwrap をやめたが、
-            //     実機で通るのを確かめるまでは対象外のまま（クラッシュはセルフテスト全体を道連れにする）
-            if cfg!(target_os = "windows") {
-                println!(
-                    "TAKO_SELF_TEST_SKIPPED: 71（Web ビューが WebView2 側の非巻き戻し panic で \
-                     アプリごと落ちていた。#724 の手当ては実機で未確認）"
-                );
-            } else {
+            //     借用の外へ出す（W1）手当てを入れ、wry 0.57（#2445）で上流も unwrap をやめた。
+            //     実機（11/16）で同じ並びが落ちないことを確かめたので、#2429 / #2430 で Windows でも
+            //     走らせる（#1481 の宛先の検査も Windows の宛先 = gpui の窓のスレッドの focus で読む）
+            {
                 #[allow(clippy::too_many_arguments)]
                 fn web_req(
                     action: &str,
@@ -77279,27 +77283,37 @@ mod self_test {
                 }
                 // #1481: Web ビューを見たあと、ターミナルへ戻れば打鍵が届く。
                 //
-                //   **「届く」を決めているのは AppKit の実体 1 つ**（NSWindow の
-                //   first responder）。他項目の打鍵（`dispatch_keystroke`）は GPUI へ
-                //   直に流すので AppKit の責任連鎖を通らず、この症状は原理的に見えない。
+                //   **「届く」を決めているのは OS の実体 1 つ**（macOS = NSWindow の
+                //   first responder / Windows = gpui の窓のスレッドの focus の窓。#2430）。
+                //   他項目の打鍵（`dispatch_keystroke`）は GPUI へ直に流すので OS の配送を
+                //   通らず、この症状は原理的に見えない。
                 //   ここでは宛先そのものを読む（`key_focus_owner` = `クラス名@アドレス`。
-                //   gpui の描画ビュー = tako に届く / `WKWebView` 系 = ページに吸われる。
-                //   アドレスまで見るのは 2 枚のどちらが持っているかを言い分けるため）。
+                //   gpui の描画ビュー / `Zed::Window` = tako に届く / `WKWebView` 系・`Chrome_…` =
+                //   ページに吸われる。アドレスまで見るのは 2 枚のどちらが持っているかを言い分けるため）。
                 //
                 //   ユーザーの「ページをクリックした」は `WebView::focus()`
-                //   （= `makeFirstResponder:webview`）で作る。**クリックが AppKit 層で
-                //   起こすことと同じ**もので、GPUI のマウス経路は通らない
+                //   （macOS = `makeFirstResponder:webview` / Windows = WebView2 の `MoveFocus`）で作る。
+                //   **クリックが OS の層で起こすことと同じ**もので、GPUI のマウス経路は通らない
                 //   （ネイティブビューへのクリックは GPUI に見えないため、合成マウスでは
-                //   この前提を作れない）。**実マウスでのクリックは未検証**。
+                //   この前提を作れない）。実マウスでのクリックは Windows の実機で別に確かめる（#2430）。
+                //   Windows の `MoveFocus` はブラウザのプロセスで宛先を動かすので、移ったことは
+                //   **状態を待って**確かめる（`grab`。macOS は最初の 1 回で当たる）。
                 //
                 //   宛先の復帰を実時間では測らない（#796）。`clear_text_input_focus` は
-                //   操作と同じターンで走るので、操作 → 1 フレーム描く → 読むで確定する。
+                //   操作と同じターンで走る（Windows の `SetFocus` も同期）ので、操作 → 1 フレーム描く
+                //   → 読むで確定する。
                 //
                 //   A/B: `TAKO_1481_LEGACY=1` で「宛先を戻さない」修正前へ戻ると、
                 //   最初の経路（ターミナルをクリック）が `owner=WryWebView` で FAILED に
-                //   なる（セルフテストは最初の失敗で打ち切るので後続はそこまで届かない）
-                #[cfg(target_os = "macos")]
+                //   なる（セルフテストは最初の失敗で打ち切るので後続はそこまで届かない）。
+                //   Windows の `TAKO_2430_LEGACY=1`（宛先を読まない修正前）は前提の `grab` が
+                //   `holds=false`・素性 `Chrome_…` で FAILED になる
                 {
+                    /// 宛先が tako に在る（Web ビューが持っておらず、宛先そのものも在る）。
+                    /// 宙に浮いた形（素性が空・`@0x0`）を「戻った」と読み違えない（#2430）
+                    fn at_tako(o: &Option<(bool, String, u64)>) -> bool {
+                        matches!(o, Some((false, s, _)) if !s.is_empty() && !s.starts_with('@'))
+                    }
                     /// 宛先を読む: (Web ビューが持っているか, 素性, 戻した回数)
                     fn owner(
                         window: WindowHandle<TakoApp>,
@@ -77317,10 +77331,11 @@ mod self_test {
                             .ok()
                             .flatten()
                     }
-                    /// ページのクリック相当（AppKit の宛先を Web ビューへ移す）。
-                    /// **移したことをその場で確かめる**ので、前提が立たない回を
-                    /// 「直った」と読み違えない（#796 / #872 の素通り禁止）
-                    fn grab(
+                    /// ページのクリック相当（OS の宛先を Web ビューへ移す）。
+                    /// **移したことを確かめる**ので、前提が立たない回を
+                    /// 「直った」と読み違えない（#796 / #872 の素通り禁止）。
+                    /// Windows の `MoveFocus` はブラウザのプロセスで着地するので状態を待つ（#2430）
+                    async fn grab(
                         window: WindowHandle<TakoApp>,
                         cx: &mut AsyncApp,
                         id: u64,
@@ -77334,7 +77349,23 @@ mod self_test {
                                     .unwrap_or(false)
                             })
                             .unwrap_or(false);
-                        focused && matches!(owner(window, cx), Some((true, _, _)))
+                        focused && wait_page_holds(window, cx, None, "71-1481-grab").await
+                    }
+                    /// 宛先が Web ビュー側に在るまで待つ。2 枚目へ寄せ直すとき（`from` = 前の宛先の
+                    /// 素性）は、宛先が**別の**ページへ移るまで待つ
+                    async fn wait_page_holds(
+                        window: WindowHandle<TakoApp>,
+                        cx: &mut AsyncApp,
+                        from: Option<&str>,
+                        tag: &str,
+                    ) -> bool {
+                        wait_for_backend_state(cx, tag, text_wait_budget(25, 200, 20), |cx| {
+                            matches!(
+                                owner(window, cx),
+                                Some((true, o, _)) if from.is_none_or(|f| f != o)
+                            )
+                        })
+                        .await
                     }
                     let panes = window
                         .update(cx, |app, _, _| {
@@ -77354,7 +77385,7 @@ mod self_test {
                     };
                     // 前提: ページのクリック相当で宛先が Web ビューへ移る。
                     // ここではまだ描かない（描くと操作扱いの復帰が走る前の素の状態を見たい）
-                    let grabbed = grab(window, cx, web_id);
+                    let grabbed = grab(window, cx, web_id).await;
                     if !grabbed {
                         println!("TAKO_WV_KEYFOCUS: grab 失敗 owner={:?}", owner(window, cx));
                     }
@@ -77388,10 +77419,10 @@ mod self_test {
                         });
                         notify_and_draw(any, window, cx);
                         let o = owner(window, cx);
-                        if !matches!(&o, Some((false, _, _))) {
+                        if !at_tako(&o) {
                             println!("TAKO_WV_KEYFOCUS: click 後 owner={o:?}");
                         }
-                        matches!(o, Some((false, _, _)))
+                        at_tako(&o)
                     };
                     check(
                         click_ok,
@@ -77399,7 +77430,7 @@ mod self_test {
                     );
 
                     // 経路 2: `tako focus`（CLI / MCP と同一 dispatch + 後処理）
-                    let focus_ok = grab(window, cx, web_id)
+                    let focus_ok = grab(window, cx, web_id).await
                         && {
                             let _ = window.update(cx, |app, _, _| {
                                 let _ = tako_control::dispatch(
@@ -77415,10 +77446,10 @@ mod self_test {
                             });
                             notify_and_draw(any, window, cx);
                             let o = owner(window, cx);
-                            if !matches!(&o, Some((false, _, _))) {
+                            if !at_tako(&o) {
                                 println!("TAKO_WV_KEYFOCUS: tako focus 後 owner={o:?}");
                             }
-                            matches!(o, Some((false, _, _)))
+                            at_tako(&o)
                         };
                     check(
                         focus_ok,
@@ -77451,7 +77482,7 @@ mod self_test {
                                 let back = window
                                     .update(cx, |app, _, _| app.workspace.active_tab_id())
                                     .ok();
-                                let moved = grab(window, cx, web_id)
+                                let moved = grab(window, cx, web_id).await
                                     && {
                                         let _ = window.update(cx, |app, _, _| {
                                             let _ = tako_control::dispatch(
@@ -77465,12 +77496,12 @@ mod self_test {
                                         });
                                         notify_and_draw(any, window, cx);
                                         let o = owner(window, cx);
-                                        if !matches!(&o, Some((false, _, _))) {
+                                        if !at_tako(&o) {
                                             println!(
                                                 "TAKO_WV_KEYFOCUS: タブ切替後 owner={o:?}"
                                             );
                                         }
-                                        matches!(o, Some((false, _, _)))
+                                        at_tako(&o)
                                     };
                                 // 元のタブへ戻して後続の検査の前提を壊さない
                                 if let Some(back) = back {
@@ -77497,7 +77528,7 @@ mod self_test {
                     // URL 入力欄にフォーカスしたあと: アドレスバー編集中は Web ビューを
                     // 隠して GPUI に画面とキーを渡す（`webview_desired_bounds`）。
                     // 抜けるのは `clear_text_input_focus`（#503 と同じ集合）
-                    let addr_ok = grab(window, cx, web_id)
+                    let addr_ok = grab(window, cx, web_id).await
                         && {
                             let _ = window.update(cx, |app, _, cx| {
                                 app.webview_address_bar
@@ -77507,7 +77538,7 @@ mod self_test {
                             });
                             notify_and_draw(any, window, cx);
                             let o = owner(window, cx);
-                            if !matches!(&o, Some((false, _, _))) {
+                            if !at_tako(&o) {
                                 println!("TAKO_WV_KEYFOCUS: アドレスバー後 owner={o:?}");
                             }
                             // 編集状態から抜けて Web ビューを戻す（close 検査の前提）
@@ -77516,7 +77547,7 @@ mod self_test {
                                 cx.notify();
                             });
                             notify_and_draw(any, window, cx);
-                            matches!(o, Some((false, _, _)))
+                            at_tako(&o)
                         };
                     check(
                         addr_ok,
@@ -77562,9 +77593,10 @@ mod self_test {
                                 let ready2 =
                                     wait_webview_ready(window, cx, web2_id, "71-2nd-ready").await;
                                 notify_and_draw(any, window, cx);
-                                let ok = ready2 && grab(window, cx, web_id) && {
+                                let ok = ready2 && grab(window, cx, web_id).await && {
                                     // いまは 1 枚目のページが宛先
                                     let held1 = owner(window, cx);
+                                    let from = held1.as_ref().map(|(_, o, _)| o.clone());
                                     let _ = window.update(cx, |app, _, _| {
                                         let _ = tako_control::dispatch(
                                             app,
@@ -77577,6 +77609,16 @@ mod self_test {
                                         app.clear_text_input_focus();
                                     });
                                     notify_and_draw(any, window, cx);
+                                    // 寄せ直し（`WebView::focus()`）は Windows ではブラウザのプロセスで
+                                    // 着地するので、宛先が別のページへ移るまで待ってから読む（#2430。
+                                    // macOS は最初の 1 回で当たる）
+                                    let _ = wait_page_holds(
+                                        window,
+                                        cx,
+                                        from.as_deref(),
+                                        "71-1481-two",
+                                    )
+                                    .await;
                                     let held2 = owner(window, cx);
                                     // ①打鍵は Web ビュー側に残る（tako へ取り上げない）
                                     // ②戻した回数は増えない ③宛先は別のオブジェクトへ
@@ -77653,13 +77695,13 @@ mod self_test {
                                     });
                                     notify_and_draw(any, window, cx);
                                 };
-                                let ok = grab(window, cx, web_id) && {
+                                let ok = grab(window, cx, web_id).await && {
                                     move_to(cx, other);
                                     let o = owner(window, cx);
-                                    if !matches!(&o, Some((false, _, _))) {
+                                    if !at_tako(&o) {
                                         println!("TAKO_WV_KEYFOCUS: 別タブへ移した後 owner={o:?}");
                                     }
-                                    matches!(o, Some((false, _, _)))
+                                    at_tako(&o)
                                 };
                                 // 元のタブへ戻す（close 検査はこのタブのペイン数を見る）
                                 move_to(cx, home);
@@ -77673,7 +77715,7 @@ mod self_test {
                     );
 
                     // close 後の検査（下）のために、宛先を Web ビューへ戻しておく
-                    let grabbed_for_close = grab(window, cx, web_id);
+                    let grabbed_for_close = grab(window, cx, web_id).await;
                     check(
                         grabbed_for_close,
                         "項目 71 #1481 の前提（close 前に宛先が Web ビューに在る）",
@@ -77705,8 +77747,9 @@ mod self_test {
                     .unwrap_or(false);
                 check(closed, "Web ビュー close（完全破棄 + ペイン後始末）");
                 // #1481: ページごと破棄したあとも打鍵が届く。宛先のまま消えると
-                // ウィンドウの first responder が宙に浮き、どこへも届かなくなる
-                #[cfg(target_os = "macos")]
+                // ウィンドウの first responder（Windows = スレッドの focus の窓）が宙に浮き、
+                // どこへも届かなくなる。宙に浮いた形（宛先が無い = 素性が `@0x0`）は
+                // 「Web ビューが持っていない」でも通さない（#2430）
                 {
                     let o = window
                         .update(cx, |app, _, _| {
@@ -77718,11 +77761,13 @@ mod self_test {
                         })
                         .ok()
                         .flatten();
-                    if !matches!(&o, Some((false, _))) {
+                    let held_by_tako =
+                        matches!(&o, Some((false, s)) if !s.is_empty() && !s.starts_with('@'));
+                    if !held_by_tako {
                         println!("TAKO_WV_KEYFOCUS: close 後 owner={o:?}");
                     }
                     check(
-                        matches!(o, Some((false, _))),
+                        held_by_tako,
                         "Web ビューを閉じたあとも打鍵の宛先が tako に在る (#1481)",
                     );
                 }

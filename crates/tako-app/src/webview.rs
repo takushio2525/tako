@@ -13,6 +13,9 @@
 //! tako のオーバーレイ UI（ドロワー・ピン留め窓・ホバープレビュー等）は webview の
 //! 下に隠れる。重なりが生じる UI の表示中は呼び出し側が `sync_frame(None)` で隠すこと
 //! （`.agent/architecture.md`「Web ビューペイン」節）。
+//! Windows で「上に乗る」には gpui の DirectComposition を切る必要がある（既定の合成は木を
+//! 子窓より上に重ねる。#2429）。切るのは起動の最初の 1 か所 = 境界 B11
+//! `platform::webview_host::prepare_compositor`。キー入力の宛先の Windows の腕も同じ境界にある（#2430）。
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -267,6 +270,15 @@ impl WindowHandleBox {
     /// 採った GPUI の窓（#1837）
     pub fn owner(&self) -> gpui::AnyWindowHandle {
         self.owner
+    }
+
+    /// 親が Win32 の窓なら、その HWND（#2430。キー入力の宛先の Windows の腕へ渡す）。
+    /// OS を名指さず窓のハンドルの種類で振り分ける（[`Self::attached`] と同じ形）
+    fn win32_hwnd(&self) -> Option<isize> {
+        match &self.raw {
+            raw_window_handle::RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
+            _ => None,
+        }
     }
 
     /// 親がいまも窓に載っているか（#1837。macOS = 描画ビューの `window` が nil でない /
@@ -1508,13 +1520,18 @@ mod key_monitor {
 
     pub(super) fn install() {}
     pub(super) fn set_has_webview(_: bool) {}
-    /// Windows（WebView2）のキー入力の宛先は #521 で扱う。ここでは「Web ビューが
-    /// 奪っていない」ことにして何もしない（誤って毎フレーム触らないため）
+    /// Windows（WebView2）のキー入力の宛先はここを通らない: 公開口
+    /// （[`super::webview_holds_key_focus`] ほか）が親の HWND で境界 B11
+    /// `platform::webview_host` の Win32 の腕へ振り分ける（#2430）。ここへ来るのは
+    /// AppKit でも Win32 でもない親だけなので「Web ビューが奪っていない」ことにする
     pub(super) fn holds_key_focus(_view: *const c_void) -> bool {
         false
     }
     pub(super) fn return_to_app(_view: *const c_void) -> bool {
         false
+    }
+    pub(super) fn owner_class(_view: *const c_void) -> String {
+        String::new()
     }
     /// 親ビューの retain は macOS だけ（#1837。Windows の親は HWND で、生存は IsWindow で見る）
     pub(super) fn retain_view(_view: *const c_void) {}
@@ -1535,25 +1552,48 @@ pub fn set_has_webview(v: bool) {
     key_monitor::set_has_webview(v);
 }
 
-/// キー入力の宛先（macOS では NSWindow の first responder）が Web ビュー側か（#1481）。
+/// キー入力の宛先（macOS = NSWindow の first responder / Windows = gpui の窓のスレッドの
+/// focus の窓）が Web ビュー側か（#1481 / #2430）。
 ///
-/// **状態ではなく AppKit の実体を読む**。「さっき Web ビューを触ったか」という印を
-/// 持つと必ずどこかで降ろし忘れる（#503）ので、問うたその場で実体へ聞く
+/// **状態ではなく OS の実体を読む**。「さっき Web ビューを触ったか」という印を
+/// 持つと必ずどこかで降ろし忘れる（#503）ので、問うたその場で実体へ聞く。
+/// 親が Win32 の窓なら境界 B11 の Win32 の腕（`GetGUIThreadInfo` + `IsChild`）、
+/// それ以外は `key_monitor`（AppKit）。A/B の `TAKO_2430_LEGACY=1` では Windows を修正前
+/// （常に偽 = `return_webview_key_focus` が入口で抜ける）へ戻す
 pub fn webview_holds_key_focus(handle: &WindowHandleBox) -> bool {
-    key_monitor::holds_key_focus(handle.ns_view_ptr())
+    match handle.win32_hwnd() {
+        Some(hwnd) => {
+            !legacy_2430() && crate::platform::webview_host::win32_child_holds_key_focus(hwnd)
+        }
+        None => key_monitor::holds_key_focus(handle.ns_view_ptr()),
+    }
 }
 
-/// キー入力の宛先の素性（診断用。`クラス名@アドレス`。gpui の描画ビュー = tako に届く /
-/// `WKWebView` 系 = ページに奪われている。アドレスは 2 枚のどちらかを言い分けるため）。
-/// 呼び手は macOS のセルフテストだけ（#1537）
-#[cfg(target_os = "macos")]
+/// キー入力の宛先の素性（診断用。`クラス名@アドレス`。macOS = gpui の描画ビューなら tako に届く /
+/// `WKWebView` 系はページに奪われている。Windows = `Zed::Window@HWND` なら tako /
+/// `Chrome_…@HWND` はページ。アドレスは 2 枚のどちらかを言い分けるため）。
+/// 呼び手はセルフテスト項目 71 の #1481 群（#1537 / #2430）
 pub fn key_focus_owner(handle: &WindowHandleBox) -> String {
-    key_monitor::owner_class(handle.ns_view_ptr())
+    match handle.win32_hwnd() {
+        Some(hwnd) => crate::platform::webview_host::win32_key_focus_owner(hwnd),
+        None => key_monitor::owner_class(handle.ns_view_ptr()),
+    }
 }
 
-/// キー入力の宛先を GPUI の描画ビューへ戻す。実際に戻したら true（#1481）
+/// キー入力の宛先を GPUI の窓（macOS = 描画ビュー / Windows = gpui の窓の HWND）へ戻す。
+/// 実際に戻したら true（#1481 / #2430）
 pub fn return_key_focus_to_app(handle: &WindowHandleBox) -> bool {
-    key_monitor::return_to_app(handle.ns_view_ptr())
+    match handle.win32_hwnd() {
+        Some(hwnd) => !legacy_2430() && crate::platform::webview_host::win32_return_key_focus(hwnd),
+        None => key_monitor::return_to_app(handle.ns_view_ptr()),
+    }
+}
+
+/// #2430 の修正前へ戻す（`TAKO_2430_LEGACY=1`。Windows の実機の A/B 用）。
+/// 1 の間は Windows のキー入力の宛先を読まず戻さない = ページをクリックした後にターミナルを
+/// クリックしても打鍵がページへ流れ続ける
+fn legacy_2430() -> bool {
+    std::env::var_os("TAKO_2430_LEGACY").is_some_and(|v| !v.is_empty())
 }
 
 /// ナビゲーションのタイムアウト秒数。
