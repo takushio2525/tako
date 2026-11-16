@@ -23,6 +23,11 @@
 // （`persist_diag`）。子プロセス側の対策は `platform::process::no_console_window`
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+// 出力マクロ（`eprintln!` 等）を std の版から差し替える。**他の `mod` より先に置く**
+// （マクロは宣言より後ろにしか効かない。理由は `tako_core::stdio` の先頭 = #1758 / #1805 / #2936）
+#[macro_use]
+mod stdio;
+
 mod about_window;
 mod autorename;
 mod chat_view;
@@ -33618,6 +33623,12 @@ fn main() {
     // #1811: 製品の入口を通ったと宣言する（**必ず 1 文目**）。これが無いプロセスは
     // 置き場に関係なくテスト扱い = 本番の data dir / ホーム配下へ書かない
     tako_core::paths::mark_product_process();
+    // #2936: 標準出力・標準エラーへの書き込みの失敗で落ちない（GUI の規則。**必ず 2 文目**）。
+    // std の版は書けないと panic する（Windows の実測は受け継いだ std ハンドルが書けない別物を
+    // 指した `ERROR_ACCESS_DENIED`・macOS は読み手の閉じたパイプの EPIPE）。このクレートと
+    // tako-core / tako-control の出力マクロはどれも `tako_core::stdio` を通るので、ここ 1 か所で
+    // 起動の後で壊れた場合も含めて守られる。A/B は `TAKO_2936_LEGACY=1`
+    tako_core::stdio::adopt_gui_rule();
     // #2367: 器（tmux）の中のペインの子を起動時の fd 上限へ戻す段として起きたなら、soft を下げて
     // シェルを exec する（戻らない）。**ほかの初期化より前**（段はスレッドも窓も持たない）
     tako_core::platform::fd_limit::exec_container_child_if_requested();

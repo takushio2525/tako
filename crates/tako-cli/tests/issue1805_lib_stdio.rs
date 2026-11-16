@@ -258,15 +258,17 @@ fn mcp_serve_のgate_checkは_stderrが閉じていても応答を返す() {
 /// - `src/bin/` の実行ファイルの根は lib の `#[macro_use]` が届かない別のクレートなので、
 ///   素の `eprintln!` 自体が std の版になる（`tako-mcp` は `writeln!` で書き、失敗を捨てる）
 ///
-/// tako-app（GUI）は対象外: 規則を採らないので出力の扱いは std の版と同じ（#1805）。
-/// `crates/tako-control/src/bin/tako-lsp-fake.rs` もテスト用の偽の言語サーバで CLI の経路に
+/// tako-app（GUI）も対象: #2936 で同じ差し替えを置き、main が GUI の規則（書き込みの失敗を
+/// 種類によらず捨てる）を採る。std の版を名指すと書けない標準エラーで GUI ごと落ちる。
+/// `crates/tako-control/src/bin/tako-lsp-fake.rs` はテスト用の偽の言語サーバで CLI / GUI の経路に
 /// 無いので対象外（stdout は LSP の通り道）
 #[test]
 fn ライブラリ側でstdの出力マクロを名指さない() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let implementation = Path::new("tako-core/src/stdio.rs");
     let mut offenders = Vec::new();
-    for krate in ["tako-core", "tako-control", "tako-cli"] {
+    // tako-app は #2936 で同じ差し替えを置いた（GUI の規則は `tako_core::stdio` の同じ口を通る）
+    for krate in ["tako-core", "tako-control", "tako-cli", "tako-app"] {
         for file in rust_files(&root.join(krate).join("src")) {
             let rel = file
                 .strip_prefix(&root)
@@ -294,8 +296,8 @@ fn ライブラリ側でstdの出力マクロを名指さない() {
     }
     assert!(
         offenders.is_empty(),
-        "std の出力マクロ（読み手の閉じたパイプで panic する版）が CLI の経路へ戻っている。\
-         素の `eprintln!` 等（`#[macro_use] mod stdio;` の版）で書く（#1805）:\n{}",
+        "std の出力マクロ（読み手の閉じたパイプで panic する版）が CLI / GUI の経路へ戻っている。\
+         素の `eprintln!` 等（`#[macro_use] mod stdio;` の版）で書く（#1805 / #2936）:\n{}",
         offenders.join("\n")
     );
 }

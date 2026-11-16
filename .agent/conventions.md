@@ -1687,7 +1687,7 @@ psmux は入力送出を持たないので、**tako-app が保持していない
 
 ## CLI の出力はパイプの切断で panic させない（Issue #1758 / #1805）
 
-**tako-core / tako-control / tako-cli の `println!` / `print!` / `eprintln!` / `eprint!` は
+**tako-core / tako-control / tako-cli / tako-app の `println!` / `print!` / `eprintln!` / `eprint!` は
 std の版ではなく、各クレートの根の `#[macro_use] mod stdio;` が定義する同名マクロを指し、
 実体はどれも `tako_core::stdio` の 1 実装（`out` / `err`）。** Rust は SIGPIPE を無視した
 状態で main に入るので、std の版は読み手が先に閉じたパイプへの書き込み（EPIPE）で panic する。
@@ -1709,8 +1709,8 @@ Windows には SIGPIPE が無く、同じ場面は `ERROR_NO_DATA` = `ErrorKind:
 - **規則はプロセスの入口が採ったときだけ効く**: `tako` の main は両方
   （`stop_quietly_on_closed_stdout` / `drop_lines_on_closed_stderr`）、`tako-mcp` は標準エラーだけ
   （ブリッジの stdout はプロトコルの通り道で、書き込みの失敗はブリッジ自身が `Result` で扱う）。
-  **GUI（tako-app）とテストのビルドは採らないので std の版と同じ**（GUI のプロセスで走る
-  ライブラリの出力は 1 バイトも変わらない・テストハーネスの出力の捕捉もそのまま効く）
+  GUI（tako-app）は別の **GUI の規則**を採る（下の節 = #2936）。**テストのビルドは採らないので
+  std の版と同じ**（テストハーネスの出力の捕捉もそのまま効く）
 - **SIGPIPE を既定へ戻す案は採らない**: Windows に効かない / 同じバイナリの
   `tako remote serve`（起動情報を読んだ親が stdio のパイプを捨てる daemon）が 1 行の出力で
   プロセスごと死ぬ / `tako mcp serve` の終わり方が「シグナル死」になる
@@ -1731,17 +1731,50 @@ codex 0.154.0 はセッションの終わりに **SIGTERM**、agy はセッシ�
 クライアントが落ちた / 殺されたとき（stdin と stdout が同時に閉じる）で、そのときは
 終了コードを読む親がもう居ない。
 
+### GUI の出力は書けない標準エラーで落とさない（Issue #2936）
+
+**tako-app の main は 2 文目（`mark_product_process` の直後）で `tako_core::stdio::adopt_gui_rule()`
+を採る。** GUI の規則は標準出力・標準エラーとも、書き込みの失敗を**種類によらず**捨てて続ける
+（GUI の stdout / stderr は診断を流すだけで、読み手が居なくても失敗ではない）。std の版が黙って
+捨てるのは「ハンドルが無い」（unix の EBADF / Windows の `ERROR_INVALID_HANDLE` = エクスプローラーから
+起こした GUI）だけで、それ以外は panic して GUI ごと落ちていた。実測（11/16・Windows）: 予約タスクから
+`Start-Process` で起こした GUI（親がすぐ終わり、受け継いだ std ハンドルが書けない別物を指した）が
+器の取り合いの警告（`backend/psmux.rs` の `wrap_spawn`）で
+`failed printing to stderr: アクセスが拒否されました。 (os error 5)` を出して落ちた。macOS でも
+stderr の読み手が先に閉じたパイプなら EPIPE で同じことが起きる。
+
+- 書けた分の出力は std の版と 1 バイトも変わらない（同じハンドル・同じ書式・同じ同期の書き込み。
+  パイプ / ファイルへ向けた出力の新旧の一致はテストが見る）
+- tako-core / tako-control の出力も GUI のプロセスでは同じ規則が効く（同じ `tako_core::stdio` を通る）
+- A/B は `TAKO_2936_LEGACY=1`（採らない = 修正前の形）
+- **比べて採らなかった案**: 起動時に stderr を検査して NUL へ向け直す案は、起動の後で壊れる場合
+  （親が後から閉じたパイプ）を守れない。全 `eprintln!` を `let _ = writeln!(…)` へ置き換える案は、
+  数が多く（tako-app だけで 1,200 か所超）後から足す行を書き方で縛るしかない。マクロの差し替えなら
+  後から足す行も宣言の順だけで同じ口を通る。stderr を自前のパイプへ差し替えて転送する案は、
+  終了の直前の行を落とし、GUI の stderr を受け継いだ子が GUI より長生きすると転送の先が消える
+- 残り: gpui ほか外部のクレートの出力は差し替えが届かない（gpui の `eprintln!` はビルド時の
+  環境変数 `TRACK_THREAD_BORROWS` を立てたときだけ、`println!` は macOS の未知の外観の 1 行だけで、
+  普段の経路には無い）
+- 番犬 `crates/tako-control/tests/issue2936_gui_stdio_watchdog.rs`: main の 2 文目・規則を採るのは
+  GUI の入口だけ・GUI のプロセスのクレートの本番コードで標準出力・標準エラーのハンドルを直に取る
+  場所の凍結表（`writeln!(io::stderr(), …).unwrap()` を名指す）・本番コードの `dbg!`。どれも
+  `file:line` で名指す
+- 実際に書けない標準エラー（読み手を閉じたパイプ・読み取り専用のハンドル = Windows の
+  `ERROR_ACCESS_DENIED`）で走り切ることは、`crates/tako-core/tests/issue2936_gui_stdio.rs`
+  （器の取り合いの警告）と tako-app の `stdio::tests`（代表の `eprintln!`）が子プロセスで見る
+  （子の補助は `tako_core::test_child::run_broken_stderr_cases`。Windows は CI の名指しの段）
+
 ### 書くときの決まり
 
 - `std::println!` / `std::eprintln!` と綴って差し替えを迂回しない（実体の `tako_core::stdio`
   だけが例外）。`#[macro_use] mod stdio;` は `tako-cli/src/main.rs`・`tako-cli/src/lib.rs`・
-  `tako-control/src/lib.rs`・`tako-core/src/lib.rs` の**最初の `mod` 宣言**に置く（マクロは
-  宣言より後ろにしか効かず、順を崩すと前にあるモジュールが黙って std の版へ戻る）。
+  `tako-control/src/lib.rs`・`tako-core/src/lib.rs`・`tako-app/src/main.rs` の**最初の `mod` 宣言**に
+  置く（マクロは宣言より後ろにしか効かず、順を崩すと前にあるモジュールが黙って std の版へ戻る）。
   `src/bin/` の実行ファイルの根は lib の差し替えが届かない別のクレートなので、素の出力マクロを
   使わない（`tako-mcp` は `writeln!` で書いて失敗を捨てる）。番犬は
   `crates/tako-cli/tests/issue1758_broken_pipe.rs` の `出力マクロの宣言が他のmodより先にある` と
   `crates/tako-cli/tests/issue1805_lib_stdio.rs` の `ライブラリ側でstdの出力マクロを名指さない`
-  （どちらも `file:line` で名指す。tako-app と `tako-lsp-fake` は対象外）
+  （どちらも `file:line` で名指す。`tako-lsp-fake` は対象外）
 - 入口のスレッド（`tako-main`）以外から標準出力へ出すなら、その join 側でも `StdoutClosed` を見る
   （見ずに `expect` するとそこで panic メッセージが出る）
 - `stdout()` を自分で握って書く経路（`mcp serve` の `writeln!`）は従来どおり `Result` で返し、
