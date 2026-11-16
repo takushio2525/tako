@@ -17,7 +17,7 @@ tako では、AI がそれを**タスクとして起票**し、待ち行列に�
 
 <div class="tk-ut-os not-content">
 <span class="tk-ut-os-tag">Windows</span>
-<span class="tk-ut-os-text">この機能は Windows ではまだ<strong>未実測</strong>です。実装は macOS と共通ですが、Windows 実機で確かめていないので「対応」とは書いていません。スマホからの操作（tako remote）も同じく未確認です。詳しくは<a href="#windows-では">このページの末尾</a>と <a href="/windows-support/">Windows 対応状況</a>にあります。</span>
+<span class="tk-ut-os-text">起票・一覧・右パネルでの展開・返答・完了は Windows 実機で確かめてあります。返答が起票した master へ届くところと、スマホからの操作（tako remote）は、Windows ではまだ<strong>未確認</strong>です。詳しくは<a href="#windows-では">このページの末尾</a>と <a href="/windows-support/">Windows 対応状況</a>にあります。</span>
 </div>
 
 ## 右パネルで見る
@@ -142,16 +142,10 @@ master には「ユーザーに**聞くこと・見てもらうこと・許可�
 
 ## Windows では
 
-右パネルの切り替え（`tako panel`）は Windows 実機で確かめてあります。タスクそのものと、スマホからの操作はまだです。
+右パネルの切り替え（`tako panel`）と、タスクの起票・一覧・展開・返答・完了は Windows 実機で確かめてあります。返答が起票した master の入力欄へ届くところは、実際の AI エージェントで動く master が要るので、Windows ではまだ確かめていません。スマホからの操作もまだです。
 
 <WindowsLimits
 	items={[
-		{
-			kind: 'pending',
-			title: '人がやること（ユーザータスク）',
-			text: '起票・一覧・返答・配送は macOS と同じ実装を通りますが、Windows 実機での確認がまだです。',
-			tools: ['tako_todo'],
-		},
 		{
 			kind: 'pending',
 			title: 'スマホからの操作（tako remote）',
