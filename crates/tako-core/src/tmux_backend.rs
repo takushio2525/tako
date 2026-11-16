@@ -106,6 +106,8 @@ enum Need {
     ExtendedKeys,
     /// copy mode の位置インジケータを出さずに済むこと
     SuppressesCopyModeIndicator,
+    /// 器の既定のシェルの先読み（psmux の warm）を止められること（#2484）
+    DisablesShellPrewarm,
 }
 
 impl Need {
@@ -113,6 +115,7 @@ impl Need {
         match self {
             Need::ExtendedKeys => caps.extended_keys,
             Need::SuppressesCopyModeIndicator => caps.suppresses_copy_mode_indicator,
+            Need::DisablesShellPrewarm => caps.disables_shell_prewarm,
         }
     }
 }
@@ -133,6 +136,13 @@ const DIRECTIVES: &[Directive] = &[
     Directive {
         needs: None,
         line: "set -g history-limit 10000",
+    },
+    // #2484: psmux は既定でサーバーごとに次のペイン用のシェル（warm pane）と待機サーバー
+    // （`<ソケット>____warm__`）を先に起こす。`-f` で起こす tako の器は待機サーバーを拾わないので
+    // 丸ごと無駄（Windows 実機: 器 2 本で pwsh 10 本 → 4 本）。tmux はこの設定を知らない
+    Directive {
+        needs: Some(Need::DisablesShellPrewarm),
+        line: "set -g warm off",
     },
     Directive {
         needs: None,
@@ -198,12 +208,16 @@ pub fn backend_conf(caps: &BackendCapabilities) -> String {
 /// いまの器へ書く設定の中身。
 ///
 /// A/B は `TAKO_974_LEGACY=1`（能力を無視して全部書く = #974 前の挙動）・
+/// `TAKO_2484_LEGACY=1`（`warm off` を書かない = #2484 前の挙動。ゲートは `backend::psmux::issue2484_legacy`）・
 /// `TAKO_2085_LEGACY=1`（自ら閉じたペインの最後の出力を書き出さない = #2085 前の挙動）・
 /// `TAKO_2741_LEGACY=1`（最後のセッションが消えたらサーバーも終わる = #2741 前の挙動）
 fn conf_body() -> String {
     let legacy = std::env::var("TAKO_974_LEGACY").is_ok_and(|v| v == "1");
     let caps = crate::backend::capabilities();
-    let mut body = backend_conf(&apply_legacy(caps, legacy));
+    let mut body = backend_conf(&apply_issue2484_legacy(
+        apply_legacy(caps, legacy),
+        crate::backend::psmux::issue2484_legacy(),
+    ));
     body.push_str(&pane_died_conf(
         &caps,
         pane_died_dir().as_deref(),
@@ -536,11 +550,22 @@ fn ensure_pane_died_dir(dir: &Path) {
 }
 
 /// A/B の適用（**純関数**）。`TAKO_974_LEGACY=1` は器の能力を無視して全部書く
-/// = #974 前の挙動へ戻す。環境変数を読まないのでテストが直列化を要らない
+/// = #974 前の挙動へ戻す。環境変数を読まないのでテストが直列化を要らない。
+/// #974 前の conf に `warm off` は無かった（#2484 で足した）ので、それも書かない側へ倒す
 fn apply_legacy(mut caps: BackendCapabilities, legacy: bool) -> BackendCapabilities {
     if legacy {
         caps.extended_keys = true;
         caps.suppresses_copy_mode_indicator = true;
+        caps.disables_shell_prewarm = false;
+    }
+    caps
+}
+
+/// #2484 の A/B の conf への適用（**純関数**）。`TAKO_2484_LEGACY=1` は `warm off` を書かない
+/// = #2484 前の本番の conf へ戻す
+fn apply_issue2484_legacy(mut caps: BackendCapabilities, legacy: bool) -> BackendCapabilities {
+    if legacy {
+        caps.disables_shell_prewarm = false;
     }
     caps
 }
@@ -595,13 +620,24 @@ pub fn ensure_conf() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/dev/null"))
 }
 
-/// conf を `dir` へ原子的に置き、そのパスを返す
+/// conf を `dir` へ原子的に置き、そのパスを返す。
+///
+/// **内容が同じなら書かない**（[`conf_needs_write`]。#2484 で psmux 版の書き手 = #1314 から寄せた）。
+/// 器のペインを開くたびにここを通るが、中身はバージョンの間は変わらないので 2 回目以降は
+/// 読むだけで終わり、差し替えの窓そのものが無くなる。Windows では置換先を別のプロセス
+/// （`-f` で conf を読んでいる器のサーバー）が `FILE_SHARE_DELETE` 無しで開いていると rename が
+/// 失敗し、ここが `Err` を返すと器は conf 無し（= `warm` も status バーも既定）で起きる。
+/// 書き手は tmp → rename だけなので、読めた内容は常に完全（途中状態と比べて誤判定しない）。
+/// A/B は `TAKO_2484_LEGACY=1`（毎回書き直す = #2484 前）
 fn write_conf_in(dir: &Path, body: &str) -> std::io::Result<PathBuf> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
     std::fs::create_dir_all(dir)?;
     let path = dir.join("tmux-backend.conf");
+    if !crate::backend::psmux::issue2484_legacy() && !conf_needs_write(&path, body) {
+        return Ok(path);
+    }
     // tmp 名は **書き込み 1 回ごとに** 固有にする。プロセス固有までしか分けないと、
     // 同時に走った書き手同士が同じ tmp を奪い合い（A が truncate 中に B が rename）、
     // 途中状態がそのまま原子的に差し替わってしまう（この修正を作る過程で実測）。
@@ -617,6 +653,11 @@ fn write_conf_in(dir: &Path, body: &str) -> std::io::Result<PathBuf> {
         return Err(e);
     }
     Ok(path)
+}
+
+/// 置いてある conf が `body` と違う（= 書き直す必要がある）か。読めない・不在は「違う」へ倒す
+fn conf_needs_write(path: &Path, body: &str) -> bool {
+    !std::fs::read(path).is_ok_and(|cur| cur == body.as_bytes())
 }
 
 /// 稼働中のバックエンドサーバーへ最新 conf を再適用する。
@@ -645,17 +686,21 @@ pub fn sync_conf(socket: &str) {
 /// `backend::wrap_spawn_for_pane`（器の名前の検査 → 器の `wrap_spawn`）を通り、
 /// `TmuxBackend::wrap_spawn` がここへ委譲する。組み立ての本体は [`wrap_options_for`]
 pub fn wrap_options(options: SpawnOptions, socket: &str, session: &str) -> SpawnOptions {
+    let caps = crate::backend::capabilities();
     wrap_options_for(
         options,
         crate::tmux::tmux_bin(),
-        crate::backend::capabilities().quotes_program,
+        caps.quotes_program,
+        caps.direct_inner_argv && !crate::backend::psmux::issue2484_legacy(),
         socket,
         session,
     )
 }
 
 /// [`wrap_options`] の組み立ての本体。器のクライアントの実行ファイル（`program`）と、
-/// 内側コマンドの第 1 語の書き方（`quotes_program` = 器の能力。#881）を呼び出し側が決める。
+/// 内側コマンドの第 1 語の書き方（`quotes_program` = 器の能力。#881）と、素のペインのシェルを
+/// 器のシェルで包まずに起こさせるか（`direct_argv` = 器の能力 `direct_inner_argv`。#2484 の段 2）を
+/// 呼び出し側が決める。
 ///
 /// tmux と psmux で argv の形を分けない 1 実装（#885）。`PsmuxBackend::wrap_spawn` が
 /// 自分の能力とクライアントでここを呼ぶ（本番の Windows が #885 まで走らせてきた形 =
@@ -664,6 +709,7 @@ pub(crate) fn wrap_options_for(
     options: SpawnOptions,
     program: &str,
     quotes_program: bool,
+    direct_argv: bool,
     socket: &str,
     session: &str,
 ) -> SpawnOptions {
@@ -713,33 +759,53 @@ pub(crate) fn wrap_options_for(
     // 素のペインでも、統合を起動引数で読ませる環境（Windows の psmux。#2432）では
     // そのシェルを明示する（器の default-shell は引数なしの pwsh を起こすため）。
     // unix は `pane_shell` が None なので上の理由どおり渡さないまま
-    let mut inner = None;
-    if let Some(command) = options
-        .command
-        .clone()
-        .or_else(crate::shell_integration::pane_shell)
-    {
-        inner = Some(crate::backend::compose_inner_command(
-            &command,
-            quotes_program,
-        ));
-    }
-    // #2367: GUI が fd 上限を引き上げたなら、器の中のペインの子は起動時の値へ戻す段
-    // （GUI 自身の実行ファイル）を通す。残余引数が 2 個以上だと tmux は `execvp` で直に起こし
-    // （シェルの -c を挟まない = 上の .zshenv の問題は起きない）、段は soft を下げてから tmux が
-    // 自分で起こすはずだった形（ログインシェル / `$SHELL -c <inner>`）を exec し直す。
-    // このクライアントには引き上げた値が渡り（`TerminalSession::spawn` が並びを見て決める）、
-    // それが起こす器の tmux サーバーが受け継ぐ。段を通さないなら従来どおり（A/B は TAKO_2367_LEGACY=1）
-    match crate::platform::fd_limit::container_child_argv(inner.as_deref()) {
-        Some(argv) => args.extend(argv),
-        None => args.extend(inner),
-    }
+    let explicit = options.command.clone();
+    let shell = match explicit {
+        Some(_) => None,
+        None => crate::shell_integration::pane_shell(),
+    };
+    args.extend(inner_args(explicit, shell, quotes_program, direct_argv));
     SpawnOptions {
         command: Some(SpawnCommand {
             program: program.to_string(),
             args,
         }),
         ..options
+    }
+}
+
+/// 器のクライアントの argv の末尾 = 器の中で動かすもの（[`wrap_options_for`] の判断部。**純関数**に近い:
+/// 読む env は fd の上限の段 = #2367 だけ）。`explicit` は呼び手の明示のコマンド、`shell` は素のペインの
+/// シェル（統合を起動引数で読ませる環境 = Windows でだけ `Some`。#2432）。
+///
+/// - 素のペインのシェルで、器が包まずに起こせる（`direct_argv`）なら `--` の後ろへ argv のまま
+///   （#2484 の段 2。psmux は `pwsh -NoLogo -Command` で包まない = 器 1 本あたりの pwsh が 2 本 → 1 本）
+/// - それ以外は 1 本の文字列（[`crate::backend::compose_inner_command`]）。明示のコマンドは包みのシェルが
+///   `.cmd` / `.ps1` のシムの解決と `$PROFILE` の環境を担っているので、direct の器でも包ませる
+/// - #2367: GUI が fd 上限を引き上げたなら、器の中のペインの子は起動時の値へ戻す段
+///   （GUI 自身の実行ファイル）を通す。残余引数が 2 個以上だと tmux は `execvp` で直に起こし
+///   （シェルの -c を挟まない = `.zshenv` の問題は起きない）、段は soft を下げてから tmux が
+///   自分で起こすはずだった形（ログインシェル / `$SHELL -c <inner>`）を exec し直す。
+///   このクライアントには引き上げた値が渡り（`TerminalSession::spawn` が並びを見て決める）、
+///   それが起こす器の tmux サーバーが受け継ぐ。段を通さないなら従来どおり（A/B は TAKO_2367_LEGACY=1）。
+///   direct の形（psmux）には通さない（段は unix の tmux のためのもの）
+fn inner_args(
+    explicit: Option<SpawnCommand>,
+    shell: Option<SpawnCommand>,
+    quotes_program: bool,
+    direct_argv: bool,
+) -> Vec<String> {
+    match (explicit, shell) {
+        (None, Some(shell)) if direct_argv => crate::backend::direct_inner_argv(&shell),
+        (explicit, shell) => {
+            let inner = explicit
+                .or(shell)
+                .map(|command| crate::backend::compose_inner_command(&command, quotes_program));
+            match crate::platform::fd_limit::container_child_argv(inner.as_deref()) {
+                Some(argv) => argv,
+                None => inner.into_iter().collect(),
+            }
+        }
     }
 }
 
@@ -2167,10 +2233,80 @@ set -gq copy-mode-position-format ''
             crate::backend::psmux::UNKNOWN_OPTIONS,
             "psmux が拒否する設定の列挙が生成側とずれている"
         );
-        // 実バイナリで受理を確かめてある conf にも当然入っていない
+        // psmux の器へ実際に書く conf にも当然入っていない（#2484 で conf の正本はこの 1 本）
+        let conf = backend_conf(&psmux_caps());
         for unknown in crate::backend::psmux::UNKNOWN_OPTIONS {
-            assert!(!crate::backend::psmux::verified_conf().contains(unknown));
+            assert!(!conf.contains(unknown), "{unknown} が残っている:\n{conf}");
         }
+    }
+
+    /// #2484: psmux の器へ書く conf は既定の先読み（warm）を止める。tmux の器へは書かない
+    /// （tmux は `warm` を知らない = 書くと tmux が設定の誤りを報告する）。器が無いときも書かない
+    #[test]
+    fn issue2484_psmuxの器へ書くconfはwarm_offを含みtmuxへは書かない() {
+        use crate::backend::SessionBackend;
+        let psmux = backend_conf(&psmux_caps());
+        assert!(
+            psmux.lines().any(|l| l == "set -g warm off"),
+            "psmux の器の conf に warm off が無い（器ごとに pwsh が余計に常駐する）:\n{psmux}"
+        );
+        assert!(!backend_conf(&tmux_caps()).contains("warm"));
+        assert!(!backend_conf(&crate::backend::NullBackend.capabilities()).contains("warm"));
+        // 足したのは warm off の 1 行だけ（#974 の削り方は変わらない）
+        let without_warm: String = psmux
+            .lines()
+            .filter(|l| *l != "set -g warm off")
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(
+            without_warm,
+            backend_conf(&apply_issue2484_legacy(psmux_caps(), true)),
+            "A/B（TAKO_2484_LEGACY=1）は warm off の 1 行だけを落とす = #2484 前の本番の conf"
+        );
+    }
+
+    /// #2484 の段 2: 素のペインのシェルは、包まずに起こせる器（psmux）へだけ `--` の後ろの argv で渡す。
+    /// 明示のコマンドはその器でも 1 本の文字列（包みのシェルが `.cmd` / `.ps1` と `$PROFILE` を担う）、
+    /// 包む器（tmux）は従来どおり 1 本の文字列。シェルが無い（unix）なら何も足さない
+    #[test]
+    fn issue2484_素のペインのシェルだけを包まずに渡す() {
+        let shell = SpawnCommand {
+            program: "C:\\Program Files\\PowerShell\\7\\pwsh.exe".into(),
+            args: vec![
+                "-NoExit".into(),
+                "-EncodedCommand".into(),
+                "QQBCAA==".into(),
+            ],
+        };
+        let claude = SpawnCommand {
+            program: "claude".into(),
+            args: vec!["--resume".into(), "a b".into()],
+        };
+        assert_eq!(
+            inner_args(None, Some(shell.clone()), false, true),
+            crate::backend::direct_inner_argv(&shell),
+            "psmux の素のペイン = 包まない"
+        );
+        assert_eq!(
+            inner_args(Some(claude.clone()), None, false, true),
+            vec![crate::backend::compose_inner_command(&claude, false)],
+            "明示のコマンドは包ませる"
+        );
+        assert_eq!(
+            inner_args(None, Some(shell.clone()), false, false),
+            vec![crate::backend::compose_inner_command(&shell, false)],
+            "A/B（TAKO_2484_LEGACY=1）= 包みの中で起こす"
+        );
+        assert_eq!(
+            inner_args(None, Some(shell.clone()), true, false),
+            vec![crate::backend::compose_inner_command(&shell, true)],
+            "tmux の器は従来どおり"
+        );
+        assert!(
+            inner_args(None, None, true, false).is_empty(),
+            "unix の素のペインは何も渡さない"
+        );
+        assert!(inner_args(None, None, false, true).is_empty());
     }
 
     /// A/B（`TAKO_974_LEGACY=1`）は器の能力を無視して #974 前の全部書きへ戻る。
@@ -2252,8 +2388,11 @@ set -gq copy-mode-position-format ''
 
         let dir = std::env::temp_dir().join(format!("tako-conf-625-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        // 器に依らず決定的にするため、中身は 1 回だけ組んで全スレッドで共有する（#974）
+        // 器に依らず決定的にするため、中身は 1 回だけ組んで全スレッドで共有する（#974）。
+        // #2484 で書き手は「同じ内容なら書かない」になったので、2 つの本文（長さも違う）を
+        // 交互に書かせて差し替えを起こし続ける（同じ本文だけだと 2 回目以降は rename しない = 検出力が無い）
         let body = Arc::new(backend_conf(&tmux_caps()));
+        let alt = Arc::new(format!("{body}# alt\n"));
         let path = write_conf_in(&dir, &body).expect("conf を置ける");
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -2265,17 +2404,20 @@ set -gq copy-mode-position-format ''
         let start = Arc::new(Barrier::new(WRITERS + READERS));
         let mut writers = Vec::new();
         for _ in 0..WRITERS {
-            let (d, s, b, w, g) = (
+            let (d, s, b, a, w, g) = (
                 dir.clone(),
                 stop.clone(),
                 body.clone(),
+                alt.clone(),
                 writes.clone(),
                 start.clone(),
             );
             writers.push(std::thread::spawn(move || {
                 g.wait();
+                let mut flip = false;
                 while !s.load(Ordering::Relaxed) {
-                    if write_conf_in(&d, &b).is_ok() {
+                    flip = !flip;
+                    if write_conf_in(&d, if flip { &a } else { &b }).is_ok() {
                         w.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -2283,13 +2425,14 @@ set -gq copy-mode-position-format ''
         }
         let mut readers = Vec::new();
         for _ in 0..READERS {
-            let (p, bad, n, e, w, b, g) = (
+            let (p, bad, n, e, w, b, a, g) = (
                 path.clone(),
                 partial.clone(),
                 reads.clone(),
                 failed_reads.clone(),
                 writes.clone(),
                 body.clone(),
+                alt.clone(),
                 start.clone(),
             );
             readers.push(std::thread::spawn(move || {
@@ -2301,7 +2444,7 @@ set -gq copy-mode-position-format ''
                     match std::fs::read_to_string(&p) {
                         Ok(read) => {
                             n.fetch_add(1, Ordering::Relaxed);
-                            if read != *b {
+                            if read != *b && read != *a {
                                 bad.fetch_add(1, Ordering::Relaxed);
                             }
                         }
@@ -2336,6 +2479,49 @@ set -gq copy-mode-position-format ''
             "読み取り回数が少なすぎて検出力が無い: 読み取り {n} / {READS} 回\
              （失敗 {failed} 回）・書き換え {w} / {WRITES} 回（上限 {LIMIT:?} で打ち切り）"
         );
+    }
+
+    /// #2484（#1314 から寄せた）: 内容が同じなら書き直さない。判断そのものを固定する
+    #[test]
+    fn 同じ内容のconfは書き直さない() {
+        let scratch = crate::test_residue::ScratchDir::new("conf-skip-2484");
+        let path = scratch.path().join("tmux-backend.conf");
+        let body = backend_conf(&psmux_caps());
+        assert!(conf_needs_write(&path, &body), "不在なら書く");
+        write_conf_in(scratch.path(), &body).expect("1 回目");
+        assert!(!conf_needs_write(&path, &body), "同じ内容なら書かない");
+        assert!(
+            conf_needs_write(&path, &backend_conf(&tmux_caps())),
+            "内容が変わったら書く（バージョン更新・器の違い）"
+        );
+    }
+
+    /// #2484（#1314 から寄せた）: 「書かない」が実際に最終パスにも tmp にも触っていないことを、
+    /// 置き場を読み取り専用にして確かめる（書こうとすれば tmp の作成で失敗する）。権限で検査するので unix 限定
+    #[cfg(unix)]
+    #[test]
+    fn 同じ内容なら読み取り専用の置き場でも成功する() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = crate::test_residue::ScratchDir::new("conf-readonly-2484");
+        let root = scratch.path();
+        let body = backend_conf(&psmux_caps());
+        write_conf_in(root, &body).expect("1 回目は書ける");
+        let restore = std::fs::metadata(root).expect("属性").permissions();
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o555))
+            .expect("置き場を読み取り専用にする");
+        // root 権限では権限検査が効かない。効いていない環境では検出力が無いので飛ばす
+        let enforced = std::fs::write(root.join("probe.tmp"), b"x").is_err();
+        let same = write_conf_in(root, &body);
+        let differ = write_conf_in(root, &backend_conf(&tmux_caps()));
+        std::fs::set_permissions(root, restore).expect("属性を戻す");
+        if enforced {
+            same.expect("同じ内容なら最終パスにも tmp にも触らないので成功する");
+            assert!(
+                differ.is_err(),
+                "内容が違えば書こうとして失敗するはず（検出力の確認）"
+            );
+        }
     }
 
     /// 残骸ソケットの判定（#625）。

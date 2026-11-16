@@ -93,6 +93,8 @@ mod tests {
             suppresses_copy_mode_indicator: true,
             keeps_exit_output: true,
             keeps_empty_server: true,
+            disables_shell_prewarm: false,
+            direct_inner_argv: false,
             label,
         }
     }

@@ -5157,8 +5157,9 @@ impl TakoApp {
         if tmux_persist && tmux_available {
             // 生き残っている既存サーバーへ最新 conf を再適用する（conf は
             // サーバー起動時にしか読まれないため、バージョン更新の設定変更が
-            // ここで同期されないと永久に届かない）
-            tako_core::tmux_backend::sync_conf(&tako_core::tmux_backend::socket_name());
+            // ここで同期されないと永久に届かない）。届け方は器ごとに違う（psmux は
+            // セッションごとに別サーバーなので器ごとに読ませる = #2484）ので器へ任せる
+            tako_core::backend::backend().sync_config();
         }
         let mut restored: Vec<tako_control::layout::RestoredPane> = Vec::new();
         let mut collapsed_tmux_tabs: std::collections::HashSet<TabId> =
@@ -27253,7 +27254,8 @@ impl TmuxHost for TakoApp {
         }
         self.tmux_persist = enabled;
         if enabled && tako_core::backend::capabilities().survives_app_exit {
-            tako_core::tmux_backend::sync_conf(&tako_core::tmux_backend::socket_name());
+            // 届け方は器ごと（#2484）。tmux は `tmux_backend::sync_conf` と同じ
+            tako_core::backend::backend().sync_config();
         }
         if std::env::var_os("TAKO_SELF_TEST").is_none() {
             let mut settings = tako_control::settings::load();

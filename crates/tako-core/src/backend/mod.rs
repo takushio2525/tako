@@ -333,6 +333,24 @@ pub struct BackendCapabilities {
     /// あるかを Windows 実機で確かめていない）ので false = 設定を 1 行も足さない（#974）。
     /// 器が無いときはサーバーそのものが無い（隙間も無い）ので true
     pub keeps_empty_server: bool,
+    /// **器が既定で先読みするシェル（psmux の warm）を、器の conf で止められるか**（#2484）。
+    ///
+    /// psmux は既定（`warm on`）でサーバーごとに次のペイン用のシェルを 1 本先に起こし（warm pane）、
+    /// 次の `new-session` 用の待機サーバー（`<ソケット>____warm__`）も 1 本立てる。tako は器を
+    /// `-f <conf>` で起こすので psmux は待機サーバーを**使わず**（psmux の仕様: 独自の conf では
+    /// 拾わない）、先読みは丸ごと無駄になる（Windows 実機の実測: 器 2 本で pwsh 10 本 → `warm off` で
+    /// 4 本・private 291 MB → 115 MB）。true の器へは conf に `set -g warm off` を書く。
+    /// tmux はシェルを先読みしないので false（書くと tmux が知らない設定になる）。器が無いときも false
+    pub disables_shell_prewarm: bool,
+    /// **素のペインのシェルを、器のシェルで包まずに直接起こせるか**（#2484 の段 2）。
+    ///
+    /// psmux は `new-session` に渡したコマンドを必ず `pwsh -NoLogo -Command "<コマンド>"` で包むので、
+    /// tako の素のペインのシェル（統合つきの `pwsh -NoExit -EncodedCommand …`）は**包みの pwsh の子**として
+    /// 起きていた = 器 1 本につき pwsh が 2 本。psmux 3.2 以降は `new-session … -- <プログラム> <引数>…` を
+    /// 包まずに直接起こす。true の器へは素のペインのシェルをこの形で渡す（明示のコマンドは従来どおり
+    /// 包む: 包みの pwsh が `.cmd` / `.ps1` のシムの解決と利用者の `$PROFILE` の環境を担っている）。
+    /// tmux は従来どおりシェルを渡さない（default-shell を直接ログインシェルで起こす）ので false
+    pub direct_inner_argv: bool,
     /// UI・診断・system prompt に出す名前
     pub label: &'static str,
 }
@@ -378,6 +396,9 @@ impl BackendCapabilities {
             "keeps_exit_output": self.keeps_exit_output,
             // #2741: 最後のセッションが消えても器のサーバーを残すか
             "keeps_empty_server": self.keeps_empty_server,
+            // #2484: 器の先読みのシェルを止めるか・素のペインのシェルを包まずに起こすか
+            "disables_shell_prewarm": self.disables_shell_prewarm,
+            "direct_inner_argv": self.direct_inner_argv,
             "note": self.degraded_note(),
         })
     }
@@ -1021,6 +1042,20 @@ pub(crate) fn compose_inner_command(
     psmux::inner_command(command)
 }
 
+/// 素のペインのシェルを、器のシェルで包まずに起こさせる形（#2484 の段 2。**純関数**）。
+///
+/// `--` の後ろへプログラムと引数を**1 語ずつそのまま**並べる。器（psmux 3.2 以降）はこれを
+/// 1 本の文字列へ連結せず、そのまま `CreateProcess` へ渡す（3.3.7 のソース: `build_raw_command`）。
+/// 引数は Windows のコマンドラインとして器のクライアント → サーバーへ 1 語ずつ引用されて運ばれるので、
+/// [`compose_inner_command`] のような器の単語分割に合わせた引用も、第 1 語を 1 語にする手当て（#881）も要らない
+pub(crate) fn direct_inner_argv(command: &crate::terminal::SpawnCommand) -> Vec<String> {
+    let mut argv = Vec::with_capacity(command.args.len() + 2);
+    argv.push("--".to_string());
+    argv.push(command.program.clone());
+    argv.extend(command.args.iter().cloned());
+    argv
+}
+
 /// [`wrap_spawn_for_pane`] の結果
 #[derive(Debug)]
 pub struct PaneSpawn {
@@ -1130,7 +1165,29 @@ pub enum Binary {
 /// 見つかったバイナリ（プロセス内で 1 回だけ解決してキャッシュする）
 pub fn binary() -> &'static Binary {
     static BINARY: OnceLock<Binary> = OnceLock::new();
-    BINARY.get_or_init(detect_binary)
+    BINARY.get_or_init(|| {
+        let found = detect_binary();
+        if psmux::issue2484_legacy() {
+            return found;
+        }
+        pin_psmux_path(found, crate::platform::exe::pin_process_path)
+    })
+}
+
+/// 見つけた psmux の実行ファイルを、起こす形（絶対パス）へ寄せる（#2484。**純関数**）。
+///
+/// 器の操作（`list-sessions` 等）も器のクライアント（ペインを開くたび）も、この `bin` を起こし続ける。
+/// 素の名前（PATH で見つけた `psmux`）のままだと起こすたびに探し直し、プロセスのコマンドラインにも
+/// 素の名前しか残らない。`TAKO_PSMUX_BIN` で渡されたパスは Windows なら `PATHEXT` だけ補う。
+/// 引けなければ受け取った名前のまま（従来と同じ起こし方）。tmux は `tmux::tmux_bin` が自分で寄せる
+fn pin_psmux_path(found: Binary, pin: impl Fn(&str) -> Option<String>) -> Binary {
+    match found {
+        Binary::Psmux { bin, version } => Binary::Psmux {
+            bin: pin(&bin).unwrap_or(bin),
+            version,
+        },
+        other => other,
+    }
 }
 
 fn detect_binary() -> Binary {
@@ -1766,6 +1823,58 @@ mod tests {
         }
     }
 
+    /// #2484: 見つけた psmux は起こす形（絶対パス）へ寄せる。引けなければ名前のまま、tmux は触らない
+    #[test]
+    fn issue2484_psmuxの実行ファイルは絶対パスへ寄せる() {
+        let pinned = pin_psmux_path(psmux_bin(), |name| {
+            (name == "tmux").then(|| "C:\\psmux\\tmux.exe".to_string())
+        });
+        assert_eq!(
+            pinned,
+            Binary::Psmux {
+                bin: "C:\\psmux\\tmux.exe".into(),
+                version: "3.3.7".into(),
+            }
+        );
+        assert_eq!(
+            pin_psmux_path(psmux_bin(), |_| None),
+            psmux_bin(),
+            "引けなければ名前のまま"
+        );
+        assert_eq!(
+            pin_psmux_path(tmux_bin(), |_| Some("/elsewhere/tmux".into())),
+            tmux_bin(),
+            "tmux は tmux::tmux_bin が自分で寄せるので触らない"
+        );
+        assert_eq!(
+            pin_psmux_path(Binary::Absent, |_| Some("x".into())),
+            Binary::Absent
+        );
+    }
+
+    /// #2484 の段 2: 素のペインのシェルは `--` の後ろへ 1 語ずつ（空白入りのプログラムも括らない）
+    #[test]
+    fn issue2484_直接起こす形はダブルダッシュの後ろのargv() {
+        let shell = crate::terminal::SpawnCommand {
+            program: "C:\\Program Files\\PowerShell\\7\\pwsh.exe".into(),
+            args: vec![
+                "-NoExit".into(),
+                "-EncodedCommand".into(),
+                "QQBCAA==".into(),
+            ],
+        };
+        assert_eq!(
+            direct_inner_argv(&shell),
+            vec![
+                "--",
+                "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+                "-NoExit",
+                "-EncodedCommand",
+                "QQBCAA=="
+            ]
+        );
+    }
+
     #[test]
     fn 環境変数noneはバイナリの有無によらず器なしへ倒れる() {
         for env in ["none", "NONE", " none ", "null", "off"] {
@@ -1894,6 +2003,8 @@ mod tests {
             suppresses_copy_mode_indicator: true,
             keeps_exit_output: true,
             keeps_empty_server: true,
+            disables_shell_prewarm: false,
+            direct_inner_argv: false,
             label: "tmux",
         };
         assert!(with_container.degraded_note().is_none());
@@ -1911,6 +2022,8 @@ mod tests {
             suppresses_copy_mode_indicator: true,
             keeps_exit_output: true,
             keeps_empty_server: true,
+            disables_shell_prewarm: false,
+            direct_inner_argv: false,
             label: "none",
         };
         let note = without.degraded_note().expect("縮退の説明が要る");
@@ -1934,6 +2047,8 @@ mod tests {
             suppresses_copy_mode_indicator: true,
             keeps_exit_output: true,
             keeps_empty_server: true,
+            disables_shell_prewarm: false,
+            direct_inner_argv: false,
             label: "none",
         };
         let v = caps.describe();
@@ -1956,6 +2071,8 @@ mod tests {
             suppresses_copy_mode_indicator: true,
             keeps_exit_output: true,
             keeps_empty_server: true,
+            disables_shell_prewarm: false,
+            direct_inner_argv: false,
             label: "tmux",
         };
         assert_eq!(tmux.describe()["scrollback"], "backend");
@@ -1979,6 +2096,8 @@ mod tests {
             suppresses_copy_mode_indicator: false,
             keeps_exit_output: false,
             keeps_empty_server: false,
+            disables_shell_prewarm: false,
+            direct_inner_argv: false,
             label: "psmux",
         };
         let v = psmux.describe();
@@ -2031,6 +2150,8 @@ mod tests {
                 suppresses_copy_mode_indicator: true,
                 keeps_exit_output: true,
                 keeps_empty_server: true,
+                disables_shell_prewarm: false,
+                direct_inner_argv: false,
                 label: "session-host",
             }
         }
@@ -2256,6 +2377,8 @@ mod tests {
             suppresses_copy_mode_indicator: true,
             keeps_exit_output: true,
             keeps_empty_server: true,
+            disables_shell_prewarm: false,
+            direct_inner_argv: false,
             label: "session-host",
         };
         assert!(b1.full_restore());
@@ -2330,6 +2453,8 @@ mod tests {
                 suppresses_copy_mode_indicator: true,
                 keeps_exit_output: true,
                 keeps_empty_server: true,
+                disables_shell_prewarm: false,
+                direct_inner_argv: false,
                 label: "capture-only",
             }
         }

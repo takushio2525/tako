@@ -45,6 +45,8 @@ impl SessionBackend for NullBackend {
             keeps_exit_output: true,
             // 器が無い = サーバーそのものが無い（最後のセッションの後の隙間も無い。#2741）
             keeps_empty_server: true,
+            disables_shell_prewarm: false,
+            direct_inner_argv: false,
             label: "none",
         }
     }
