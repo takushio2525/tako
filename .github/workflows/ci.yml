@@ -196,6 +196,14 @@ jobs:
       - name: PWA をビルド（rust_embed が dist/ を要求する）
         working-directory: web/tako-remote
         run: npm ci --no-audit --no-fund && npm run build
+      # lock が npm 11（Node 24 LTS の npm）の `npm ci` でも通るかの検査（#2930）。npm 11（11.9 以降）は
+      # peer で入る包みの任意依存が lock に無いと「不一致」として断り、npm 10 は見逃す。CI の Node 22（npm 10）
+      # だけでは、Node 24 の開発機でだけ build.rs の PWA 自動ビルドごと cargo build が止まる形を拾えない。
+      # --dry-run は lock の判定だけを走らせ node_modules に触れない（上の npm ci を後段の e2e がそのまま使う）。
+      # 版は固定する（上げるときはこの行だけ。公開から 2 週間以上置いた版にする）
+      - name: PWA の lock が npm 11 の npm ci でも通る（#2930）
+        working-directory: web/tako-remote
+        run: npx -y npm@11.21.1 ci --dry-run --no-audit --no-fund
       # rust-toolchain.toml と同じバージョンをピン（git 版 gpui が新しめの stable を要求）
       - uses: dtolnay/rust-toolchain@master
         with:

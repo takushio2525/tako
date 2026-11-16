@@ -4898,6 +4898,19 @@ npm が無い / npm が失敗した環境では**1 行目に手順が出て**止
 手順を変えるときは `build.rs` の `pwa` モジュールと `build-pwa.sh` を**対で**直す
 （build.rs 側が npm を直接起こすのは、Windows の開発機に bash があるとは限らないため）。
 
+**`web/tako-remote/package-lock.json` は npm 10（CI の Node 22）と npm 11（Node 24 LTS）の
+両方の `npm ci` で通る形に保つ**（#2930）。npm 11 の `npm ci` は、peer で入る包みの任意依存が
+lock に無いと不一致（`EUSAGE` / `Missing: … from lock file`）として断り、npm 10 は見逃す
+（実測: 11.6.0 はまだ通し、11.9.0 / 11.21.x は断る）。
+以前は使っていない `geist`（Next.js 用のフォントローダー）が peer の `next` を連れてきて、
+Node 24 の機械でだけ build.rs の自動ビルドごと `cargo build` が止まっていた（node_modules も
+Next.js の分だけ膨らみ 247 MB あった。外して 60 MB）。フォントは実体を `public/fonts/` に
+同梱しているので npm の依存には入れない（版と更新の手順は `THIRD-PARTY-NOTICES.md` の Geist の節）。
+**peer に枠組み（Next.js 等）を要求する包みを PWA の依存に足さない**。CI の macOS ジョブが
+「PWA をビルド」の直後に npm 11 の `npm ci --dry-run` で lock を検査する（node_modules に
+触れない・数秒）。手元で確かめるなら `cd web/tako-remote && npx -y npm@11.21.1 ci --dry-run`
+（版は CI と同じにする。`npm@11` だと手元の古い npm 11 で範囲を満たして素通りすることがある）。
+
 ## CI 完了の判定は待ちスクリプトを通す（Issue #1333 / #1313）
 
 **PR の CI が終わったかどうかを自分で判定しない。`scripts/wait-pr-checks.sh <PR>` を使う。**
