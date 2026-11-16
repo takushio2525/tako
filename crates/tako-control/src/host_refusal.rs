@@ -112,6 +112,15 @@ pub enum HostRefusal {
     UrlHasWhitespace(String),
     /// `URL に制御文字が含まれています（NSURL が解釈できない）: <url>`
     UrlHasControlChar(String),
+    /// `<scheme>: の URL は Web ビューで開かない（ページの外から任意のスクリプトを走らせる形になる）。…`
+    /// （#2937。`javascript` / `vbscript`。scheme は小文字 = `web_url::SCRIPT_SCHEMES`）
+    UrlScriptScheme(String),
+    /// `<scheme>: の URL は Web ビューで開けない（開ける scheme は http / https / file / data / about）。…`
+    /// （#2937。scheme は小文字。表は `web_url::OPENABLE_SCHEMES`）
+    UrlSchemeUnsupported(String),
+    /// `URL を解釈できない（Web ビュー（NSURL）が受け付けない形）: <url>。…`
+    /// （#2937。境界 B38 `platform::webview_url` の確かめが nil を返した = 渡すと wry が abort する形）
+    UrlUnparsable(String),
     /// `Web ビューの親（tako の窓）が閉じているので Web ビューを作れない。…（#1837）`
     /// （GUI は persist.log へは日本語の文で残す = 診断）
     WebViewParentDetached,
@@ -371,6 +380,32 @@ impl HostRefusal {
             (Self::UrlHasControlChar(url), En) => {
                 format!("the URL contains control characters (NSURL cannot parse it): {url}")
             }
+            (Self::UrlScriptScheme(scheme), Ja) => format!(
+                "{scheme}: の URL は Web ビューで開かない（ページの外から任意のスクリプトを\
+                 走らせる形になる）。開いているページで JavaScript を走らせるなら tako web eval '<式>'"
+            ),
+            (Self::UrlScriptScheme(scheme), En) => format!(
+                "{scheme}: URLs are not opened in the web view (that would run an arbitrary script \
+                 from outside the page). To run JavaScript in the open page, use tako web eval '<expression>'"
+            ),
+            (Self::UrlSchemeUnsupported(scheme), Ja) => format!(
+                "{scheme}: の URL は Web ビューで開けない（開ける scheme は {}）。\
+                 Web ページなら https:// から書く",
+                crate::web_url::OPENABLE_SCHEMES.join(" / ")
+            ),
+            (Self::UrlSchemeUnsupported(scheme), En) => format!(
+                "{scheme}: URLs cannot be opened in the web view (supported schemes: {}). \
+                 For a web page, start the URL with https://",
+                crate::web_url::OPENABLE_SCHEMES.join(" / ")
+            ),
+            (Self::UrlUnparsable(url), Ja) => format!(
+                "URL を解釈できない（Web ビュー（NSURL）が受け付けない形）: {url}。\
+                 ホスト名とポート番号の書き方を確かめる（例: http://localhost:3000）"
+            ),
+            (Self::UrlUnparsable(url), En) => format!(
+                "cannot parse the URL (the web view (NSURL) does not accept it): {url}. \
+                 Check how the host name and port are written (e.g. http://localhost:3000)"
+            ),
             (Self::WebViewParentDetached, Ja) => {
                 "Web ビューの親（tako の窓）が閉じているので Web ビューを作れない。\
                  tako の窓を開いてから開き直す（#1837）"

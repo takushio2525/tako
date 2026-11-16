@@ -1262,3 +1262,17 @@ Windows CI のテスト（`crates/tako-control/src/ipc.rs` の `windows_tests::i
       `tako_show_command` が呼べて CARD-DONE が返る
 - [ ] 本番で codex の worker を 1 本 spawn し、応答の `mcp.denied` に `~/.codex/config.toml` の MCP（tako 以外）が並び、
       `ps` でその codex の子孫に止めた MCP が居ない
+
+## Web ビューへ渡す URL の検査（#2937、2026-11-16）
+
+規則（形・scheme の表・正規化）は `web_url` の単体テストと番犬（`issue2937_webview_url_guard_watchdog`）で、macOS の
+NSURL の解釈（境界 B38）は `platform::webview_url` の単体テストで、実経路（CLI の新旧の腕・visual-test の dock と
+アドレスバー）は `bash scripts/test-webview-url-2937.sh` で見る。WebView2 は B38 で確かめないので、Windows の実機で次を確かめる:
+
+- [ ] `tako web open 'javascript:alert(2937)'` → 非 0 で終わり「javascript: の URL は Web ビューで開かない…」と
+      `tako web eval` の案内が返る。GUI は生きている（`tako web list` が答える）
+- [ ] `tako web open 'https://example.com:abc'` → GUI は落ちず、理由つきで返る（WebView2 の `Navigate` の Err =
+      「URL 読み込み失敗」か生成失敗の理由。macOS の「URL を解釈できない」とは文が違ってよい）
+- [ ] `tako web open http://localhost:5173`・`about:blank`・`data:text/html,ok`・`file:///C:/…/x.html` は修正前と同じく開く
+- [ ] dock の URL 欄とアドレスバーで `javascript:alert(1)` + Enter → 欄の下（アドレスバーは開いたままの本文）に
+      理由が出て、Web ビューは増えない・URL は変わらない

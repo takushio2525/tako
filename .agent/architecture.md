@@ -1378,6 +1378,46 @@ GPUI のオーバーレイ（ピン留め窓 FR-2.16.15・ホバープレビュ�
 オフスクリーン合成（CEF/Servo 級の重量）か webview 内 JS オーバーレイが要る。
 スクリーンショット系機能（terminal_screen_lines 等）には webview の中身は映らない
 
+### Web ビューへ渡す URL の検査（#334 / #2937）
+
+wry 0.57.1 の macOS 実装は `navigate_to_url`（生成時の `with_url` も読み込みの `load_url` も通る）で
+`NSURL::URLWithString(…).unwrap()` を呼ぶので、NSURL が解釈できない文字列を渡すと **GUI ごと abort** する
+（`wkwebview/mod.rs:917`）。#334 で空白・制御文字を入口で断ったが、`tako web open 'javascript:alert(2936)'` は
+正規化が表に無い scheme に `https://` を前に付けて `https://javascript:alert(2936)`（ポートが数字でない形）に
+してしまい、検査を抜けて落ちた（#2937）。
+
+- **1 実装**: 正規化と検査は `tako_control::web_url`（`normalize` / `check`）。GUI の `webview::normalize_url` /
+  `validate_url` はそこへ委ねるだけ。scheme の文法は `tako_core::url_guard::split_scheme`（#1376 と同じ読み方）
+- **検査の 3 段**: ①形（空・空白・制御文字 = #334）②scheme の表（開くのは http / https / file / data / about =
+  修正前の正規化が通していた 5 つ。`javascript:` / `vbscript:` は「ページの外から任意のスクリプトを走らせる形」
+  として名指しで断り、次の一手は `tako web eval`。それ以外の scheme は「開けない」と断る）③解釈の確かめ（境界 B38。
+  macOS は wry と同じ NSURL を先に呼ぶ）。断りは `HostRefusal::UrlScriptScheme` / `UrlSchemeUnsupported` /
+  `UrlUnparsable`（日英。#2365）
+- **正規化**: scheme の付いた入力はそのまま返す（開けない scheme は検査が断る）。`host:port`（`localhost:3000`・
+  `example.com:8080/x`）と `user:pass@host` は scheme と読まず、修正前と同じく `http://`（localhost /
+  127.0.0.1 / 0.0.0.0）か `https://` を前に付ける。scheme の大文字小文字は区別しない（`HTTPS://…` は修正前は
+  `https://HTTPS://…` になっていた）
+- **wry へ渡すのは 2 か所だけ**（`WebViewEntry::build_view` の `with_url` と `navigate` の `load_url`）で、
+  どちらも渡す直前に `validate_url` を通る。入口はどれもこの 2 か所に集まる:
+
+| 入口 | 経路 | 断りの出先 |
+|---|---|---|
+| CLI `tako web open` / MCP `tako_web` open | dispatch → `web_open` → `create_webview` → `queued` / `build_view` | CLI / MCP の応答（分割したペインは閉じ戻る） |
+| CLI `tako web nav` / MCP navigate | dispatch → `web_navigate` → `navigate`（wry の無いエントリは `navigate_pending`） | CLI / MCP の応答 |
+| ポート提案のチップ | `accept_port_suggestion` → CLI と同じ dispatch | （`http://localhost:<port>` なので断らない） |
+| dock の URL 欄（Enter・「開く」） | `open_webview_from_dock` → `accept_typed_web_url` → `create_webview` | URL 欄の下（欄の文字列が断ったときのままの間） |
+| アドレスバー（Enter） | `handle_webview_address_bar_key` → `accept_typed_web_url` → `navigate` | バーを開いたまま本文に（Esc で閉じると消える） |
+| ページの target=_blank / window.open | `process_pending_new_windows` → `validate_url` → dock と同じ生成 | 出さない（ページ発の要求。修正前と同じく黙って捨てる） |
+| エラー画面の「再読み込み」・⟳ | `retry` / `navigate("reload")` → `navigate` | 出さない（修正前と同じ） |
+| 起動時の復元（自動・保留の「開く」） | `create_webview` / `held` → `navigate_pending` → 生成タスクの `build_view` | stderr / persist.log |
+
+- A/B は `TAKO_2937_LEGACY=1`（修正前の正規化 + 形の検査だけ）。**検証プロセス（隔離 GUI・セルフテスト・テスト）
+  でだけ効く**（本番の GUI を abort する形へは戻さない）。実経路は `bash scripts/test-webview-url-2937.sh`
+  （CLI の新旧の腕 + visual-test `webview-url-2937`）、番犬は `issue2937_webview_url_guard_watchdog`
+  （wry へ渡す直前の検査・GUI の口の委ね・検査の 3 段・入口表）
+- Windows（WebView2）は解釈できない URL を Err で返す（落ちない）ので B38 は確かめないが、①②は同じく効く。
+  WebView2 での見え方は実機の確認待ち（`.agent/manual-checks.md` の #2937）
+
 ### Windows の生成は App の借用の外で 1 本ずつ（#724）
 
 Windows では Web ビューを開くと tako がプロセスごと落ちていた。原因は 2 つ。
@@ -1507,6 +1547,7 @@ MCP / CLI から受け、UI 層がレイアウト矩形に変換して描画す�
 | 窓の枠（B36 `tako-app::platform::window_chrome`。位置・寸法の適用 = `tako window move` / `resize`・最大化のトグル・元に戻す・アプリメニュー・枠の寸法と表記。呼び手は境界を名指す 1 経路で、`cfg` はこのファイルの中だけ。#2858） | NSWindow `setFrame:display:`（CoreGraphics のグローバル矩形を挟む）・`zoom_window()` のトグル・アプリ名メニューあり・メニューバー行 0・traffic lights の余白 68 | user32 `SetWindowPos`（論理 → 物理ピクセル）・最大化中なら `ShowWindowAsync(SW_RESTORE)`・アプリ名メニューなし（`menu_bar.rs` が窓の中に 1 行で描く）・メニューバー行 30・自前のウィンドウコントロール 102。macOS のアプリ名メニューだけの文言 5 つは `ui_text::menu` に残り、Windows で未使用の分の `allow(dead_code)` も向こうに残る（lint の属性で分岐ではない） |
 | プライバシー許可の案内（B15 `tako_control::platform::fda`。フルディスクアクセス = 診断の `fda` 項目・`tako setup` の FDA の段・`tako fda status` / `open` と MCP `tako_fda`。呼び手は対象か `supported` の答えを見る 1 本の経路で、対象外なら項目を出さない。`cfg` はこのファイルの中だけ。#2859） | TCC。付与は保護下のパス（`~/Library/Mail` ほか）への `read_dir` で判定し、設定画面はシステム設定の URL スキームで開く | 対象外（`supported` が false。判定は常に付与済み・設定画面は `OsRefusal::FdaMacOnly`。TCC 相当が無い） |
 | インストーラーの記録（B20 `tako_core::platform::install_info`。入れた版数 `installed_version`・入れた先 `install_location`・「入れた本体か」の判定の正本 `runs_from_install_dir`。呼び手 = アプリ内更新の配布系統の判定（#2434）と tako の CLI の解決 `dispatch::resolve_tako_binary` の ②「入れた本体の隣を PATH より先に」（#2931）。比べ方を 1 実装にして、更新と MCP の登録先で「入れた本体か」の答えをずらさない） | 記録なし（`None`。入れた本体は `.app` で決まり、CLI の解決は ① の `/Applications/tako.app` で見る = ② に当たらない） | Inno Setup のアンインストールキー（HKCU の `DisplayVersion` / `InstallLocation`）。比べ方は Windows のパスの流儀（大文字小文字・`/` と `\`・末尾の区切り・`\\?\` を同一視）。ポータブル zip・開発ビルドは入れた先の外 |
+| Web ビュー（wry）が URL を解釈できるか（B38 `tako_control::platform::webview_url::webview_parses`。呼び手は `tako_control::web_url::check` の 1 か所 = 生成・読み込みの前の検査。#2937） | wry と同じ `+[NSURL URLWithString:]` を同じプロセスで先に呼び、nil なら解釈できない（wry の `unwrap` が GUI ごと abort する形。同じプロセス・同じ SDK の印なので wry が受ける結果と一致する。規則を手で写さない） | 確かめない（常に通す）。WebView2 の `Navigate` は解釈できない URL を `E_INVALIDARG` の Err で返し、wry も Err で返す（落ちない）ので、tako は「URL 読み込み失敗」・生成失敗の理由として返す |
 | シェル統合 | zsh / bash / fish | PowerShell |
 
 trait で抽象化し、core/ と control/ は platform/ の trait のみに依存する。
