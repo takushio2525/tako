@@ -168,7 +168,7 @@ SH
 # 依存の導入（`tako setup --yes`）が本物の brew を起こさないための偽物（#1503 のスクリプトと同じ）
 printf '#!/bin/sh\necho "==> Pouring $2"\nexit 0\n' > "$TMP/stubs/brew"
 printf '#!/bin/sh\nif [ "$1" = "-l" ]; then shift; fi\nexec /bin/sh "$@"\n' > "$TMP/stubs/isosh"
-chmod +x "$TMP/stubs"/*
+# 実行権は空打ちの補助が付ける（素の chmod にしない = #2222 / #2228）
 fake_exec_warm "$TMP/stubs/codex" "$TMP/stubs/agy" "$TMP/stubs/isosh" "$TMP/stubs/brew" || exit 1
 SANDBOX_PATH="$HOME_DIR/.local/bin:$TMP/stubs:/usr/bin:/bin:/usr/sbin:/sbin"
 # 砂場の env（GUI と CLI で同じ）
