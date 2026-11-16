@@ -572,7 +572,7 @@ fn looks_unauthenticated(text: &str) -> bool {
 }
 
 /// 取得の本体。**実行だけを注入可能にして判断は純粋関数側に置く**
-pub fn catalog_with(
+pub fn catalog_with<R>(
     agent: WorkerAgent,
     locate: impl FnOnce(WorkerAgent) -> Result<String, AgentCliError>,
     run: impl FnOnce(&str, &[&str]) -> R,
