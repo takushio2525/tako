@@ -303,7 +303,7 @@ fn 既知フォルダを引く口は境界の1本だけ() {
             lines
                 .iter()
                 .enumerate()
-                .filter(|(_, l)| !is_comment(l) && l.contains("SHGetKnownFolderPath"))
+                .filter(|(_, l)| !is_comment(l) && touches_known_folder_api(l))
                 .map(move |(i, l)| format!("{rel}:{}: {}", i + 1, l.trim()))
         })
         .collect();
@@ -313,4 +313,23 @@ fn 既知フォルダを引く口は境界の1本だけ() {
          置き、`known_folder::os_path` を通す:\n{}",
         offenders.join("\n")
     );
+}
+
+/// API の宣言か呼び出し（`SHGetKnownFolderPath(`）。対応表の証拠の文のような地の文の名前は数えない
+fn touches_known_folder_api(line: &str) -> bool {
+    line.contains("SHGetKnownFolderPath(")
+}
+
+/// 番犬 4 が #2432 の写し（宣言と呼び出し）を名指し、地の文の名前は名指さないこと
+#[test]
+fn 番犬4は写しの宣言と呼び出しだけを名指す() {
+    for copied in [
+        "            fn SHGetKnownFolderPath(",
+        "        let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_DOCUMENTS, 0, 0, &mut raw) };",
+    ] {
+        assert!(touches_known_folder_api(copied), "{copied}");
+    }
+    assert!(!touches_known_folder_api(
+        "            \"… Known Folder（`SHGetKnownFolderPath`・境界 B39）から引く …\","
+    ));
 }
