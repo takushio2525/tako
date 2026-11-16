@@ -266,10 +266,22 @@ fn version_from_segments(segments: &[String]) -> Option<String> {
     None
 }
 
+/// `<binary> --version` で版を読む（パスにも版リソースにも版が無いときの最終手段）。
+///
+/// **上限つき**で待つ（#2951）: 上限は [`bounded_claude_version`] の `claude --version` と同じ
+/// `probe::probe_timeout()`（既定 15 秒・env `TAKO_PROBE_TIMEOUT_SECS`）。打ち切ったら子を孫まで止め
+/// （#2942 の門番 `agent_probe::output_within`。打ち切りの知らせも門番が出す）、版は空 = 取れない扱い。
+/// A/B の `TAKO_2951_LEGACY=1` は修正前と同じく上限なし（返らない CLI で呼び手のスレッドが戻らない）
 fn extract_version_via_cli(binary: &Path) -> String {
     // #1261: 問い合わせの起動は正本の門番を通す（#586 のコンソール窓抑止もそこで当たる）。
     // テストプロセスでは実 claude を起こさない = 版は空文字（版が取れない環境と同じ経路）
-    crate::agent_probe::run(std::process::Command::new(binary).arg("--version"))
+    let output = if crate::agent_probe::issue2951_legacy() {
+        crate::agent_probe::run(std::process::Command::new(binary).arg("--version"))
+    } else {
+        let program = binary.to_string_lossy();
+        crate::agent_probe::output_with_timeout(&program, &["--version"]).into_output()
+    };
+    output
         .filter(|o| o.status.success())
         .and_then(|o| {
             let text = String::from_utf8_lossy(&o.stdout).to_string();
