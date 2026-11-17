@@ -20,45 +20,6 @@
 
 ---
 
-## 2026-11-11（#2906: claude の MCP の書き先を claude CLI と同じ `$CLAUDE_CONFIG_DIR/.claude.json` へ（正本 `tako_core::claude_config` + 口 `agent_mcp::claude_user_config_json` に 7 か所を寄せた・検証プロセスは一時 dir の外の値を見ない・番犬 `issue2906_*`））
-- 砂場の A/B: setup-mcp の 2 回目が「追加しました」→「既に設定」、死んだ登録の `setup --check` が楽観 → 警告 + 修復、直書きが `~/.claude.json` → `~/.claude-alt/.claude.json`・カタログ +0 B・範囲外は #2912。PR #2914
-
-## 2026-11-11（#2907: master の system prompt の Worker Model Policy 節・Available Worker Agents・Session Identity と `tako master` の起動の行の worker の値を spawn と同じ 1 実装（`Profile::default_worker_launch` = `plan_worker_launch_typed`）から組む。言えないときは頭の 1 行と出どころの括弧・未登録のアカウントは理由を出して起動は止めない。番犬 `issue2907_prompt_worker_policy_values`・カタログ ±0 B）
-- 実 CLI の A/B で Issue の例の起動の行・prompt が high → medium（Available Worker Agents と一致）・上の段なしはバイト一致・注入 3 か所で名指し。PR #2916
-
-## 2026-11-11（#2860: 子プロセスのグループ化・打ち切り・終了シグナル・daemon 化の 16 塊を境界 B5 の `platform::process` へトークン一致で移設（tako-core 6 口・tako-control 4 口））
-- 集計器で境界の外 302 → 286、番犬 `platform_parity` の直呼びの件数 + #2633 / #1533 / tmux_named_cleanup の走査先の追従。移設前後のバイナリで打ち切り・終了シグナル・転送・daemon の停止が一致・カタログ +0 B。PR #2917
-
-## 2026-11-11（#2915: worker の `[1m]` 警告（`tako master` の起動・`profiles` の warnings）を spawn と同じ 1 実装 `default_worker_launch` の model で判定する `worker_one_m_model_note` へ寄せた。claude の語彙の系統だけ・spawn が断る状態と solo では言わない。番犬 `issue2915_one_m_warning_actual_model`・カタログ ±0 B）
-- 実 CLI の A/B で上の段・アカウントの `[1m]` は黙る → 鳴る、ポリシーの段だけ / codex / 未登録のアカウントは鳴る → 黙る。注入 2 通りで名指し。範囲外の解除の案内は #2918。PR #2919
-
-## 2026-11-11（#2920: issue2826 のバイト一致テストのシェルが印（OSC 133;A）を `stty raw` の前に出しており、ICRNL の窓で CI の macOS が間欠的に落ちた → 印を stty の後へ。番犬 `issue2920_ready_mark_before_stty_watchdog`（同じ行で合図が stty より前を名指す）・規約 conventions.md）
-- 注入 `sleep 0.3` で修正前は `"echo hi\n"` で落ち・修正後は `"echo hi\r"` で通る・25 回連続 25/25・同じ型は他に無し・カタログ +0 B。PR #2922
-
-## 2026-11-11（#2861: ファイルの同一性・状態変更時刻・実行ビット・symlink・置き換え保存の 17 塊を新設の境界 B37 `tako_core::platform::fs_meta` へトークン一致で移設（Windows の縮退は `Option` / 定数で型に出し、呼び手は `None` を 0 で埋める = 判定は不変））
-- 集計器で境界の外 286 → 269、番犬 `platform_parity` の直呼びの件数。移設前後のバイナリで同一性・実行ビット・symlink・置き換え保存の結果が一致・カタログ +0 B。Windows の腕は #2921。PR #2923
-
-## 2026-11-11（#2902: setup の --answers の launch_agent の説明を今の挙動（--yes と同じ非対話で値によらず対話を開かない・none は互換で受理）へ。番犬 answersのlaunch_agentの説明が対話を開かない挙動と一致する）
-- 注入 3 通りで file:line 名指し・砂場の PTY で素の setup は開き --answers は 5 通りとも開かない・カタログ +0 B。PR #2924
-
-## 2026-11-11（#2918: `[1m]` 警告の解除の案内を、モデルを決めた段（master / solo の model・ポリシーの段・`worker_agents.claude.model`・アカウントの default_model）から `OneMClear::command` で組む。プロファイル名入りのそのまま打てる形・solo は `--solo`・アカウントは他の欄を付け直して登録し直す）
-- 砂場の A/B で修正前は 4 通りが打っても残る（solo は同名の master の model を外していた）→ 修正後は 5 通りとも消える。番犬 `issue2918_one_m_clear_hint` は注入と修正前のバイナリで名指して落ちる・カタログ ±0 B。PR #2926
-
-## 2026-11-16（#2921: 境界 B37 fs_meta の Windows の腕に同一性（FileIdInfo のボリュームのシリアル + ファイル ID）・状態変更時刻（FileBasicInfo の ChangeTime）・置き換え保存（一時ファイル + ReplaceFileW、置き換えられないときは #2921 前のその場の上書きへ倒す）を実装）
-- A/B `TAKO_2921_LEGACY=1`・CI の Windows に名指しの段 2 本・usage の 0 の行は 1 回読み直すだけで数は不変・カタログ +0 B。PR #2927
-
-## 2026-11-16（#2751: 狭いペイン（幅 240px）で言語サーバの「未導入」の帯が高さいっぱいに折り返して本文 0 行 → 帯の文の器に上限（ペインの高さの 0.33 まで・本文が半分を下回らない範囲・`pane_height_of_area` でペイン全体の高さへ戻す）+ 器の中のスクロール・ボタンの行は器の外。A/B `TAKO_2751_LEGACY=1`・番犬 `issue2751_lsp_band_cap_watchdog`・visual-test `lsp-band-2751`）
-- tako-vd で旧 0 行 → 新 10 行・221.5px（半分 207.5px）・広いペインの画素の差 0・カタログ +0 B。PR #2932
-
-## 2026-11-16（#2929: Windows で起動のたびにサイドバーへ「リモートを自動で起動できません（#971）」が赤字で出ていた → `autostart_decision` を意図 → OS の順へ。記録が無ければ未対応 OS でも `not-desired` で黙る・記録ありは今どおり知らせる）
-- A/B `TAKO_2929_LEGACY=1`・番犬 `issue2929_remote_autostart_quiet_watchdog`（実経路の probe は Windows の CI で本物の未対応 OS を引く）・カタログ +0 B。PR #2933
-
-## 2026-11-16（#2931: Windows の `tako setup` の MCP 登録先が PATH の別の tako.exe になっていた → `resolve_tako_binary` の ① の次に「実行中の本体がインストーラーで入れた先（境界 B20 の記録）に居れば隣」を置いた。判定は #2434 と同じ `install_info::runs_from_install_dir` の 1 実装・開発ビルド / zip / macOS は不変・A/B `TAKO_2931_LEGACY=1`・番犬 `issue2931_installed_sibling_first_watchdog`）
-- 注入 2 通り（順序を戻す・記録を渡さない）で名指し・macOS の砂場の setup-mcp は修正前後で同じ登録先・カタログ +0 B・Windows 実機の確認待ちで Refs。PR #2934
-
-## 2026-11-16（#2429 / #2430: Windows の Web ビューを見えるように（gpui の DirectComposition を起動の間だけ切る・副作用は実機で差なし）・ページの後の打鍵をターミナルへ戻す（Win32 の宛先を読んで SetFocus））
-- 境界 B11 `platform/webview_host.rs` を新設・項目 71 / 155 の Windows スキップを外した・`tako_web` を Degraded へ。起票 #2948 / #2949。PR #2938
-
 ## 2026-11-16（#2930: PWA の依存から使っていない `geist`（Next.js 用のフォントローダー・peer に next）を外した。Node 24 の npm 11.9 以降は next の任意依存が lock に無いことを EUSAGE で断り、build.rs の自動ビルドごと cargo build が止まっていた。フォントは public/fonts/ に同梱済み・dist は全ファイル一致・node_modules 247 → 60 MB）
 - npm 10.9.9 / 10.9.2 / 11.6 / 11.9 / 11.21 で npm ci + build が通る・build.rs の A/B（npm 11.9）は exit 101 → 0・e2e 124 passed は前後同じ・CI の macOS ジョブへ npm 11.21.1 の `ci --dry-run`。範囲外は #2943。PR #2944
 
@@ -79,3 +40,39 @@
 
 ## 2026-11-16（#2937: `tako web open 'javascript:…'` が正規化で `https://javascript:…` になり wry の NSURL の unwrap で GUI ごと abort → 検査を `tako_control::web_url` の 1 実装（形・scheme の表・境界 B38 = macOS は wry と同じ NSURL を先に呼ぶ）へ寄せ、全入口が wry へ渡す 2 か所の直前で通る）
 - dock / アドレスバーは理由をその場に出す。A/B `TAKO_2937_LEGACY=1`・番犬 `issue2937_webview_url_guard_watchdog`。PR #2953
+
+## 2026-11-16（#2942: `tako setup bootstrap status` / `status-all`・MCP `tako_setup_bootstrap`・`tako setup` の検出と導入の段の認証確認を環境診断と同じ上限つき（`auth_state_bounded`）にし、打ち切りを `auth_unconfirmed` と「認証: 不明（N 秒で応答なし）」で知らせる。門番 `agent_probe::output_within` は `probe::output_with_timeout_grouped` で孫まで止める）
+- A/B `TAKO_2942_LEGACY=1`・番犬 `issue2942_bootstrap_auth_probe_watchdog`。実経路 `scripts/test-bootstrap-auth-timeout-2942.sh` で修正前 30 秒無言 → 修正後 上限の秒数で理由つき・孫 0 件（PASS 75）・カタログ +0 B。起票 #2951 / #2956。PR #2955
+
+## 2026-11-16（#2943: docs の「ビルド方法」の前提条件に Node.js（npm）（LTS・22 / 24 系で確認済み）と、clone 直後の最初の cargo build が build.rs で PWA を自動ビルドする注記を足し、`.agent/windows-setup.md` の「3. Git と Node.js」を同じ言い方へ。英語版のページは無い（docs は ja のみ））
+- docs のビルド + CI と同じ検査一式が緑・描画を読み戻して確認。PR #2958
+
+## 2026-11-16（#2929 / #2931 / #2935 / #2940: Windows 実機のバッチ C（ssh の `win`・origin/main `a1b91bb` をインストーラーで入れた本体・隔離インスタンス）で元の症状が出なくなったのを確かめて閉じた。#2936 / #2937 は閉じてある Issue へ実機の確認のコメントだけ）
+- 修正後と `TAKO_<N>_LEGACY=1` の A/B（#2929 サイドバーの赤字・#2931 MCP の登録先・#2935 再 attach したペインの `listen_ports`・#2940 control.json の socket）。副作用: 砂場の setup が本物のレジストリの Path へ書いた → 写しから戻して #2959 を起票・検証プロセスでない GUI が `$PROFILE` の移行を当てた → 写しから戻した。PR なし
+
+## 2026-11-17（#2959: Windows の検証プロセス（`TAKO_ISOLATED` ほか）の `tako setup` / `bootstrap path` / `undo-path` / `setup undo` が本物のユーザー環境変数 Path を読み書きしないように。門は境界 B23 の `user_path::skip_for_verification`（`is_verification_process` の 1 実装）・飛ばしたら理由と置き場を日英で言い setup は PATH を残り作業に残す・`write_typed` も門で断る）
+- A/B `TAKO_2959_LEGACY=1`・番犬 `issue2959_user_path_verification_watchdog`。Windows CI の setup の一巡に段 7（検証プロセスで Path の生の値が不変・旧アームは砂場の `.local\bin` を足す）・本番の腕は #2959 前の JSON とバイト一致・カタログ +0 B・実機の確認待ちで Refs。PR #2962
+
+## 2026-11-17（#2956: MCP `tako_setup_bootstrap` / `tako_setup_models` を `prepare_offload` → `OffloadJob::SetupBootstrap` / `SetupModels` の background で答え、UI スレッドで外部 CLI を待たない（同期の腕と 1 実装・書き込みは錠で 1 本ずつ）。番犬 `issue2956_setup_dispatch_offload_watchdog` が dispatch の同期の腕から #1984 の葉へ届く形を名指す）
+- A/B `TAKO_2956_LEGACY=1`。実経路で修正前は `tako list` が 3.1 秒 / 6 秒以上待たされ perf.log に `dispatch:SetupBootstrap 3054ms` → 修正後 0.1 秒・専有なし（PASS 21）・カタログ +0 B。残り 7 本は #2961。PR #2963
+
+## 2026-11-17（#2939: Windows のスマホのショートカットの既定のデスクトップ・ダウンロードを境界 B39 `platform::known_folder`（SHGetKnownFolderPath）で引く・#2432 の写しも寄せた・検証プロセスはホームが OS のプロファイルと同じときだけ）
+- A/B `TAKO_2939_LEGACY=1`・番犬 `issue2939_known_folder_watchdog`。Windows CI で 4 つの既知フォルダが .NET / シェルの答えと一致・macOS は前後で同じ・カタログ +0 B・実機の確認待ちで Refs。PR #2964
+
+## 2026-11-17（#2951: モデル一覧（`codex debug models` / `agy models`）と stale binary の版（`claude --version`）を上限つきの門番 `agent_probe::output_with_timeout`（`probe_timeout` = 既定 15 秒・孫まで止める）へ寄せ、打ち切りは `failure.kind = timed_out` / 版が取れない扱い。全系統は並べて聞く）
+- A/B `TAKO_2951_LEGACY=1`・番犬 `issue2951_agent_probe_unbounded_watchdog`。実経路で修正前 30 秒無言 → 修正後 上限の秒数で理由つき・孫 0 件（PASS 42）・カタログ +12 B。PR #2965
+
+## 2026-11-17（#2961 の 1: MCP `tako_setup_mcp` / `tako_setup` / `tako_config_share` を `prepare_offload` → `OffloadJob::SetupMcp` / `SetupRun` / `ConfigShare` の background で答え、UI スレッドで外部プロセスを待たない（同期の腕と 1 実装・setup の書き込みは錠 `SETUP_WRITE_SERIAL` を bootstrap と共有）。番犬の `KNOWN` から 3 つを外し寄せ先の表 `TARGETS` へ）
+- A/B `TAKO_2961_LEGACY=1`。実経路で修正前は `dispatch:SetupMcp 6084ms` / `SetupRun 4007ms` / `ConfigShare 6053ms` → 修正後 `tako list` 0.1 秒・専有なし（PASS 36）・カタログ +0 B。PR #2968
+
+## 2026-11-17（#2961 の 2: MCP `tako_remote_setup` / `tako_remote_scrollback` を `OffloadJob::RemoteSetup` / `RemoteScrollback` の background で答え（採取は器のセッション名だけ UI で解く）、`tako_open_remote` は ssh の実体を #1984 の先取り（`ProbeNeeds::ssh_bin`）で background に済ませる。番犬にメソッド呼び出しの葉 `.capture_scrollback(` を足し、辿れなかった採取を見えるようにした）
+- 実経路で修正前は `dispatch:RemoteSetup 10009ms` / `RemoteScrollback 5010ms` / `OpenRemote 5022ms` → 修正後 `tako list` 0.1 秒・専有なし（PASS 33）・カタログ +0 B。PR #2970（閉じて #2974 に含めて merge）
+
+## 2026-11-17（#2948: Windows の Web ビューのページが宛先のあいだも tako のショートカットが届くように（WebView2 の AcceleratorKeyPressed を controller から直に付け、tako の割り当てに当たる打鍵だけ Handled → 前景タスクが宛先を戻して dispatch_keystroke）。判定は macOS の #326 と同じ 1 実装 `keys::webview_key_route`（表は 1 つ・macOS の答えは旧表と全キーコードで一致））
+- A/B `TAKO_2948_LEGACY=1`・番犬 `issue2948_webview_shortcut_watchdog`（注入 8 通りで名指し）・新しい crate なし・カタログ +0 B・実機の確認待ちで Refs。PR #2971
+
+## 2026-11-17（#2961 の 3: MCP `tako_remote_folder` を action ごとに段へ分けた（open / ls / open-file / push / list = background の `remote_folder_run`・着地でツリー / プレビュー・close は着地で外して ControlMaster の後始末を background = `Settled`・ssh-pane は先取り）。番犬の `KNOWN` から外し `STAGED_TARGETS` と #1984 の `UI_PATHS` で縛る）
+- 実経路で修正前は `dispatch:RemoteFolder` 約 6060ms（ls / open-file / list / close）→ 修正後 `tako list` 0.1 秒・専有なし（PASS 35）・カタログ +0 B。PR #2972（閉じて #2974 に含めて merge）
+
+## 2026-11-17（#2961 の 4 + #2966: MCP `tako_sleep_guard` の蓋閉じの準備・片付け・電池の設定を `OffloadJob::SleepGuardOs`（設定の書き込みは着地）へ、tako-app の `apply_stale_binary_scan` の版の読みを背景の走査へ。状態の照会は今の claude の版を覚えから使う（#2966）。番犬の `KNOWN` は空・tako-app の着地は `TAKO_APP_UI_LANDINGS` が本文で見る）
+- 実経路で修正前は `dispatch:SleepGuard` 約 6060ms・着地 `periodic_land:stale_binary` 3014ms・#2966 の照会 6.1 秒 → 修正後 専有なし・照会 3.1 秒（sleep PASS 20・stale PASS 11）・カタログ +0 B。#2970 / #2972 も含めて squash merge。PR #2974
