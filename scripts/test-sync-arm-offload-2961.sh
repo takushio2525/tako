@@ -221,9 +221,10 @@ SH
 cat > "$TMP/stubs/osascript" <<'SH'
 #!/bin/sh
 if [ -e "$FAKE_DIR/hang-osascript" ]; then : > "$FAKE_DIR/pids/$$"; exec /bin/sleep 600; fi
+# 登録の台本は visudo で検証する（削除の台本には無い）
 case "$*" in
-  *"rm -f"*) echo "OK: sudoers 削除完了・disablesleep 解除" ;;
-  *) echo "OK: sudoers 登録完了" ;;
+  *visudo*) echo "OK: sudoers 登録完了" ;;
+  *) echo "OK: sudoers 削除完了・disablesleep 解除" ;;
 esac
 exit 0
 SH
@@ -710,8 +711,8 @@ stale_status_call() {
 # 走らせ、版の読み（返らない `claude --version`・上限 3 秒）が UI スレッドで起きるかを perf.log で見る
 stale_landing_case() {
   local phase="$1" pane="$2" i
-  set_flags
-  mcp_call tako_set_title "{\"pane\":${pane},\"role\":\"worker\"}" "$phase-role" 30
+  # 止まる印は役割を付ける前に立てる（役割が付いた次の走査 = 2 秒以内に、今の claude と起動時のバイナリの版を読む）
+  set_flags hang-claude-version
   mcp_call tako_send_input "{\"pane\":${pane},\"text\":\"$TMP/old/claude --serve2961\"}" "$phase-serve" 30
   for i in $(seq 1 100); do
     ls "$FAKE_DIR"/serve-* >/dev/null 2>&1 && break
@@ -721,18 +722,21 @@ stale_landing_case() {
     fail "$phase: 器のペインで偽の claude（起動時のバイナリ）が起動しない"
     return
   fi
-  set_flags hang-claude-version
-  # 走査は 2 秒ごと。今の claude と起動時のバイナリの版の読み（各 3 秒）の後に着地する
-  for i in $(seq 1 300); do
-    [ -f "$TAKO_DATA_DIR/perf.log" ] && grep -q "periodic_land:stale_binary" "$TAKO_DATA_DIR/perf.log" && break
-    [ "$(fake_pid_count)" -ge 4 ] && [ "$i" -ge 150 ] && break
+  mcp_call tako_set_title "{\"pane\":${pane},\"role\":\"worker\"}" "$phase-role" 30
+  # 背景の走査が今の claude と起動時のバイナリの版を読み（子と孫の組 × 2 = 約 6 秒）、その後に着地する。
+  # 修正前は着地（UI）がもう一度版を読んで 3 秒止まり、確定の行が perf.log に出る（約 9 秒）。修正後は出ない
+  # （15 秒見る）
+  for i in $(seq 1 150); do
+    grep -q "メインスレッド専有: periodic_land:stale_binary が" "$TAKO_DATA_DIR/perf.log" 2>/dev/null && break
     sleep 0.1
   done
+  STALE_LAND_RECORDS="$(fake_pid_count)"
   STALE_LAND_MS="$(perl -ne 'BEGIN { $m = 0 } $m = $1 if /メインスレッド専有: periodic_land:stale_binary が (\d+)ms/ && $1 > $m; END { print "$m\n" }' "$TAKO_DATA_DIR/perf.log" 2>/dev/null)"
-  echo "    着地（periodic_land:stale_binary）の専有の最大 ${STALE_LAND_MS:-0}ms・偽の claude --version の pid の記録 $(fake_pid_count) 個"
+  echo "    着地（periodic_land:stale_binary）の専有の最大 ${STALE_LAND_MS:-0}ms・偽の claude --version の pid の記録 ${STALE_LAND_RECORDS} 個"
   grep -h "periodic_land:stale_binary" "$TAKO_DATA_DIR/perf.log" 2>/dev/null | sed 's/^/      /' | head -3
-  mcp_call tako_stale_binary "{\"action\":\"status\",\"pane\":${pane}}" "$phase-stale-land" 40
   kill_fakes
+  set_flags
+  mcp_call tako_stale_binary "{\"action\":\"status\",\"pane\":${pane}}" "$phase-stale-land" 40
 }
 
 report_holds() {
@@ -816,6 +820,11 @@ phase_gui() {
       fail "gui: #2966: 状態の照会が上限 1 回分で返らない（${STALE_ELAPSED} 秒）"
     fi
     stale_landing_case gui "$pane"
+    if [ "${STALE_LAND_RECORDS:-0}" -ge 4 ]; then
+      pass "gui: 背景の走査が今の claude と起動時のバイナリの版を読んだ（記録 ${STALE_LAND_RECORDS} 個 = 返らない claude --version の経路を通った）"
+    else
+      fail "gui: 背景の走査が版を読む経路を通っていない（記録 ${STALE_LAND_RECORDS:-0} 個）"
+    fi
     check_eq "gui: 着地（apply_stale_binary_scan）が UI スレッドで claude --version を待たない" "0" "${STALE_LAND_MS:-0}"
     check_eq "gui: 着地は stale を検知している（状態の照会の stale）" "true" "$(jf stale < "$TMP/out/gui-stale-land.out")"
   fi
