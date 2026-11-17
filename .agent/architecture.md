@@ -2181,10 +2181,16 @@ lid-guard.json が使う）:
   #2942 の上限 3 秒の注入・修正前の上限なしでは返らない CLI で無期限）。`SetupDeps`（#2433）と同じく、アプリの状態に依存しない
   ので要求だけを写して `OffloadJob::SetupBootstrap` / `OffloadJob::SetupModels` へ包み、`run_reply` が同期の腕と同じ
   `setup_bootstrap_reply` / `setup_models_reply` で background から応答する。UI スレッドで 1 本ずつだった書き込み（`dry_run` でない
-  `install`・`path`・`undo-path`）の順序は錠 `SETUP_BOOTSTRAP_WRITE_SERIAL` で保つ。#1984 の番犬は集約点の `dispatch` を辿らない
+  `install`・`path`・`undo-path`）の順序は錠 `SETUP_WRITE_SERIAL` で保つ（#2961 で setup-mcp・`tako setup` の実行と共有）。#1984 の番犬は集約点の `dispatch` を辿らない
   ので、番犬 `issue2956_setup_dispatch_offload_watchdog.rs` が `dispatch_inner` の腕のうち `prepare_offload` が出さない要求の腕を
   入口に呼び出しを辿り、#1984 の葉（`RAW` + `GRAPH_LEAVES` を本文から読む）へ届く行を file:line で名指す（今ある残りは理由つきで
   `KNOWN`）。A/B は `TAKO_2956_LEGACY=1`（UI スレッドで同期に答える）
+- **setup-mcp・`tako setup` の実行・設定共有も UI スレッドで待たない**（#2961）: #2956 の番犬が洗い出した同期の腕の残りのうち
+  `SetupMcp`（`claude mcp add` ほか）・`SetupRun`（子の `tako setup`）・`ConfigShare`（git）を `prepare_offload` → `OffloadJob::SetupMcp` /
+  `SetupRun` / `ConfigShare` へ出し、`run_reply` と同期の腕が同じ `setup_mcp_reply` / `setup_run_reply` / `config_share_reply` で答える。
+  UI スレッドで写すのは setup-mcp の project スコープのペインの cwd だけ（`setup_mcp_prepare`）。書き込みは錠で 1 本ずつ（setup 系は
+  `SETUP_WRITE_SERIAL` を bootstrap の書き込みと共有・config share は `CONFIG_SHARE_WRITE_SERIAL`）。設定画面の「MCP 登録」も同じ 3 段。
+  A/B は `TAKO_2961_LEGACY=1`（門は `sync_arm_offload_legacy()` の 1 か所）、実経路は `scripts/test-sync-arm-offload-2961.sh`（FR-2.14.26）
 - **照会 1 回の中では `ps` / `tmux list-panes -a` を 1 回だけ起こす**（#1968）: 状態照会は
   `has_running_children` と claude / codex / agy の会話 ID 解決が**それぞれ** `ps` と
   `tmux list-panes -a` を起こしていた（報告 1 回で `ps` 3 本）。`agents::with_shared_scan` の

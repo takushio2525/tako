@@ -22,10 +22,11 @@
 //!    葉が増えればここも追う）へ届けば、腕の中で次の段を呼んだ行を file:line で名指す。
 //!    今ある残り（setup 以外の同期の腕）は [`KNOWN`] に理由つきで宣言する（直したら外す。外したのに
 //!    残れば名指し、宣言したのに届かなくなれば「外すこと」と落ちる）
-//! 2. [`setupの問い合わせはbackgroundから答える`] — 禁止だけでなく寄せ先も縛る（#1496 の 2 本立て）。
-//!    `prepare_offload` に `SetupBootstrap` / `SetupModels` の腕があって A/B の門
-//!    （`setup_query_offload_legacy()`）を持ち、`run_reply` が同期の腕と同じ関数
-//!    （`setup_bootstrap_reply` / `setup_models_reply`）で答える
+//! 2. [`直した要求はbackgroundから答える`] — 禁止だけでなく寄せ先も縛る（#1496 の 2 本立て）。
+//!    直した要求（[`TARGETS`]）ごとに、`prepare_offload` の腕があって A/B の門を持ち、`run_reply` と
+//!    同期の腕が同じ応答の関数で答える。#2956 は `SetupBootstrap` / `SetupModels`（門
+//!    `setup_query_offload_legacy()`）、#2961 は `SetupMcp` / `SetupRun` / `ConfigShare`（門
+//!    `sync_arm_offload_legacy()` = `TAKO_2961_LEGACY`）。直した要求が [`KNOWN`] に残っていないことも見る
 //! 3. [`修正前の形を名指しできる`] — 修正前の形の注入（`prepare_offload` の腕を消す）を 1 / 2 が
 //!    file:line で名指しすること（同じテストの中の A/B）
 //!
@@ -40,8 +41,9 @@
 //! ## 相方
 //!
 //! 実経路（返らない偽の claude / codex / agy の隔離 GUI で、perf.log の `メインスレッド専有: dispatch:SetupBootstrap`
-//! の有無を A/B で見る）は PR #2956 の本文。応答の同値（background と同期の腕）と A/B は dispatch.rs の単体テスト
-//! `issue2956_*`。
+//! の有無を A/B で見る）は PR #2956 の本文と `scripts/test-setup-offload-2956.sh`、#2961 は
+//! `scripts/test-sync-arm-offload-2961.sh`。応答の同値（background と同期の腕）と A/B は dispatch.rs の単体テスト
+//! `issue2956_*` / `issue2961_*`。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -104,20 +106,9 @@ const PARTIAL: &[(&str, &str)] = &[
 
 /// 既知の残り: `prepare_offload` が出さない同期の腕のうち、外部プロセスの待ちへ届くもの
 /// （`(要求の名前, 理由)`）。#2956 の範囲外（setup の導入・モデル一覧以外）なので #2961 で扱う。
-/// 直したら外すこと（届かなくなると [`既知の残りはまだ届く`] が落ちる）
+/// 直したら外すこと（届かなくなると [`既知の残りはまだ届く`] が落ちる）。
+/// `SetupMcp` / `SetupRun` / `ConfigShare` は #2961 の 1 本目で外した（[`TARGETS`]）
 const KNOWN: &[(&str, &str)] = &[
-    (
-        "SetupMcp",
-        "#2961: `claude mcp add` ほかとログインシェル（`setup_mcp_agents` → `register`）",
-    ),
-    (
-        "SetupRun",
-        "#2961: `tako setup` の子プロセス全体（`run_setup_cli`）と tako の実行ファイルの解決",
-    ),
-    (
-        "ConfigShare",
-        "#2961: git（`dispatch_config_share` → `init` → `git`）",
-    ),
     (
         "RemoteSetup",
         "#2961: tailscale の CLI（`run_noninteractive` → `detect_tailscale` ほか）",
@@ -694,10 +685,107 @@ fn 走査が空振りしていない() {
 
 // ===== 2. 寄せ先 =====
 
+/// 直した要求の寄せ先（#2956 / #2961）。`prepare_offload` の腕（A/B の門つき）がジョブを作り、`run_reply` と
+/// `dispatch_inner` の同期の腕が同じ応答の関数を通す
+struct Target {
+    variant: &'static str,
+    issue: &'static str,
+    /// A/B の門（`prepare_offload` の腕のガード）
+    gate: &'static str,
+    /// `prepare_offload` の腕の頭（パターン + ガード + `=>`）
+    prepare_arm: &'static str,
+    /// その腕が作るジョブ
+    job: &'static str,
+    /// 注入で消す `prepare_offload` の腕の全文（修正前の形 = 腕が無い）
+    prepare_whole: &'static str,
+    /// `run_reply` の腕
+    run_arm: &'static str,
+    /// `dispatch_inner` の同期の腕の頭と、その腕の中で応答の関数を呼ぶ字面（同じ行でもよい）
+    sync_head: &'static str,
+    sync_call: &'static str,
+    /// 応答の関数
+    reply: &'static str,
+}
+
+const TARGETS: &[Target] = &[
+    Target {
+        variant: "SetupBootstrap",
+        issue: "#2956",
+        gate: "setup_query_offload_legacy()",
+        prepare_arm: "Request::SetupBootstrap { .. } if !setup_query_offload_legacy() =>",
+        job: "OffloadJob::SetupBootstrap(",
+        prepare_whole: "bootstrap @ Request::SetupBootstrap { .. } if !setup_query_offload_legacy() => {\n            Some(Ok(OffloadJob::SetupBootstrap(Box::new(bootstrap.clone()))))\n        }\n",
+        run_arm: "OffloadJob::SetupBootstrap(request) => setup_bootstrap_reply(&request)",
+        sync_head: "request @ Request::SetupBootstrap { .. } => ",
+        sync_call: "setup_bootstrap_reply(&request)",
+        reply: "setup_bootstrap_reply",
+    },
+    Target {
+        variant: "SetupModels",
+        issue: "#2956",
+        gate: "setup_query_offload_legacy()",
+        prepare_arm: "Request::SetupModels { .. } if !setup_query_offload_legacy() =>",
+        job: "OffloadJob::SetupModels(",
+        prepare_whole: "models @ Request::SetupModels { .. } if !setup_query_offload_legacy() => {\n            Some(Ok(OffloadJob::SetupModels(Box::new(models.clone()))))\n        }\n",
+        run_arm: "OffloadJob::SetupModels(request) => setup_models_reply(&request)",
+        sync_head: "request @ Request::SetupModels { .. } => ",
+        sync_call: "setup_models_reply(&request)",
+        reply: "setup_models_reply",
+    },
+    Target {
+        variant: "SetupMcp",
+        issue: "#2961",
+        gate: "sync_arm_offload_legacy()",
+        prepare_arm: "Request::SetupMcp { scope, pane, agent } if !sync_arm_offload_legacy() =>",
+        job: "OffloadJob::SetupMcp(",
+        prepare_whole: "Request::SetupMcp { scope, pane, agent } if !sync_arm_offload_legacy() => Some(\n            setup_mcp_prepare(host, scope.as_deref(), *pane, agent.clone())\n                .map(|job| OffloadJob::SetupMcp(Box::new(job))),\n        ),\n",
+        run_arm: "OffloadJob::SetupMcp(job) => setup_mcp_reply(&job)",
+        sync_head: "Request::SetupMcp { scope, pane, agent } => {",
+        sync_call: "setup_mcp_reply(&job)",
+        reply: "setup_mcp_reply",
+    },
+    Target {
+        variant: "SetupRun",
+        issue: "#2961",
+        gate: "sync_arm_offload_legacy()",
+        prepare_arm: "Request::SetupRun { .. } if !sync_arm_offload_legacy() =>",
+        job: "OffloadJob::SetupRun(",
+        prepare_whole: "run @ Request::SetupRun { .. } if !sync_arm_offload_legacy() => {\n            Some(Ok(OffloadJob::SetupRun(Box::new(run.clone()))))\n        }\n",
+        run_arm: "OffloadJob::SetupRun(request) => setup_run_reply(&request)",
+        sync_head: "request @ Request::SetupRun { .. } => ",
+        sync_call: "setup_run_reply(&request)",
+        reply: "setup_run_reply",
+    },
+    Target {
+        variant: "ConfigShare",
+        issue: "#2961",
+        gate: "sync_arm_offload_legacy()",
+        prepare_arm: "Request::ConfigShare { .. } if !sync_arm_offload_legacy() =>",
+        job: "OffloadJob::ConfigShare(",
+        prepare_whole: "share @ Request::ConfigShare { .. } if !sync_arm_offload_legacy() => {\n            Some(Ok(OffloadJob::ConfigShare(Box::new(share.clone()))))\n        }\n",
+        run_arm: "OffloadJob::ConfigShare(request) => config_share_reply(&request)",
+        sync_head: "request @ Request::ConfigShare { .. } => ",
+        sync_call: "config_share_reply(&request)",
+        reply: "config_share_reply",
+    },
+];
+
 #[test]
-fn setupの問い合わせはbackgroundから答える() {
+fn 直した要求はbackgroundから答える() {
     let problems = target_problems(dispatch_text());
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
+fn 直した要求はknownに残っていない() {
+    for t in TARGETS {
+        assert!(
+            !KNOWN.iter().any(|(v, _)| *v == t.variant),
+            "`{}` は直した（{}）のに KNOWN に残っている",
+            t.variant,
+            t.issue
+        );
+    }
 }
 
 /// `prepare_offload` の腕と `run_reply` の答え方（本文の字面で見る）
@@ -716,30 +804,27 @@ fn target_problems(text: &str) -> Vec<String> {
         )),
         Some((start, end)) => {
             let body = &code[start..end];
-            for (needle, job) in [
-                (
-                    "Request::SetupBootstrap { .. } if !setup_query_offload_legacy() =>",
-                    "OffloadJob::SetupBootstrap(",
-                ),
-                (
-                    "Request::SetupModels { .. } if !setup_query_offload_legacy() =>",
-                    "OffloadJob::SetupModels(",
-                ),
-            ] {
+            for t in TARGETS {
+                let (needle, job) = (t.prepare_arm, t.job);
                 match body.find(needle) {
                     None => out.push(format!(
-                        "{DISPATCH}:{} `prepare_offload` に `{needle}` の腕が無い。外部プロセスの問い合わせを \
-                         UI スレッドで待つ（#2956）。`{job}` へ包み、A/B の門 `setup_query_offload_legacy()` を置く",
-                        line_of(start)
+                        "{DISPATCH}:{} `prepare_offload` に `{needle}` の腕が無い。外部プロセスを UI スレッドで待つ（{}）。\
+                         `{job}` へ包み、A/B の門 `{}` を置く",
+                        line_of(start),
+                        t.issue,
+                        t.gate
                     )),
                     Some(at) => {
-                        // 腕の本体（パターンの `{ .. }` の後ろの最初の `}` まで）
+                        // 腕の本体（`=>` の後ろから、次の腕の頭 = 次の `Request::` まで）
                         let from = at + needle.len();
-                        let arm_end = body[from..].find('}').map_or(body.len(), |i| from + i);
+                        let arm_end = body[from..]
+                            .find("Request::")
+                            .map_or(body.len(), |i| from + i);
                         if !body[from..arm_end].contains(job) {
                             out.push(format!(
-                                "{DISPATCH}:{} `{needle}` の腕が `{job}` を作らない（#2956）",
-                                line_of(start + at)
+                                "{DISPATCH}:{} `{needle}` の腕が `{job}` を作らない（{}）",
+                                line_of(start + at),
+                                t.issue
                             ));
                         }
                     }
@@ -751,43 +836,39 @@ fn target_problems(text: &str) -> Vec<String> {
         None => out.push(format!("{DISPATCH}:1 `run_reply` が無い（走査の空振り）")),
         Some((start, end)) => {
             let body = &code[start..end];
-            for (job, reply) in [
-                (
-                    "OffloadJob::SetupBootstrap(request) => setup_bootstrap_reply(&request)",
-                    "setup_bootstrap_reply",
-                ),
-                (
-                    "OffloadJob::SetupModels(request) => setup_models_reply(&request)",
-                    "setup_models_reply",
-                ),
-            ] {
-                if !body.contains(job) {
+            for t in TARGETS {
+                if !body.contains(t.run_arm) {
                     out.push(format!(
-                        "{DISPATCH}:{} `run_reply` が `{job}` で答えていない。同期の腕と同じ関数 `{reply}` を通す（#2956）",
-                        line_of(start)
+                        "{DISPATCH}:{} `run_reply` が `{}` で答えていない。同期の腕と同じ関数 `{}` を通す（{}）",
+                        line_of(start),
+                        t.run_arm,
+                        t.reply,
+                        t.issue
                     ));
                 }
             }
         }
     }
     // 同期の腕も同じ関数（応答の 1 実装）
-    for (arm, reply) in [
-        (
-            "request @ Request::SetupBootstrap { .. } => setup_bootstrap_reply(&request)",
-            "setup_bootstrap_reply",
-        ),
-        (
-            "request @ Request::SetupModels { .. } => setup_models_reply(&request)",
-            "setup_models_reply",
-        ),
-    ] {
-        if !code.contains(arm) {
+    for t in TARGETS {
+        if sync_call_at(&code, t).is_none() {
             out.push(format!(
-                "{DISPATCH}:1 `dispatch_inner` の同期の腕が `{reply}` を通していない（background と応答が分かれる。#2956）"
+                "{DISPATCH}:1 `dispatch_inner` の同期の腕（`{}`）が `{}` を通していない（background と応答が分かれる。{}）",
+                t.sync_head, t.reply, t.issue
             ));
         }
     }
     out
+}
+
+/// 同期の腕の中で応答の関数を呼ぶ位置（腕の頭の後ろ・次の腕の頭より前の最初の `sync_call`）
+fn sync_call_at(code: &str, t: &Target) -> Option<usize> {
+    let head = code.find(t.sync_head)?;
+    let after = head + t.sync_head.len();
+    let next_arm = code[after..]
+        .find("Request::")
+        .map_or(code.len(), |i| after + i);
+    code[after..next_arm].find(t.sync_call).map(|i| after + i)
 }
 
 // ===== 3. 修正前の形を名指しできる =====
@@ -795,24 +876,18 @@ fn target_problems(text: &str) -> Vec<String> {
 #[test]
 fn 修正前の形を名指しできる() {
     let text = dispatch_text();
-    for (variant, arm) in [
-        (
-            "SetupBootstrap",
-            "bootstrap @ Request::SetupBootstrap { .. } if !setup_query_offload_legacy() => {\n            Some(Ok(OffloadJob::SetupBootstrap(Box::new(bootstrap.clone()))))\n        }\n",
-        ),
-        (
-            "SetupModels",
-            "models @ Request::SetupModels { .. } if !setup_query_offload_legacy() => {\n            Some(Ok(OffloadJob::SetupModels(Box::new(models.clone()))))\n        }\n",
-        ),
-    ] {
-        assert!(text.contains(arm), "注入の元の `{variant}` の腕が本文に無い（形を変えたなら注入も追うこと）");
+    for t in TARGETS {
+        let variant = t.variant;
+        assert!(
+            text.contains(t.prepare_whole),
+            "注入の元の `{variant}` の腕が本文に無い（形を変えたなら注入も追うこと）"
+        );
         // 修正前の形: `prepare_offload` の腕を消す（= 同期の腕で UI スレッドが待つ）
-        let injected = text.replacen(arm, "", 1);
+        let injected = text.replacen(t.prepare_whole, "", 1);
         let graph = graph_with(&[(DISPATCH, &injected)]);
         let findings = scan(&graph);
         let named: Vec<&Finding> = findings.iter().filter(|f| f.variant == variant).collect();
-        let sync_arm = format!("request @ Request::{variant} {{ .. }} => ");
-        let at = injected.find(&sync_arm).expect("同期の腕が本文にある");
+        let at = sync_call_at(&injected, t).expect("同期の腕が本文にある");
         let line = injected[..at].matches('\n').count() + 1;
         assert!(
             named.iter().any(|f| f.line == line && f.text.starts_with(&format!("{DISPATCH}:{line}"))),
@@ -820,7 +895,7 @@ fn 修正前の形を名指しできる() {
         );
         let problems = target_problems(&injected);
         assert!(
-            problems.iter().any(|p| p.contains(&format!("Request::{variant} {{ .. }} if !setup_query_offload_legacy()"))),
+            problems.iter().any(|p| p.contains(t.prepare_arm)),
             "`prepare_offload` の `{variant}` の腕を消した注入を 2 が名指ししない: {problems:#?}"
         );
     }
