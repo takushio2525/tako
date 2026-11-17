@@ -324,11 +324,13 @@ fn scan_main(src: &str) -> Vec<Offender> {
 /// 引き取り（`ssh_folders.rs`）の検査
 fn scan_folders(src: &str) -> Vec<Offender> {
     let mut out = Vec::new();
-    match fn_window(src, "pub(crate) fn apply_ssh_scan(") {
+    // #2969: 引き取りの本文は `apply_ssh_scan_with`（走査が引いた ssh の実体を受ける版）にある。
+    // `apply_ssh_scan` はそこへ `None` を渡すだけの薄い入口
+    match fn_window(src, "pub(crate) fn apply_ssh_scan_with(") {
         None => out.push(Offender {
             file: FOLDERS,
             line: 0,
-            why: "`apply_ssh_scan` が見つからない（走査が空振り）".into(),
+            why: "`apply_ssh_scan_with` が見つからない（走査が空振り）".into(),
         }),
         Some((at, window)) => {
             if !code_only(&window).contains("self.adopt_ssh_connect(") {
@@ -447,8 +449,8 @@ fn 走査が空振りしていない() {
             "{MAIN} の {needle} の窓が 2 行以下（字下げの規約が変わって窓が切れている）"
         );
     }
-    let (at, window) =
-        fn_window(&folders, "pub(crate) fn apply_ssh_scan(").expect("apply_ssh_scan の窓");
+    let (at, window) = fn_window(&folders, "pub(crate) fn apply_ssh_scan_with(")
+        .expect("apply_ssh_scan_with の窓");
     assert!(
         at > 0 && window.lines().count() > 10,
         "引き取り側の窓が小さい"
@@ -544,7 +546,7 @@ fn 逆戻りを名指しできる() {
 
     // 注入 4: 引き取りを落とす（手打ちの ssh が対象外に戻る）
     let no_adopt = folders.replace(
-        "            self.adopt_ssh_connect(PaneId::from_raw(session.pane), &session.destination);",
+        "            self.adopt_ssh_connect(\n                PaneId::from_raw(session.pane),\n                &session.destination,\n                adopt_ssh_bin.as_deref(),\n            );",
         "",
     );
     assert!(no_adopt != folders, "注入 4 の対象が見つからない");
