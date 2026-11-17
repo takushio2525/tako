@@ -69,6 +69,14 @@ pub enum AgentMcpError {
     NotReflected { agent: WorkerAgent },
     /// claude はこのモジュールの担当外（呼び出し側の配線ミス）
     NotSupportedHere { agent: WorkerAgent },
+    /// CLI（`mcp add` / `mcp list`）が上限の時間内に返らなかったので打ち切った（#2967）。
+    /// 登録できたかは**確かめられていない**（未登録・失敗とは言わない）
+    TimedOut {
+        agent: WorkerAgent,
+        /// 待ったサブコマンド（`mcp add` / `mcp list`。tako の実体のパスは載せない = #927）
+        step: String,
+        waited_secs: u64,
+    },
 }
 
 impl AgentMcpError {
@@ -81,6 +89,7 @@ impl AgentMcpError {
             Self::CommandFailed { .. } => "command_failed",
             Self::NotReflected { .. } => "not_reflected",
             Self::NotSupportedHere { .. } => "not_supported_here",
+            Self::TimedOut { .. } => "timed_out",
         }
     }
 }
@@ -186,6 +195,33 @@ impl AgentMcpError {
             (Self::NotSupportedHere { agent }, En) => format!(
                 "this path does not handle MCP registration for {} (dispatch::setup_mcp handles claude)",
                 agent.as_str(),
+            ),
+            (
+                Self::TimedOut {
+                    agent,
+                    step,
+                    waited_secs,
+                },
+                Ja,
+            ) => format!(
+                "{a} {step} が {waited_secs} 秒で応答しなかったので打ち切りました（MCP の登録は確かめられませんでした）。\
+                 次の一手: 同じコマンド（{a} {step}）を端末で手で実行して止まる理由（ログイン・ネットワーク・設定ファイルの錠）を\
+                 確かめてから、tako setup-mcp --agent {a} をやり直してください",
+                a = agent.as_str(),
+            ),
+            (
+                Self::TimedOut {
+                    agent,
+                    step,
+                    waited_secs,
+                },
+                En,
+            ) => format!(
+                "{a} {step} did not respond within {waited_secs} seconds, so tako stopped waiting \
+                 (the MCP registration could not be confirmed). \
+                 Next step: run the same command ({a} {step}) by hand in a terminal to see what it waits on \
+                 (login, network, a lock on its config file), then run tako setup-mcp --agent {a} again",
+                a = agent.as_str(),
             ),
         }
     }
@@ -718,6 +754,23 @@ fn toml_header_keys(line: &str) -> Option<Vec<String>> {
 
 // --- 実 CLI を起こす層 ---
 
+/// 待つサブコマンドの名前（`mcp add` / `mcp list`）。引数の先頭 2 つだけを取る（`add` の後ろの
+/// `tako -- <tako の実体> mcp serve` を知らせ・応答へ載せない = #927）
+fn step_of(args: &[String]) -> String {
+    args.iter()
+        .take(2)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// codex / agy の CLI を起こして待つ（**上限つき**。#2967）。
+///
+/// 上限は門番 [`crate::agent_probe::command_with_timeout`]（`probe::probe_timeout()` = 既定 15 秒）。
+/// 打ち切ったら子と孫を止め（#2942）、[`AgentMcpError::TimedOut`]（確かめられなかった）を返す。
+/// #2967 より前は `Command::output()` で待ち、返らない CLI で `tako setup-mcp`・MCP `tako_setup_mcp`
+/// （setup の書き込みの錠 `SETUP_WRITE_SERIAL` を持ったまま）・`tako setup`・環境診断が返らなかった。
+/// A/B（`TAKO_2967_LEGACY=1`）は修正前の上限なしの待ち
 fn run(
     agent: WorkerAgent,
     bin: &str,
@@ -727,10 +780,34 @@ fn run(
     // #586: dispatch（GUI 内）からも到達するのでコンソールウィンドウを出させない
     tako_core::platform::process::no_console_window(&mut cmd);
     cmd.args(args);
-    cmd.output().map_err(|e| AgentMcpError::Spawn {
-        agent,
-        detail: e.to_string(),
-    })
+    if crate::agent_probe::issue2967_legacy() {
+        return cmd.output().map_err(|e| AgentMcpError::Spawn {
+            agent,
+            detail: e.to_string(),
+        });
+    }
+    let step = step_of(args);
+    let label = format!("{} {step}", agent.as_str());
+    match crate::agent_probe::command_with_timeout(&mut cmd, &label) {
+        tako_core::probe::Outcome::Done {
+            status,
+            stdout,
+            stderr,
+        } => Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        tako_core::probe::Outcome::TimedOut { waited, .. } => Err(AgentMcpError::TimedOut {
+            agent,
+            step,
+            waited_secs: waited.as_secs(),
+        }),
+        tako_core::probe::Outcome::Failed { reason, .. } => Err(AgentMcpError::Spawn {
+            agent,
+            detail: reason,
+        }),
+    }
 }
 
 /// いまの登録内容（command と転送 env）。読めなければ command は None
@@ -753,15 +830,21 @@ impl Registration {
     }
 }
 
-/// 現在の登録を CLI / 設定ファイルから読む
-fn read_registration(agent: WorkerAgent, bin: &str) -> Registration {
-    match agent {
+/// 現在の登録を CLI / 設定ファイルから読む。
+///
+/// 読めない（CLI が失敗した・設定が無い）は空の登録。**一覧の CLI が上限で返らなかったときだけ**
+/// [`AgentMcpError::TimedOut`] を返す（#2967。「未登録」と混ぜると、返らない CLI へ `mcp add` を
+/// もう一度撃って同じだけ待つ）
+fn read_registration(agent: WorkerAgent, bin: &str) -> Result<Registration, AgentMcpError> {
+    Ok(match agent {
         WorkerAgent::Codex => {
-            let Ok(out) = run(agent, bin, &list_args(agent)) else {
-                return Registration::default();
+            let out = match run(agent, bin, &list_args(agent)) {
+                Ok(out) => out,
+                Err(e @ AgentMcpError::TimedOut { .. }) => return Err(e),
+                Err(_) => return Ok(Registration::default()),
             };
             if !out.status.success() {
-                return Registration::default();
+                return Ok(Registration::default());
             }
             let listing = String::from_utf8_lossy(out.stdout.as_slice()).to_string();
             Registration {
@@ -773,10 +856,10 @@ fn read_registration(agent: WorkerAgent, bin: &str) -> Registration {
         // agy は親 env をそのまま渡すので env_vars は空のままでよい（実測）
         WorkerAgent::Agy => {
             let Some(path) = config_path(agent) else {
-                return Registration::default();
+                return Ok(Registration::default());
             };
             let Ok(content) = std::fs::read_to_string(path) else {
-                return Registration::default();
+                return Ok(Registration::default());
             };
             Registration {
                 command: agy_registered_command(&content),
@@ -784,7 +867,7 @@ fn read_registration(agent: WorkerAgent, bin: &str) -> Registration {
             }
         }
         WorkerAgent::Claude => Registration::default(),
-    }
+    })
 }
 
 /// codex の `[mcp_servers.tako]` へ `env_vars` を足す。
@@ -820,7 +903,8 @@ pub fn register(agent: WorkerAgent, tako_binary: &str) -> Result<AgentMcpResult,
     let bin = tako_core::platform::exe::find(agent.as_str())
         .ok_or(AgentMcpError::CliNotFound { agent })?;
 
-    let existing = read_registration(agent, &bin);
+    // 一覧が返らなければ `mcp add` を撃たずに返す（同じ CLI をもう一度上限まで待たない。#2967）
+    let existing = read_registration(agent, &bin)?;
     if existing.is_usable(agent, tako_binary) {
         return Ok(AgentMcpResult {
             agent,
@@ -861,8 +945,10 @@ pub fn register(agent: WorkerAgent, tako_binary: &str) -> Result<AgentMcpResult,
 
     // 書けたと言われても本当に効いているかを確認する（無言死させない。#979 スコープ 3）。
     // command が読めない = 判定材料が無いだけなので成功として扱うが、
-    // 読めたのに食い違う・env の転送が欠けるなら NotReflected
-    let after = read_registration(agent, &bin);
+    // 読めたのに食い違う・env の転送が欠けるなら NotReflected。
+    // 確かめの一覧が上限で返らないとき（#2967）も読めないのと同じ扱い: `mcp add` は成功で終わっている
+    // （打ち切りの知らせは門番が stderr へ出す）
+    let after = read_registration(agent, &bin).unwrap_or_default();
     if after.command.is_some() && !after.is_usable(agent, tako_binary) {
         return Err(AgentMcpError::NotReflected { agent });
     }
@@ -1044,7 +1130,10 @@ pub fn state(agent: WorkerAgent) -> McpState {
     let Some(bin) = tako_core::platform::exe::find(agent.as_str()) else {
         return McpState::Unknown;
     };
-    let reg = read_registration(agent, &bin);
+    // 一覧が上限で返らない（#2967）= 読み取れない（未登録とは言わない）
+    let Ok(reg) = read_registration(agent, &bin) else {
+        return McpState::Unknown;
+    };
     let Some(command) = reg.command.filter(|c| !c.is_empty()) else {
         return McpState::NotRegistered;
     };
@@ -1229,6 +1318,11 @@ mod tests {
             AgentMcpError::NotSupportedHere {
                 agent: WorkerAgent::Claude,
             },
+            AgentMcpError::TimedOut {
+                agent: WorkerAgent::Codex,
+                step: "mcp add".into(),
+                waited_secs: 15,
+            },
         ];
         let mut kinds = std::collections::HashSet::new();
         for e in &all {
@@ -1245,7 +1339,37 @@ mod tests {
             }
             assert!(kinds.insert(e.kind()), "kind が重複: {}", e.kind());
         }
-        assert_eq!(kinds.len(), 6);
+        assert_eq!(kinds.len(), 7);
+    }
+
+    /// #2967: 打ち切りは「確かめられなかった」と言い、名札にも文にも tako の実体のパスを載せない（#927）
+    #[test]
+    fn issue2967_打ち切りは確かめられなかったと言いパスを載せない() {
+        let args = add_args(WorkerAgent::Codex, "/x/dev/tako/target/debug/tako");
+        assert_eq!(step_of(&args), "mcp add");
+        assert_eq!(step_of(&list_args(WorkerAgent::Codex)), "mcp list");
+        let e = AgentMcpError::TimedOut {
+            agent: WorkerAgent::Agy,
+            step: step_of(&add_args(WorkerAgent::Agy, "/x/tako")),
+            waited_secs: 15,
+        };
+        assert_eq!(e.kind(), "timed_out");
+        let ja = e.text_in(tako_core::i18n::Lang::Ja);
+        let en = e.text_in(tako_core::i18n::Lang::En);
+        assert!(
+            ja.starts_with("agy mcp add が 15 秒で応答しなかった"),
+            "{ja}"
+        );
+        assert!(ja.contains("確かめられませんでした"), "{ja}");
+        assert!(ja.contains("tako setup-mcp --agent agy"), "{ja}");
+        assert!(
+            en.starts_with("agy mcp add did not respond within 15 seconds"),
+            "{en}"
+        );
+        assert!(en.contains("could not be confirmed"), "{en}");
+        // 「未登録」「失敗」とは言わない（打ち切りは結果を知らない）
+        assert!(!ja.contains("失敗しました"), "{ja}");
+        assert!(!en.contains(" failed"), "{en}");
     }
 
     #[test]

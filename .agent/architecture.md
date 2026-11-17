@@ -2235,6 +2235,7 @@ lid-guard.json が使う）:
   tako-app の `apply_stale_binary_scan` が読んでいた起動時のバイナリの版は背景の走査が読んで運ぶ（`StaleScanResult::running_version`）。
   #2961 の番犬の `KNOWN` は空になった。グラフの外の tako-app の着地は番犬の `TAKO_APP_UI_LANDINGS` が本文で見る。
   状態の照会は今の claude の版を覚えから使う（#2966。`stale_status_versions`）（FR-2.14.29）
+- **MCP の登録とリモートフォルダの外部コマンドは上限つきで待つ**（#2967 / #2973）: #2961 で UI スレッドからは出したが、background の待ち自体に上限が無かった（返らない CLI で応答と setup の書き込みの錠が止まる）。エージェント CLI の書き込み（`claude mcp remove` / `add`・`codex mcp list` / `add`・`agy mcp add`）は門番 `agent_probe::command_with_timeout`（組み立て済みの `Command` = cwd を持てる・名札を呼び手が決める = 実体のパスを載せない。上限 `probe_timeout`・孫まで止める）、ssh / sftp は `remote_fs::spawn_capture` が `probe::wait_with_timeout` で待つ（上限は `remote_timeout` 30 秒・`ssh -O` 5 秒・転送は大きさから）。打ち切りは `SetupRefusal::ClaudeMcpTimedOut` / `AgentMcpError::TimedOut` / `RemoteErrorKind::NoResponse` で理由と次の一手を返す。番犬 `issue2967_unbounded_cli_wait_watchdog.rs` が入口から辿って上限なしの `.output()` / `.wait_with_output()` を名指す（FR-2.14.30）
 - **照会 1 回の中では `ps` / `tmux list-panes -a` を 1 回だけ起こす**（#1968）: 状態照会は
   `has_running_children` と claude / codex / agy の会話 ID 解決が**それぞれ** `ps` と
   `tmux list-panes -a` を起こしていた（報告 1 回で `ps` 3 本）。`agents::with_shared_scan` の

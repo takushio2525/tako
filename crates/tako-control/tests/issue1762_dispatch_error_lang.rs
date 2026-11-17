@@ -11947,10 +11947,11 @@ fn setup_refusal_index(r: &SetupRefusal) -> usize {
         S::DepSourceUnreachable { .. } => 60,
         S::DepInstallerTooOld { .. } => 61,
         S::DepWingetFailed { .. } => 62,
+        S::ClaudeMcpTimedOut { .. } => 63,
     }
 }
 
-const SETUP_REFUSAL_VARIANTS: usize = 63;
+const SETUP_REFUSAL_VARIANTS: usize = 64;
 
 /// tako-core の 3 型（bootstrap の path / undo-path の中身）の通し番号
 fn path_block_index(e: &PathBlockError) -> usize {
@@ -11996,10 +11997,11 @@ fn agent_mcp_index(e: &AgentMcpError) -> usize {
         AgentMcpError::CommandFailed { .. } => 3,
         AgentMcpError::NotReflected { .. } => 4,
         AgentMcpError::NotSupportedHere { .. } => 5,
+        AgentMcpError::TimedOut { .. } => 6,
     }
 }
 
-const AGENT_MCP_VARIANTS: usize = 6;
+const AGENT_MCP_VARIANTS: usize = 7;
 
 /// `tako mod ui` に断られる answers（slash に許可リストの外のコマンド）の実物の `UiError`
 fn mod_ui_refusal() -> tako_core::claude_mod_ui::UiError {
@@ -12454,6 +12456,17 @@ fn setup_refusal_table() -> Vec<(SetupRefusal, String)> {
              Installer failed with exit code: 1"
                 .into(),
         ),
+        // #2967 で足した（#2365 より後なので「前の固定文」は今の日本語）
+        (
+            S::ClaudeMcpTimedOut {
+                step: "add".into(),
+                waited_secs: 15,
+            },
+            "claude mcp add が 15 秒で応答しなかったので打ち切りました（MCP の登録は確かめられませんでした）。\
+             次の一手: 同じコマンド（claude mcp add）を端末で手で実行して止まる理由（ログイン・ネットワーク・設定ファイルの錠）を\
+             確かめてから、tako setup-mcp をやり直してください"
+                .into(),
+        ),
     ]
 }
 
@@ -12642,6 +12655,18 @@ fn agent_mcp_table() -> Vec<(AgentMcpError, String)> {
                 agent: WorkerAgent::Claude,
             },
             "claude の MCP 登録はこの経路では扱いません（claude は dispatch::setup_mcp が担当）".into(),
+        ),
+        // #2967 で足した（#2365 より後なので「前の固定文」は今の日本語）
+        (
+            A::TimedOut {
+                agent: codex,
+                step: "mcp list".into(),
+                waited_secs: 15,
+            },
+            "codex mcp list が 15 秒で応答しなかったので打ち切りました（MCP の登録は確かめられませんでした）。\
+             次の一手: 同じコマンド（codex mcp list）を端末で手で実行して止まる理由（ログイン・ネットワーク・設定ファイルの錠）を\
+             確かめてから、tako setup-mcp --agent codex をやり直してください"
+                .into(),
         ),
     ]
 }
