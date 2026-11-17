@@ -16107,11 +16107,22 @@ fn 使用量と対応表と移行とremote系の型の口に日本語の固定�
 #[test]
 fn dispatchとcliのremote系の口は日本語の口を呼ばない() {
     let mut failures = Vec::new();
-    for head in [
-        "        Request::RemoteMessages { session_id, tail } =>",
-        "        Request::RemoteSetup { action, answers } =>",
+    // #2961: RemoteSetup / RemoteScrollback の腕の本体は、同期の腕と background の腕が通る 1 実装
+    // （`remote_setup_reply` / `remote_scrollback_reply`）へ移った。腕の値ではなくその関数を見る
+    for (head, value) in [
+        (
+            "        Request::RemoteMessages { session_id, tail } =>",
+            true,
+        ),
+        ("fn remote_setup_reply(", false),
+        ("fn remote_scrollback_reply(", false),
     ] {
-        let Some(lines) = run_value_lines(DISPATCH_SRC, head) else {
+        let found = if value {
+            run_value_lines(DISPATCH_SRC, head)
+        } else {
+            front_scope_lines(DISPATCH_SRC, Some(head))
+        };
+        let Some(lines) = found else {
             failures.push(format!(
                 "{DISPATCH_PATH}: 走査の範囲 `{}` が見つからない（改名で番犬が空振りする）",
                 head.trim()
