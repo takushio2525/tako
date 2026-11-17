@@ -18586,8 +18586,10 @@ pub fn remote_ssh_argv(ssh_host: &str) -> Vec<String> {
 }
 
 /// [`remote_ssh_argv`] の本体。ssh の実体を引数で受ける（#2961。GUI の UI スレッドの dispatch は
-/// background で引いた答え = [`UiProbes::ssh_bin`] で組む。ログインシェルを待たない）
-fn remote_ssh_argv_with(ssh_host: &str, ssh_bin: Option<String>) -> Vec<String> {
+/// background で引いた答え = [`UiProbes::ssh_bin`] で組む。ログインシェルを待たない）。
+/// tako-app の ssh の検知の着地（`adopt_ssh_connect`）も、走査（background）が引いた実体でここを呼ぶ（#2969）。
+/// `None` は素の `ssh`（起こすシェルが PATH で引く = 待たない側。見つからなかったときと同じ形）
+pub fn remote_ssh_argv_with(ssh_host: &str, ssh_bin: Option<String>) -> Vec<String> {
     let hosts = match tako_core::ssh_config::default_ssh_config_path() {
         Some(p) => tako_core::ssh_config::parse_ssh_config(&p),
         None => Vec::new(),
