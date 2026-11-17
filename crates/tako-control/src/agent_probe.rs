@@ -62,6 +62,20 @@ pub fn issue2951_legacy() -> bool {
     )
 }
 
+/// #2967 の A/B の env（`1` = 修正前と同じく、MCP の登録（`claude mcp remove` / `add`・`codex mcp list` / `add`・
+/// `agy mcp add`）を上限なしの `Command::output()` で待つ）
+pub const ISSUE2967_LEGACY_ENV: &str = "TAKO_2967_LEGACY";
+
+/// #2967 の A/B が立っているか（**門はここ 1 か所**）。呼ばれるたびに読む（テストが `run_alone!` の子で
+/// 切り替えられるよう、値を覚えない）。呼び手は `if crate::agent_probe::issue2967_legacy() {` の形で置く
+/// （番犬 `issue2967_unbounded_cli_wait_watchdog` が A/B の旧経路の腕として読む形）
+pub fn issue2967_legacy() -> bool {
+    matches!(
+        std::env::var(ISSUE2967_LEGACY_ENV).ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
 /// エージェント CLI を問い合わせ目的で起こす（**上限なし**）。
 ///
 /// 禁じられているときは**プロセスを 1 つも作らずに** `None` を返す
@@ -123,6 +137,37 @@ pub fn output_within(
     } else {
         tako_core::probe::output_with_timeout_grouped(program, args, budget)
     };
+    if let Some(notice) = outcome.timeout_notice() {
+        eprintln!("  {notice}");
+    }
+    outcome
+}
+
+/// **組み立て済みの** `Command` でエージェント CLI を起こし、上限つきで待つ（#2967）。
+///
+/// 問い合わせ（[`output_with_timeout`]）と違い、作業ディレクトリを持つ（`claude mcp add --scope project` は
+/// そのプロジェクトの `.mcp.json` へ書く）・名札を呼び手が決める（`claude mcp add … -- <tako の実体> mcp serve` の
+/// 引数をそのまま名札にすると、開発ビルドの実ホームパスが知らせ・応答へ載る = #927）書き込みの口のためにある。
+/// 上限は [`output_with_timeout`] と同じ `probe::probe_timeout()`（既定 15 秒。`mcp add` / `mcp remove` /
+/// `mcp list` は設定の読み書きで、登録済みの MCP サーバへ 1 台ずつ繋いで回る `claude mcp list`（実測 5.26 秒 =
+/// #1503）より重くならない）。
+///
+/// 門番（テストプロセスからは起こさない = #1261）・孫まで止める打ち切り（子にグループを率いさせる =
+/// `probe::group_output_with_timeout`。#2942）・打ち切りの知らせ（stderr。#1503）は [`output_within`] と同じ。
+/// コンソールウィンドウの抑止（#586）はここで当てる
+pub fn command_with_timeout(
+    cmd: &mut std::process::Command,
+    label: &str,
+) -> tako_core::probe::Outcome {
+    if blocked() {
+        return tako_core::probe::Outcome::Failed {
+            label: label.to_string(),
+            reason: "検証プロセスからの問い合わせは禁じられています（#1261）".to_string(),
+        };
+    }
+    tako_core::platform::process::no_console_window(cmd);
+    let outcome =
+        tako_core::probe::group_output_with_timeout(cmd, label, tako_core::probe::probe_timeout());
     if let Some(notice) = outcome.timeout_notice() {
         eprintln!("  {notice}");
     }

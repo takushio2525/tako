@@ -31,6 +31,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use crate::i18n::Lang;
 use crate::platform::support::Note;
@@ -57,6 +58,58 @@ pub const SERVER_ALIVE_COUNT_MAX: u32 = 3;
 
 /// symlink の実体がディレクトリかを確かめる件数の上限（1 ディレクトリあたり）
 const MAX_SYMLINK_PROBES: usize = 64;
+
+/// ssh / sftp の待ちの既定の上限（#2973）。接続を張る ssh（ControlMaster = `-N -f`）と sftp のバッチ
+/// （多重化の無い Windows では sftp が自分で接続を張る）に掛ける。
+///
+/// 根拠: TCP の接続は [`CONNECT_TIMEOUT_SECS`]（10 秒）で ssh 自身が切る。鍵交換・認証で相手が黙ったときの
+/// 見切りは keepalive（[`SERVER_ALIVE_INTERVAL_SECS`] × [`SERVER_ALIVE_COUNT_MAX`] ≒ 15 秒）が持つ。
+/// その和 25 秒に余裕 5 秒。**ssh が自分で切れない形**（ProxyCommand・認証エージェント・ラッパーが返らない・
+/// 多重化の master が応答しない）はここで tako が切る。#2973 より前は上限が無く、`tako_remote_folder` の
+/// MCP は応答の安全網（300 秒）まで返らなかった
+pub const DEFAULT_REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// [`DEFAULT_REMOTE_TIMEOUT`] を上書きする env（秒）。0 / 不正 / 空は既定へ落ちる（= 外せない。
+/// `probe::parse_timeout_secs` の 1 実装）。遅い回線で伸ばす・検証で縮める口
+pub const REMOTE_TIMEOUT_ENV: &str = "TAKO_REMOTE_TIMEOUT_SECS";
+
+/// `ssh -O check` / `ssh -O exit` の上限（#2973）。手元の多重化のソケットへの往復だけで、相手まで行かない。
+/// 実測（macOS・OpenSSH・置き場の無いソケットへの `-O check`）は 0.01 秒の桁。ssh の設定の
+/// `Match exec` が重いときの余裕を見て 5 秒（[`remote_timeout`] がこれより短ければそちら）
+pub const MUX_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 転送（`get` / `put`）を含む sftp のバッチに足す時間の見込み = この速さを下回る回線は打ち切る（#2973）。
+/// 64 KiB/s（≒ 0.5 Mbps）。プレビューの上限 [`MAX_PREVIEW_BYTES`]（8 MiB）なら 128 秒が足される
+pub const MIN_TRANSFER_BYTES_PER_SEC: u64 = 64 * 1024;
+
+/// #2973 の A/B の env（`1` = 修正前と同じく ssh / sftp を上限なしの `wait_with_output` で待つ）
+pub const ISSUE2973_LEGACY_ENV: &str = "TAKO_2973_LEGACY";
+
+/// #2973 の A/B が立っているか（**門はここ 1 か所**。値を覚えない）
+pub fn issue2973_legacy() -> bool {
+    matches!(
+        std::env::var(ISSUE2973_LEGACY_ENV).ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
+/// 接続を張る ssh と sftp のバッチの上限（[`DEFAULT_REMOTE_TIMEOUT`]・env [`REMOTE_TIMEOUT_ENV`]）
+pub fn remote_timeout() -> Duration {
+    crate::probe::parse_timeout_secs(
+        std::env::var(REMOTE_TIMEOUT_ENV).ok().as_deref(),
+        DEFAULT_REMOTE_TIMEOUT,
+    )
+}
+
+/// `ssh -O check` / `-O exit` の上限（[`MUX_CONTROL_TIMEOUT`] と [`remote_timeout`] の短いほう）
+pub fn mux_control_timeout() -> Duration {
+    remote_timeout().min(MUX_CONTROL_TIMEOUT)
+}
+
+/// `bytes` を転送する sftp のバッチの上限（[`remote_timeout`] + `bytes` を [`MIN_TRANSFER_BYTES_PER_SEC`] で送る時間）
+pub fn transfer_timeout(bytes: u64) -> Duration {
+    remote_timeout() + Duration::from_secs(bytes.div_ceil(MIN_TRANSFER_BYTES_PER_SEC))
+}
 
 // --- リモートの位置 ---------------------------------------------------------
 
@@ -237,6 +290,10 @@ pub enum RemoteErrorKind {
     TooLarge,
     /// **開いた時点とリモートの実体が食い違っている**（#966。書き戻しを止めた）
     Conflict,
+    /// ssh / sftp（**手元のクライアント**）が上限の時間内に返らなかったので打ち切った（#2973）。
+    /// ネットワークの相手が黙った形（[`RemoteErrorKind::Timeout`]）は ssh 自身が切るので、ここへ来るのは
+    /// ssh が自分で切れない形（ProxyCommand・認証エージェント・多重化の master が応答しない）
+    NoResponse,
     /// 応答が読めない・想定外の失敗
     Other,
 }
@@ -258,6 +315,7 @@ impl RemoteErrorKind {
         RemoteErrorKind::NotDirectory,
         RemoteErrorKind::TooLarge,
         RemoteErrorKind::Conflict,
+        RemoteErrorKind::NoResponse,
         RemoteErrorKind::Other,
     ];
 
@@ -311,6 +369,10 @@ impl RemoteErrorKind {
             RemoteErrorKind::Conflict => Note::new(
                 "開いたときからリモート側が変わっています（上書きしませんでした）",
                 "The remote file changed since you opened it (nothing was overwritten)",
+            ),
+            RemoteErrorKind::NoResponse => Note::new(
+                "ssh / sftp が上限の時間内に応答しませんでした（待つのを打ち切りました）",
+                "ssh / sftp did not respond within the time limit (tako stopped waiting)",
             ),
             RemoteErrorKind::Other => Note::new("接続に失敗しました", "The connection failed"),
         }
@@ -367,6 +429,10 @@ impl RemoteErrorKind {
                 "リモートを読み直して編集をやり直すか、こちらの内容で上書きしてよければ強制保存してください（編集内容はローカルに残っています）",
                 "Reload the remote file and redo your edit, or force-save to overwrite it with your version (your edit is kept locally)",
             ),
+            RemoteErrorKind::NoResponse => Note::new(
+                "同じ ssh / sftp を端末で手で実行して、何を待って止まるか（ProxyCommand・認証エージェント・接続の共有（ControlMaster））を確かめてください",
+                "Run the same ssh / sftp by hand in a terminal to see what it waits on (ProxyCommand, the auth agent, or the shared connection (ControlMaster))",
+            ),
             RemoteErrorKind::Other => Note::new(
                 "下の詳細を確認してください",
                 "Check the details below",
@@ -390,6 +456,7 @@ impl RemoteErrorKind {
             RemoteErrorKind::NotDirectory => "not_directory",
             RemoteErrorKind::TooLarge => "too_large",
             RemoteErrorKind::Conflict => "conflict",
+            RemoteErrorKind::NoResponse => "no_response",
             RemoteErrorKind::Other => "other",
         }
     }
@@ -1350,7 +1417,52 @@ fn is_shell_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-fn spawn_capture(bin: &str, args: &[String], stdin_text: Option<&str>) -> std::io::Result<Output> {
+/// ssh / sftp の起動・待ちの失敗（#2973）
+#[derive(Debug)]
+enum CaptureError {
+    /// 起こせない（実行ファイルが無い等）・待ちそのものに失敗した
+    Spawn(String),
+    /// 上限の時間内に返らなかったので打ち切った（子と孫は止めた）。`label` はパスを含まない名札（#927）
+    TimedOut {
+        label: &'static str,
+        waited_secs: u64,
+    },
+}
+
+impl CaptureError {
+    /// 分類済みの失敗へ（起こせない = [`RemoteErrorKind::ClientMissing`]・打ち切り = [`RemoteErrorKind::NoResponse`]）
+    fn into_remote(self, target: &str, bin: &str) -> RemoteError {
+        match self {
+            CaptureError::Spawn(e) => RemoteError::new(
+                RemoteErrorKind::ClientMissing,
+                target,
+                format!("{bin}: {e}"),
+            ),
+            CaptureError::TimedOut { label, waited_secs } => RemoteError::new(
+                RemoteErrorKind::NoResponse,
+                target,
+                format!("{label} ({waited_secs} s)"),
+            ),
+        }
+    }
+}
+
+/// ssh / sftp を起こし、**上限つきで**待つ（#2973。`budget` は呼び手が待つものごとに決める =
+/// [`remote_timeout`] / [`mux_control_timeout`] / [`transfer_timeout`]）。
+///
+/// 待ちは `probe::wait_with_timeout` の 1 実装（子が終わった後のパイプの読み切りにも予算が掛かる）。
+/// 子には自分のプロセスグループを率いさせるので、打ち切ると ProxyCommand・ラッパーが起こした孫まで止まる
+/// （unix。Windows は待ちの 1 実装の入れ物 = Job Object が止める = #2462）。接続を張る ssh（`-N -f`）は
+/// 認証の後に自分で `setsid` して離れる（OpenSSH の `daemon(3)`）ので、張れた master は打ち切りの巻き添えに
+/// ならない。sftp のバッチは別スレッドで書き込む（読まない子へ書き込みが詰まっても上限が効く）。
+/// A/B（[`ISSUE2973_LEGACY_ENV`]）は修正前の上限なしの `wait_with_output`
+fn spawn_capture(
+    bin: &str,
+    args: &[String],
+    stdin_text: Option<&str>,
+    budget: Duration,
+    label: &'static str,
+) -> Result<Output, CaptureError> {
     let mut cmd = Command::new(bin);
     cmd.args(args)
         .stdin(if stdin_text.is_some() {
@@ -1362,22 +1474,58 @@ fn spawn_capture(bin: &str, args: &[String], stdin_text: Option<&str>) -> std::i
         .stderr(Stdio::piped());
     // Windows でコンソールウィンドウを出さない（#586 と同じ理由）
     crate::platform::process::no_console_window(&mut cmd);
-    let mut child = cmd.spawn()?;
+    if issue2973_legacy() {
+        let spawn = |e: std::io::Error| CaptureError::Spawn(e.to_string());
+        let mut child = cmd.spawn().map_err(spawn)?;
+        if let Some(text) = stdin_text {
+            use std::io::Write;
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+        }
+        let out = child.wait_with_output().map_err(spawn)?;
+        return Ok(Output {
+            status_ok: out.status.success(),
+            code: out.status.code(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    crate::platform::process::lead_own_group(&mut cmd);
+    let mut spawned =
+        crate::probe::spawn_for_wait(&mut cmd).map_err(|e| CaptureError::Spawn(e.to_string()))?;
     if let Some(text) = stdin_text {
-        use std::io::Write;
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
+        if let Some(mut stdin) = spawned.child.stdin.take() {
+            let text = text.to_string();
+            // 作れない（資源切れ）ときは書き込みを諦める = 閉じた標準入力で sftp がすぐ失敗する
+            let _ = std::thread::Builder::new()
+                .name("tako-sftp-batch".into())
+                .spawn(move || {
+                    use std::io::Write;
+                    let _ = stdin.write_all(text.as_bytes());
+                });
         }
     }
-    let out = child.wait_with_output()?;
-    Ok(Output {
-        status_ok: out.status.success(),
-        code: out.status.code(),
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-    })
+    match crate::probe::wait_with_timeout(spawned, label, budget) {
+        crate::probe::Outcome::Done {
+            status,
+            stdout,
+            stderr,
+        } => Ok(Output {
+            status_ok: status.success(),
+            code: status.code(),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        }),
+        crate::probe::Outcome::TimedOut { waited, .. } => Err(CaptureError::TimedOut {
+            label,
+            waited_secs: waited.as_secs(),
+        }),
+        crate::probe::Outcome::Failed { reason, .. } => Err(CaptureError::Spawn(reason)),
+    }
 }
 
+#[derive(Debug)]
 struct Output {
     status_ok: bool,
     code: Option<i32>,
@@ -1430,15 +1578,23 @@ fn first_lines(text: &str, n: usize) -> String {
 /// [`liveness`] を使うこと: そちらは「判定できない」を `Unknown` として返すので、
 /// 切断と取り違えて再接続を撃ち続ける形にならない（#1090）
 pub fn master_alive(host: &str) -> bool {
+    matches!(master_check(host), Ok(true))
+}
+
+/// `ssh -O check` の答え（[`master_alive`] の本体）。**`Err` は上限で返らなかったときだけ**（#2973。
+/// [`RemoteErrorKind::NoResponse`] = 理由と次の一手つき）。起こせない・非ゼロ終了は「生きていない」
+fn master_check(host: &str) -> Result<bool, RemoteError> {
     if !crate::platform::ssh_client::multiplexing_available() {
-        return false;
+        return Ok(false);
     }
-    let Some(ssh) = ssh_bin() else { return false };
+    let Some(ssh) = ssh_bin() else {
+        return Ok(false);
+    };
     let Some(cp) = control_path(host) else {
-        return false;
+        return Ok(false);
     };
     if !cp.exists() {
-        return false;
+        return Ok(false);
     }
     let args = vec![
         "-O".to_string(),
@@ -1447,9 +1603,11 @@ pub fn master_alive(host: &str) -> bool {
         control_path_option(&cp),
         host.to_string(),
     ];
-    spawn_capture(&ssh, &args, None)
-        .map(|o| o.status_ok)
-        .unwrap_or(false)
+    match spawn_capture(&ssh, &args, None, mux_control_timeout(), "ssh -O check") {
+        Ok(out) => Ok(out.status_ok),
+        Err(CaptureError::Spawn(_)) => Ok(false),
+        Err(e) => Err(e.into_remote(host, &ssh)),
+    }
 }
 
 /// ホストへの接続が「いま使えるか」（#1090）。
@@ -1485,26 +1643,40 @@ impl Liveness {
 /// ControlPath の置き場が無いホスト（#2855）も、多重化の無いプラットフォームと同じく
 /// `Unknown`。`Dead` で埋めると自動再接続（#1040）が撃ち続ける
 pub fn liveness(host: &str) -> Liveness {
+    liveness_checked(host).unwrap_or(Liveness::Dead)
+}
+
+/// [`liveness`] に**打ち切りの理由**を添えた口（#2973）。`ssh -O check` が上限で返らなかったときだけ
+/// `Err`（[`RemoteErrorKind::NoResponse`]）。[`liveness`] はそれを `Dead` と読む（応答しない master は
+/// 張り直す = 自動再接続 #1040 の回復の形）。`tako_remote_folder` の `list` は理由を応答へ載せる
+pub fn liveness_checked(host: &str) -> Result<Liveness, RemoteError> {
     if !multiplexing_for(host) {
-        return Liveness::Unknown;
+        return Ok(Liveness::Unknown);
     }
-    if master_alive(host) {
+    Ok(if master_check(host)? {
         Liveness::Live
     } else {
         Liveness::Dead
-    }
+    })
 }
 
 /// ControlMaster を落とす（`ssh -O exit`）。閉じるときに呼ぶ。
-/// 多重化が無いプラットフォームでは落とす器が無いので何もしない（#1090）
-pub fn close_master(host: &str) {
+/// 多重化が無いプラットフォームでは落とす器が無いので何もしない（#1090）。
+///
+/// 落とせなかった（起こせない・非ゼロ終了）は従来どおり黙る（`ControlPersist` の後に master は自分で消える）。
+/// **`ssh -O exit` が上限で返らなかったときだけ** `Err`（#2973。[`RemoteErrorKind::NoResponse`]）
+pub fn close_master(host: &str) -> Result<(), RemoteError> {
     if !crate::platform::ssh_client::multiplexing_available() {
-        return;
+        return Ok(());
     }
-    let Some(ssh) = ssh_bin() else { return };
-    let Some(cp) = control_path(host) else { return };
+    let Some(ssh) = ssh_bin() else {
+        return Ok(());
+    };
+    let Some(cp) = control_path(host) else {
+        return Ok(());
+    };
     if !cp.exists() {
-        return;
+        return Ok(());
     }
     let args = vec![
         "-O".to_string(),
@@ -1513,7 +1685,10 @@ pub fn close_master(host: &str) {
         control_path_option(&cp),
         host.to_string(),
     ];
-    let _ = spawn_capture(&ssh, &args, None);
+    match spawn_capture(&ssh, &args, None, mux_control_timeout(), "ssh -O exit") {
+        Err(e @ CaptureError::TimedOut { .. }) => Err(e.into_remote(host, &ssh)),
+        _ => Ok(()),
+    }
 }
 
 /// ControlMaster を確立する（既に生きていれば何もしない）。
@@ -1578,17 +1753,26 @@ pub fn ensure_master(host: &str) -> Result<(), RemoteError> {
         "-f".to_string(),
     ];
     args.push(host.to_string());
-    let out = spawn_capture(&ssh, &args, None).map_err(|e| {
-        RemoteError::new(RemoteErrorKind::ClientMissing, host, format!("{ssh}: {e}"))
-    })?;
+    let out = spawn_capture(&ssh, &args, None, remote_timeout(), "ssh -N -f")
+        .map_err(|e| e.into_remote(host, &ssh))?;
     if !out.status_ok {
         return Err(RemoteError::new(out.classify(), host, out.diagnosis()));
     }
     Ok(())
 }
 
-/// sftp のバッチを 1 回走らせる
+/// sftp のバッチを 1 回走らせる（転送を含まない = 上限は [`remote_timeout`]）
 fn sftp_batch(host: &str, target: &str, commands: &[String]) -> Result<Output, RemoteError> {
+    sftp_batch_within(host, target, commands, remote_timeout())
+}
+
+/// sftp のバッチを 1 回走らせる（上限を呼び手が決める = 転送は [`transfer_timeout`]。#2973）
+fn sftp_batch_within(
+    host: &str,
+    target: &str,
+    commands: &[String],
+    budget: Duration,
+) -> Result<Output, RemoteError> {
     let Some(sftp) = sftp_bin() else {
         return Err(RemoteError::new(
             RemoteErrorKind::ClientMissing,
@@ -1601,13 +1785,8 @@ fn sftp_batch(host: &str, target: &str, commands: &[String]) -> Result<Output, R
     args.push("-".into());
     args.push(host.to_string());
     let script = batch_script(commands);
-    spawn_capture(&sftp, &args, Some(&script)).map_err(|e| {
-        RemoteError::new(
-            RemoteErrorKind::ClientMissing,
-            target,
-            format!("{sftp}: {e}"),
-        )
-    })
+    spawn_capture(&sftp, &args, Some(&script), budget, "sftp -b -")
+        .map_err(|e| e.into_remote(target, &sftp))
 }
 
 /// 接続を確立し、リモートのホームディレクトリ（sftp の初期 cwd）を返す。
@@ -1740,7 +1919,9 @@ pub fn fetch_file(
         quote_sftp_arg(path),
         quote_sftp_arg(&local.to_string_lossy())
     );
-    let out = sftp_batch(host, &target, &[cmd])?;
+    // 転送の上限は大きさから（素性が読めなければ上限いっぱい。#2973）
+    let bytes = stat.as_ref().map_or(max_bytes, |s| s.size.min(max_bytes));
+    let out = sftp_batch_within(host, &target, &[cmd], transfer_timeout(bytes))?;
     if !out.status_ok || !local.exists() {
         return Err(RemoteError::new(out.classify(), target, out.diagnosis()));
     }
@@ -2065,7 +2246,12 @@ pub fn save_file(
         commands.push(format!("chmod {octal} {}", quote_sftp_arg(path)));
     }
     commands.push(format!("ls -la {}", quote_sftp_arg(path)));
-    let out = sftp_batch(host, &target, &commands);
+    let out = sftp_batch_within(
+        host,
+        &target,
+        &commands,
+        transfer_timeout(bytes.len() as u64),
+    );
     let _ = std::fs::remove_file(&local);
     let out = out?;
     if !out.status_ok {
@@ -2105,7 +2291,8 @@ fn fetch_to_temp(host: &str, path: &str) -> Result<PathBuf, RemoteError> {
     })?;
     let local = dir.join(format!("cur-{}", temp_token()));
     let _ = std::fs::remove_file(&local);
-    let out = sftp_batch(
+    // 大きさは分からない（競合を見るための取得）ので、プレビューの上限ぶんの転送を見込む（#2973）
+    let out = sftp_batch_within(
         host,
         &target,
         &[format!(
@@ -2113,6 +2300,7 @@ fn fetch_to_temp(host: &str, path: &str) -> Result<PathBuf, RemoteError> {
             quote_sftp_arg(path),
             quote_sftp_arg(&local.to_string_lossy())
         )],
+        transfer_timeout(MAX_PREVIEW_BYTES),
     )?;
     if !out.status_ok || !local.exists() {
         return Err(RemoteError::new(out.classify(), target, out.diagnosis()));
@@ -3153,14 +3341,23 @@ drwx******    1 -        -           49152 Aug 23 22:34 dev
     fn 置き場が無いホストは多重化なしの形と判定になる() {
         let src = include_str!("remote_fs.rs");
         let production = src.split("#[cfg(test)]\nmod tests {").next().unwrap_or(src);
-        // 生死の判定は置き場まで見る（能力だけを見ると `Dead` で埋めて自動再接続が撃ち続ける）
+        // 生死の判定は置き場まで見る（能力だけを見ると `Dead` で埋めて自動再接続が撃ち続ける）。
+        // #2973 から `liveness` は打ち切りの理由つきの `liveness_checked` へ委ねる（判定はそちらの 1 実装）
         let liveness_body = production
             .split_once("pub fn liveness(host: &str) -> Liveness {")
             .map(|(_, rest)| rest.split("\n}\n").next().unwrap_or(""))
             .unwrap_or("");
         assert!(
-            liveness_body.contains("if !multiplexing_for(host) {"),
-            "liveness が置き場の有無を見ていない: {liveness_body}"
+            liveness_body.contains("liveness_checked(host)"),
+            "liveness が liveness_checked へ委ねていない: {liveness_body}"
+        );
+        let checked_body = production
+            .split_once("pub fn liveness_checked(host: &str) -> Result<Liveness, RemoteError> {")
+            .map(|(_, rest)| rest.split("\n}\n").next().unwrap_or(""))
+            .unwrap_or("");
+        assert!(
+            checked_body.contains("if !multiplexing_for(host) {"),
+            "liveness_checked が置き場の有無を見ていない: {checked_body}"
         );
         let ensure_body = production
             .split_once("pub fn ensure_master(host: &str) -> Result<(), RemoteError> {")
@@ -3303,14 +3500,148 @@ drwx******    1 -        -           49152 Aug 23 22:34 dev
                 RemoteErrorKind::NotDirectory => "not_directory",
                 RemoteErrorKind::TooLarge => "too_large",
                 RemoteErrorKind::Conflict => "conflict",
+                RemoteErrorKind::NoResponse => "no_response",
                 RemoteErrorKind::Other => "other",
             };
             assert_eq!(tag, kind.as_str(), "as_str と全列挙が食い違う: {kind:?}");
         }
         assert_eq!(
             RemoteErrorKind::ALL.len(),
-            14,
+            15,
             "種別を足したら ALL にも足す（網羅テストが回らなくなる）"
+        );
+    }
+
+    /// #2973: 上限は待つものごとに決まる（相手まで行かない `ssh -O` は短く、転送は大きさから）
+    #[test]
+    fn issue2973_上限は待つものごとに決まる() {
+        // 既定の根拠: ssh 自身が切る接続（10 秒）+ keepalive の見切り（5 × 3 秒）+ 余裕 5 秒
+        assert_eq!(
+            DEFAULT_REMOTE_TIMEOUT,
+            Duration::from_secs(
+                u64::from(CONNECT_TIMEOUT_SECS)
+                    + u64::from(SERVER_ALIVE_INTERVAL_SECS * SERVER_ALIVE_COUNT_MAX)
+                    + 5
+            )
+        );
+        assert!(mux_control_timeout() <= MUX_CONTROL_TIMEOUT);
+        assert!(mux_control_timeout() <= remote_timeout());
+        assert_eq!(transfer_timeout(0), remote_timeout());
+        assert_eq!(
+            transfer_timeout(1),
+            remote_timeout() + Duration::from_secs(1)
+        );
+        // プレビューの上限（8 MiB）を 64 KiB/s で送る時間 = 128 秒
+        assert_eq!(
+            transfer_timeout(MAX_PREVIEW_BYTES),
+            remote_timeout() + Duration::from_secs(128)
+        );
+        // 0 / 不正 / 空は既定へ落ちる（= 外せない。probe と同じ 1 実装）
+        for raw in [Some("0"), Some("x"), Some(""), None] {
+            assert_eq!(
+                crate::probe::parse_timeout_secs(raw, DEFAULT_REMOTE_TIMEOUT),
+                DEFAULT_REMOTE_TIMEOUT,
+                "{raw:?}"
+            );
+        }
+    }
+
+    /// #2973: 返らない ssh / sftp は上限で打ち切り、子と孫を止めて「応答なし」（理由と次の一手）を返す
+    #[cfg(unix)]
+    #[test]
+    fn issue2973_返らないクライアントは上限で打ち切り孫まで止める() {
+        let scratch = crate::test_residue::ScratchDir::new("remote-fs-2973");
+        let pid_file = scratch.path().join("grandchild.pid");
+        // 孫（`sleep`）を抱えて自分も返らない = ProxyCommand・ラッパーが返らない形
+        let script = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
+        let args = vec!["-c".to_string(), script];
+        let err = spawn_capture(
+            "/bin/sh",
+            &args,
+            None,
+            Duration::from_millis(300),
+            "ssh -O check",
+        )
+        .expect_err("上限で打ち切る");
+        assert!(
+            matches!(
+                err,
+                CaptureError::TimedOut {
+                    label: "ssh -O check",
+                    waited_secs: 0
+                }
+            ),
+            "{err:?}"
+        );
+        let remote = err.into_remote("host-a", "/usr/bin/ssh");
+        assert_eq!(remote.kind, RemoteErrorKind::NoResponse);
+        assert_eq!(remote.kind.as_str(), "no_response");
+        assert_eq!(remote.detail, "ssh -O check (0 s)");
+        let ja = remote.report_in(Lang::Ja);
+        let en = remote.report_in(Lang::En);
+        assert!(
+            ja.contains("host-a: ssh / sftp が上限の時間内に応答しませんでした"),
+            "{ja}"
+        );
+        assert!(ja.contains("手で実行"), "次の一手が無い: {ja}");
+        assert!(en.contains("did not respond within the time limit"), "{en}");
+        assert!(en.contains("by hand"), "次の一手が無い: {en}");
+        // 名札にも詳細にも実行ファイルのパスを載せない（#927）
+        assert!(!remote.detail.contains("/usr/bin"), "{}", remote.detail);
+
+        // 孫はグループへの TERM（猶予の後は KILL）で消える
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("孫の pid が書かれている")
+            .trim()
+            .parse()
+            .expect("pid");
+        let mut gone = false;
+        for _ in 0..50 {
+            // SAFETY: シグナル 0 は存在の確かめだけでプロセスにもメモリにも触れない
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(gone, "打ち切った ssh の孫（pid {pid}）が残っている");
+    }
+
+    /// #2973: sftp のバッチは標準入力で渡る（書き込みを別スレッドへ出しても中身は変わらない）
+    #[cfg(unix)]
+    #[test]
+    fn issue2973_sftpのバッチは標準入力で渡る() {
+        let args = vec!["-c".to_string(), "cat".to_string()];
+        let out = spawn_capture(
+            "/bin/sh",
+            &args,
+            Some("pwd\nls -la \"/tmp\"\n"),
+            Duration::from_secs(30),
+            "sftp -b -",
+        )
+        .expect("返る");
+        assert!(out.status_ok);
+        assert_eq!(out.stdout, "pwd\nls -la \"/tmp\"\n");
+    }
+
+    /// #2973: 起こせないクライアントは従来どおり「見つからない」（応答なしと混ぜない）
+    #[test]
+    fn issue2973_起こせないクライアントは見つからないと言う() {
+        let err = spawn_capture(
+            "/nonexistent-2973/ssh",
+            &[],
+            None,
+            Duration::from_secs(5),
+            "ssh -N -f",
+        )
+        .expect_err("起こせない");
+        assert!(matches!(err, CaptureError::Spawn(_)), "{err:?}");
+        let remote = err.into_remote("host-a", "/nonexistent-2973/ssh");
+        assert_eq!(remote.kind, RemoteErrorKind::ClientMissing);
+        assert!(
+            remote.detail.starts_with("/nonexistent-2973/ssh: "),
+            "{}",
+            remote.detail
         );
     }
 

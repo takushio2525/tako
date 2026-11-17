@@ -19204,28 +19204,47 @@ fn remote_folder_list_snapshot(host: &dyn ControlHost) -> RemoteFolderList {
     RemoteFolderList { tabs, loading }
 }
 
-/// 接続の生死を埋めて `list` の応答を組む（background。ホストごとに 1 回 = `ssh -O check`）
+/// 接続の生死を埋めて `list` の応答を組む（background。ホストごとに 1 回 = `ssh -O check`）。
+///
+/// `ssh -O check` が上限で返らなかったホスト（#2973）は `connected: false` に加えて `connection_error`
+/// （種別・理由・次の一手・詳細 = `push` の `failed` と同じ形）を載せる。返ったホストの応答は #2973 の前と同じ
 fn remote_folder_list_finish(list: RemoteFolderList) -> Value {
     let RemoteFolderList { mut tabs, loading } = list;
-    let mut seen: Vec<(String, Option<bool>)> = Vec::new();
+    let mut seen: Vec<(String, Option<bool>, Option<Value>)> = Vec::new();
     for tab in &mut tabs {
         let Some(folders) = tab["remote_folders"].as_array_mut() else {
             continue;
         };
         for folder in folders {
             let host = folder["host"].as_str().unwrap_or_default().to_string();
-            let connected = match seen.iter().find(|(h, _)| *h == host) {
-                Some((_, c)) => *c,
+            let (connected, error) = match seen.iter().find(|(h, _, _)| *h == host) {
+                Some((_, c, e)) => (*c, e.clone()),
                 None => {
-                    let c = tako_core::remote_fs::liveness(&host).as_bool();
-                    seen.push((host, c));
-                    c
+                    let (c, e) = match tako_core::remote_fs::liveness_checked(&host) {
+                        Ok(live) => (live.as_bool(), None),
+                        Err(e) => (Some(false), Some(remote_error_json(&e))),
+                    };
+                    seen.push((host, c, e.clone()));
+                    (c, e)
                 }
             };
             folder["connected"] = json!(connected);
+            if let Some(error) = error {
+                folder["connection_error"] = error;
+            }
         }
     }
     json!({ "tabs": tabs, "loading_files": loading })
+}
+
+/// リモートの失敗を応答へ載せる形（`push` の `failed` の行と同じ欄 = `kind` / `error` / `next_step` / `detail`）
+fn remote_error_json(e: &tako_core::remote_fs::RemoteError) -> Value {
+    json!({
+        "kind": e.kind.as_str(),
+        "error": e.summary(),
+        "next_step": e.next_step(),
+        "detail": e.detail.replace('\n', " "),
+    })
 }
 
 /// `push` の書き込み（リモートへの書き戻し）を 1 本ずつにする錠（#2961）。UI スレッドで答えていた間は
@@ -19308,11 +19327,24 @@ pub struct RemoteFolderClosed {
 
 /// どのタブからも参照されなくなったホストの接続（ControlMaster）を畳んでから `close` に応答する（background）。
 /// 開いたままにすると `ControlPersist` の間ずっと ssh が居座る
+///
+/// `ssh -O exit` が上限で返らなかったホスト（#2973）は `master_errors`（ホストと種別・理由・次の一手・詳細）に
+/// 載せる。フォルダは外れている（着地で外した）ので `closed` は変わらない。畳めなかった master は
+/// `ControlPersist` の後に自分で消える。全部畳めたときの応答は #2973 の前と同じ
 fn remote_folder_close_masters(closed: RemoteFolderClosed) -> Value {
+    let mut master_errors: Vec<Value> = Vec::new();
     for h in &closed.hosts {
-        tako_core::remote_fs::close_master(h);
+        if let Err(e) = tako_core::remote_fs::close_master(h) {
+            let mut row = remote_error_json(&e);
+            row["host"] = json!(h);
+            master_errors.push(row);
+        }
     }
-    json!({ "closed": closed.closed })
+    let mut reply = json!({ "closed": closed.closed });
+    if !master_errors.is_empty() {
+        reply["master_errors"] = json!(master_errors);
+    }
+    reply
 }
 
 /// `close` の着地（UI スレッド。#2961）。閉じるのは**全タブ横断が既定**。`--tab` で 1 タブへ絞る。
@@ -24566,7 +24598,11 @@ fn setup_mcp_via_cli(
     if let McpScope::Project(cwd) = scope {
         rm.current_dir(cwd);
     }
-    let _ = rm.output(); // 未登録なら失敗するが無視
+    // 未登録なら失敗するが無視。**返らないときだけは止める**（#2967。同じ CLI の `mcp add` をもう一度
+    // 上限まで待たない = setup の書き込みの錠 `SETUP_WRITE_SERIAL` を早く手放す）
+    if let Err(e @ SetupRefusal::ClaudeMcpTimedOut { .. }) = claude_mcp_output(&mut rm, "remove") {
+        return Err(e);
+    }
 
     let mut cmd = std::process::Command::new(claude_bin);
     tako_core::platform::process::no_console_window(&mut cmd);
@@ -24585,9 +24621,7 @@ fn setup_mcp_via_cli(
     if let McpScope::Project(cwd) = scope {
         cmd.current_dir(cwd);
     }
-    let output = cmd
-        .output()
-        .map_err(|e| SetupRefusal::ClaudeMcpAddSpawn(e.to_string()))?;
+    let output = claude_mcp_output(&mut cmd, "add")?;
     if !output.status.success() {
         return Err(SetupRefusal::ClaudeMcpAddFailed {
             status: output.status.to_string(),
@@ -24595,6 +24629,44 @@ fn setup_mcp_via_cli(
         });
     }
     Ok(())
+}
+
+/// claude の `mcp remove` / `mcp add` を起こして待つ（**上限つき**。#2967）。
+///
+/// 上限は門番 [`crate::agent_probe::command_with_timeout`]（`probe::probe_timeout()` = 既定 15 秒）。打ち切ったら
+/// 子と孫を止め（#2942）、[`SetupRefusal::ClaudeMcpTimedOut`]（登録は確かめられなかった）を返す。名札は
+/// `claude mcp <step>` だけ（`add` の後ろの tako の実体のパスを知らせ・応答へ載せない = #927）。
+/// #2967 より前は `Command::output()` で待ち、返らない claude で `tako setup-mcp`・MCP `tako_setup_mcp`
+/// （setup の書き込みの錠を持ったまま）が返らなかった。A/B（`TAKO_2967_LEGACY=1`）は修正前の上限なしの待ち
+fn claude_mcp_output(
+    cmd: &mut std::process::Command,
+    step: &str,
+) -> Result<std::process::Output, SetupRefusal> {
+    if crate::agent_probe::issue2967_legacy() {
+        return cmd
+            .output()
+            .map_err(|e| SetupRefusal::ClaudeMcpAddSpawn(e.to_string()));
+    }
+    match crate::agent_probe::command_with_timeout(cmd, &format!("claude mcp {step}")) {
+        tako_core::probe::Outcome::Done {
+            status,
+            stdout,
+            stderr,
+        } => Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        tako_core::probe::Outcome::TimedOut { waited, .. } => {
+            Err(SetupRefusal::ClaudeMcpTimedOut {
+                step: step.to_string(),
+                waited_secs: waited.as_secs(),
+            })
+        }
+        tako_core::probe::Outcome::Failed { reason, .. } => {
+            Err(SetupRefusal::ClaudeMcpAddSpawn(reason))
+        }
+    }
 }
 
 fn setup_mcp_direct(tako_binary: &str, scope: &McpScope) -> Result<(), SetupRefusal> {

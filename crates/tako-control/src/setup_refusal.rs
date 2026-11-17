@@ -48,6 +48,9 @@ pub enum SetupRefusal {
     ClaudeMcpAddSpawn(String),
     /// `claude mcp add` が非ゼロ終了（`status` は終了状態の表示 = `exit status: 1`）
     ClaudeMcpAddFailed { status: String, stderr: String },
+    /// `claude mcp remove` / `claude mcp add` が上限の時間内に返らなかったので打ち切った（#2967）。
+    /// 登録できたかは確かめられていない。`step` は `remove` / `add`（tako の実体のパスは載せない = #927）
+    ClaudeMcpTimedOut { step: String, waited_secs: u64 },
     /// MCP の設定ファイル（`~/.claude.json` / `.mcp.json`）を読めない
     McpConfigRead { path: String, error: String },
     /// MCP の設定ファイルを JSON として解釈できない（書き換えを中止した）
@@ -246,6 +249,17 @@ impl SetupRefusal {
             (Self::ClaudeMcpAddFailed { status, stderr }, En) => {
                 format!("claude mcp add failed ({status}): {stderr}")
             }
+            (Self::ClaudeMcpTimedOut { step, waited_secs }, Ja) => format!(
+                "claude mcp {step} が {waited_secs} 秒で応答しなかったので打ち切りました（MCP の登録は確かめられませんでした）。\
+                 次の一手: 同じコマンド（claude mcp {step}）を端末で手で実行して止まる理由（ログイン・ネットワーク・設定ファイルの錠）を\
+                 確かめてから、tako setup-mcp をやり直してください"
+            ),
+            (Self::ClaudeMcpTimedOut { step, waited_secs }, En) => format!(
+                "claude mcp {step} did not respond within {waited_secs} seconds, so tako stopped waiting \
+                 (the MCP registration could not be confirmed). \
+                 Next step: run the same command (claude mcp {step}) by hand in a terminal to see what it waits on \
+                 (login, network, a lock on its config file), then run tako setup-mcp again"
+            ),
             (Self::McpConfigRead { path, error }, Ja) => format!("{path} の読み取りに失敗: {error}"),
             (Self::McpConfigRead { path, error }, En) => format!("failed to read {path}: {error}"),
             (Self::McpConfigNotJson { path, reason }, Ja) => format!(
