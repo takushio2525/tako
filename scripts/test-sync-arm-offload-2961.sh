@@ -236,7 +236,7 @@ cat > "$TMP/stubs/sftp" <<'SH'
 while IFS= read -r line; do
   echo "sftp> $line"
   case "$line" in
-    pwd) echo "Remote working directory: /home/fake2961" ;;
+    pwd) echo "Remote working directory: /home/testuser" ;;
     "ls -la"*)
       echo 'drwxr-xr-x    3 fake     staff          96 Nov 17 10:00 .'
       echo 'drwxr-xr-x    3 fake     staff          96 Nov 17 10:00 ..'
@@ -561,16 +561,16 @@ FOLDER_HOST="fakehost2961"
 returning_folder_calls() {
   local phase="$1"
   set_flags
-  mcp_call tako_remote_folder "{\"action\":\"open\",\"host\":\"$FOLDER_HOST\",\"path\":\"/home/fake2961\",\"focus\":false}" "$phase-fopen" 60
+  mcp_call tako_remote_folder "{\"action\":\"open\",\"host\":\"$FOLDER_HOST\",\"path\":\"/home/testuser\",\"focus\":false}" "$phase-fopen" 60
   check_eq "$phase: 返る ssh / sftp: MCP の remote folder（open）が返る" "0" "$MCP_HUNG"
   mcp_call tako_remote_folder "{\"action\":\"ls\",\"host\":\"$FOLDER_HOST\"}" "$phase-fls" 60
   mcp_call tako_remote_folder '{"action":"list"}' "$phase-flist" 60
   mcp_call tako_remote_folder '{"action":"pending"}' "$phase-fpending" 60
-  mcp_call tako_remote_folder "{\"action\":\"open-file\",\"host\":\"$FOLDER_HOST\",\"path\":\"/home/fake2961/hello.txt\"}" "$phase-ffile" 60
+  mcp_call tako_remote_folder "{\"action\":\"open-file\",\"host\":\"$FOLDER_HOST\",\"path\":\"/home/testuser/hello.txt\"}" "$phase-ffile" 60
   mcp_call tako_remote_folder "{\"action\":\"close\",\"host\":\"$FOLDER_HOST\"}" "$phase-fclose" 60
   check_eq "$phase: 返る ssh: MCP の remote folder（close）が返る" "0" "$MCP_HUNG"
   # 止まる段のために開き直す（突き合わせない）
-  mcp_call tako_remote_folder "{\"action\":\"open\",\"host\":\"$FOLDER_HOST\",\"path\":\"/home/fake2961\",\"terminal\":false,\"focus\":false}" "$phase-freopen" 60
+  mcp_call tako_remote_folder "{\"action\":\"open\",\"host\":\"$FOLDER_HOST\",\"path\":\"/home/testuser\",\"terminal\":false,\"focus\":false}" "$phase-freopen" 60
 }
 
 # folder 系: 返らない偽物の 4 本（期待 = fast / blocked）。sftp と `ssh -O` は上限なしなので偽物を落として返す
@@ -584,7 +584,7 @@ hanging_folder_calls() {
   check_eq "$phase: 返らない sftp（ls）: 偽物を落とすと MCP が返る" "0" "$MCP_HUNG"
 
   set_flags hang-sftp
-  mcp_start tako_remote_folder "{\"action\":\"open-file\",\"host\":\"$FOLDER_HOST\",\"path\":\"/home/fake2961/hello.txt\"}" "$phase-ffile-hang"
+  mcp_start tako_remote_folder "{\"action\":\"open-file\",\"host\":\"$FOLDER_HOST\",\"path\":\"/home/testuser/hello.txt\"}" "$phase-ffile-hang"
   list_during "${phase}・返らない sftp（remote folder open-file）" "$expect" "$limit"
   kill_fakes
   mcp_wait 30
@@ -603,7 +603,7 @@ hanging_folder_calls() {
   kill_fakes
   mcp_wait 30
   check_eq "$phase: 返らない ssh -O exit（close）: 偽物を落とすと MCP が返る" "0" "$MCP_HUNG"
-  check_eq "$phase: close の応答（外したフォルダ）" "[\"$FOLDER_HOST:/home/fake2961\"]" \
+  check_eq "$phase: close の応答（外したフォルダ）" "[\"$FOLDER_HOST:/home/testuser\"]" \
     "$(jf closed < "$TMP/out/$phase-fclose-hang.out")"
 }
 
