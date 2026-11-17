@@ -107,19 +107,12 @@ const PARTIAL: &[(&str, &str)] = &[
 /// 既知の残り: `prepare_offload` が出さない同期の腕のうち、外部プロセスの待ちへ届くもの
 /// （`(要求の名前, 理由)`）。#2956 の範囲外（setup の導入・モデル一覧以外）なので #2961 で扱う。
 /// 直したら外すこと（届かなくなると [`既知の残りはまだ届く`] が落ちる）。
-/// `SetupMcp` / `SetupRun` / `ConfigShare` は #2961 の 1 本目で外した（[`TARGETS`]）
+/// `SetupMcp` / `SetupRun` / `ConfigShare` は #2961 の 1 本目、`RemoteSetup` / `RemoteScrollback` は 2 本目で
+/// 外した（[`TARGETS`]）。`OpenRemote` は 2 本目で先取り（[`PROBE_TARGETS`]）へ寄せた
 const KNOWN: &[(&str, &str)] = &[
-    (
-        "RemoteSetup",
-        "#2961: tailscale の CLI（`run_noninteractive` → `detect_tailscale` ほか）",
-    ),
     (
         "RemoteFolder",
         "#2961: `ssh -O exit` とログインシェル（`dispatch_remote_folder` → `close_master`）",
-    ),
-    (
-        "OpenRemote",
-        "#2961: ログインシェルの `command -v ssh`（`remote_ssh_argv` → … → `resolve_bin`）",
     ),
     (
         "SleepGuard",
@@ -227,7 +220,17 @@ fn fns_named(graph: &call_graph::Graph, name: &str) -> Vec<usize> {
 
 // ===== #1984 の番犬の葉を本文から読む =====
 
-/// #1984 の番犬の `RAW` と `GRAPH_LEAVES`（`(綴り, 名指しの理由)`）。
+/// #1984 の番犬の葉に足す、メソッド呼び出しの葉（`(綴り, 名指しの理由)`。#2961）。
+///
+/// 呼び出しのグラフは名前で関数を引くので、トレイトのオブジェクト越しのメソッド呼び出し
+/// （`capture.capture_scrollback(…)`）の先へは辿れない。その先が外部プロセスを待つ形をここで葉にする
+/// （#2961 で `RemoteScrollback` の既定の経路 = 器の `capture-pane` が番犬から見えていなかった）
+const METHOD_LEAVES: &[(&str, &str)] = &[(
+    ".capture_scrollback(",
+    "器の `capture-pane` を待つ（`DetachedCapture` のメソッド = グラフが辿らない形。#2961）",
+)];
+
+/// #1984 の番犬の `RAW` と `GRAPH_LEAVES`（`(綴り, 名指しの理由)`）に [`METHOD_LEAVES`] を足したもの。
 ///
 /// 写して持つと葉が増えたときにここだけ古くなるので、あちらの本文の配列を読む。読み方は
 /// 「配列の頭から `\n];` まで・行コメントを飛ばし・`( "綴り", "理由" )` の組を拾う」だけ
@@ -251,6 +254,11 @@ fn leaves() -> &'static [(String, String)] {
                 .unwrap_or_else(|| panic!("{WATCHDOG_1984} の `{head}` の終わり（`\\n];`）が無い"));
             out.extend(tuples_of(&body[..end]));
         }
+        out.extend(
+            METHOD_LEAVES
+                .iter()
+                .map(|(needle, why)| (needle.to_string(), why.to_string())),
+        );
         out
     })
 }
@@ -768,7 +776,43 @@ const TARGETS: &[Target] = &[
         sync_call: "config_share_reply(&request)",
         reply: "config_share_reply",
     },
+    Target {
+        variant: "RemoteSetup",
+        issue: "#2961",
+        gate: "sync_arm_offload_legacy()",
+        prepare_arm: "Request::RemoteSetup { .. } if !sync_arm_offload_legacy() =>",
+        job: "OffloadJob::RemoteSetup(",
+        prepare_whole: "remote_setup @ Request::RemoteSetup { .. } if !sync_arm_offload_legacy() => {\n            Some(Ok(OffloadJob::RemoteSetup(Box::new(remote_setup.clone()))))\n        }\n",
+        run_arm: "OffloadJob::RemoteSetup(request) => remote_setup_reply(&request)",
+        sync_head: "request @ Request::RemoteSetup { .. } => ",
+        sync_call: "remote_setup_reply(&request)",
+        reply: "remote_setup_reply",
+    },
+    Target {
+        variant: "RemoteScrollback",
+        issue: "#2961",
+        gate: "sync_arm_offload_legacy()",
+        prepare_arm: "Request::RemoteScrollback { pane_id, lines } if !sync_arm_offload_legacy() =>",
+        job: "OffloadJob::RemoteScrollback {",
+        prepare_whole: "Request::RemoteScrollback { pane_id, lines } if !sync_arm_offload_legacy() => {\n            Some(scrollback_target_session(host, pane_id).map(|session| {\n                OffloadJob::RemoteScrollback {\n                    session,\n                    lines: *lines,\n                }\n            }))\n        }\n",
+        run_arm: "remote_scrollback_reply(&session, lines)",
+        sync_head: "Request::RemoteScrollback { pane_id, lines } => {",
+        sync_call: "remote_scrollback_reply(&session, lines)",
+        reply: "remote_scrollback_reply",
+    },
 ];
+
+/// 先取り（#1984 の `ProbeNeeds` → `UiProbes`）へ寄せた要求（#2961）。UI スレッドの同期の腕は残り、待つ問い合わせだけを
+/// background が先に済ませる。`(要求, probe_needs の腕の頭, その腕が立てる印, 同期の腕の頭, 読む側の関数の呼び出し,
+/// 注入で戻す修正前の呼び出し)`
+const PROBE_TARGETS: &[(&str, &str, &str, &str, &str, &str)] = &[(
+    "OpenRemote",
+    "Request::OpenRemote { .. } if !sync_arm_offload_legacy() => Some(ProbeNeeds {",
+    "ssh_bin: ssh_bin_need(),",
+    "        Request::OpenRemote {\n            host: ssh_host,",
+    "let argv = remote_ssh_argv_probed(&ssh_host);",
+    "let argv = remote_ssh_argv(&ssh_host);",
+)];
 
 #[test]
 fn 直した要求はbackgroundから答える() {
@@ -777,7 +821,66 @@ fn 直した要求はbackgroundから答える() {
 }
 
 #[test]
+fn 先取りへ寄せた要求はその答えで組む() {
+    let problems = probe_target_problems(dispatch_text());
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// [`PROBE_TARGETS`] の検査: `probe_needs` に腕があって印を立て、同期の腕が先取りを読む関数を呼ぶ
+fn probe_target_problems(text: &str) -> Vec<String> {
+    let code = production_range::code_view::code_view(text);
+    let line_of = |at: usize| code[..at].matches('\n').count() + 1;
+    let mut out = Vec::new();
+    let needs_at = code.find("fn probe_needs(");
+    for (variant, needs_arm, flag, sync_head, call, _) in PROBE_TARGETS {
+        match needs_at.and_then(|at| code[at..].find(needs_arm).map(|i| at + i)) {
+            None => out.push(format!(
+                "{DISPATCH}:{} `probe_needs` に `{needs_arm}` の腕が無い。`Request::{variant}` の待つ問い合わせを \
+                 background で先取りしない（#2961）",
+                needs_at.map_or(1, line_of)
+            )),
+            Some(at) => {
+                let arm = &code[at..];
+                let arm_end = arm[needs_arm.len()..]
+                    .find("Request::")
+                    .map_or(arm.len(), |i| needs_arm.len() + i);
+                if !arm[..arm_end].contains(flag) {
+                    out.push(format!(
+                        "{DISPATCH}:{} `{needs_arm}` の腕が `{flag}` を立てない（#2961）",
+                        line_of(at)
+                    ));
+                }
+            }
+        }
+        match code.find(sync_head) {
+            None => out.push(format!(
+                "{DISPATCH}:1 `dispatch_inner` の `Request::{variant}` の腕が読めない（走査の空振り）"
+            )),
+            Some(at) => {
+                let after = at + sync_head.len();
+                let next_arm = code[after..]
+                    .find("\n        Request::")
+                    .map_or(code.len(), |i| after + i);
+                if !code[after..next_arm].contains(call) {
+                    out.push(format!(
+                        "{DISPATCH}:{} `Request::{variant}` の同期の腕が先取りを読む `{call}` を通らない（UI スレッドで待つ。#2961）",
+                        line_of(at)
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
 fn 直した要求はknownに残っていない() {
+    for (variant, ..) in PROBE_TARGETS {
+        assert!(
+            !KNOWN.iter().any(|(v, _)| v == variant),
+            "`{variant}` は先取りへ寄せた（#2961）のに KNOWN に残っている"
+        );
+    }
     for t in TARGETS {
         assert!(
             !KNOWN.iter().any(|(v, _)| *v == t.variant),
@@ -897,6 +1000,31 @@ fn 修正前の形を名指しできる() {
         assert!(
             problems.iter().any(|p| p.contains(t.prepare_arm)),
             "`prepare_offload` の `{variant}` の腕を消した注入を 2 が名指ししない: {problems:#?}"
+        );
+    }
+    // 先取りへ寄せた要求: 同期の腕を修正前の呼び出し（その場で問い合わせる）へ戻すと 1 と 2 が名指す
+    for (variant, _, _, _, call, legacy_call) in PROBE_TARGETS {
+        assert!(
+            text.contains(call),
+            "注入の元の `{call}` が本文に無い（形を変えたなら注入も追うこと）"
+        );
+        let injected = text.replacen(call, legacy_call, 1);
+        let graph = graph_with(&[(DISPATCH, &injected)]);
+        let findings = scan(&graph);
+        let at = injected
+            .find(legacy_call)
+            .expect("注入した呼び出しが本文にある");
+        let line = injected[..at].matches('\n').count() + 1;
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.variant == *variant && f.line == line),
+            "`{variant}` の同期の腕を修正前の呼び出しへ戻した注入（{DISPATCH}:{line}）が名指しされない: {findings:#?}"
+        );
+        let problems = probe_target_problems(&injected);
+        assert!(
+            problems.iter().any(|p| p.contains(call)),
+            "`{variant}` の同期の腕を修正前の呼び出しへ戻した注入を 2 が名指ししない: {problems:#?}"
         );
     }
 }

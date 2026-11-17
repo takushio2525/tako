@@ -2191,6 +2191,11 @@ lid-guard.json が使う）:
   UI スレッドで写すのは setup-mcp の project スコープのペインの cwd だけ（`setup_mcp_prepare`）。書き込みは錠で 1 本ずつ（setup 系は
   `SETUP_WRITE_SERIAL` を bootstrap の書き込みと共有・config share は `CONFIG_SHARE_WRITE_SERIAL`）。設定画面の「MCP 登録」も同じ 3 段。
   A/B は `TAKO_2961_LEGACY=1`（門は `sync_arm_offload_legacy()` の 1 か所）、実経路は `scripts/test-sync-arm-offload-2961.sh`（FR-2.14.26）
+- **リモートのセットアップ・スクロールバック・SSH ペインの ssh の解決も UI スレッドで待たない**（#2961 の 2 本目）: `RemoteSetup`（tailscale の CLI）は
+  `OffloadJob::RemoteSetup`、`RemoteScrollback` は器のセッション名だけ UI で解いて `OffloadJob::RemoteScrollback`（器の `capture-pane`）。
+  `OpenRemote` はペインを作るので同期の腕のまま、ssh の実体（ログインシェルの `command -v ssh`）だけを #1984 の先取り
+  （`ProbeNeeds::ssh_bin`）で background に済ませ、`remote_ssh_argv_probed` が答えで argv を組む（`remote_ssh_argv_with` = 実体を引数で受ける
+  本体・tako-core の `ssh_pane_argv_using`）。メソッド呼び出し越しの採取は番犬の葉 `METHOD_LEAVES`（`.capture_scrollback(`）で見る（FR-2.14.27）
 - **照会 1 回の中では `ps` / `tmux list-panes -a` を 1 回だけ起こす**（#1968）: 状態照会は
   `has_running_children` と claude / codex / agy の会話 ID 解決が**それぞれ** `ps` と
   `tmux list-panes -a` を起こしていた（報告 1 回で `ps` 3 本）。`agents::with_shared_scan` の

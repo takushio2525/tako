@@ -7104,6 +7104,12 @@ pub enum OffloadJob {
     /// AI 系設定の共有（`tako_config_share`。#2961）。git（init / commit / push / pull）を UI スレッドで待たない。
     /// workspace に触らないのでそのまま background から応答する
     ConfigShare(Box<Request>),
+    /// リモート接続の非対話セットアップ（`tako_remote_setup`。#2961）。tailscale の CLI（検出・状態・serve の設定）を
+    /// UI スレッドで待たない。workspace に触らないのでそのまま background から応答する
+    RemoteSetup(Box<Request>),
+    /// スクロールバックの採取（`tako_remote_scrollback`。#2961）。器のセッション名の解決（workspace を読む）は
+    /// UI スレッド、器の `capture-pane` は background（workspace に触らないのでそのまま応答する）
+    RemoteScrollback { session: String, lines: Option<u32> },
     /// tmux 一覧（#1984）。UI スレッドでは tako のペインとの対応表だけを写し、
     /// `tmux list-sessions` ほか（ソケットごとに数本）は background で起こす
     TmuxList {
@@ -8211,6 +8217,19 @@ pub fn prepare_offload(
         share @ Request::ConfigShare { .. } if !sync_arm_offload_legacy() => {
             Some(Ok(OffloadJob::ConfigShare(Box::new(share.clone()))))
         }
+        // #2961: リモートのセットアップ（tailscale の CLI）と器のスクロールバックの採取（`capture-pane`）も UI スレッドで
+        // 待たない。採取は器のセッション名の解決（workspace を読む）だけをここで行う（解けなければ同期の腕と同じ断り）
+        remote_setup @ Request::RemoteSetup { .. } if !sync_arm_offload_legacy() => {
+            Some(Ok(OffloadJob::RemoteSetup(Box::new(remote_setup.clone()))))
+        }
+        Request::RemoteScrollback { pane_id, lines } if !sync_arm_offload_legacy() => {
+            Some(scrollback_target_session(host, pane_id).map(|session| {
+                OffloadJob::RemoteScrollback {
+                    session,
+                    lines: *lines,
+                }
+            }))
+        }
         Request::TmuxList { socket } if !tako_core::probe::issue1984_legacy() => {
             Some(Ok(OffloadJob::TmuxList {
                 ctx: collect_tmux_context(host),
@@ -8559,6 +8578,49 @@ fn config_share_reply(request: &Request) -> Result<Value, DispatchError> {
     )
 }
 
+/// `tako_remote_setup` の `run`（tailscale の serve の設定・QR の書き出し）を 1 本ずつにする錠（#2961）。
+/// UI スレッドで答えていた間は届いた順に 1 本ずつ走っていた。background へ出した後も serve の設定が重ならないよう
+/// 順序を保つ（`check` は錠を取らない）
+static REMOTE_SETUP_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `tako_remote_setup` の応答（同期の腕と background の腕 = [`OffloadJob::RemoteSetup`] が通る 1 実装。#2961）。
+/// tailscale の CLI は 1 本ずつ上限つき（`TAILSCALE_TIMEOUT`）で待つ
+fn remote_setup_reply(request: &Request) -> Result<Value, DispatchError> {
+    let Request::RemoteSetup { action, answers } = request else {
+        unreachable!("remote_setup_reply は RemoteSetup だけを受ける");
+    };
+    match action.as_str() {
+        "run" => {
+            let parsed: crate::remote_setup::RemoteSetupAnswers = answers
+                .clone()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|e| crate::RemoteRefusal::SetupAnswersInvalid(e.to_string()).invalid())?
+                .unwrap_or_default();
+            let _serial = REMOTE_SETUP_SERIAL
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::remote_setup::run_noninteractive(&parsed)
+                .map_err(crate::RemoteRefusal::operation)
+        }
+        "check" => Ok(crate::remote_setup::check_status()),
+        other => Err(Reason::UnknownActionPlain {
+            got: other.to_string(),
+            allowed: "run / check",
+        }
+        .invalid()),
+    }
+}
+
+/// `tako_remote_scrollback` の応答（同期の腕と background の腕 = [`OffloadJob::RemoteScrollback`] が通る 1 実装。
+/// #2961）。器のセッション名は解決済み（[`scrollback_target_session`]）。器の `capture-pane` は上限つき
+/// （`TMUX_QUERY_TIMEOUT`）
+fn remote_scrollback_reply(session: &str, lines: Option<u32>) -> Result<Value, DispatchError> {
+    let result = crate::remote::scrollback_session(session, lines.unwrap_or(1000))
+        .map_err(crate::RemoteRefusal::operation)?;
+    Ok(json!({ "lines": result }))
+}
+
 impl OffloadJob {
     /// ジョブ本体（サブプロセス実行）。UI スレッドで呼ばないこと。
     ///
@@ -8790,6 +8852,10 @@ impl OffloadJob {
             OffloadJob::SetupMcp(job) => setup_mcp_reply(&job),
             OffloadJob::SetupRun(request) => setup_run_reply(&request),
             OffloadJob::ConfigShare(request) => config_share_reply(&request),
+            OffloadJob::RemoteSetup(request) => remote_setup_reply(&request),
+            OffloadJob::RemoteScrollback { session, lines } => {
+                remote_scrollback_reply(&session, lines)
+            }
             OffloadJob::UsageShow { query, shown } => crate::usage::usage_payload(
                 &query,
                 crate::usage::Refresh::Budget(crate::usage::MCP_REFRESH_BUDGET),
@@ -8966,6 +9032,9 @@ pub struct UiProbes {
     tmux_open: Option<(TmuxOpenKey, Result<TmuxOpenLookup, String>)>,
     /// `orchestrator self` の会話 ID と状態（#2017。`claude agents --json` + 器の pid 祖先辿り）
     self_scan: Option<SelfScan>,
+    /// ssh の実体（#2961。`remote_fs::ssh_bin` = unix はログインシェルの `command -v ssh`）。
+    /// 外側の `Some` = 引いた・内側の `None` = 見つからなかった
+    ssh_bin: Option<Option<String>>,
 }
 
 /// `orchestrator self` が走査で採った答え（#2017。[`UiProbes::self_scan`]）
@@ -9004,6 +9073,8 @@ pub struct ProbeNeeds {
     /// `orchestrator self` の器のセッション名と、走査が要るか（#2017。`false` = mod の報告が
     /// 答えている = background は何もしない。UI スレッドの dispatch を必ず先取りの内側で回すため）
     self_scan: Option<(String, bool)>,
+    /// ssh の実体を引く（#2961。SSH ペインの argv）
+    ssh_bin: bool,
 }
 
 impl ProbeNeeds {
@@ -9015,6 +9086,7 @@ impl ProbeNeeds {
             && self.git_conflict.is_none()
             && self.tmux_open.is_none()
             && self.self_scan.is_none()
+            && !self.ssh_bin
     }
 
     /// 子プロセスを待つ問い合わせの本体。**UI スレッドで呼ばないこと**（`run_staged` から）
@@ -9061,6 +9133,9 @@ impl ProbeNeeds {
             if let Some((socket, session)) = self.tmux_open {
                 let found = compute_tmux_open_lookup(socket.as_deref(), &session);
                 probes.tmux_open = Some(((socket, session), found));
+            }
+            if self.ssh_bin {
+                probes.ssh_bin = Some(tako_core::remote_fs::ssh_bin());
             }
         });
     }
@@ -9284,6 +9359,26 @@ fn agent_need(
     (!known).then_some(agent)
 }
 
+/// SSH ペインの argv（[`remote_ssh_argv`]）。
+///
+/// 先取りの内側（UI スレッドの dispatch）では background が引いた ssh の実体だけを使う（#2961）。
+/// 答えが無ければ素の `ssh`（起こすときに PATH で引く = 待たない側。見つからなかったときと同じ形）
+fn remote_ssh_argv_probed(ssh_host: &str) -> Vec<String> {
+    match probed(|p| p.ssh_bin.clone()) {
+        Probed::Answer(ssh_bin) => remote_ssh_argv_with(ssh_host, ssh_bin),
+        Probed::Missing => remote_ssh_argv_with(ssh_host, None),
+        Probed::Outside => remote_ssh_argv(ssh_host),
+    }
+}
+
+/// ssh の実体の先取りが要るか（#2961。既に答えがあれば要らない）
+fn ssh_bin_need() -> bool {
+    !matches!(
+        probed(|p| p.ssh_bin.as_ref().map(|_| ())),
+        Probed::Answer(_)
+    )
+}
+
 fn tako_bin_need() -> bool {
     !matches!(
         probed(|p| p.tako_bin.as_ref().map(|_| ())),
@@ -9482,6 +9577,12 @@ fn probe_needs(host: &dyn ControlHost, request: &Request) -> Option<ProbeNeeds> 
         Request::StaleBinary { action, pane } if action.as_deref() == Some("restart") => {
             Some(restart_needs(host, *pane))
         }
+        // #2961: SSH ペインの argv の ssh の実体（unix はログインシェルの `command -v ssh`）を UI スレッドで
+        // 引かない。A/B の `TAKO_2961_LEGACY=1` は修正前と同じ = 先取りなしで同期の腕がその場で引く
+        Request::OpenRemote { .. } if !sync_arm_offload_legacy() => Some(ProbeNeeds {
+            ssh_bin: ssh_bin_need(),
+            ..ProbeNeeds::default()
+        }),
         _ => None,
     }
 }
@@ -13341,35 +13442,17 @@ fn dispatch_inner(
             dispatch_remote_shortcuts(&action, path.as_deref(), name.as_deref())
         }
 
+        // GUI では `prepare_offload` が器のセッション名を解いて採取を background へ出す（#2961）
         Request::RemoteScrollback { pane_id, lines } => {
             // 数値の PaneId は **app 自身の workspace** で器のセッションへ解決する（#972）。
             // remote 側にも IPC 経由の解決があるが、それは CLI（別プロセス）用で、
             // ここから使うと自分自身への入れ子 IPC になる
             let session = scrollback_target_session(host, &pane_id)?;
-            let result = crate::remote::scrollback_session(&session, lines.unwrap_or(1000))
-                .map_err(crate::RemoteRefusal::operation)?;
-            Ok(json!({ "lines": result }))
+            remote_scrollback_reply(&session, lines)
         }
 
-        Request::RemoteSetup { action, answers } => match action.as_str() {
-            "run" => {
-                let parsed: crate::remote_setup::RemoteSetupAnswers = answers
-                    .map(serde_json::from_value)
-                    .transpose()
-                    .map_err(|e| {
-                        crate::RemoteRefusal::SetupAnswersInvalid(e.to_string()).invalid()
-                    })?
-                    .unwrap_or_default();
-                crate::remote_setup::run_noninteractive(&parsed)
-                    .map_err(crate::RemoteRefusal::operation)
-            }
-            "check" => Ok(crate::remote_setup::check_status()),
-            other => Err(Reason::UnknownActionPlain {
-                got: other.to_string(),
-                allowed: "run / check",
-            }
-            .invalid()),
-        },
+        // GUI では `prepare_offload` が background へ出す（#2961。tailscale の CLI を UI スレッドで待たない）
+        request @ Request::RemoteSetup { .. } => remote_setup_reply(&request),
 
         Request::Web {
             action,
@@ -14539,7 +14622,8 @@ fn dispatch_inner(
                     tako_core::remote_fs::control_path_limit()
                 ));
             }
-            let argv = remote_ssh_argv(&ssh_host);
+            // #2961: ssh の実体は先取りした答え（GUI の UI スレッドでログインシェルを待たない）
+            let argv = remote_ssh_argv_probed(&ssh_host);
             let dir = remote_dir
                 .as_deref()
                 .map(str::trim)
@@ -18335,6 +18419,12 @@ pub fn dispatch_config_share(
 /// （`remote_fs::ssh_pane_argv`）。ここで対話ログインした接続がそのまま共有されるので、
 /// パスワード認証しか無い相手でも一度入れば以後ツリーが追加認証なしで開く（#65）
 pub fn remote_ssh_argv(ssh_host: &str) -> Vec<String> {
+    remote_ssh_argv_with(ssh_host, tako_core::remote_fs::ssh_bin())
+}
+
+/// [`remote_ssh_argv`] の本体。ssh の実体を引数で受ける（#2961。GUI の UI スレッドの dispatch は
+/// background で引いた答え = [`UiProbes::ssh_bin`] で組む。ログインシェルを待たない）
+fn remote_ssh_argv_with(ssh_host: &str, ssh_bin: Option<String>) -> Vec<String> {
     let hosts = match tako_core::ssh_config::default_ssh_config_path() {
         Some(p) => tako_core::ssh_config::parse_ssh_config(&p),
         None => Vec::new(),
@@ -18349,7 +18439,7 @@ pub fn remote_ssh_argv(ssh_host: &str) -> Vec<String> {
         }
         None => Vec::new(),
     };
-    let mut argv = tako_core::remote_fs::ssh_pane_argv(ssh_host, &extra);
+    let mut argv = tako_core::remote_fs::ssh_pane_argv_using(ssh_bin, ssh_host, &extra);
     // 宛先は config の `User` を反映した形へ差し替える（`ssh_command()` と同じ規則）
     if let Some(h) = hosts.iter().find(|h| h.name == ssh_host) {
         if let Some(user) = &h.user {
@@ -60317,6 +60407,156 @@ tako | pane 2 [ compact ]       [-]
             // 同期の腕は今も答える（応答の形は変えていない）
             assert!(dispatch(&mut host, request, PaneOrigin::Cli).is_err());
         }
+    }
+
+    /// #2961 で突き合わせる remote 系の要求（tailscale・器を起こさない形 = 起こす前の断り）
+    fn issue2961_remote_requests() -> Vec<Request> {
+        vec![
+            // 未知の action（tailscale を起こさない）
+            Request::RemoteSetup {
+                action: "nope".into(),
+                answers: None,
+            },
+            // 答えの形が違う（検出の前に断る）
+            Request::RemoteSetup {
+                action: "run".into(),
+                answers: Some(json!("not-an-object")),
+            },
+        ]
+    }
+
+    /// #2961: `RemoteSetup` は準備で background のジョブになり、UI スレッドへの続きを作らずに同期の腕と同じ応答を返す
+    #[test]
+    fn issue2961_remote_setupはbackgroundから同じ応答を返す() {
+        let mut host = MockHost::new();
+        for request in issue2961_remote_requests() {
+            let job = match prepare_offload(&mut host, &request) {
+                Some(Ok(job)) => job,
+                Some(Err(e)) => panic!("{request:?} の準備が断った: {e:?}"),
+                None => panic!("{request:?} を UI スレッドの同期の腕で答えている（#2961）"),
+            };
+            assert!(matches!(job, OffloadJob::RemoteSetup(_)), "{request:?}");
+            let offloaded = match job.run_staged() {
+                OffloadOutcome::Reply(reply) => reply,
+                OffloadOutcome::OnUi(_) => panic!("{request:?} の続きを UI スレッドへ戻している"),
+            };
+            assert!(offloaded.is_err(), "{request:?} は断りで終わる形のはず");
+            let synced = dispatch(&mut host, request.clone(), PaneOrigin::Mcp);
+            assert_eq!(
+                format!("{offloaded:?}"),
+                format!("{synced:?}"),
+                "{request:?}"
+            );
+        }
+    }
+
+    /// #2961: スクロールバックの採取は器のセッション名を準備（UI スレッド）で解く。解けないペインは準備で
+    /// 同期の腕と同じ断りを返し、解けたらセッション名と行数だけを持つジョブになる
+    #[test]
+    fn issue2961_remote_scrollbackは準備でセッションを解く() {
+        let mut host = MockHost::new();
+        let unresolved = Request::RemoteScrollback {
+            pane_id: tako_core::unused_id::pane().as_u64().to_string(),
+            lines: Some(10),
+        };
+        let prepared = match prepare_offload(&mut host, &unresolved) {
+            Some(Err(e)) => e,
+            Some(Ok(_)) => panic!("解けないペインの採取をジョブにしている"),
+            None => panic!("RemoteScrollback が準備を通っていない"),
+        };
+        let synced = dispatch(&mut host, unresolved, PaneOrigin::Mcp).unwrap_err();
+        assert_eq!(format!("{prepared:?}"), format!("{synced:?}"));
+        // 器のセッション名の指定はそのままジョブへ（採取 = 器を起こすのは background）
+        let named = Request::RemoteScrollback {
+            pane_id: "tako-2961-test".into(),
+            lines: Some(10),
+        };
+        match prepare_offload(&mut host, &named) {
+            Some(Ok(OffloadJob::RemoteScrollback { session, lines })) => {
+                assert_eq!(session, "tako-2961-test");
+                assert_eq!(lines, Some(10));
+            }
+            _ => panic!("器のセッション名の採取がジョブにならない"),
+        }
+    }
+
+    /// #2961: `OpenRemote` は ssh の実体（unix はログインシェル）を先取りしてから UI スレッドで dispatch する。
+    /// 先取りの内側の argv は background の答えだけで組み、答えが無ければ素の `ssh`（待たない側）
+    #[test]
+    fn issue2961_open_remoteはsshの実体を先取りする() {
+        let mut host = MockHost::new();
+        let request = Request::OpenRemote {
+            host: "tako-2961-nohost.invalid".into(),
+            focus: None,
+            remote_dir: None,
+            target: None,
+            pane: None,
+            tab: None,
+            direction: None,
+        };
+        match prepare_offload(&mut host, &request) {
+            Some(Ok(OffloadJob::Probe(job))) => {
+                assert!(job.needs.ssh_bin, "ssh の実体を先取りしない")
+            }
+            _ => panic!("OpenRemote が先取りのジョブにならない（#2961）"),
+        }
+        let answered = UiProbes {
+            ssh_bin: Some(Some("/fake/bin/ssh".into())),
+            ..UiProbes::default()
+        };
+        let argv = with_ui_probes(&answered, || {
+            remote_ssh_argv_probed("tako-2961-nohost.invalid")
+        });
+        assert_eq!(argv.first().map(String::as_str), Some("/fake/bin/ssh"));
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("tako-2961-nohost.invalid")
+        );
+        // 答えがある内側では先取りは要らない（もう一巡を出さない）
+        assert!(!with_ui_probes(&answered, ssh_bin_need));
+        // 内側だが答えが無い = 待たずに素の `ssh`
+        let argv = with_ui_probes(&UiProbes::default(), || {
+            remote_ssh_argv_probed("tako-2961-nohost.invalid")
+        });
+        assert_eq!(argv.first().map(String::as_str), Some("ssh"));
+    }
+
+    /// #2961 の A/B: `TAKO_2961_LEGACY=1` は remote 系も修正前と同じく同期の腕（UI スレッドで待つ）
+    #[test]
+    fn issue2961_legacyはremote系を同期の腕で答える() {
+        if tako_core::run_alone!(issue2961_legacyはremote系を同期の腕で答える) {
+            return;
+        }
+        let mut host = MockHost::new();
+        let open = Request::OpenRemote {
+            host: "tako-2961-nohost.invalid".into(),
+            focus: None,
+            remote_dir: None,
+            target: None,
+            pane: None,
+            tab: None,
+            direction: None,
+        };
+        std::env::remove_var(SYNC_ARM_OFFLOAD_LEGACY_ENV);
+        for request in issue2961_remote_requests() {
+            assert!(
+                prepare_offload(&mut host, &request).is_some(),
+                "{request:?}"
+            );
+        }
+        assert!(prepare_offload(&mut host, &open).is_some());
+        std::env::set_var(SYNC_ARM_OFFLOAD_LEGACY_ENV, "1");
+        for request in issue2961_remote_requests() {
+            assert!(
+                prepare_offload(&mut host, &request).is_none(),
+                "A/B なのに {request:?} を background へ出している"
+            );
+            assert!(dispatch(&mut host, request, PaneOrigin::Cli).is_err());
+        }
+        assert!(
+            prepare_offload(&mut host, &open).is_none(),
+            "A/B なのに OpenRemote の ssh の実体を先取りしている"
+        );
     }
 
     /// #2961: setup の実行ファイルの差し替え（`TAKO_2961_INJECT_SETUP_BIN`）は検証プロセスでだけ効き、
