@@ -42,6 +42,37 @@ pub(crate) fn legacy_mode() -> bool {
     *LEGACY.get_or_init(|| std::env::var_os("TAKO_976_LEGACY").is_some())
 }
 
+/// #2969 の A/B の env（`1` = 修正前と同じく、検知の着地（UI スレッド）が引き取りの 1 行を組むときに
+/// ログインシェルの `command -v ssh` を待つ）
+pub(crate) const ISSUE2969_LEGACY_ENV: &str = "TAKO_2969_LEGACY";
+
+/// #2969 の A/B が立っているか（**門はここ 1 か所**。呼ばれるたびに読む）。呼び手は
+/// `if crate::ssh_folders::issue2969_legacy() {` の形で置く（番犬 `issue2956_setup_dispatch_offload_watchdog` の
+/// `TAKO_APP_UI_LANDINGS` が A/B の旧経路の腕として読む形）
+pub(crate) fn issue2969_legacy() -> bool {
+    matches!(
+        std::env::var(ISSUE2969_LEGACY_ENV).ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
+/// 検知の着地が引き取りの 1 行（`remote_ssh_argv_with`）を組む ssh の実体を、**走査（background）の段で**引く（#2969）。
+///
+/// 引くのは走査の結果に引き取るペイン（`settled` = 着地の [`TakoApp::adopt_ssh_connect`] が触らないペインの外）が
+/// あるときだけ（`remote_fs::ssh_bin` = unix はログインシェルの `command -v ssh`。上限 `login_shell_timeout`・覚えなし）。
+/// 引き取り済みのペインばかりの tick（ssh が生きている間のほぼ全部）はログインシェルを起こさない。
+/// `settled` が `None`（引き取りが止めてある = #1446 / #2969 の A/B）なら引かない。
+/// 引かなかった・見つからなかったときの `None` は、着地で素の `ssh` になる（待たない側）
+pub(crate) fn adopt_ssh_bin(state: &SshScanState, settled: Option<&[u64]>) -> Option<String> {
+    let settled = settled?;
+    state
+        .sessions
+        .iter()
+        .any(|s| !settled.contains(&s.pane))
+        .then(tako_core::remote_fs::ssh_bin)
+        .flatten()
+}
+
 /// 同一バイナリで #1041 の前の挙動へ戻す A/B（`TAKO_1041_LEGACY=1`）。
 ///
 /// 戻るのは 2 つ: リモートルートを**経路を問わず全部ローカルの後ろ**へ並べる /
@@ -144,10 +175,22 @@ impl TakoApp {
         self.ssh_links.values().any(|link| link.live)
     }
 
+    /// 走査結果を反映し、**これから接続を確かめるべき仕事**を返す（引き取りの 1 行は素の `ssh` で組む。
+    /// 定期の tick は走査が引いた ssh の実体を渡す [`Self::apply_ssh_scan_with`] を通る）
+    pub(crate) fn apply_ssh_scan(&mut self, state: SshScanState) -> Vec<SshAutoOpenJob> {
+        self.apply_ssh_scan_with(state, None)
+    }
+
     /// 走査結果を反映し、**これから接続を確かめるべき仕事**を返す。
     ///
-    /// ここではネットワークへ触らない（UI スレッドで呼ばれる）
-    pub(crate) fn apply_ssh_scan(&mut self, mut state: SshScanState) -> Vec<SshAutoOpenJob> {
+    /// ここではネットワークへ触らず、外部プロセスも待たない（UI スレッドで呼ばれる）。引き取り
+    /// （[`Self::adopt_ssh_connect`]）が打ち直す 1 行の ssh の実体は、走査（background）の段が引いた
+    /// `adopt_ssh_bin`（[`adopt_ssh_bin`]）で組む（#2969。修正前はここでログインシェルの `command -v ssh` を待った）
+    pub(crate) fn apply_ssh_scan_with(
+        &mut self,
+        mut state: SshScanState,
+        adopt_ssh_bin: Option<String>,
+    ) -> Vec<SshAutoOpenJob> {
         // #1041: **tako が開いた SSH ペイン**は、tako が知っているホスト名
         // （`~/.ssh/config` の Host）へ読み替える。
         //
@@ -175,7 +218,11 @@ impl TakoApp {
         // 増えない。これが無いと、ユーザーが手で `ssh <host>` と打ったペインは
         // dispatch を通らないので切断しても誰も見ておらず、無言でローカルへ落ちる
         for session in &state.sessions {
-            self.adopt_ssh_connect(PaneId::from_raw(session.pane), &session.destination);
+            self.adopt_ssh_connect(
+                PaneId::from_raw(session.pane),
+                &session.destination,
+                adopt_ssh_bin.as_deref(),
+            );
         }
         let mut jobs: Vec<SshAutoOpenJob> = Vec::new();
         for session in &state.sessions {

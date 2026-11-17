@@ -1107,10 +1107,17 @@ fn 修正前の形を名指しできる() {
 /// tako-core しか辿らないので、ここに挙げた関数の本文に外部プロセスの起動・待ち（#1984 の葉）と、版の読み
 /// （`extract_version_from_path(` = パスに版が無ければ `claude --version`）が直に書かれていないかを字面で見る。
 /// A/B の旧経路の腕（`if …legacy() {` の then 側）は除く。
+/// #2969: ssh の検知の着地（`apply_ssh_scan_with` → 引き取り `adopt_ssh_connect`）も挙げる。
 /// #2976: リモートフォルダの自動復帰の見張り（定期の tick の積み込み `drive_remote_recovery` と、背景の
 /// 生死の判定の着地 `land_remote_liveness`）も挙げる
 const TAKO_APP_UI_LANDINGS: &[(&str, &str)] = &[
     ("crates/tako-app/src/main.rs", "fn apply_stale_binary_scan("),
+    ("crates/tako-app/src/ssh_folders.rs", "fn apply_ssh_scan("),
+    (
+        "crates/tako-app/src/ssh_folders.rs",
+        "fn apply_ssh_scan_with(",
+    ),
+    ("crates/tako-app/src/main.rs", "fn adopt_ssh_connect("),
     (
         "crates/tako-app/src/ssh_folders.rs",
         "fn drive_remote_recovery(",
@@ -1126,6 +1133,15 @@ const TAKO_APP_EXTRA_LEAVES: &[(&str, &str)] = &[
     (
         "extract_version_from_path(",
         "claude の版を読む（パスにも版リソースにも版が無ければ `claude --version` を上限まで待つ。#2961）",
+    ),
+    (
+        "remote_ssh_argv(",
+        "SSH ペインの argv を組む（ssh の実体をログインシェルの `command -v ssh` で引く = 上限 5 秒。\
+         走査が引いた実体を受ける `remote_ssh_argv_with` を使う。#2969）",
+    ),
+    (
+        "remote_fs::ssh_bin(",
+        "ssh の実体を引く（ログインシェルの `command -v ssh`。#2969）",
     ),
     (
         "remote_fs::liveness(",
@@ -1203,6 +1219,55 @@ fn tako_appのuiスレッドの着地は外部プロセスを待たない() {
         }
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
+fn tako_appのsshの引き取りでログインシェルを待つ修正前の形を名指しできる() {
+    // #2969: 引き取りの A/B の門を外す（着地でログインシェルの `command -v ssh` を待つ修正前の形）
+    let file = "crates/tako-app/src/main.rs";
+    let text = read(file);
+    let fixed = "let argv = if crate::ssh_folders::issue2969_legacy() {";
+    assert!(
+        text.contains(fixed),
+        "注入の元（A/B の門つきの argv の組み立て）が本文に無い（形を変えたなら注入も追うこと）"
+    );
+    let injected = text.replacen(fixed, "let argv = if true {", 1);
+    let found = ui_landing_offenders(&injected, "fn adopt_ssh_connect(")
+        .expect("注入した本文にも関数がある");
+    assert!(
+        found.iter().any(|(_, n, _)| n == "remote_ssh_argv("),
+        "門を外した注入（着地でログインシェルを待つ `remote_ssh_argv`）を名指ししない: {found:?}"
+    );
+    // 着地の本体へ ssh の実体の解決を直に書き足す形も名指す
+    let folders = "crates/tako-app/src/ssh_folders.rs";
+    let text = read(folders);
+    let anchor = "    ) -> Vec<SshAutoOpenJob> {\n";
+    assert!(
+        text.contains(anchor),
+        "注入の位置（`apply_ssh_scan_with` の頭）が本文に無い（形を変えたなら注入も追うこと）"
+    );
+    let injected = text.replacen(
+        anchor,
+        "    ) -> Vec<SshAutoOpenJob> {\n        let adopt_ssh_bin = tako_core::remote_fs::ssh_bin();\n",
+        1,
+    );
+    let found = ui_landing_offenders(&injected, "fn apply_ssh_scan_with(")
+        .expect("注入した本文にも関数がある");
+    assert!(
+        found.iter().any(|(_, n, _)| n == "remote_fs::ssh_bin("),
+        "着地で ssh の実体を引く注入を名指ししない: {found:?}"
+    );
+    // 今の形は名指さない
+    for (f, head) in [
+        (file, "fn adopt_ssh_connect("),
+        (folders, "fn apply_ssh_scan_with("),
+    ] {
+        assert_eq!(
+            ui_landing_offenders(&read(f), head),
+            Some(Vec::new()),
+            "{f} {head}"
+        );
+    }
 }
 
 #[test]

@@ -7304,6 +7304,7 @@ impl TakoApp {
                             app.collect_ssh_scan_targets(),
                             app.ssh_scan.clone(),
                             app.ssh_auto_tracked(),
+                            app.ssh_adopt_settled_panes(),
                         )
                     };
                     app.detect_new_failures();
@@ -7455,7 +7456,7 @@ impl TakoApp {
                         settings,
                         running_children_scan,
                         stale_outcome,
-                        ssh_state,
+                        (ssh_state, ssh_adopt_bin),
                         codex_limits,
                         transcript_ctx,
                     ) = cx
@@ -7465,7 +7466,7 @@ impl TakoApp {
                             let sleep_guard_active = settings.sleep_guard_mode
                                 == tako_control::sleep_guard::SleepGuardMode::WhileAgentsRunning;
                             let (running_targets, running_prev) = running_children_scan;
-                            let (ssh_targets, ssh_prev, ssh_tracked) = ssh_scan;
+                            let (ssh_targets, ssh_prev, ssh_tracked, ssh_settled) = ssh_scan;
                             let now = std::time::Instant::now();
                             let rescan_running =
                                 tako_control::agents::should_rescan_running_children(
@@ -7516,6 +7517,12 @@ impl TakoApp {
                                 snapshot.as_ref().filter(|_| rescan_ssh || ssh_share),
                                 now,
                             );
+                            // #2969: 着地の引き取りが打ち直す 1 行の ssh の実体は、引き取るペインがあるときだけ
+                            // ここ（background）で引く（UI スレッドでログインシェルを待たない）
+                            let ssh_adopt_bin = crate::ssh_folders::adopt_ssh_bin(
+                                &ssh_state,
+                                ssh_settled.as_deref(),
+                            );
                             // 採り直した回は前回と突き合わせ、busy の集合が変わっていたら次の tick で
                             // 確かめ直す（#2477。1 瞬間だけ居た子を 60 秒の保険まで残さない）
                             let running_state =
@@ -7543,7 +7550,7 @@ impl TakoApp {
                                 settings,
                                 running_state,
                                 stale_outcome,
-                                ssh_state,
+                                (ssh_state, ssh_adopt_bin),
                                 codex_limits,
                                 transcript_ctx,
                             )
@@ -7572,8 +7579,11 @@ impl TakoApp {
                         if stale_changed {
                             cx.notify();
                         }
-                        // #976: 検知の反映はメモリ操作だけ（接続の確認は次の段で背景へ）
-                        app.apply_ssh_scan(ssh_state)
+                        // #976: 検知の反映はメモリ操作だけ（接続の確認は次の段で背景へ）。
+                        // #2969: 引き取りの ssh の実体は背景の走査が引いた答え。区間を測る
+                        // （UI スレッドで外部プロセスを待てば perf.log に名指しで出る）
+                        let _s = tako_control::diag::perf_span("periodic_land:ssh_scan");
+                        app.apply_ssh_scan_with(ssh_state, ssh_adopt_bin)
                     });
                     let Ok(ssh_jobs) = ok else {
                         break;
@@ -15623,7 +15633,10 @@ impl TakoApp {
     /// `begin_ssh_connect` が呼ばれず、切断しても無言でローカルへ落ちていた（実測）。
     /// 検知は既にそのペインを見つけている（`remote-folder auto` が使っている材料）
     /// ので、**同じ材料をここでも使う**（新しい走査は増やさない）
-    fn adopt_ssh_connect(&mut self, pane: PaneId, destination: &str) {
+    ///
+    /// 打ち直す 1 行の ssh の実体（`ssh_bin`）は走査（background）の段が引いて運ぶ（#2969。[`ssh_folders::adopt_ssh_bin`]）。
+    /// ここは UI スレッドなので、ログインシェルの `command -v ssh` は待たない
+    fn adopt_ssh_connect(&mut self, pane: PaneId, destination: &str, ssh_bin: Option<&str>) {
         use tako_core::ssh_progress::ConnectPhase;
         if Self::legacy_1446() {
             return;
@@ -15649,8 +15662,14 @@ impl TakoApp {
         // `ps` の行が引用を失っている（空白で連結されている）うえ、外から来た文字列を
         // シェルへ流し込むことになるため。`~/.ssh/config` の Host 設定は
         // `remote_ssh_argv` が反映するので、`ssh <host>` と打った普通の使い方は同じ形に
-        // 戻る（手で足した引数は引き継がれない = 打ち直した行がペインに見える）
-        let argv = tako_control::dispatch::remote_ssh_argv(destination);
+        // 戻る（手で足した引数は引き継がれない = 打ち直した行がペインに見える）。
+        // ssh の実体は走査（background）が引いた答え（#2969。引いていなければ素の `ssh` = 待たない側）。
+        // A/B は修正前と同じくここでログインシェルに聞く
+        let argv = if crate::ssh_folders::issue2969_legacy() {
+            tako_control::dispatch::remote_ssh_argv(destination)
+        } else {
+            tako_control::dispatch::remote_ssh_argv_with(destination, ssh_bin.map(str::to_string))
+        };
         let line = tako_control::launch_cmd::command_line(
             tako_control::launch_cmd::launch_dialect(),
             &argv,
@@ -15671,6 +15690,25 @@ impl TakoApp {
                 "手打ちの ssh を検知"
             }
         ));
+    }
+
+    /// [`Self::adopt_ssh_connect`] が触らないペイン（追跡していて、諦めた / 失敗の表示で止まっていない）。
+    /// 走査（background）は、検知したペインがこの外にあるときだけ ssh の実体を引く（#2969。
+    /// [`ssh_folders::adopt_ssh_bin`]）。引き取りが止めてある（#1446 / #2969 の A/B）なら `None` = 引かない
+    fn ssh_adopt_settled_panes(&self) -> Option<Vec<u64>> {
+        use tako_core::ssh_progress::ConnectPhase;
+        if Self::legacy_1446() || crate::ssh_folders::issue2969_legacy() {
+            return None;
+        }
+        Some(
+            self.ssh_connect
+                .iter()
+                .filter(|(_, st)| {
+                    !matches!(st.phase, ConnectPhase::Failed { .. } | ConnectPhase::GaveUp)
+                })
+                .map(|(pane, _)| pane.as_u64())
+                .collect(),
+        )
     }
 
     /// 保存する SSH 追跡（#1446）。**接続が成立した実績のあるペインだけ**を残す
