@@ -109,13 +109,9 @@ const PARTIAL: &[(&str, &str)] = &[
 /// 直したら外すこと（届かなくなると [`既知の残りはまだ届く`] が落ちる）。
 /// `SetupMcp` / `SetupRun` / `ConfigShare` は #2961 の 1 本目、`RemoteSetup` / `RemoteScrollback` は 2 本目で
 /// 外した（[`TARGETS`]）。`OpenRemote` は 2 本目で先取り（[`PROBE_TARGETS`]）へ寄せた。`RemoteFolder` は 3 本目で
-/// action ごとの段（[`STAGED_TARGETS`]）へ寄せた
-const KNOWN: &[(&str, &str)] = &[
-    (
-        "SleepGuard",
-        "#2961: sudoers の書き込み（蓋閉じの準備・片付け = `install_sudoers_typed` / `remove_sudoers_done`）",
-    ),
-];
+/// action ごとの段（[`STAGED_TARGETS`]）へ寄せた。
+/// `SleepGuard` は 4 本目で段（[`STAGED_TARGETS`]）へ寄せた = #2961 で残りは無くなった
+const KNOWN: &[(&str, &str)] = &[];
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -820,12 +816,20 @@ fn 直した要求はbackgroundから答える() {
 /// action ごとに段を分ける準備の関数へ寄せた要求（#2961）。`prepare_offload` の腕（A/B の門つき）が準備の関数を呼ぶ。
 /// 準備・着地（UI スレッドで回る段）が外部プロセスへ届かないことは #1984 の番犬の `UI_PATHS` が見る。
 /// `(要求, prepare_offload の腕の頭, 腕が呼ぶ準備の関数, 注入で消す腕の全文)`
-const STAGED_TARGETS: &[(&str, &str, &str, &str)] = &[(
-    "RemoteFolder",
-    "Request::RemoteFolder { .. } if !sync_arm_offload_legacy() =>",
-    "remote_folder_prepare(host, request)",
-    "        Request::RemoteFolder { .. } if !sync_arm_offload_legacy() => {\n            remote_folder_prepare(host, request)\n        }\n",
-)];
+const STAGED_TARGETS: &[(&str, &str, &str, &str)] = &[
+    (
+        "RemoteFolder",
+        "Request::RemoteFolder { .. } if !sync_arm_offload_legacy() =>",
+        "remote_folder_prepare(host, request)",
+        "        Request::RemoteFolder { .. } if !sync_arm_offload_legacy() => {\n            remote_folder_prepare(host, request)\n        }\n",
+    ),
+    (
+        "SleepGuard",
+        "Request::SleepGuard { action, .. } if !sync_arm_offload_legacy() =>",
+        "sleep_guard_prepare(action.as_deref())",
+        "        Request::SleepGuard { action, .. } if !sync_arm_offload_legacy() => {\n            sleep_guard_prepare(action.as_deref())\n        }\n",
+    ),
+];
 
 #[test]
 fn 段へ寄せた要求は準備の関数を通る() {
@@ -1095,4 +1099,108 @@ fn 修正前の形を名指しできる() {
             "`{variant}` の同期の腕を修正前の呼び出しへ戻した注入を 2 が名指ししない: {problems:#?}"
         );
     }
+}
+
+// ===== 4. 呼び出しのグラフの外（tako-app）の UI スレッドの着地 =====
+
+/// tako-app の UI スレッドで回る着地（`(ファイル, 関数の頭)`。#2961）。呼び出しのグラフは tako-control /
+/// tako-core しか辿らないので、ここに挙げた関数の本文に外部プロセスの起動・待ち（#1984 の葉）と、版の読み
+/// （`extract_version_from_path(` = パスに版が無ければ `claude --version`）が直に書かれていないかを字面で見る。
+/// A/B の旧経路の腕（`if …legacy() {` の then 側）は除く
+const TAKO_APP_UI_LANDINGS: &[(&str, &str)] =
+    &[("crates/tako-app/src/main.rs", "fn apply_stale_binary_scan(")];
+
+/// tako-app の着地で名指す綴りのうち、#1984 の葉に無いもの（`(綴り, 理由)`）
+const TAKO_APP_EXTRA_LEAVES: &[(&str, &str)] = &[(
+    "extract_version_from_path(",
+    "claude の版を読む（パスにも版リソースにも版が無ければ `claude --version` を上限まで待つ。#2961）",
+)];
+
+/// `text`（テスト領域を潰した本文）の関数 `head` の中で、A/B の旧経路の腕の外に書かれた葉（`(行, 綴り, 理由)`）
+fn ui_landing_offenders(text: &str, head: &str) -> Option<Vec<(usize, String, String)>> {
+    let code = production_range::code_view::code_view(text);
+    let bytes = code.as_bytes();
+    let at = code.find(head)?;
+    let open = at + code[at..].find('{')?;
+    let close = matching(bytes, open);
+    let body = &code[open..close];
+    // A/B の旧経路の腕（`if …legacy() {` の then 側）の範囲
+    let mut legacy: Vec<(usize, usize)> = Vec::new();
+    for (i, _) in body.match_indices("legacy() {") {
+        let line_start = body[..i].rfind('\n').map_or(0, |n| n + 1);
+        if !body[line_start..i].trim_start().contains("if ") {
+            continue;
+        }
+        let brace = open + i + "legacy() ".len();
+        legacy.push((brace, matching(bytes, brace)));
+    }
+    let line_of = |pos: usize| code[..pos].matches('\n').count() + 1;
+    let mut out = Vec::new();
+    let leaves: Vec<(String, String)> = leaves()
+        .iter()
+        .cloned()
+        .chain(
+            TAKO_APP_EXTRA_LEAVES
+                .iter()
+                .map(|(n, w)| (n.to_string(), w.to_string())),
+        )
+        .collect();
+    for (needle, why) in &leaves {
+        for (i, _) in body.match_indices(needle.as_str()) {
+            let pos = open + i;
+            if legacy.iter().any(|(a, b)| (*a..*b).contains(&pos)) {
+                continue;
+            }
+            out.push((line_of(pos), needle.clone(), why.clone()));
+        }
+    }
+    out.sort();
+    Some(out)
+}
+
+#[test]
+fn tako_appのuiスレッドの着地は外部プロセスを待たない() {
+    let mut problems = Vec::new();
+    for (file, head) in TAKO_APP_UI_LANDINGS {
+        match ui_landing_offenders(&read(file), head) {
+            None => problems.push(format!(
+                "{file}:1 `{head}` が無い（走査が空振り。改名したなら TAKO_APP_UI_LANDINGS も追うこと）"
+            )),
+            Some(found) => {
+                for (line, needle, why) in found {
+                    problems.push(format!(
+                        "{file}:{line}（UI スレッドの着地 `{head}`）が `{needle}` を呼ぶ（{why}）。\
+                         背景の段で済ませて結果だけを着地へ運ぶこと（#2961）"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
+fn tako_appの着地で版を読む修正前の形を名指しできる() {
+    let file = "crates/tako-app/src/main.rs";
+    let text = read(file);
+    let fixed = "let spawned_version = if tako_control::dispatch::sync_arm_offload_legacy() {";
+    assert!(
+        text.contains(fixed),
+        "注入の元（A/B の門つきの版の読み）が本文に無い（形を変えたなら注入も追うこと）"
+    );
+    // 修正前の形: 門を外して着地で版を読む
+    let injected = text.replacen(fixed, "let spawned_version = if true {", 1);
+    let found = ui_landing_offenders(&injected, "fn apply_stale_binary_scan(")
+        .expect("注入した本文にも関数がある");
+    assert!(
+        found
+            .iter()
+            .any(|(_, n, _)| n == "extract_version_from_path("),
+        "門を外した注入（着地で `claude --version`）を名指ししない: {found:?}"
+    );
+    // 今の形は名指さない
+    assert_eq!(
+        ui_landing_offenders(&text, "fn apply_stale_binary_scan("),
+        Some(Vec::new())
+    );
 }

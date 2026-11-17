@@ -8,7 +8,9 @@
 #      修正前（`TAKO_2961_LEGACY=1`）は `tako list` が要求の終わりまで待たされ、perf.log に専有が出る。
 #      返る偽物では修正前後で MCP の応答の本文が同じ
 #   対象の要求は組ごと（SUITE）: setup（SetupMcp / SetupRun / ConfigShare）・remote（RemoteSetup /
-#   RemoteScrollback / OpenRemote）・folder（RemoteFolder の open / ls / list / pending / open-file / close）
+#   RemoteScrollback / OpenRemote）・folder（RemoteFolder の open / ls / list / pending / open-file / close）・
+#   sleep（SleepGuard の蓋閉じの準備・片付け）・stale（#2966 の版の問い合わせの回数と、tako-app の
+#   `apply_stale_binary_scan` = 2 秒 tick の着地が `claude --version` を UI スレッドで待たないこと）
 #
 # **本物の claude / codex / agy / tako setup / git は起こさない**: 偽の claude は `cc` で作り、codex / agy は
 # シェルの偽物。`tako setup` の子は検証プロセスでだけ読む注入 `TAKO_2961_INJECT_SETUP_BIN` で偽物を指す
@@ -20,7 +22,9 @@
 # （一時 HOME・偽物だけが居る PATH・ログインシェルにしない SHELL = #2956 のスクリプトと同じ作り）で動かす。
 # 落とすのは自分で起こした pid だけ。窓は常設の仮想ディスプレイ（tako-vd）へ出る。
 #
-# 選んで回す: ONLY=gui|legacy（既定は両方）・SUITE=setup|remote|folder（既定は全部）。
+# 選んで回す: ONLY=gui|legacy（既定は両方）・SUITE=setup|remote|folder|sleep|stale（既定は全部）。
+# **本物の sudoers / pmset には触らない**: osascript は PATH の先頭の偽物、sudoers の有無と `sudo pmset` は
+# #2904 の偽の置き場（`TAKO_2904_FAKE_PMSET`。検証プロセスでだけ読む）。
 # CI には登録しない（GUI と cc が要る）。CI 側の担保は単体テスト（dispatch.rs の `issue2961_*`）と番犬
 # （`crates/tako-control/tests/issue2956_setup_dispatch_offload_watchdog.rs` の `TARGETS`）。
 #
@@ -33,7 +37,8 @@ export TAKO_LANG=ja
 unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_ORCHESTRATOR_ROLE TAKO_MCP_URL \
   CLAUDE_CODE_PLUGIN_DIRS TAKO_CLI TAKO_2961_LEGACY TAKO_2961_INJECT_SETUP_BIN TAKO_GIT_BIN \
   TAKO_SETUP_RUN_TIMEOUT_SECS TAKO_IPC_TIMEOUT_SECS TAKO_PERF_LOG CLAUDE_CONFIG_DIR \
-  TAKO_TAILSCALE_BIN TAKO_TMUX_BIN TAKO_TMUX_SOCKET
+  TAKO_TAILSCALE_BIN TAKO_TMUX_BIN TAKO_TMUX_SOCKET TAKO_2904_FAKE_PMSET TAKO_2966_LEGACY \
+  TAKO_SETUP_PROBE_TIMEOUT_SECS
 unset CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ID CLAUDECODE
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -128,8 +133,28 @@ static void record(void) {
 int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "tako-fake-exec-warm") == 0) return 0;
   if (argc > 1 && strcmp(argv[1], "--version") == 0) {
+    if (flag("hang-claude-version")) {
+      /* 子と孫の組で止まる（#2942 / #2951 の打ち切りは孫まで止める）。どちらも pid を書く */
+      record();
+      if (fork() == 0) {
+        record();
+        for (;;) pause();
+      }
+      for (;;) pause();
+    }
     printf("2.1.294 (Claude Code)\n");
     return 0;
+  }
+  if (argc > 1 && strcmp(argv[1], "--serve2961") == 0) {
+    /* 器のペインで「起動時のバイナリ」として動き続ける（stale の検知の相手）。pid は別の置き場へ */
+    const char *dir = getenv("FAKE_DIR");
+    if (dir) {
+      char path[1024];
+      snprintf(path, sizeof path, "%s/serve-%d", dir, (int)getpid());
+      FILE *f = fopen(path, "w");
+      if (f) fclose(f);
+    }
+    for (;;) pause();
   }
   if (argc > 1 && strcmp(argv[1], "auth") == 0) {
     printf("{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"subscriptionType\":\"max\"}\n");
@@ -192,6 +217,20 @@ case "$1" in
 esac
 exit 0
 SH
+# 偽の osascript（sudoers の登録・削除の管理者の確認の代わり。PATH の先頭 = GUI が素の名前で起こす）
+cat > "$TMP/stubs/osascript" <<'SH'
+#!/bin/sh
+if [ -e "$FAKE_DIR/hang-osascript" ]; then : > "$FAKE_DIR/pids/$$"; exec /bin/sleep 600; fi
+case "$*" in
+  *"rm -f"*) echo "OK: sudoers 削除完了・disablesleep 解除" ;;
+  *) echo "OK: sudoers 登録完了" ;;
+esac
+exit 0
+SH
+# #2904 の偽の pmset の置き場（sudoers の有無はここのファイル・`sudo pmset` はここの偽の sudo）
+FAKE_PMSET="$TMP/fakepmset"
+mkdir -p "$FAKE_PMSET"
+printf '#!/bin/sh\necho "$*" >> "%s/sudo.log"\nexit 0\n' "$FAKE_PMSET" > "$FAKE_PMSET/sudo"
 # 偽の tailscale（`TAKO_TAILSCALE_BIN` で指す。検出の `--version` が止まる / 決まった形で答える）
 cat > "$TMP/stubs/tailscale" <<'SH'
 #!/bin/sh
@@ -268,14 +307,19 @@ exec /bin/sh "\$@"
 SH
 # 実行権は空打ちの補助が付ける（素の chmod にしない = #2222 / #2228）
 fake_exec_warm "$TMP/stubs/codex" "$TMP/stubs/agy" "$TMP/stubs/fake-tako" "$TMP/stubs/fake-git" \
-  "$TMP/stubs/tailscale" "$TMP/stubs/ssh" "$TMP/stubs/sftp" "$TMP/stubs/tmux-wrap" "$TMP/stubs/isosh" || exit 1
+  "$TMP/stubs/tailscale" "$TMP/stubs/ssh" "$TMP/stubs/sftp" "$TMP/stubs/tmux-wrap" "$TMP/stubs/isosh" \
+  "$TMP/stubs/osascript" "$FAKE_PMSET/sudo" || exit 1
+# stale の検知の相手（起動時のバイナリ）は今の claude と別のパスに置いた同じ偽物
+mkdir -p "$TMP/old"
+command cp -f "$HOME_DIR/.local/bin/claude" "$TMP/old/claude"
+"$TMP/old/claude" "$FAKE_EXEC_WARM_ARG"
 SANDBOX_PATH="$HOME_DIR/.local/bin:$TMP/stubs:/usr/bin:/bin:/usr/sbin:/sbin"
 # 砂場の env（GUI と CLI で同じ）
 sandbox_env() {
   echo "HOME=$HOME_DIR" "SHELL=$TMP/stubs/isosh" "CODEX_HOME=$HOME_DIR/.codex" "TAKO_ISOLATED=1" \
     "PATH=$SANDBOX_PATH" "FAKE_DIR=$FAKE_DIR" "TAKO_GIT_BIN=$TMP/stubs/fake-git" \
     "TAKO_2961_INJECT_SETUP_BIN=$TMP/stubs/fake-tako" "TAKO_TAILSCALE_BIN=$TMP/stubs/tailscale" \
-    "TAKO_TMUX_BIN=$TMP/stubs/tmux-wrap"
+    "TAKO_TMUX_BIN=$TMP/stubs/tmux-wrap" "TAKO_2904_FAKE_PMSET=$FAKE_PMSET"
 }
 # 砂場の PATH で claude / codex / agy が偽物を指すこと（本物を起こさない前提）
 for name in claude codex agy; do
@@ -607,6 +651,90 @@ hanging_folder_calls() {
     "$(jf closed < "$TMP/out/$phase-fclose-hang.out")"
 }
 
+# sleep 系: 返る偽物（osascript）で 1 回ずつ答えさせる（A/B の突き合わせ用）。sudoers は偽の置き場
+returning_sleep_calls() {
+  local phase="$1"
+  set_flags
+  rm -f "${FAKE_PMSET:?}/sudoers"
+  mcp_call tako_sleep_guard '{"action":"install-lid-sleep"}' "$phase-sinstall" 60
+  check_eq "$phase: 返る osascript: MCP の sleep guard（install-lid-sleep）が返る" "0" "$MCP_HUNG"
+  : > "$FAKE_PMSET/sudoers"
+  mcp_call tako_sleep_guard '{"action":"remove-lid-sleep"}' "$phase-sremove" 60
+  check_eq "$phase: 返る osascript: MCP の sleep guard（remove-lid-sleep）が返る" "0" "$MCP_HUNG"
+  rm -f "${FAKE_PMSET:?}/sudoers"
+}
+
+# sleep 系: 返らない osascript（管理者の確認を待つ形）の 2 本
+hanging_sleep_calls() {
+  local phase="$1" expect="$2" limit="$3"
+  set_flags hang-osascript
+  rm -f "${FAKE_PMSET:?}/sudoers"
+  mcp_start tako_sleep_guard '{"action":"install-lid-sleep"}' "$phase-sinstall-hang"
+  list_during "${phase}・返らない osascript（sleep guard install-lid-sleep）" "$expect" "$limit"
+  kill_fakes
+  mcp_wait 30
+  check_eq "$phase: 返らない osascript（install）: 偽物を落とすと MCP が返る" "0" "$MCP_HUNG"
+
+  set_flags hang-osascript
+  : > "$FAKE_PMSET/sudoers"
+  mcp_start tako_sleep_guard '{"action":"remove-lid-sleep"}' "$phase-sremove-hang"
+  list_during "${phase}・返らない osascript（sleep guard remove-lid-sleep）" "$expect" "$limit"
+  kill_fakes
+  mcp_wait 30
+  check_eq "$phase: 返らない osascript（remove）: 偽物を落とすと MCP が返る" "0" "$MCP_HUNG"
+  rm -f "${FAKE_PMSET:?}/sudoers"
+}
+
+# 記録した偽物の pid の数（返らない `claude --version` の子と孫）
+fake_pid_count() {
+  local n=0 f
+  for f in "$FAKE_DIR/pids"/*; do [ -f "$f" ] && n=$((n + 1)); done
+  echo "$n"
+}
+
+# stale 系 1（#2966）: 器のペインの状態の照会が今の claude の版を何回読むか（返らない `claude --version`・上限 3 秒）
+stale_status_call() {
+  local phase="$1" pane="$2"
+  set_flags
+  # 今の claude の覚え（5 秒）が切れるのを待ってから聞く（起動時の解決の覚えに当たると読まない）
+  sleep 6
+  set_flags hang-claude-version
+  mcp_call tako_stale_binary "{\"action\":\"status\",\"pane\":${pane}}" "$phase-stale" 40
+  STALE_PIDS="$(fake_pid_count)"
+  STALE_ELAPSED="$MCP_ELAPSED"
+  echo "    状態の照会: ${MCP_ELAPSED} 秒・偽の claude --version の pid の記録 ${STALE_PIDS} 個（子と孫の組 = 2 個で 1 回）"
+  kill_fakes
+}
+
+# stale 系 2: 2 秒 tick の着地（`apply_stale_binary_scan`）。器のペインを worker にして別のパスの偽の claude を
+# 走らせ、版の読み（返らない `claude --version`・上限 3 秒）が UI スレッドで起きるかを perf.log で見る
+stale_landing_case() {
+  local phase="$1" pane="$2" i
+  set_flags
+  mcp_call tako_set_title "{\"pane\":${pane},\"role\":\"worker\"}" "$phase-role" 30
+  mcp_call tako_send_input "{\"pane\":${pane},\"text\":\"$TMP/old/claude --serve2961\"}" "$phase-serve" 30
+  for i in $(seq 1 100); do
+    ls "$FAKE_DIR"/serve-* >/dev/null 2>&1 && break
+    sleep 0.1
+  done
+  if ! ls "$FAKE_DIR"/serve-* >/dev/null 2>&1; then
+    fail "$phase: 器のペインで偽の claude（起動時のバイナリ）が起動しない"
+    return
+  fi
+  set_flags hang-claude-version
+  # 走査は 2 秒ごと。今の claude と起動時のバイナリの版の読み（各 3 秒）の後に着地する
+  for i in $(seq 1 300); do
+    [ -f "$TAKO_DATA_DIR/perf.log" ] && grep -q "periodic_land:stale_binary" "$TAKO_DATA_DIR/perf.log" && break
+    [ "$(fake_pid_count)" -ge 4 ] && [ "$i" -ge 150 ] && break
+    sleep 0.1
+  done
+  STALE_LAND_MS="$(perl -ne 'BEGIN { $m = 0 } $m = $1 if /メインスレッド専有: periodic_land:stale_binary が (\d+)ms/ && $1 > $m; END { print "$m\n" }' "$TAKO_DATA_DIR/perf.log" 2>/dev/null)"
+  echo "    着地（periodic_land:stale_binary）の専有の最大 ${STALE_LAND_MS:-0}ms・偽の claude --version の pid の記録 $(fake_pid_count) 個"
+  grep -h "periodic_land:stale_binary" "$TAKO_DATA_DIR/perf.log" 2>/dev/null | sed 's/^/      /' | head -3
+  mcp_call tako_stale_binary "{\"action\":\"status\",\"pane\":${pane}}" "$phase-stale-land" 40
+  kill_fakes
+}
+
 report_holds() {
   local phase="$1" want_hold="$2" kind ms kinds="${3:-SetupMcp SetupRun ConfigShare}"
   for kind in $kinds; do
@@ -620,7 +748,7 @@ report_holds() {
       fail "$phase: A/B: dispatch:$kind の専有が出ない（${ms}ms）"
     fi
   done
-  grep -h "メインスレッド専有: dispatch:\(SetupMcp\|SetupRun\|ConfigShare\|RemoteSetup\|RemoteScrollback\|OpenRemote\|RemoteFolder\)" \
+  grep -h "メインスレッド専有: dispatch:\(SetupMcp\|SetupRun\|ConfigShare\|RemoteSetup\|RemoteScrollback\|OpenRemote\|RemoteFolder\|SleepGuard\)" \
     "$TAKO_DATA_DIR/perf.log" 2>/dev/null | sed 's/^/      /' | head -12
 }
 
@@ -643,7 +771,7 @@ compare_bodies() {
 phase_gui() {
   echo "== gui: 修正後（tako setup の子の上限は注入で 4 秒）"
   set_flags
-  start_app gui TAKO_SETUP_RUN_TIMEOUT_SECS=4 || return
+  start_app gui TAKO_SETUP_RUN_TIMEOUT_SECS=4 TAKO_SETUP_PROBE_TIMEOUT_SECS=3 || return
   if suite setup; then
     returning_calls gui
     check_eq "gui: 返る claude: claude へ登録した" "true" "$(jf agents/0/configured < "$TMP/out/gui-mcp.out")"
@@ -670,6 +798,27 @@ phase_gui() {
     hanging_folder_calls gui fast 20
     report_holds gui 0 "RemoteFolder"
   fi
+  if suite sleep; then
+    returning_sleep_calls gui
+    check_eq "gui: 返る osascript: 蓋閉じ継続の準備（result / lid_sleep_mode）" "OK: sudoers 登録完了/while-agents-running" \
+      "$(jf result < "$TMP/out/gui-sinstall.out")/$(jf lid_sleep_mode < "$TMP/out/gui-sinstall.out")"
+    hanging_sleep_calls gui fast 20
+    report_holds gui 0 "SleepGuard"
+  fi
+  if suite stale; then
+    local pane
+    pane="$(first_pane gui-stale-list)"
+    stale_status_call gui "$pane"
+    check_eq "gui: #2966: 返らない claude --version を 1 回だけ起こす（子と孫の組 = 2 個）" "2" "$STALE_PIDS"
+    if awk -v e="$STALE_ELAPSED" 'BEGIN { exit !(e < 5.5) }'; then
+      pass "gui: #2966: 状態の照会は上限 1 回分で返る（${STALE_ELAPSED} 秒・上限 3 秒）"
+    else
+      fail "gui: #2966: 状態の照会が上限 1 回分で返らない（${STALE_ELAPSED} 秒）"
+    fi
+    stale_landing_case gui "$pane"
+    check_eq "gui: 着地（apply_stale_binary_scan）が UI スレッドで claude --version を待たない" "0" "${STALE_LAND_MS:-0}"
+    check_eq "gui: 着地は stale を検知している（状態の照会の stale）" "true" "$(jf stale < "$TMP/out/gui-stale-land.out")"
+  fi
   stop_app
 }
 
@@ -677,7 +826,7 @@ phase_gui() {
 phase_legacy() {
   echo "== legacy: TAKO_2961_LEGACY=1（UI スレッドで答える）"
   set_flags
-  start_app legacy TAKO_2961_LEGACY=1 TAKO_SETUP_RUN_TIMEOUT_SECS=4 || return
+  start_app legacy TAKO_2961_LEGACY=1 TAKO_SETUP_RUN_TIMEOUT_SECS=4 TAKO_SETUP_PROBE_TIMEOUT_SECS=3 || return
   if suite setup; then
     returning_calls legacy
     compare_bodies mcp run share share-status
@@ -696,7 +845,37 @@ phase_legacy() {
     hanging_folder_calls legacy blocked 6
     report_holds legacy 1 "RemoteFolder"
   fi
+  if suite sleep; then
+    returning_sleep_calls legacy
+    compare_bodies sinstall sremove
+    hanging_sleep_calls legacy blocked 6
+    report_holds legacy 1 "SleepGuard"
+  fi
   stop_app
+  if suite stale; then
+    # #2966 の A/B は別の GUI（`TAKO_2966_LEGACY=1`。#2961 の A/B とは門が別）
+    start_app legacy2966 TAKO_2966_LEGACY=1 TAKO_SETUP_PROBE_TIMEOUT_SECS=3 || return
+    local pane
+    pane="$(first_pane legacy2966-stale-list)"
+    stale_status_call legacy2966 "$pane"
+    check_eq "legacy2966: A/B: 返らない claude --version を 2 回起こす（子と孫の組 × 2 = 4 個）" "4" "$STALE_PIDS"
+    if awk -v e="$STALE_ELAPSED" 'BEGIN { exit !(e >= 5.5) }'; then
+      pass "legacy2966: A/B: 状態の照会は上限 2 回分かかる（${STALE_ELAPSED} 秒）"
+    else
+      fail "legacy2966: A/B: 状態の照会が上限 2 回分かからない（${STALE_ELAPSED} 秒）"
+    fi
+    stop_app
+    # #2961 の A/B（着地で版を読む修正前の形）
+    start_app legacystale TAKO_2961_LEGACY=1 TAKO_SETUP_PROBE_TIMEOUT_SECS=3 || return
+    pane="$(first_pane legacystale-list)"
+    stale_landing_case legacystale "$pane"
+    if [ "${STALE_LAND_MS:-0}" -ge 2500 ]; then
+      pass "legacystale: A/B: 着地が UI スレッドで claude --version を待つ（periodic_land:stale_binary ${STALE_LAND_MS}ms）"
+    else
+      fail "legacystale: A/B: 着地の専有が出ない（${STALE_LAND_MS:-0}ms）"
+    fi
+    stop_app
+  fi
 }
 
 want gui && phase_gui

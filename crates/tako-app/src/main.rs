@@ -7556,8 +7556,13 @@ impl TakoApp {
                         // #372: 走査結果をそのまま渡す（busy の数え方を呼び出し側へ
                         // 散らさない。保存も apply_sleep_guard の中で行う）
                         app.apply_sleep_guard(&settings, running_children_scan);
-                        if stale_outcome.is_some_and(|outcome| app.apply_stale_binary_scan(outcome))
-                        {
+                        // #2961: 着地の区間を測る（UI スレッドで外部プロセスを待てば perf.log に名指しで出る）
+                        let stale_changed = {
+                            let _s = tako_control::diag::perf_span("periodic_land:stale_binary");
+                            stale_outcome
+                                .is_some_and(|outcome| app.apply_stale_binary_scan(outcome))
+                        };
+                        if stale_changed {
                             cx.notify();
                         }
                         // #976: 検知の反映はメモリ操作だけ（接続の確認は次の段で背景へ）
@@ -20198,8 +20203,13 @@ impl TakoApp {
             };
 
             if running_path != current_path {
-                let spawned_version =
-                    tako_control::stale_binary::extract_version_from_path(&running_path);
+                // #2961: 版は背景の走査が読んだもの（`claude --version` を UI スレッドで待たない）。
+                // A/B（`TAKO_2961_LEGACY=1`）は修正前と同じくここで読む
+                let spawned_version = if tako_control::dispatch::sync_arm_offload_legacy() {
+                    tako_control::stale_binary::extract_version_from_path(&running_path)
+                } else {
+                    result.running_version.clone().unwrap_or_default()
+                };
                 self.stale_binary_banners.insert(
                     pane_id,
                     StaleBinaryBanner {

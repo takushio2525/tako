@@ -263,6 +263,8 @@ impl TakoApp {
                     OffloadContinuation::RemoteFolderOpened(_)
                     | OffloadContinuation::RemoteFileFetched(_)
                     | OffloadContinuation::RemoteFolderClose(_) => None,
+                    // 定義ジャンプの問い合わせからは来ない（#2961 のスリープ防止の着地）
+                    OffloadContinuation::SleepGuardOs(_) => None,
                 };
                 self.land_lsp_goto(next, menu, cx);
             }

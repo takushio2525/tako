@@ -7117,6 +7117,10 @@ pub enum OffloadJob {
     RemoteFolder(Box<RemoteFolderJob>),
     /// `close` の続き（#2961。[`remote_folder_close_masters`]）。外したホストの ControlMaster を畳んでから応答する
     RemoteFolderCloseMasters(Box<RemoteFolderClosed>),
+    /// スリープ防止の OS への操作（`tako_sleep_guard` の蓋閉じの準備・片付け・電池の設定。#2961）。sudoers の登録・削除
+    /// （管理者の確認を待つ osascript）を UI スレッドで待たない。設定の書き込みと応答は着地
+    /// （[`OffloadContinuation::SleepGuardOs`]）
+    SleepGuardOs(SleepGuardOs),
     /// tmux 一覧（#1984）。UI スレッドでは tako のペインとの対応表だけを写し、
     /// `tmux list-sessions` ほか（ソケットごとに数本）は background で起こす
     TmuxList {
@@ -7423,6 +7427,8 @@ pub enum OffloadContinuation {
     /// リモートフォルダを外す着地（#2961。[`remote_folder_close_place`]）。続きの後始末は background
     /// （[`OffloadJob::RemoteFolderCloseMasters`]）
     RemoteFolderClose(Box<RemoteFolderArgs>),
+    /// スリープ防止の OS への操作の着地（#2961。[`sleep_guard_os_land`] = 設定の書き込みと応答）
+    SleepGuardOs(Box<SleepGuardOsLanding>),
 }
 
 impl OffloadContinuation {
@@ -7448,6 +7454,8 @@ impl OffloadContinuation {
             Self::Mod(_) => false,
             // #2743: 同期の腕の判定（`Request::Send`）と同じ = ペインの中身だけ
             Self::SendAttached(_) => false,
+            // #2961: 同期の腕の判定（`Request::SleepGuard`）と同じ = 設定と OS だけ（幾何に触らない）
+            Self::SleepGuardOs(_) => false,
             // #1510: 押す（ペインを開く・master を起こす）ときだけタブが増える
             Self::Welcome(landing) => landing.probe_for == WelcomeProbeFor::Next,
             // #2086: 同期の腕と同じ判定（返答だけが真 = master を起こすとタブが増える）
@@ -7544,6 +7552,10 @@ pub fn finish_offload(
         // #2961: もう一巡を出せない直の呼び手は、外す（UI）から後始末（background の続き）までを同じスレッドで順に通す
         OffloadContinuation::RemoteFolderClose(args) => {
             remote_folder_close_place(host, &args).map(remote_folder_close_masters)
+        }
+        OffloadContinuation::SleepGuardOs(landing) => {
+            let SleepGuardOsLanding { os, done } = *landing;
+            sleep_guard_os_land(os, done)
         }
     }
 }
@@ -8259,6 +8271,11 @@ pub fn prepare_offload(
         Request::RemoteFolder { .. } if !sync_arm_offload_legacy() => {
             remote_folder_prepare(host, request)
         }
+        // #2961: 蓋閉じの準備・片付け（sudoers の登録・削除 = 管理者の確認を待つ osascript）と電池の設定を開く `open` を
+        // UI スレッドで待たない。設定の書き込みと応答は着地（UI）。status / set は待たないので `None` = 同期の腕
+        Request::SleepGuard { action, .. } if !sync_arm_offload_legacy() => {
+            sleep_guard_prepare(action.as_deref())
+        }
         Request::TmuxList { socket } if !tako_core::probe::issue1984_legacy() => {
             Some(Ok(OffloadJob::TmuxList {
                 ctx: collect_tmux_context(host),
@@ -8650,6 +8667,103 @@ fn remote_scrollback_reply(session: &str, lines: Option<u32>) -> Result<Value, D
     Ok(json!({ "lines": result }))
 }
 
+/// スリープ防止の OS への操作のうち外部プロセスを待つもの（#2961。`tako_sleep_guard` の action）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SleepGuardOs {
+    /// 蓋閉じ継続の準備（macOS は sudoers の登録 = 管理者の確認を待つ osascript）
+    InstallLid,
+    /// 蓋閉じ継続の片付け（macOS は sudoers の削除 + `disablesleep 0`）
+    RemoveLid,
+    /// 電池の設定を開く（`open`）
+    OpenBattery,
+}
+
+impl SleepGuardOs {
+    fn of(action: &str) -> Option<Self> {
+        match action {
+            "install-lid-sleep" => Some(Self::InstallLid),
+            "remove-lid-sleep" => Some(Self::RemoveLid),
+            "open-battery-settings" => Some(Self::OpenBattery),
+            _ => None,
+        }
+    }
+}
+
+/// `tako_sleep_guard` の準備（`prepare_offload` の腕。#2961）。外部プロセスを待つ action だけジョブにし、
+/// `status` / `set`（設定の読み書きと IOKit の読み = 待たない）と知らない action は `None` = 同期の腕
+fn sleep_guard_prepare(action: Option<&str>) -> Option<Result<OffloadJob, DispatchError>> {
+    SleepGuardOs::of(action.unwrap_or("status")).map(|os| Ok(OffloadJob::SleepGuardOs(os)))
+}
+
+/// sudoers の登録・削除を 1 本ずつにする錠（#2961）。UI スレッドで答えていた間は届いた順に 1 本ずつ走っていた
+static SLEEP_GUARD_OS_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 外部プロセスを待つ段（background。UI スレッドで呼ぶのは同期の腕 = テスト・直呼び・A/B だけ）
+fn sleep_guard_os_run(os: SleepGuardOs) -> Result<Option<String>, DispatchError> {
+    let _serial = SLEEP_GUARD_OS_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // 手段（macOS = sudoers 登録 / Windows = 権限不要）は `sleep_guard` 側に閉じているので、
+    // ここは OS を意識しない単一経路にする（#697）。CLI（`tako sleep-guard install-lid-sleep`）と
+    // 同じ関数を通るので 3 経路で挙動が食い違わない
+    match os {
+        SleepGuardOs::InstallLid => crate::sleep_guard::prepare_lid_control_typed()
+            .map(Some)
+            .map_err(OsRefusal::operation),
+        SleepGuardOs::RemoveLid => crate::sleep_guard::teardown_lid_control_typed()
+            .map(Some)
+            .map_err(OsRefusal::operation),
+        SleepGuardOs::OpenBattery => crate::sleep_guard::open_battery_settings_typed()
+            .map(|()| None)
+            .map_err(OsRefusal::operation),
+    }
+}
+
+/// 着地（UI スレッド。#2961）: 設定の書き込みと応答。設定ファイルは UI スレッドの他の書き手（テーマ・言語ほか）と
+/// 同じスレッドで読み書きする（background から書くと、同じファイルの読み → 書きが重なって片方の変更が消える）
+fn sleep_guard_os_land(
+    os: SleepGuardOs,
+    done: Result<Option<String>, DispatchError>,
+) -> Result<Value, DispatchError> {
+    let result = done?;
+    match os {
+        SleepGuardOs::InstallLid => {
+            let mut settings = crate::settings::load();
+            settings.lid_sleep_mode = crate::sleep_guard::LidSleepMode::WhileAgentsRunning;
+            crate::settings::save(&settings)
+                .map_err(|e| Reason::settings_save_failed(&e).operation())?;
+            Ok(serde_json::json!({
+                "result": result,
+                "lid_sleep_mode": "while-agents-running",
+                // 手段が sudoers ではない OS もあるので、実態を読んで返す
+                // （固定の true を返すと Windows で嘘になる）
+                "sudoers_installed": crate::sleep_guard::is_sudoers_installed(),
+                "lid_setup_required": crate::sleep_guard::lid_setup_pending(),
+            }))
+        }
+        SleepGuardOs::RemoveLid => {
+            let mut settings = crate::settings::load();
+            settings.lid_sleep_mode = crate::sleep_guard::LidSleepMode::Off;
+            crate::settings::save(&settings)
+                .map_err(|e| Reason::settings_save_failed(&e).operation())?;
+            Ok(serde_json::json!({
+                "result": result,
+                "lid_sleep_mode": "off",
+                "sudoers_installed": crate::sleep_guard::is_sudoers_installed(),
+            }))
+        }
+        SleepGuardOs::OpenBattery => Ok(serde_json::json!({
+            "result": ReplyNote::BatterySettingsOpened.to_string(),
+        })),
+    }
+}
+
+/// スリープ防止の着地へ運ぶもの（#2961）
+pub struct SleepGuardOsLanding {
+    os: SleepGuardOs,
+    done: Result<Option<String>, DispatchError>,
+}
+
 impl OffloadJob {
     /// ジョブ本体（サブプロセス実行）。UI スレッドで呼ばないこと。
     ///
@@ -8693,6 +8807,13 @@ impl OffloadJob {
             OffloadJob::RemoteFolderCloseMasters(closed) => {
                 OffloadOutcome::Reply(Ok(remote_folder_close_masters(*closed)))
             }
+            // #2961: 待つのはここ（background）。設定の書き込みと応答は UI スレッドの着地
+            OffloadJob::SleepGuardOs(os) => OffloadOutcome::OnUi(
+                OffloadContinuation::SleepGuardOs(Box::new(SleepGuardOsLanding {
+                    os,
+                    done: sleep_guard_os_run(os),
+                })),
+            ),
             OffloadJob::LspGoto(job) => {
                 OffloadOutcome::OnUi(OffloadContinuation::LspGoto(Box::new(job.run())))
             }
@@ -9037,9 +9158,11 @@ impl OffloadJob {
                 "tako mod の続きは run_staged で走らせる（置き場の写しと描き直しに UI スレッドの続きが要る）"
                     .into(),
             )),
-            OffloadJob::RemoteFolder(_) | OffloadJob::RemoteFolderCloseMasters(_) => {
+            OffloadJob::RemoteFolder(_)
+            | OffloadJob::RemoteFolderCloseMasters(_)
+            | OffloadJob::SleepGuardOs(_) => {
                 Err(DispatchError::Operation(
-                    "リモートフォルダの段は run_staged で走らせる（ツリーへ載せるのに UI スレッドの続きが要る）"
+                    "リモートフォルダ・スリープ防止の段は run_staged で走らせる（ツリー・設定の書き込みに UI スレッドの続きが要る）"
                         .into(),
                 ))
             }
@@ -13846,42 +13969,21 @@ fn dispatch_inner(
                 // 閉じているので、ここは OS を意識しない単一経路にする（#697）。
                 // CLI（`tako sleep-guard install-lid-sleep`）と同じ関数を通るので
                 // 3 経路で挙動が食い違わない
-                "install-lid-sleep" => {
-                    let result = crate::sleep_guard::prepare_lid_control_typed()
-                        .map_err(OsRefusal::operation)?;
-                    let mut settings = crate::settings::load();
-                    settings.lid_sleep_mode = crate::sleep_guard::LidSleepMode::WhileAgentsRunning;
-                    crate::settings::save(&settings)
-                        .map_err(|e| Reason::settings_save_failed(&e).operation())?;
-                    Ok(serde_json::json!({
-                        "result": result,
-                        "lid_sleep_mode": "while-agents-running",
-                        // 手段が sudoers ではない OS もあるので、実態を読んで返す
-                        // （固定の true を返すと Windows で嘘になる）
-                        "sudoers_installed": crate::sleep_guard::is_sudoers_installed(),
-                        "lid_setup_required": crate::sleep_guard::lid_setup_pending(),
-                    }))
-                }
-                "remove-lid-sleep" => {
-                    let result = crate::sleep_guard::teardown_lid_control_typed()
-                        .map_err(OsRefusal::operation)?;
-                    let mut settings = crate::settings::load();
-                    settings.lid_sleep_mode = crate::sleep_guard::LidSleepMode::Off;
-                    crate::settings::save(&settings)
-                        .map_err(|e| Reason::settings_save_failed(&e).operation())?;
-                    Ok(serde_json::json!({
-                        "result": result,
-                        "lid_sleep_mode": "off",
-                        "sudoers_installed": crate::sleep_guard::is_sudoers_installed(),
-                    }))
-                }
-                "open-battery-settings" => {
-                    crate::sleep_guard::open_battery_settings_typed()
-                        .map_err(OsRefusal::operation)?;
-                    Ok(serde_json::json!({
-                        "result": ReplyNote::BatterySettingsOpened.to_string(),
-                    }))
-                }
+                // 外部プロセスを待つ 3 つ（sudoers の登録・削除 = 管理者の確認を待つ osascript、電池の設定を開く
+                // `open`）。GUI では `prepare_offload` が background へ出し、設定の書き込みと応答は着地（#2961）。
+                // ここ（テスト・直呼び・A/B）は同じ段を同じ順に通す
+                "install-lid-sleep" => sleep_guard_os_land(
+                    SleepGuardOs::InstallLid,
+                    sleep_guard_os_run(SleepGuardOs::InstallLid),
+                ),
+                "remove-lid-sleep" => sleep_guard_os_land(
+                    SleepGuardOs::RemoveLid,
+                    sleep_guard_os_run(SleepGuardOs::RemoveLid),
+                ),
+                "open-battery-settings" => sleep_guard_os_land(
+                    SleepGuardOs::OpenBattery,
+                    sleep_guard_os_run(SleepGuardOs::OpenBattery),
+                ),
                 other => Err(Reason::UnknownValue {
                     key: "action",
                     got: other.to_string(),
@@ -31715,16 +31817,29 @@ fn finish_stale_status(ctx: &StaleStatusCtx) -> Value {
 
     // 起動時バイナリパス: PID が取れたら pidpath で取得
     let spawned = pid.and_then(crate::stale_binary::pidpath);
-    let current = crate::stale_binary::resolve_current_claude_binary();
 
-    let spawned_version = spawned
-        .as_ref()
-        .map(|p| crate::stale_binary::extract_version_from_path(p))
-        .unwrap_or_default();
-    let current_version = current
-        .as_ref()
-        .map(|p| crate::stale_binary::extract_version_from_path(p))
-        .unwrap_or_default();
+    // #2966: 今の claude の版は解決のときに読んだ覚えの版を使う（パスからもう一度読むと、版を持たない
+    // claude では `claude --version` を 2 回起こし、返らない claude で上限の 2 倍待つ）。A/B は修正前と同じ読み方
+    let (current, spawned_version, current_version) = if crate::stale_binary::issue2966_legacy() {
+        let current = crate::stale_binary::resolve_current_claude_binary();
+        let spawned_version = spawned
+            .as_ref()
+            .map(|p| crate::stale_binary::extract_version_from_path(p))
+            .unwrap_or_default();
+        let current_version = current
+            .as_ref()
+            .map(|p| crate::stale_binary::extract_version_from_path(p))
+            .unwrap_or_default();
+        (current, spawned_version, current_version)
+    } else {
+        let resolved = crate::stale_binary::resolve_current_claude_binary_with_version();
+        let (spawned_version, current_version) = crate::stale_binary::stale_status_versions(
+            spawned.as_deref(),
+            resolved.as_ref().map(|(p, v)| (p.as_path(), v.as_str())),
+            &crate::stale_binary::extract_version_from_path,
+        );
+        (resolved.map(|(p, _)| p), spawned_version, current_version)
+    };
 
     let stale = match (&spawned, &current) {
         (Some(s), Some(c)) => s != c,
@@ -61138,6 +61253,73 @@ tako | pane 2 [ compact ]       [-]
                 "A/B なのに {request:?} を background へ出している"
             );
         }
+    }
+
+    fn issue2961_sleep(action: &str) -> Request {
+        Request::SleepGuard {
+            action: Some(action.into()),
+            mode: None,
+            power_condition: None,
+            lid_sleep_mode: None,
+            lid_power_condition: None,
+            lid_battery_floor: None,
+        }
+    }
+
+    /// #2961: スリープ防止は外部プロセスを待つ action（蓋閉じの準備・片付け・電池の設定）だけジョブにし、
+    /// status / set / 知らない action は同期の腕。A/B は全部同期の腕
+    #[test]
+    fn issue2961_sleep_guardは待つactionだけ段へ出す() {
+        if tako_core::run_alone!(issue2961_sleep_guardは待つactionだけ段へ出す) {
+            return;
+        }
+        let mut host = MockHost::new();
+        std::env::remove_var(SYNC_ARM_OFFLOAD_LEGACY_ENV);
+        for (action, os) in [
+            ("install-lid-sleep", SleepGuardOs::InstallLid),
+            ("remove-lid-sleep", SleepGuardOs::RemoveLid),
+            ("open-battery-settings", SleepGuardOs::OpenBattery),
+        ] {
+            match prepare_offload(&mut host, &issue2961_sleep(action)) {
+                Some(Ok(OffloadJob::SleepGuardOs(got))) => assert_eq!(got, os, "{action}"),
+                _ => panic!("{action} が background のジョブにならない（#2961）"),
+            }
+        }
+        for action in ["status", "set", "nope"] {
+            assert!(
+                prepare_offload(&mut host, &issue2961_sleep(action)).is_none(),
+                "{action} は外部プロセスを待たないので同期の腕"
+            );
+        }
+        std::env::set_var(SYNC_ARM_OFFLOAD_LEGACY_ENV, "1");
+        for action in [
+            "install-lid-sleep",
+            "remove-lid-sleep",
+            "open-battery-settings",
+        ] {
+            assert!(
+                prepare_offload(&mut host, &issue2961_sleep(action)).is_none(),
+                "A/B なのに {action} を background へ出している"
+            );
+        }
+    }
+
+    /// #2961: スリープ防止の着地は background の断りをそのまま返し（設定を書かない）、電池の設定は同期の腕と同じ応答
+    #[test]
+    fn issue2961_sleep_guardの着地は断りを設定に書かない() {
+        let refused = sleep_guard_os_land(
+            SleepGuardOs::InstallLid,
+            Err(OsRefusal::UserCanceled.operation()),
+        );
+        assert_eq!(
+            format!("{refused:?}"),
+            format!("{:?}", Err::<Value, _>(OsRefusal::UserCanceled.operation()))
+        );
+        let opened = sleep_guard_os_land(SleepGuardOs::OpenBattery, Ok(None)).unwrap();
+        assert_eq!(
+            opened,
+            json!({ "result": ReplyNote::BatterySettingsOpened.to_string() })
+        );
     }
 
     /// #2961: setup の実行ファイルの差し替え（`TAKO_2961_INJECT_SETUP_BIN`）は検証プロセスでだけ効き、

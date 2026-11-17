@@ -642,6 +642,29 @@ impl SettingsWindow {
         .detach();
     }
 
+    /// 蓋閉じ継続の準備・片付け（#2961）。macOS は sudoers の登録・削除で管理者の確認を待つので、IPC の受け口と
+    /// 同じ `prepare_offload` → background → 着地（設定の書き込みは着地 = UI）で通し、確認の間も窓を止めない。
+    /// A/B の `TAKO_2961_LEGACY=1` は同期の dispatch（修正前と同じ）
+    fn lid_setup_off_ui(&mut self, action: &str, success: String, cx: &mut Context<Self>) {
+        let request = Request::SleepGuard {
+            action: Some(action.into()),
+            mode: None,
+            power_condition: None,
+            lid_sleep_mode: None,
+            lid_power_condition: None,
+            lid_battery_floor: None,
+        };
+        self.dispatch_off_ui(request, cx, move |this, result, cx| {
+            // 着地が設定（`lid_sleep_mode`）を書いたので読み直す（同期の `dispatch` と同じ）
+            this.settings = settings::load();
+            this.message = Some(match result {
+                Ok(_) => (success, false),
+                Err(e) => (e, true),
+            });
+            this.refresh_tab_status(cx);
+        });
+    }
+
     /// 任意の依存ツールの一覧を読み直す（#2433。`tako setup deps` / MCP `tako_setup_deps` と同じ dispatch。
     /// 検出は unix でログインシェルを起こすので background で読む）
     fn refresh_deps(&mut self, cx: &mut Context<Self>) {
@@ -3201,19 +3224,11 @@ impl SettingsWindow {
                             txt::sleep_lid_install(),
                             BtnKind::Normal,
                             cx.listener(|this, _, _, cx| {
-                                this.run_with_message(
-                                    Request::SleepGuard {
-                                        action: Some("install-lid-sleep".into()),
-                                        mode: None,
-                                        power_condition: None,
-                                        lid_sleep_mode: None,
-                                        lid_power_condition: None,
-                                        lid_battery_floor: None,
-                                    },
+                                this.lid_setup_off_ui(
+                                    "install-lid-sleep",
                                     txt::msg_lid_installed().to_string(),
                                     cx,
                                 );
-                                this.refresh_tab_status(cx);
                             }),
                         ))
                         .child(self.button(
@@ -3221,19 +3236,11 @@ impl SettingsWindow {
                             txt::sleep_lid_remove(),
                             BtnKind::Normal,
                             cx.listener(|this, _, _, cx| {
-                                this.run_with_message(
-                                    Request::SleepGuard {
-                                        action: Some("remove-lid-sleep".into()),
-                                        mode: None,
-                                        power_condition: None,
-                                        lid_sleep_mode: None,
-                                        lid_power_condition: None,
-                                        lid_battery_floor: None,
-                                    },
+                                this.lid_setup_off_ui(
+                                    "remove-lid-sleep",
                                     txt::msg_lid_removed().to_string(),
                                     cx,
                                 );
-                                this.refresh_tab_status(cx);
                             }),
                         )),
                 )

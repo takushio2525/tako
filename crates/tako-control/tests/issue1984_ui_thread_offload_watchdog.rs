@@ -273,6 +273,9 @@ const UI_PATHS: &[&str] = &[
     "fn remote_file_fetched_land(",
     "fn remote_folder_close_place(",
     "fn remote_folder_inline(",
+    // #2961: スリープ防止の段のうち UI スレッドで回るもの（準備と、設定の書き込みの着地）
+    "fn sleep_guard_prepare(",
+    "fn sleep_guard_os_land(",
 ];
 
 /// 読む側の関数（子プロセスの口は `Probed::Outside` の腕でだけ呼ぶ）
