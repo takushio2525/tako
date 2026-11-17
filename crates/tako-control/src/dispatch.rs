@@ -7115,7 +7115,7 @@ pub enum OffloadJob {
     /// （[`OffloadContinuation::RemoteFolderOpened`] / [`OffloadContinuation::RemoteFileFetched`] /
     /// [`OffloadContinuation::RemoteFolderClose`]）
     RemoteFolder(Box<RemoteFolderJob>),
-    /// `close` の続き（#2961。[`RemoteFolderClosed::finish`]）。外したホストの ControlMaster を畳んでから応答する
+    /// `close` の続き（#2961。[`remote_folder_close_masters`]）。外したホストの ControlMaster を畳んでから応答する
     RemoteFolderCloseMasters(Box<RemoteFolderClosed>),
     /// tmux 一覧（#1984）。UI スレッドでは tako のペインとの対応表だけを写し、
     /// `tmux list-sessions` ほか（ソケットごとに数本）は background で起こす
@@ -7543,7 +7543,7 @@ pub fn finish_offload(
         }
         // #2961: もう一巡を出せない直の呼び手は、外す（UI）から後始末（background の続き）までを同じスレッドで順に通す
         OffloadContinuation::RemoteFolderClose(args) => {
-            remote_folder_close_place(host, &args).map(RemoteFolderClosed::finish)
+            remote_folder_close_place(host, &args).map(remote_folder_close_masters)
         }
     }
 }
@@ -8678,7 +8678,7 @@ impl OffloadJob {
                 crate::claude_mod::Landing::reply(job.run()),
             ))),
             // #2961: 待つのはここ（background）。ツリー・プレビュー・フォルダを外すのは UI スレッドの着地
-            OffloadJob::RemoteFolder(job) => match job.run() {
+            OffloadJob::RemoteFolder(job) => match remote_folder_run(*job) {
                 RemoteFolderStep::Reply(reply) => OffloadOutcome::Reply(reply),
                 RemoteFolderStep::Opened(landing) => {
                     OffloadOutcome::OnUi(OffloadContinuation::RemoteFolderOpened(landing))
@@ -8691,7 +8691,7 @@ impl OffloadJob {
                 }
             },
             OffloadJob::RemoteFolderCloseMasters(closed) => {
-                OffloadOutcome::Reply(Ok(closed.finish()))
+                OffloadOutcome::Reply(Ok(remote_folder_close_masters(*closed)))
             }
             OffloadJob::LspGoto(job) => {
                 OffloadOutcome::OnUi(OffloadContinuation::LspGoto(Box::new(job.run())))
@@ -18618,12 +18618,13 @@ fn dispatch_remote_folder(
         RemoteFolderPlan::Inline | RemoteFolderPlan::SshPane => {
             remote_folder_inline(host, origin, &args)
         }
-        RemoteFolderPlan::Work(work) => match (RemoteFolderJob { args, work }).run() {
+        RemoteFolderPlan::Work(work) => match remote_folder_run(RemoteFolderJob { args, work }) {
             RemoteFolderStep::Reply(reply) => reply,
             RemoteFolderStep::Opened(landing) => remote_folder_open_land(host, origin, *landing),
             RemoteFolderStep::Fetched(landing) => remote_file_fetched_land(host, origin, *landing),
             RemoteFolderStep::Close(args) => {
-                remote_folder_close_place(host, &args).map(RemoteFolderClosed::finish)
+                let closed = remote_folder_close_place(host, &args)?;
+                Ok(remote_folder_close_masters(closed))
             }
         },
     }
@@ -18842,69 +18843,69 @@ pub struct RemoteFileFetchedLanding {
     fetched: (std::path::PathBuf, Option<tako_core::remote_fs::RemoteStat>),
 }
 
-impl RemoteFolderJob {
-    /// 外部プロセスを待つ本体（UI スレッドで呼ぶのは同期の腕 = テスト・直呼び・A/B だけ）
-    fn run(self) -> RemoteFolderStep {
-        use tako_core::remote_fs;
-        let RemoteFolderJob { args, work } = self;
-        match work {
-            RemoteFolderWork::Listing { host, open } => {
-                let given = args
-                    .path
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|p| !p.is_empty())
-                    .map(str::to_string);
-                // `open` はホームを応答に載せるので必ず繋ぐ（path 省略時はリモートのホーム = sftp の初期 cwd）。
-                // `ls` は path 省略時だけ
-                let home = if open || given.is_none() {
-                    match remote_fs::connect(&host) {
-                        Ok(home) => Some(home),
-                        Err(e) => return RemoteFolderStep::Reply(Err(remote_folder_err(e))),
-                    }
-                } else {
-                    None
-                };
-                let dir = given.unwrap_or_else(|| home.clone().unwrap_or_default());
-                // 開く前に「本当にディレクトリとして読めるか」を確かめる。
-                // ここで弾くと、ツリーに開けないルートが並ぶのを防げる
-                let entries = match remote_fs::list_dir(&host, &dir) {
-                    Ok(entries) => entries,
+/// 外部プロセスを待つ本体（UI スレッドで呼ぶのは同期の腕 = テスト・直呼び・A/B だけ）。
+/// メソッドではなく関数にしてあるのは、番犬（`issue2956_*`）の呼び出しのグラフが同期の腕から辿れるようにするため
+/// （メソッド呼び出しの先は名前で引けない）
+fn remote_folder_run(job: RemoteFolderJob) -> RemoteFolderStep {
+    use tako_core::remote_fs;
+    let RemoteFolderJob { args, work } = job;
+    match work {
+        RemoteFolderWork::Listing { host, open } => {
+            let given = args
+                .path
+                .as_deref()
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_string);
+            // `open` はホームを応答に載せるので必ず繋ぐ（path 省略時はリモートのホーム = sftp の初期 cwd）。
+            // `ls` は path 省略時だけ
+            let home = if open || given.is_none() {
+                match remote_fs::connect(&host) {
+                    Ok(home) => Some(home),
                     Err(e) => return RemoteFolderStep::Reply(Err(remote_folder_err(e))),
-                };
-                if !open {
-                    return RemoteFolderStep::Reply(Ok(remote_folder_ls_reply(
-                        &host, &dir, &entries,
-                    )));
                 }
-                // 着地で繋ぐターミナル（#1041）の ssh の実体もここで引く（UI スレッドでログインシェルを待たない）
-                let ssh_bin = args.terminal.unwrap_or(true).then(remote_fs::ssh_bin);
-                RemoteFolderStep::Opened(Box::new(RemoteFolderOpenLanding {
-                    home: home.unwrap_or_default(),
-                    args,
-                    ssh_host: host,
-                    dir,
-                    entries: entries.len(),
-                    ssh_bin,
-                }))
+            } else {
+                None
+            };
+            let dir = given.unwrap_or_else(|| home.clone().unwrap_or_default());
+            // 開く前に「本当にディレクトリとして読めるか」を確かめる。
+            // ここで弾くと、ツリーに開けないルートが並ぶのを防げる
+            let entries = match remote_fs::list_dir(&host, &dir) {
+                Ok(entries) => entries,
+                Err(e) => return RemoteFolderStep::Reply(Err(remote_folder_err(e))),
+            };
+            if !open {
+                return RemoteFolderStep::Reply(Ok(remote_folder_ls_reply(&host, &dir, &entries)));
             }
-            // SFTP で取得 → 既存のプレビュー経路（OpenFile）へ流す。
-            // 構文色・md・画像・PDF・目次・リンクの実装を二重に持たない
-            RemoteFolderWork::Fetch { host, file } => {
-                match remote_fs::fetch_file(&host, &file, remote_fs::MAX_PREVIEW_BYTES) {
-                    Ok(fetched) => RemoteFolderStep::Fetched(Box::new(RemoteFileFetchedLanding {
-                        ssh_host: host,
-                        file,
-                        focus: args.focus,
-                        fetched,
-                    })),
-                    Err(e) => RemoteFolderStep::Reply(Err(remote_folder_err(e))),
-                }
-            }
-            RemoteFolderWork::Push => RemoteFolderStep::Reply(remote_folder_push_reply(&args)),
-            RemoteFolderWork::List(list) => RemoteFolderStep::Reply(Ok(list.finish())),
-            RemoteFolderWork::Close => RemoteFolderStep::Close(Box::new(args)),
+            // 着地で繋ぐターミナル（#1041）の ssh の実体もここで引く（UI スレッドでログインシェルを待たない）
+            let ssh_bin = args.terminal.unwrap_or(true).then(remote_fs::ssh_bin);
+            RemoteFolderStep::Opened(Box::new(RemoteFolderOpenLanding {
+                home: home.unwrap_or_default(),
+                args,
+                ssh_host: host,
+                dir,
+                entries: entries.len(),
+                ssh_bin,
+            }))
         }
+        // SFTP で取得 → 既存のプレビュー経路（OpenFile）へ流す。
+        // 構文色・md・画像・PDF・目次・リンクの実装を二重に持たない
+        RemoteFolderWork::Fetch { host, file } => {
+            match remote_fs::fetch_file(&host, &file, remote_fs::MAX_PREVIEW_BYTES) {
+                Ok(fetched) => RemoteFolderStep::Fetched(Box::new(RemoteFileFetchedLanding {
+                    ssh_host: host,
+                    file,
+                    focus: args.focus,
+                    fetched,
+                })),
+                Err(e) => RemoteFolderStep::Reply(Err(remote_folder_err(e))),
+            }
+        }
+        RemoteFolderWork::Push => RemoteFolderStep::Reply(remote_folder_push_reply(&args)),
+        RemoteFolderWork::List(list) => {
+            RemoteFolderStep::Reply(Ok(remote_folder_list_finish(*list)))
+        }
+        RemoteFolderWork::Close => RemoteFolderStep::Close(Box::new(args)),
     }
 }
 
@@ -19024,7 +19025,7 @@ fn remote_file_fetched_land(
 }
 
 /// `list` の材料（準備 = UI スレッドで写す。#2961）。接続の生死（`connected`）だけ空けておき、
-/// [`RemoteFolderList::finish`]（background）が埋める
+/// [`remote_folder_list_finish`]（background）が埋める
 pub struct RemoteFolderList {
     tabs: Vec<Value>,
     loading: Vec<Value>,
@@ -19069,7 +19070,7 @@ fn remote_folder_list_snapshot(host: &dyn ControlHost) -> RemoteFolderList {
                         "entries": found.map(|(_, _, n)| *n),
                         // #1090: 多重化が無いプラットフォームでは
                         // 「繋がっているか」を安く判定できないので null。
-                        // #2961: 判定（`ssh -O check`）は background の [`RemoteFolderList::finish`] が埋める
+                        // #2961: 判定（`ssh -O check`）は background の [`remote_folder_list_finish`] が埋める
                         "connected": Value::Null,
                         // #1041: どの経路で載ったか / ローカルルートの前か後ろか
                         "origin": origin_of(r).as_str(),
@@ -19101,30 +19102,28 @@ fn remote_folder_list_snapshot(host: &dyn ControlHost) -> RemoteFolderList {
     RemoteFolderList { tabs, loading }
 }
 
-impl RemoteFolderList {
-    /// 接続の生死を埋めて応答を組む（background。ホストごとに 1 回 = `ssh -O check`）
-    fn finish(self) -> Value {
-        let RemoteFolderList { mut tabs, loading } = self;
-        let mut seen: Vec<(String, Option<bool>)> = Vec::new();
-        for tab in &mut tabs {
-            let Some(folders) = tab["remote_folders"].as_array_mut() else {
-                continue;
+/// 接続の生死を埋めて `list` の応答を組む（background。ホストごとに 1 回 = `ssh -O check`）
+fn remote_folder_list_finish(list: RemoteFolderList) -> Value {
+    let RemoteFolderList { mut tabs, loading } = list;
+    let mut seen: Vec<(String, Option<bool>)> = Vec::new();
+    for tab in &mut tabs {
+        let Some(folders) = tab["remote_folders"].as_array_mut() else {
+            continue;
+        };
+        for folder in folders {
+            let host = folder["host"].as_str().unwrap_or_default().to_string();
+            let connected = match seen.iter().find(|(h, _)| *h == host) {
+                Some((_, c)) => *c,
+                None => {
+                    let c = tako_core::remote_fs::liveness(&host).as_bool();
+                    seen.push((host, c));
+                    c
+                }
             };
-            for folder in folders {
-                let host = folder["host"].as_str().unwrap_or_default().to_string();
-                let connected = match seen.iter().find(|(h, _)| *h == host) {
-                    Some((_, c)) => *c,
-                    None => {
-                        let c = tako_core::remote_fs::liveness(&host).as_bool();
-                        seen.push((host, c));
-                        c
-                    }
-                };
-                folder["connected"] = json!(connected);
-            }
+            folder["connected"] = json!(connected);
         }
-        json!({ "tabs": tabs, "loading_files": loading })
     }
+    json!({ "tabs": tabs, "loading_files": loading })
 }
 
 /// `push` の書き込み（リモートへの書き戻し）を 1 本ずつにする錠（#2961）。UI スレッドで答えていた間は
@@ -19201,19 +19200,17 @@ fn remote_folder_push_reply(args: &RemoteFolderArgs) -> Result<Value, DispatchEr
 /// `close` の着地で外したフォルダと、どのタブからも参照されなくなったホスト（#2961）
 pub struct RemoteFolderClosed {
     closed: Vec<String>,
-    /// ControlMaster を畳むホスト（background の [`RemoteFolderClosed::finish`]）
+    /// ControlMaster を畳むホスト（background の [`remote_folder_close_masters`]）
     hosts: Vec<String>,
 }
 
-impl RemoteFolderClosed {
-    /// どのタブからも参照されなくなったホストの接続（ControlMaster）を畳んでから応答する（background）。
-    /// 開いたままにすると `ControlPersist` の間ずっと ssh が居座る
-    fn finish(self) -> Value {
-        for h in &self.hosts {
-            tako_core::remote_fs::close_master(h);
-        }
-        json!({ "closed": self.closed })
+/// どのタブからも参照されなくなったホストの接続（ControlMaster）を畳んでから `close` に応答する（background）。
+/// 開いたままにすると `ControlPersist` の間ずっと ssh が居座る
+fn remote_folder_close_masters(closed: RemoteFolderClosed) -> Value {
+    for h in &closed.hosts {
+        tako_core::remote_fs::close_master(h);
     }
+    json!({ "closed": closed.closed })
 }
 
 /// `close` の着地（UI スレッド。#2961）。閉じるのは**全タブ横断が既定**。`--tab` で 1 タブへ絞る。
@@ -19273,7 +19270,7 @@ fn remote_folder_close_place(
         };
         return Err(Reason::RemoteFolderNotOpen(what).operation());
     }
-    // どのタブからも参照されなくなったホストは接続（ControlMaster）も畳む（[`RemoteFolderClosed::finish`]）
+    // どのタブからも参照されなくなったホストは接続（ControlMaster）も畳む（[`remote_folder_close_masters`]）
     let still_open: Vec<String> = host
         .workspace()
         .tabs()
@@ -60990,6 +60987,157 @@ tako | pane 2 [ compact ]       [-]
             prepare_offload(&mut host, &open).is_none(),
             "A/B なのに OpenRemote の ssh の実体を先取りしている"
         );
+    }
+
+    fn issue2961_folder(action: &str, host: Option<&str>, path: Option<&str>) -> Request {
+        Request::RemoteFolder {
+            action: action.into(),
+            host: host.map(str::to_string),
+            path: path.map(str::to_string),
+            tab: None,
+            focus: Some(false),
+            all: false,
+            force: false,
+            enabled: None,
+            terminal: None,
+        }
+    }
+
+    /// #2961: リモートフォルダは action ごとに段を分ける。引数の断りは準備（UI スレッド）で同期の腕と同じ形、
+    /// 外部プロセスを待たない action（auto / pending / 知らない action）は同期の腕のまま、待つ action はジョブになる
+    #[test]
+    fn issue2961_remote_folderはactionごとに段を分ける() {
+        let mut host = MockHost::new();
+        // 引数の断り（ssh / sftp を起こす前）
+        for request in [
+            issue2961_folder("open", None, None),
+            issue2961_folder("ls", Some("  "), None),
+            issue2961_folder("open-file", Some("h2961"), None),
+            issue2961_folder("ssh-pane", None, None),
+        ] {
+            let prepared = match prepare_offload(&mut host, &request) {
+                Some(Err(e)) => e,
+                Some(Ok(_)) => panic!("{request:?} の引数の断りをジョブにしている"),
+                None => panic!("{request:?} が準備を通っていない"),
+            };
+            let synced = dispatch(&mut host, request.clone(), PaneOrigin::Mcp).unwrap_err();
+            assert_eq!(
+                format!("{prepared:?}"),
+                format!("{synced:?}"),
+                "{request:?}"
+            );
+        }
+        // 待たない action は同期の腕
+        for request in [
+            issue2961_folder("auto", None, None),
+            issue2961_folder("pending", None, None),
+            issue2961_folder("nope", None, None),
+        ] {
+            assert!(
+                prepare_offload(&mut host, &request).is_none(),
+                "{request:?}"
+            );
+        }
+        // 待つ action はジョブ（ssh / sftp を起こすので走らせはしない）
+        for (request, work) in [
+            (issue2961_folder("open", Some("h2961"), None), "listing"),
+            (
+                issue2961_folder("ls", Some("h2961"), Some("/srv")),
+                "listing",
+            ),
+            (
+                issue2961_folder("open-file", Some("h2961"), Some("/a.txt")),
+                "fetch",
+            ),
+            (issue2961_folder("push", None, None), "push"),
+            (issue2961_folder("list", None, None), "list"),
+            (issue2961_folder("close", Some("h2961"), None), "close"),
+        ] {
+            let job = match prepare_offload(&mut host, &request) {
+                Some(Ok(OffloadJob::RemoteFolder(job))) => job,
+                _ => panic!("{request:?} がリモートフォルダの段のジョブにならない（#2961）"),
+            };
+            let got = match job.work {
+                RemoteFolderWork::Listing { .. } => "listing",
+                RemoteFolderWork::Fetch { .. } => "fetch",
+                RemoteFolderWork::Push => "push",
+                RemoteFolderWork::List(_) => "list",
+                RemoteFolderWork::Close => "close",
+            };
+            assert_eq!(got, work, "{request:?}");
+        }
+        // ssh-pane は ssh の実体の先取り（入れ子の OpenRemote が答えで argv を組む）
+        match prepare_offload(
+            &mut host,
+            &issue2961_folder("ssh-pane", Some("h2961"), None),
+        ) {
+            Some(Ok(OffloadJob::Probe(job))) => assert!(job.needs.ssh_bin),
+            _ => panic!("ssh-pane が ssh の実体の先取りにならない"),
+        }
+    }
+
+    /// #2961: 外部プロセスを起こさずに終わる形（開いていない list・開いていない close・退避の無い push）は、
+    /// 段を通しても同期の腕と同じ応答。close は着地（UI）で断り、後始末の background へ出さない
+    #[test]
+    fn issue2961_remote_folderの段は同期の腕と同じ応答を返す() {
+        let mut host = MockHost::new();
+        let list = issue2961_folder("list", None, None);
+        let job = prepare_offload(&mut host, &list).unwrap().unwrap();
+        let staged = match job.run_staged() {
+            OffloadOutcome::Reply(reply) => reply,
+            OffloadOutcome::OnUi(_) => panic!("list の続きを UI スレッドへ戻している"),
+        };
+        let synced = dispatch(&mut host, list, PaneOrigin::Mcp);
+        assert_eq!(format!("{staged:?}"), format!("{synced:?}"));
+
+        let push = issue2961_folder("push", Some("h2961-none"), None);
+        let job = prepare_offload(&mut host, &push).unwrap().unwrap();
+        let staged = match job.run_staged() {
+            OffloadOutcome::Reply(reply) => reply,
+            OffloadOutcome::OnUi(_) => panic!("push の続きを UI スレッドへ戻している"),
+        };
+        let synced = dispatch(&mut host, push, PaneOrigin::Mcp);
+        assert!(staged.is_err());
+        assert_eq!(format!("{staged:?}"), format!("{synced:?}"));
+
+        let close = issue2961_folder("close", Some("h2961-none"), None);
+        let job = prepare_offload(&mut host, &close).unwrap().unwrap();
+        let continuation = match job.run_staged() {
+            OffloadOutcome::OnUi(c @ OffloadContinuation::RemoteFolderClose(_)) => c,
+            _ => panic!("close が着地（UI）へ戻らない"),
+        };
+        let landed = match land_offload(&mut host, continuation, PaneOrigin::Mcp) {
+            OffloadLanding::Done(reply) => reply,
+            _ => panic!("開いていない close を後始末の background へ出している"),
+        };
+        let synced = dispatch(&mut host, close, PaneOrigin::Mcp);
+        assert!(landed.is_err());
+        assert_eq!(format!("{landed:?}"), format!("{synced:?}"));
+    }
+
+    /// #2961 の A/B: `TAKO_2961_LEGACY=1` はリモートフォルダも修正前と同じく同期の腕
+    #[test]
+    fn issue2961_legacyはremote_folderを同期の腕で答える() {
+        if tako_core::run_alone!(issue2961_legacyはremote_folderを同期の腕で答える) {
+            return;
+        }
+        let mut host = MockHost::new();
+        let requests = [
+            issue2961_folder("list", None, None),
+            issue2961_folder("close", Some("h2961"), None),
+            issue2961_folder("ssh-pane", Some("h2961"), None),
+        ];
+        std::env::remove_var(SYNC_ARM_OFFLOAD_LEGACY_ENV);
+        for request in &requests {
+            assert!(prepare_offload(&mut host, request).is_some(), "{request:?}");
+        }
+        std::env::set_var(SYNC_ARM_OFFLOAD_LEGACY_ENV, "1");
+        for request in &requests {
+            assert!(
+                prepare_offload(&mut host, request).is_none(),
+                "A/B なのに {request:?} を background へ出している"
+            );
+        }
     }
 
     /// #2961: setup の実行ファイルの差し替え（`TAKO_2961_INJECT_SETUP_BIN`）は検証プロセスでだけ効き、

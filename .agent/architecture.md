@@ -2196,6 +2196,11 @@ lid-guard.json が使う）:
   `OpenRemote` はペインを作るので同期の腕のまま、ssh の実体（ログインシェルの `command -v ssh`）だけを #1984 の先取り
   （`ProbeNeeds::ssh_bin`）で background に済ませ、`remote_ssh_argv_probed` が答えで argv を組む（`remote_ssh_argv_with` = 実体を引数で受ける
   本体・tako-core の `ssh_pane_argv_using`）。メソッド呼び出し越しの採取は番犬の葉 `METHOD_LEAVES`（`.capture_scrollback(`）で見る（FR-2.14.27）
+- **リモートフォルダの操作も UI スレッドで ssh / sftp を待たない**（#2961 の 3 本目）: `prepare_offload` の腕が `remote_folder_prepare` で
+  action ごとに段を分ける（`open` / `ls` / `open-file` / `push` / `list` = background の `remote_folder_run`、`open` / `open-file` は
+  着地でツリー・プレビューへ、`close` は着地でフォルダを外してから ControlMaster の後始末を background = `Settled`、`ssh-pane` は ssh の
+  実体の先取り、`auto` / `pending` は同期の腕）。背景の本体はメソッドではなく関数にしてある（番犬の呼び出しのグラフが同期の腕から
+  辿れるように）。UI スレッドで回る段は #1984 の番犬の `UI_PATHS` が見る（FR-2.14.28）
 - **照会 1 回の中では `ps` / `tmux list-panes -a` を 1 回だけ起こす**（#1968）: 状態照会は
   `has_running_children` と claude / codex / agy の会話 ID 解決が**それぞれ** `ps` と
   `tmux list-panes -a` を起こしていた（報告 1 回で `ps` 3 本）。`agents::with_shared_scan` の

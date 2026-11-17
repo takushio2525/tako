@@ -7067,8 +7067,13 @@ const DISPATCH_REASON_SCOPES: &[&str] = &[
     // 変更履歴の差分・リモートフォルダ・config share・scrollback
     "fn preview_changelog_diff_prepare(",
     "fn preview_changelog_diff_land(",
-    "    fn need_host(",
-    "    fn need_path(",
+    // #2961: 入れ子の `need_host` / `need_path` を外へ出し、段に分けた関数へ断りを移した
+    "fn remote_folder_need_host(",
+    "fn remote_folder_need_path(",
+    "fn remote_folder_target_tab(",
+    "fn remote_folder_close_place(",
+    "fn remote_folder_push_reply(",
+    "fn remote_folder_inline(",
     "pub fn dispatch_config_share(",
     "fn scrollback_target_session(",
     // コマンドカード・Code Runner
