@@ -1111,7 +1111,10 @@ fn 修正前の形を名指しできる() {
 const TAKO_APP_UI_LANDINGS: &[(&str, &str)] = &[
     ("crates/tako-app/src/main.rs", "fn apply_stale_binary_scan("),
     ("crates/tako-app/src/ssh_folders.rs", "fn apply_ssh_scan("),
-    ("crates/tako-app/src/ssh_folders.rs", "fn apply_ssh_scan_with("),
+    (
+        "crates/tako-app/src/ssh_folders.rs",
+        "fn apply_ssh_scan_with(",
+    ),
     ("crates/tako-app/src/main.rs", "fn adopt_ssh_connect("),
 ];
 
@@ -1236,7 +1239,11 @@ fn tako_appのsshの引き取りでログインシェルを待つ修正前の形
         (file, "fn adopt_ssh_connect("),
         (folders, "fn apply_ssh_scan_with("),
     ] {
-        assert_eq!(ui_landing_offenders(&read(f), head), Some(Vec::new()), "{f} {head}");
+        assert_eq!(
+            ui_landing_offenders(&read(f), head),
+            Some(Vec::new()),
+            "{f} {head}"
+        );
     }
 }
 

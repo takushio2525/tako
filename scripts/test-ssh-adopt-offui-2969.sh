@@ -228,16 +228,23 @@ stop_app() {
   APP_PID=""
 }
 
+# 偽の ssh（対話の形）が起きて pid を書いたか（パイプを組まない = pipefail の下で読み手が早く抜けない）
+fake_started() {
+  local out
+  out="$(command ls "$FAKE_DIR/pids" 2>/dev/null)"
+  [ -n "$out" ]
+}
+
 # 手打ちの ssh に見えるペインを作り、引き取りまで待つ（上限 30 秒）。結果: ADOPTED（source）・HOLD_MS・ASKED（ログインシェルに聞いた回数）
 adopt_case() {
   local phase="$1" i
-  rm -f "$FAKE_DIR"/asked-ssh-*
+  rm -f "${FAKE_DIR:?}"/asked-ssh-*
   mcp_call tako_split_pane "{\"command\":[\"$TMP/bin/ssh\",\"$HOST\"],\"focus\":false}" "$phase-split" 30
   for i in $(seq 1 100); do
-    command ls "$FAKE_DIR/pids" 2>/dev/null | grep -q . && break
+    fake_started && break
     sleep 0.1
   done
-  if ! command ls "$FAKE_DIR/pids" 2>/dev/null | grep -q .; then
+  if ! fake_started; then
     fail "$phase: 偽の ssh のペインが起きない（$(head -c 300 "$TMP/out/$phase-split.out")）"
     return 1
   fi
@@ -267,7 +274,7 @@ phase_gui() {
     fail "gui: ssh の実体を引いていない（ログインシェルに聞いた回数 ${ASKED:-0}）"
   fi
   # 引き取った後の tick（ssh が生きている間）はログインシェルを起こさない
-  rm -f "$FAKE_DIR"/asked-ssh-*
+  rm -f "${FAKE_DIR:?}"/asked-ssh-*
   sleep 8
   check_eq "gui: 引き取り済みのペインだけの tick はログインシェルを起こさない（8 秒の間に聞いた回数）" "0" \
     "$(command ls "$FAKE_DIR" | grep -c '^asked-ssh-' || true)"
