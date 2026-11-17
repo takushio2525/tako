@@ -107,25 +107,11 @@ const PARTIAL: &[(&str, &str)] = &[
 /// 既知の残り: `prepare_offload` が出さない同期の腕のうち、外部プロセスの待ちへ届くもの
 /// （`(要求の名前, 理由)`）。#2956 の範囲外（setup の導入・モデル一覧以外）なので #2961 で扱う。
 /// 直したら外すこと（届かなくなると [`既知の残りはまだ届く`] が落ちる）。
-/// `SetupMcp` / `SetupRun` / `ConfigShare` は #2961 の 1 本目で外した（[`TARGETS`]）
-const KNOWN: &[(&str, &str)] = &[
-    (
-        "RemoteSetup",
-        "#2961: tailscale の CLI（`run_noninteractive` → `detect_tailscale` ほか）",
-    ),
-    (
-        "RemoteFolder",
-        "#2961: `ssh -O exit` とログインシェル（`dispatch_remote_folder` → `close_master`）",
-    ),
-    (
-        "OpenRemote",
-        "#2961: ログインシェルの `command -v ssh`（`remote_ssh_argv` → … → `resolve_bin`）",
-    ),
-    (
-        "SleepGuard",
-        "#2961: sudoers の書き込み（蓋閉じの準備・片付け = `install_sudoers_typed` / `remove_sudoers_done`）",
-    ),
-];
+/// `SetupMcp` / `SetupRun` / `ConfigShare` は #2961 の 1 本目、`RemoteSetup` / `RemoteScrollback` は 2 本目で
+/// 外した（[`TARGETS`]）。`OpenRemote` は 2 本目で先取り（[`PROBE_TARGETS`]）へ寄せた。`RemoteFolder` は 3 本目で
+/// action ごとの段（[`STAGED_TARGETS`]）へ寄せた。
+/// `SleepGuard` は 4 本目で段（[`STAGED_TARGETS`]）へ寄せた = #2961 で残りは無くなった
+const KNOWN: &[(&str, &str)] = &[];
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -227,7 +213,17 @@ fn fns_named(graph: &call_graph::Graph, name: &str) -> Vec<usize> {
 
 // ===== #1984 の番犬の葉を本文から読む =====
 
-/// #1984 の番犬の `RAW` と `GRAPH_LEAVES`（`(綴り, 名指しの理由)`）。
+/// #1984 の番犬の葉に足す、メソッド呼び出しの葉（`(綴り, 名指しの理由)`。#2961）。
+///
+/// 呼び出しのグラフは名前で関数を引くので、トレイトのオブジェクト越しのメソッド呼び出し
+/// （`capture.capture_scrollback(…)`）の先へは辿れない。その先が外部プロセスを待つ形をここで葉にする
+/// （#2961 で `RemoteScrollback` の既定の経路 = 器の `capture-pane` が番犬から見えていなかった）
+const METHOD_LEAVES: &[(&str, &str)] = &[(
+    ".capture_scrollback(",
+    "器の `capture-pane` を待つ（`DetachedCapture` のメソッド = グラフが辿らない形。#2961）",
+)];
+
+/// #1984 の番犬の `RAW` と `GRAPH_LEAVES`（`(綴り, 名指しの理由)`）に [`METHOD_LEAVES`] を足したもの。
 ///
 /// 写して持つと葉が増えたときにここだけ古くなるので、あちらの本文の配列を読む。読み方は
 /// 「配列の頭から `\n];` まで・行コメントを飛ばし・`( "綴り", "理由" )` の組を拾う」だけ
@@ -251,6 +247,11 @@ fn leaves() -> &'static [(String, String)] {
                 .unwrap_or_else(|| panic!("{WATCHDOG_1984} の `{head}` の終わり（`\\n];`）が無い"));
             out.extend(tuples_of(&body[..end]));
         }
+        out.extend(
+            METHOD_LEAVES
+                .iter()
+                .map(|(needle, why)| (needle.to_string(), why.to_string())),
+        );
         out
     })
 }
@@ -768,7 +769,43 @@ const TARGETS: &[Target] = &[
         sync_call: "config_share_reply(&request)",
         reply: "config_share_reply",
     },
+    Target {
+        variant: "RemoteSetup",
+        issue: "#2961",
+        gate: "sync_arm_offload_legacy()",
+        prepare_arm: "Request::RemoteSetup { .. } if !sync_arm_offload_legacy() =>",
+        job: "OffloadJob::RemoteSetup(",
+        prepare_whole: "remote_setup @ Request::RemoteSetup { .. } if !sync_arm_offload_legacy() => {\n            Some(Ok(OffloadJob::RemoteSetup(Box::new(remote_setup.clone()))))\n        }\n",
+        run_arm: "OffloadJob::RemoteSetup(request) => remote_setup_reply(&request)",
+        sync_head: "request @ Request::RemoteSetup { .. } => ",
+        sync_call: "remote_setup_reply(&request)",
+        reply: "remote_setup_reply",
+    },
+    Target {
+        variant: "RemoteScrollback",
+        issue: "#2961",
+        gate: "sync_arm_offload_legacy()",
+        prepare_arm: "Request::RemoteScrollback { pane_id, lines } if !sync_arm_offload_legacy() =>",
+        job: "OffloadJob::RemoteScrollback {",
+        prepare_whole: "Request::RemoteScrollback { pane_id, lines } if !sync_arm_offload_legacy() => {\n            Some(scrollback_target_session(host, pane_id).map(|session| {\n                OffloadJob::RemoteScrollback {\n                    session,\n                    lines: *lines,\n                }\n            }))\n        }\n",
+        run_arm: "remote_scrollback_reply(&session, lines)",
+        sync_head: "Request::RemoteScrollback { pane_id, lines } => {",
+        sync_call: "remote_scrollback_reply(&session, lines)",
+        reply: "remote_scrollback_reply",
+    },
 ];
+
+/// 先取り（#1984 の `ProbeNeeds` → `UiProbes`）へ寄せた要求（#2961）。UI スレッドの同期の腕は残り、待つ問い合わせだけを
+/// background が先に済ませる。`(要求, probe_needs の腕の頭, その腕が立てる印, 同期の腕の頭, 読む側の関数の呼び出し,
+/// 注入で戻す修正前の呼び出し)`
+const PROBE_TARGETS: &[(&str, &str, &str, &str, &str, &str)] = &[(
+    "OpenRemote",
+    "Request::OpenRemote { .. } if !sync_arm_offload_legacy() => Some(ProbeNeeds {",
+    "ssh_bin: ssh_bin_need(),",
+    "        Request::OpenRemote {\n            host: ssh_host,",
+    "let argv = remote_ssh_argv_probed(&ssh_host);",
+    "let argv = remote_ssh_argv(&ssh_host);",
+)];
 
 #[test]
 fn 直した要求はbackgroundから答える() {
@@ -776,8 +813,127 @@ fn 直した要求はbackgroundから答える() {
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
+/// action ごとに段を分ける準備の関数へ寄せた要求（#2961）。`prepare_offload` の腕（A/B の門つき）が準備の関数を呼ぶ。
+/// 準備・着地（UI スレッドで回る段）が外部プロセスへ届かないことは #1984 の番犬の `UI_PATHS` が見る。
+/// `(要求, prepare_offload の腕の頭, 腕が呼ぶ準備の関数, 注入で消す腕の全文)`
+const STAGED_TARGETS: &[(&str, &str, &str, &str)] = &[
+    (
+        "RemoteFolder",
+        "Request::RemoteFolder { .. } if !sync_arm_offload_legacy() =>",
+        "remote_folder_prepare(host, request)",
+        "        Request::RemoteFolder { .. } if !sync_arm_offload_legacy() => {\n            remote_folder_prepare(host, request)\n        }\n",
+    ),
+    (
+        "SleepGuard",
+        "Request::SleepGuard { action, .. } if !sync_arm_offload_legacy() =>",
+        "sleep_guard_prepare(action.as_deref())",
+        "        Request::SleepGuard { action, .. } if !sync_arm_offload_legacy() => {\n            sleep_guard_prepare(action.as_deref())\n        }\n",
+    ),
+];
+
+#[test]
+fn 段へ寄せた要求は準備の関数を通る() {
+    let problems = staged_target_problems(dispatch_text());
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// [`STAGED_TARGETS`] の検査（本文の字面で見る）
+fn staged_target_problems(text: &str) -> Vec<String> {
+    let code = production_range::code_view::code_view(text);
+    let line_of = |at: usize| code[..at].matches('\n').count() + 1;
+    let mut out = Vec::new();
+    let prepare = code.find("pub fn prepare_offload(");
+    for (variant, arm, call, _) in STAGED_TARGETS {
+        match prepare.and_then(|at| code[at..].find(arm).map(|i| at + i)) {
+            None => out.push(format!(
+                "{DISPATCH}:{} `prepare_offload` に `{arm}` の腕が無い。`Request::{variant}` の外部プロセスを \
+                 UI スレッドで待つ（#2961）。`{call}` で action ごとに段へ分ける",
+                prepare.map_or(1, line_of)
+            )),
+            Some(at) => {
+                let from = at + arm.len();
+                let arm_end = code[from..]
+                    .find("Request::")
+                    .map_or(code.len(), |i| from + i);
+                if !code[from..arm_end].contains(call) {
+                    out.push(format!(
+                        "{DISPATCH}:{} `{arm}` の腕が `{call}` を呼ばない（#2961）",
+                        line_of(at)
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn 先取りへ寄せた要求はその答えで組む() {
+    let problems = probe_target_problems(dispatch_text());
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// [`PROBE_TARGETS`] の検査: `probe_needs` に腕があって印を立て、同期の腕が先取りを読む関数を呼ぶ
+fn probe_target_problems(text: &str) -> Vec<String> {
+    let code = production_range::code_view::code_view(text);
+    let line_of = |at: usize| code[..at].matches('\n').count() + 1;
+    let mut out = Vec::new();
+    let needs_at = code.find("fn probe_needs(");
+    for (variant, needs_arm, flag, sync_head, call, _) in PROBE_TARGETS {
+        match needs_at.and_then(|at| code[at..].find(needs_arm).map(|i| at + i)) {
+            None => out.push(format!(
+                "{DISPATCH}:{} `probe_needs` に `{needs_arm}` の腕が無い。`Request::{variant}` の待つ問い合わせを \
+                 background で先取りしない（#2961）",
+                needs_at.map_or(1, line_of)
+            )),
+            Some(at) => {
+                let arm = &code[at..];
+                let arm_end = arm[needs_arm.len()..]
+                    .find("Request::")
+                    .map_or(arm.len(), |i| needs_arm.len() + i);
+                if !arm[..arm_end].contains(flag) {
+                    out.push(format!(
+                        "{DISPATCH}:{} `{needs_arm}` の腕が `{flag}` を立てない（#2961）",
+                        line_of(at)
+                    ));
+                }
+            }
+        }
+        match code.find(sync_head) {
+            None => out.push(format!(
+                "{DISPATCH}:1 `dispatch_inner` の `Request::{variant}` の腕が読めない（走査の空振り）"
+            )),
+            Some(at) => {
+                let after = at + sync_head.len();
+                let next_arm = code[after..]
+                    .find("\n        Request::")
+                    .map_or(code.len(), |i| after + i);
+                if !code[after..next_arm].contains(call) {
+                    out.push(format!(
+                        "{DISPATCH}:{} `Request::{variant}` の同期の腕が先取りを読む `{call}` を通らない（UI スレッドで待つ。#2961）",
+                        line_of(at)
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
 #[test]
 fn 直した要求はknownに残っていない() {
+    for (variant, ..) in STAGED_TARGETS {
+        assert!(
+            !KNOWN.iter().any(|(v, _)| v == variant),
+            "`{variant}` は段へ寄せた（#2961）のに KNOWN に残っている"
+        );
+    }
+    for (variant, ..) in PROBE_TARGETS {
+        assert!(
+            !KNOWN.iter().any(|(v, _)| v == variant),
+            "`{variant}` は先取りへ寄せた（#2961）のに KNOWN に残っている"
+        );
+    }
     for t in TARGETS {
         assert!(
             !KNOWN.iter().any(|(v, _)| *v == t.variant),
@@ -899,4 +1055,152 @@ fn 修正前の形を名指しできる() {
             "`prepare_offload` の `{variant}` の腕を消した注入を 2 が名指ししない: {problems:#?}"
         );
     }
+    // 段へ寄せた要求: `prepare_offload` の腕を消すと、同期の腕（全 action が UI スレッドで待つ）を 1 が、腕が無いことを 2 が名指す
+    for (variant, arm, _, whole) in STAGED_TARGETS {
+        assert!(
+            text.contains(whole),
+            "注入の元の `{variant}` の腕が本文に無い（形を変えたなら注入も追うこと）"
+        );
+        let injected = text.replacen(whole, "", 1);
+        let graph = graph_with(&[(DISPATCH, &injected)]);
+        let findings = scan(&graph);
+        assert!(
+            findings.iter().any(|f| f.variant == *variant),
+            "`prepare_offload` の `{variant}` の腕を消した注入で、同期の腕が名指しされない: {findings:#?}"
+        );
+        let problems = staged_target_problems(&injected);
+        assert!(
+            problems.iter().any(|p| p.contains(arm)),
+            "`prepare_offload` の `{variant}` の腕を消した注入を 2 が名指ししない: {problems:#?}"
+        );
+    }
+    // 先取りへ寄せた要求: 同期の腕を修正前の呼び出し（その場で問い合わせる）へ戻すと 1 と 2 が名指す
+    for (variant, _, _, _, call, legacy_call) in PROBE_TARGETS {
+        assert!(
+            text.contains(call),
+            "注入の元の `{call}` が本文に無い（形を変えたなら注入も追うこと）"
+        );
+        let injected = text.replacen(call, legacy_call, 1);
+        let graph = graph_with(&[(DISPATCH, &injected)]);
+        let findings = scan(&graph);
+        let at = injected
+            .find(legacy_call)
+            .expect("注入した呼び出しが本文にある");
+        let line = injected[..at].matches('\n').count() + 1;
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.variant == *variant && f.line == line),
+            "`{variant}` の同期の腕を修正前の呼び出しへ戻した注入（{DISPATCH}:{line}）が名指しされない: {findings:#?}"
+        );
+        let problems = probe_target_problems(&injected);
+        assert!(
+            problems.iter().any(|p| p.contains(call)),
+            "`{variant}` の同期の腕を修正前の呼び出しへ戻した注入を 2 が名指ししない: {problems:#?}"
+        );
+    }
+}
+
+// ===== 4. 呼び出しのグラフの外（tako-app）の UI スレッドの着地 =====
+
+/// tako-app の UI スレッドで回る着地（`(ファイル, 関数の頭)`。#2961）。呼び出しのグラフは tako-control /
+/// tako-core しか辿らないので、ここに挙げた関数の本文に外部プロセスの起動・待ち（#1984 の葉）と、版の読み
+/// （`extract_version_from_path(` = パスに版が無ければ `claude --version`）が直に書かれていないかを字面で見る。
+/// A/B の旧経路の腕（`if …legacy() {` の then 側）は除く
+const TAKO_APP_UI_LANDINGS: &[(&str, &str)] =
+    &[("crates/tako-app/src/main.rs", "fn apply_stale_binary_scan(")];
+
+/// tako-app の着地で名指す綴りのうち、#1984 の葉に無いもの（`(綴り, 理由)`）
+const TAKO_APP_EXTRA_LEAVES: &[(&str, &str)] = &[(
+    "extract_version_from_path(",
+    "claude の版を読む（パスにも版リソースにも版が無ければ `claude --version` を上限まで待つ。#2961）",
+)];
+
+/// `text`（テスト領域を潰した本文）の関数 `head` の中で、A/B の旧経路の腕の外に書かれた葉（`(行, 綴り, 理由)`）
+fn ui_landing_offenders(text: &str, head: &str) -> Option<Vec<(usize, String, String)>> {
+    let code = production_range::code_view::code_view(text);
+    let bytes = code.as_bytes();
+    let at = code.find(head)?;
+    let open = at + code[at..].find('{')?;
+    let close = matching(bytes, open);
+    let body = &code[open..close];
+    // A/B の旧経路の腕（`if …legacy() {` の then 側）の範囲
+    let mut legacy: Vec<(usize, usize)> = Vec::new();
+    for (i, _) in body.match_indices("legacy() {") {
+        let line_start = body[..i].rfind('\n').map_or(0, |n| n + 1);
+        if !body[line_start..i].trim_start().contains("if ") {
+            continue;
+        }
+        let brace = open + i + "legacy() ".len();
+        legacy.push((brace, matching(bytes, brace)));
+    }
+    let line_of = |pos: usize| code[..pos].matches('\n').count() + 1;
+    let mut out = Vec::new();
+    let leaves: Vec<(String, String)> = leaves()
+        .iter()
+        .cloned()
+        .chain(
+            TAKO_APP_EXTRA_LEAVES
+                .iter()
+                .map(|(n, w)| (n.to_string(), w.to_string())),
+        )
+        .collect();
+    for (needle, why) in &leaves {
+        for (i, _) in body.match_indices(needle.as_str()) {
+            let pos = open + i;
+            if legacy.iter().any(|(a, b)| (*a..*b).contains(&pos)) {
+                continue;
+            }
+            out.push((line_of(pos), needle.clone(), why.clone()));
+        }
+    }
+    out.sort();
+    Some(out)
+}
+
+#[test]
+fn tako_appのuiスレッドの着地は外部プロセスを待たない() {
+    let mut problems = Vec::new();
+    for (file, head) in TAKO_APP_UI_LANDINGS {
+        match ui_landing_offenders(&read(file), head) {
+            None => problems.push(format!(
+                "{file}:1 `{head}` が無い（走査が空振り。改名したなら TAKO_APP_UI_LANDINGS も追うこと）"
+            )),
+            Some(found) => {
+                for (line, needle, why) in found {
+                    problems.push(format!(
+                        "{file}:{line}（UI スレッドの着地 `{head}`）が `{needle}` を呼ぶ（{why}）。\
+                         背景の段で済ませて結果だけを着地へ運ぶこと（#2961）"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
+fn tako_appの着地で版を読む修正前の形を名指しできる() {
+    let file = "crates/tako-app/src/main.rs";
+    let text = read(file);
+    let fixed = "let spawned_version = if tako_control::dispatch::sync_arm_offload_legacy() {";
+    assert!(
+        text.contains(fixed),
+        "注入の元（A/B の門つきの版の読み）が本文に無い（形を変えたなら注入も追うこと）"
+    );
+    // 修正前の形: 門を外して着地で版を読む
+    let injected = text.replacen(fixed, "let spawned_version = if true {", 1);
+    let found = ui_landing_offenders(&injected, "fn apply_stale_binary_scan(")
+        .expect("注入した本文にも関数がある");
+    assert!(
+        found
+            .iter()
+            .any(|(_, n, _)| n == "extract_version_from_path("),
+        "門を外した注入（着地で `claude --version`）を名指ししない: {found:?}"
+    );
+    // 今の形は名指さない
+    assert_eq!(
+        ui_landing_offenders(&text, "fn apply_stale_binary_scan("),
+        Some(Vec::new())
+    );
 }

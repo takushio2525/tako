@@ -259,6 +259,12 @@ impl TakoApp {
                     OffloadContinuation::Mod(_) => None,
                     // 定義ジャンプの問い合わせからは来ない（#2743 の添付つきの送信の着地）
                     OffloadContinuation::SendAttached(_) => None,
+                    // 定義ジャンプの問い合わせからは来ない（#2961 のリモートフォルダの着地）
+                    OffloadContinuation::RemoteFolderOpened(_)
+                    | OffloadContinuation::RemoteFileFetched(_)
+                    | OffloadContinuation::RemoteFolderClose(_) => None,
+                    // 定義ジャンプの問い合わせからは来ない（#2961 のスリープ防止の着地）
+                    OffloadContinuation::SleepGuardOs(_) => None,
                 };
                 self.land_lsp_goto(next, menu, cx);
             }

@@ -65,9 +65,20 @@ const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// `~/.local/bin/claude`（または PATH 上の claude）の symlink を解決し実パスを返す
 pub fn resolve_current_claude_binary() -> Option<PathBuf> {
+    resolve_current_claude_binary_with_version().map(|(path, _)| path)
+}
+
+/// [`resolve_current_claude_binary`] と同じ解決で、覚え（[`CachedResult::current_version`]）の版も返す（#2966）。
+///
+/// 解決のときに版を読んで覚えへ入れているので、呼び手がパスからもう一度読むと、パスにも版リソースにも版が
+/// 無い claude では `claude --version`（上限 `probe_timeout`）を 2 回起こす（返らない claude で上限の 2 倍待つ）
+pub fn resolve_current_claude_binary_with_version() -> Option<(PathBuf, String)> {
     if let Some(cached) = CACHE.lock().ok()?.as_ref() {
         if cached.at.elapsed() < CACHE_TTL {
-            return Some(cached.current_binary.clone());
+            return Some((
+                cached.current_binary.clone(),
+                cached.current_version.clone(),
+            ));
         }
     }
 
@@ -77,11 +88,40 @@ pub fn resolve_current_claude_binary() -> Option<PathBuf> {
     if let Ok(mut guard) = CACHE.lock() {
         *guard = Some(CachedResult {
             current_binary: path.clone(),
-            current_version: version,
+            current_version: version.clone(),
             at: std::time::Instant::now(),
         });
     }
-    Some(path)
+    Some((path, version))
+}
+
+/// #2966 の A/B の env（`1` = 修正前と同じく、状態の照会が今の claude の版をパスからもう一度読む）
+pub const ISSUE2966_LEGACY_ENV: &str = "TAKO_2966_LEGACY";
+
+/// #2966 の A/B の門（要求のたびに読む = テストが `run_alone!` の子で切り替えられるよう、値を覚えない）
+pub fn issue2966_legacy() -> bool {
+    matches!(
+        std::env::var(ISSUE2966_LEGACY_ENV).ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
+/// 状態の照会の版（起動時のバイナリの版, 今の claude の版）を決める（#2966。版の読み方を引数で受ける純関数）。
+///
+/// 今の claude の版は解決のときに読んだ覚えの版をそのまま使い、起動時のバイナリが今の claude と同じパスなら
+/// それも使う（同じ実行ファイルを 2 回読まない）。違うパスのときだけ `extract` で読む
+pub fn stale_status_versions(
+    spawned: Option<&Path>,
+    current: Option<(&Path, &str)>,
+    extract: &dyn Fn(&Path) -> String,
+) -> (String, String) {
+    let current_version = current.map(|(_, v)| v.to_string()).unwrap_or_default();
+    let spawned_version = match (spawned, current) {
+        (Some(s), Some((c, v))) if s == c => v.to_string(),
+        (Some(s), _) => extract(s),
+        (None, _) => String::new(),
+    };
+    (spawned_version, current_version)
 }
 
 /// `claude` コマンドの symlink 先を実パスまで解決する。
@@ -507,6 +547,10 @@ pub struct StaleScanResult {
     pub key: u64,
     /// ペイン内で動いている claude の実パス（見つからなければ None）
     pub running_binary: Option<PathBuf>,
+    /// 動いている claude の版（#2961）。**今の claude と違うパスのとき（stale）だけ**ここ（background）で読む。
+    /// 着地（UI スレッドの `apply_stale_binary_scan`）がバナーへ出す版で、パスにも版リソースにも版が無ければ
+    /// `claude --version`（上限 `probe_timeout`）を起こすので UI スレッドでは読まない
+    pub running_version: Option<String>,
 }
 
 /// claude バイナリの変化を検出するための指紋。サブプロセスを起こさず
@@ -654,9 +698,18 @@ fn poll_with_launcher_and_snapshot(
         };
         targets
             .iter()
-            .map(|t| StaleScanResult {
-                key: t.key,
-                running_binary: find_claude_pid(snapshot, &t.backend_session).and_then(pidpath),
+            .map(|t| {
+                let running_binary =
+                    find_claude_pid(snapshot, &t.backend_session).and_then(pidpath);
+                let running_version = running_binary
+                    .as_deref()
+                    .filter(|running| Some(*running) != current_binary.as_deref())
+                    .map(extract_version_from_path);
+                StaleScanResult {
+                    key: t.key,
+                    running_binary,
+                    running_version,
+                }
             })
             .collect()
     };
@@ -687,6 +740,43 @@ pub fn status_to_json(status: &StaleStatus) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+
+    /// #2966: 今の claude の版は覚えの版を使い、版を読み直さない。起動時のバイナリが今と同じパスならそれも使い、
+    /// 違うパスのときだけ読む
+    #[test]
+    fn issue2966_状態の照会は今のclaudeの版を読み直さない() {
+        let calls = std::cell::Cell::new(0);
+        let extract = |p: &Path| {
+            calls.set(calls.get() + 1);
+            format!("read:{}", p.display())
+        };
+        let current = (Path::new("/opt/c/claude"), "2.1.300");
+        // 起動時のバイナリが無い（器のペインに claude が居ない）= 読まない
+        assert_eq!(
+            stale_status_versions(None, Some(current), &extract),
+            (String::new(), "2.1.300".to_string())
+        );
+        assert_eq!(calls.get(), 0);
+        // 同じパス = 覚えの版をそのまま
+        assert_eq!(
+            stale_status_versions(Some(Path::new("/opt/c/claude")), Some(current), &extract),
+            ("2.1.300".to_string(), "2.1.300".to_string())
+        );
+        assert_eq!(calls.get(), 0);
+        // 違うパス（stale）だけ読む
+        assert_eq!(
+            stale_status_versions(Some(Path::new("/old/claude")), Some(current), &extract),
+            ("read:/old/claude".to_string(), "2.1.300".to_string())
+        );
+        assert_eq!(calls.get(), 1);
+        // 今の claude が解けない = 版は空・起動時のバイナリは読む
+        assert_eq!(
+            stale_status_versions(Some(Path::new("/old/claude")), None, &extract),
+            ("read:/old/claude".to_string(), String::new())
+        );
+        assert_eq!(calls.get(), 2);
+    }
+
     use super::*;
 
     /// #1968: 保険の探索（ログインシェル）は覚えを通す。見つかったパスは実行できる限り

@@ -1042,9 +1042,33 @@ pub fn ssh_pane_argv(host: &str, extra: &[String]) -> Vec<String> {
     )
 }
 
+/// [`ssh_pane_argv`] の ssh の実体を呼び手が渡す版（#2961）。
+///
+/// [`ssh_bin`] は unix でログインシェルの `command -v ssh`（上限 5 秒・覚えなし）を起こすので、
+/// GUI の UI スレッドで組む呼び手は background で引いた答えをここへ渡す。`None` は素の `ssh`
+/// （起こすときに PATH で引く = [`ssh_pane_argv`] が見つけられなかったときと同じ形）
+pub fn ssh_pane_argv_using(ssh: Option<String>, host: &str, extra: &[String]) -> Vec<String> {
+    ssh_pane_argv_from(
+        ssh,
+        host,
+        extra,
+        crate::platform::ssh_client::multiplexing_available(),
+    )
+}
+
 /// [`ssh_pane_argv`] の中身（多重化の可否を引数で受ける**純粋関数**）
 pub(crate) fn ssh_pane_argv_with(host: &str, extra: &[String], multiplexing: bool) -> Vec<String> {
-    let mut argv = vec![ssh_bin().unwrap_or_else(|| "ssh".into())];
+    ssh_pane_argv_from(ssh_bin(), host, extra, multiplexing)
+}
+
+/// argv の組み立て（ssh の実体と多重化の可否を引数で受ける。子プロセスを起こさない）
+fn ssh_pane_argv_from(
+    ssh: Option<String>,
+    host: &str,
+    extra: &[String],
+    multiplexing: bool,
+) -> Vec<String> {
+    let mut argv = vec![ssh.unwrap_or_else(|| "ssh".into())];
     argv.extend(common_opts_with(host, false, multiplexing));
     argv.extend(extra.iter().cloned());
     argv.push(host.to_string());

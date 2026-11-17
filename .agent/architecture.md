@@ -2220,6 +2220,21 @@ lid-guard.json が使う）:
   UI スレッドで写すのは setup-mcp の project スコープのペインの cwd だけ（`setup_mcp_prepare`）。書き込みは錠で 1 本ずつ（setup 系は
   `SETUP_WRITE_SERIAL` を bootstrap の書き込みと共有・config share は `CONFIG_SHARE_WRITE_SERIAL`）。設定画面の「MCP 登録」も同じ 3 段。
   A/B は `TAKO_2961_LEGACY=1`（門は `sync_arm_offload_legacy()` の 1 か所）、実経路は `scripts/test-sync-arm-offload-2961.sh`（FR-2.14.26）
+- **リモートのセットアップ・スクロールバック・SSH ペインの ssh の解決も UI スレッドで待たない**（#2961 の 2 本目）: `RemoteSetup`（tailscale の CLI）は
+  `OffloadJob::RemoteSetup`、`RemoteScrollback` は器のセッション名だけ UI で解いて `OffloadJob::RemoteScrollback`（器の `capture-pane`）。
+  `OpenRemote` はペインを作るので同期の腕のまま、ssh の実体（ログインシェルの `command -v ssh`）だけを #1984 の先取り
+  （`ProbeNeeds::ssh_bin`）で background に済ませ、`remote_ssh_argv_probed` が答えで argv を組む（`remote_ssh_argv_with` = 実体を引数で受ける
+  本体・tako-core の `ssh_pane_argv_using`）。メソッド呼び出し越しの採取は番犬の葉 `METHOD_LEAVES`（`.capture_scrollback(`）で見る（FR-2.14.27）
+- **リモートフォルダの操作も UI スレッドで ssh / sftp を待たない**（#2961 の 3 本目）: `prepare_offload` の腕が `remote_folder_prepare` で
+  action ごとに段を分ける（`open` / `ls` / `open-file` / `push` / `list` = background の `remote_folder_run`、`open` / `open-file` は
+  着地でツリー・プレビューへ、`close` は着地でフォルダを外してから ControlMaster の後始末を background = `Settled`、`ssh-pane` は ssh の
+  実体の先取り、`auto` / `pending` は同期の腕）。背景の本体はメソッドではなく関数にしてある（番犬の呼び出しのグラフが同期の腕から
+  辿れるように）。UI スレッドで回る段は #1984 の番犬の `UI_PATHS` が見る（FR-2.14.28）
+- **スリープ防止の蓋閉じの準備・片付けと stale の着地も UI スレッドで待たない**（#2961 の 4 本目・#2966）: `SleepGuard` の外部プロセスを
+  待つ 3 つの action は `OffloadJob::SleepGuardOs`（background = sudoers の osascript / `open`、着地 = 設定の書き込みと応答）。
+  tako-app の `apply_stale_binary_scan` が読んでいた起動時のバイナリの版は背景の走査が読んで運ぶ（`StaleScanResult::running_version`）。
+  #2961 の番犬の `KNOWN` は空になった。グラフの外の tako-app の着地は番犬の `TAKO_APP_UI_LANDINGS` が本文で見る。
+  状態の照会は今の claude の版を覚えから使う（#2966。`stale_status_versions`）（FR-2.14.29）
 - **照会 1 回の中では `ps` / `tmux list-panes -a` を 1 回だけ起こす**（#1968）: 状態照会は
   `has_running_children` と claude / codex / agy の会話 ID 解決が**それぞれ** `ps` と
   `tmux list-panes -a` を起こしていた（報告 1 回で `ps` 3 本）。`agents::with_shared_scan` の

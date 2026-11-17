@@ -265,6 +265,17 @@ const UI_PATHS: &[&str] = &[
     "pub fn user_task_respond_deliver(",
     "pub fn user_task_launch_land(",
     "fn launch_master_for_response(",
+    // #2961: リモートフォルダの段のうち UI スレッドで回るもの（準備・着地・外部プロセスを待たない action）
+    "fn remote_folder_plan(",
+    "fn remote_folder_prepare(",
+    "fn remote_folder_list_snapshot(",
+    "fn remote_folder_open_land(",
+    "fn remote_file_fetched_land(",
+    "fn remote_folder_close_place(",
+    "fn remote_folder_inline(",
+    // #2961: スリープ防止の段のうち UI スレッドで回るもの（準備と、設定の書き込みの着地）
+    "fn sleep_guard_prepare(",
+    "fn sleep_guard_os_land(",
 ];
 
 /// 読む側の関数（子プロセスの口は `Probed::Outside` の腕でだけ呼ぶ）
@@ -277,6 +288,8 @@ const READERS: &[&str] = &[
     "fn tmux_open_lookup(",
     // #2017
     "fn self_agent_scan(",
+    // #2961: SSH ペインの argv の ssh の実体（ログインシェルの `command -v ssh`）
+    "fn remote_ssh_argv_probed(",
 ];
 
 /// `probe_needs` が挙げるべき要求（先取りが要る要求）
@@ -290,6 +303,8 @@ const PROBED_REQUESTS: &[&str] = &[
     "Request::StaleBinary",
     "Request::GitResolveAgent",
     "Request::TmuxOpen",
+    // #2961
+    "Request::OpenRemote",
 ];
 
 fn workspace_root() -> PathBuf {
@@ -544,6 +559,8 @@ fn scan_background(dispatch: &str) -> Vec<Offender> {
                 "ProcessSnapshot::capture()",
                 "git::repo_root(",
                 "compute_tmux_open_lookup(",
+                // #2961
+                "remote_fs::ssh_bin()",
             ] {
                 if code_lines_with(&window, needle).is_empty() {
                     out.push(Offender {

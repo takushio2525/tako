@@ -7067,8 +7067,13 @@ const DISPATCH_REASON_SCOPES: &[&str] = &[
     // 変更履歴の差分・リモートフォルダ・config share・scrollback
     "fn preview_changelog_diff_prepare(",
     "fn preview_changelog_diff_land(",
-    "    fn need_host(",
-    "    fn need_path(",
+    // #2961: 入れ子の `need_host` / `need_path` を外へ出し、段に分けた関数へ断りを移した
+    "fn remote_folder_need_host(",
+    "fn remote_folder_need_path(",
+    "fn remote_folder_target_tab(",
+    "fn remote_folder_close_place(",
+    "fn remote_folder_push_reply(",
+    "fn remote_folder_inline(",
     "pub fn dispatch_config_share(",
     "fn scrollback_target_session(",
     // コマンドカード・Code Runner
@@ -16107,11 +16112,22 @@ fn 使用量と対応表と移行とremote系の型の口に日本語の固定�
 #[test]
 fn dispatchとcliのremote系の口は日本語の口を呼ばない() {
     let mut failures = Vec::new();
-    for head in [
-        "        Request::RemoteMessages { session_id, tail } =>",
-        "        Request::RemoteSetup { action, answers } =>",
+    // #2961: RemoteSetup / RemoteScrollback の腕の本体は、同期の腕と background の腕が通る 1 実装
+    // （`remote_setup_reply` / `remote_scrollback_reply`）へ移った。腕の値ではなくその関数を見る
+    for (head, value) in [
+        (
+            "        Request::RemoteMessages { session_id, tail } =>",
+            true,
+        ),
+        ("fn remote_setup_reply(", false),
+        ("fn remote_scrollback_reply(", false),
     ] {
-        let Some(lines) = run_value_lines(DISPATCH_SRC, head) else {
+        let found = if value {
+            run_value_lines(DISPATCH_SRC, head)
+        } else {
+            front_scope_lines(DISPATCH_SRC, Some(head))
+        };
+        let Some(lines) = found else {
             failures.push(format!(
                 "{DISPATCH_PATH}: 走査の範囲 `{}` が見つからない（改名で番犬が空振りする）",
                 head.trim()
