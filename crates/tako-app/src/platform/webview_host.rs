@@ -17,6 +17,25 @@
 //! | 宛先が Web ビュー側か（[`win32_child_holds_key_focus`]。#2430） | 呼ばれない（`key_monitor`） | gpui の窓のスレッドの宛先（`GetGUIThreadInfo`）が窓の子孫（`IsChild`） | 偽 |
 //! | 宛先を gpui へ戻す（[`win32_return_key_focus`]） | 呼ばれない | `SetFocus(gpui の窓)`（wry の `focus_parent` と同じ） | 偽 |
 //! | 宛先の素性（[`win32_key_focus_owner`]。診断・セルフテスト） | 呼ばれない | `クラス名@HWND` | 空 |
+//! | ページが宛先のあいだの tako のショートカット（[`watch_app_shortcuts`]。#326 / #2948） | `webview.rs` の `key_monitor`（NSEvent の local monitor。キーの名前は [`macos_ansi_letter`]） | WebView2 の `AcceleratorKeyPressed` で先取りして `Handled` | 付けない |
+//!
+//! ## ページが宛先のあいだの tako のショートカット（#2948）
+//!
+//! WebView2 の子窓は別プロセスなので、ページが宛先のあいだの打鍵は gpui の窓プロシージャを
+//! 通らない（Ctrl+Shift+T がページに飲まれる）。wry 0.57.1 は `AcceleratorKeyPressed` を公開して
+//! いないので、`WebViewExtWindows::controller()` から直に付ける。コールバックの中では
+//! **打鍵をキー名へ直して判定し、tako のものだけ `Handled` にして前景タスクへ渡すだけ**にする。
+//! 宛先を gpui へ戻す（#1481 の 1 実装）・同じ打鍵を gpui のキーバインドへ配る
+//! （`Window::dispatch_keystroke`）のはコールバックを抜けた後の gpui の前景タスク（`main.rs`）で、
+//! 理由は 2 つ: ① WebView2 はコールバックの答え（`Handled`）を待って打鍵を止めているので、
+//! その中で `SetFocus` を呼ぶと別プロセスの窓への `WM_KILLFOCUS` の同期送信になり待ち合う恐れがある、
+//! ② 窓へ `WM_KEYDOWN` を投げ直す形は、gpui が届いた時点の修飾キーの状態（`GetKeyState`）を
+//! 読み直すので、その前に指を離すと修飾の無い文字としてターミナルへ流れる。
+//! 判定（どの打鍵を先取りするか）は macOS と同じ 1 実装 `keybindings::webview_key_route`
+//! （表は `tako_core::platform::keys::WEBVIEW_PAGE_KEYS`）。キー名は gpui_windows（rev `cafbf4b`）の
+//! `parse_immutable` / `get_keystroke_key` と同じ規則・同じ Win32 の呼び出しで作る
+//! （[`win32_named_key`] / [`win32_shifts_to_symbol`]）ので、判定した打鍵と gpui が実キーから作る
+//! 打鍵が一致する。
 //!
 //! ## なぜ DirectComposition を切るか（#2429）
 //!
@@ -169,6 +188,174 @@ pub(crate) fn win32_key_focus_owner(parent: isize) -> String {
     }
 }
 
+// --- ページが宛先のあいだの tako のショートカット（#326 / #2948） ------------------------------
+
+/// Web ビューのページがキー入力の宛先のあいだ、tako の割り当てに当たる打鍵を先取りする口を
+/// 付ける（#2948。Windows = WebView2 の `AcceleratorKeyPressed`）。
+///
+/// `steal` は打鍵（gpui の `Keystroke`）を受けて「tako が先取りするか」を答え、先取りするなら
+/// tako への配送まで引き受ける（呼び手 = `webview.rs`。判定は `keybindings::webview_key_route` の
+/// 1 実装）。true を返した打鍵だけページへ渡さない。付けたら true（macOS は `key_monitor` が
+/// 受け持つので付けない = false）
+pub(crate) fn watch_app_shortcuts(view: &wry::WebView, steal: fn(gpui::Keystroke) -> bool) -> bool {
+    #[cfg(windows)]
+    {
+        win32::watch_accelerators(view, steal)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (view, steal);
+        false
+    }
+}
+
+/// NSEvent の `modifierFlags` の各修飾（AppKit の `NSEventModifierFlag*`）
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) const NS_SHIFT_KEY_MASK: u64 = 1 << 17;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) const NS_CONTROL_KEY_MASK: u64 = 1 << 18;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) const NS_ALTERNATE_KEY_MASK: u64 = 1 << 19;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) const NS_COMMAND_KEY_MASK: u64 = 1 << 20;
+
+/// macOS の NSEvent の local monitor（`webview.rs` の `key_monitor`。#326）が、打鍵
+/// （virtual key code と `modifierFlags`）をページへ渡すか。判定は Windows の
+/// `AcceleratorKeyPressed` と同じ 1 実装 `tako_core::platform::keys::webview_key_route`。
+/// macOS の規則は tako の割り当てかを問わない（⌘ の打鍵は PTY へ届かない）ので `app_bound` は偽で渡す
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn macos_key_routes_to_page(key_code: u16, flags: u64) -> bool {
+    use tako_core::platform::keys::{webview_key_route, WebviewKeyMods, WebviewKeyRoute};
+    use tako_core::platform::support::Platform;
+    let mods = WebviewKeyMods {
+        platform_key: flags & NS_COMMAND_KEY_MASK != 0,
+        control: flags & NS_CONTROL_KEY_MASK != 0,
+        alt: flags & NS_ALTERNATE_KEY_MASK != 0,
+        shift: flags & NS_SHIFT_KEY_MASK != 0,
+    };
+    let key = macos_ansi_letter(key_code).unwrap_or("");
+    webview_key_route(Platform::MacOs, key, mods, false) == WebviewKeyRoute::Page
+}
+
+/// macOS の ANSI 配列の英字の virtual key code（Carbon の `kVK_ANSI_*`）→ キー名。
+/// #326 の表（`WEBVIEW_PASSTHROUGH_KEYS`）と同じく**配列によらない物理位置**で引く
+/// （Dvorak でも ⌘ + 物理の C の位置は `c`）。英字以外は None
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn macos_ansi_letter(code: u16) -> Option<&'static str> {
+    Some(match code {
+        0x00 => "a",
+        0x01 => "s",
+        0x02 => "d",
+        0x03 => "f",
+        0x04 => "h",
+        0x05 => "g",
+        0x06 => "z",
+        0x07 => "x",
+        0x08 => "c",
+        0x09 => "v",
+        0x0B => "b",
+        0x0C => "q",
+        0x0D => "w",
+        0x0E => "e",
+        0x0F => "r",
+        0x10 => "y",
+        0x11 => "t",
+        0x1F => "o",
+        0x20 => "u",
+        0x22 => "i",
+        0x23 => "p",
+        0x25 => "l",
+        0x26 => "j",
+        0x28 => "k",
+        0x2D => "n",
+        0x2E => "m",
+        _ => return None,
+    })
+}
+
+/// 文字ではなく名前で呼ぶ Win32 の virtual key code → gpui のキー名
+/// （gpui_windows rev `cafbf4b` の `events.rs` の `parse_immutable` の写し）
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn win32_named_key(vk: u32) -> Option<&'static str> {
+    Some(match vk {
+        0x20 => "space",
+        0x08 => "backspace",
+        0x0D => "enter",
+        0x09 => "tab",
+        0x26 => "up",
+        0x28 => "down",
+        0x27 => "right",
+        0x25 => "left",
+        0x24 => "home",
+        0x23 => "end",
+        0x21 => "pageup",
+        0x22 => "pagedown",
+        0xA6 => "back",
+        0xA7 => "forward",
+        0x1B => "escape",
+        0x2D => "insert",
+        0x2E => "delete",
+        0x5D => "menu",
+        0x70 => "f1",
+        0x71 => "f2",
+        0x72 => "f3",
+        0x73 => "f4",
+        0x74 => "f5",
+        0x75 => "f6",
+        0x76 => "f7",
+        0x77 => "f8",
+        0x78 => "f9",
+        0x79 => "f10",
+        0x7A => "f11",
+        0x7B => "f12",
+        0x7C => "f13",
+        0x7D => "f14",
+        0x7E => "f15",
+        0x7F => "f16",
+        0x80 => "f17",
+        0x81 => "f18",
+        0x82 => "f19",
+        0x83 => "f20",
+        0x84 => "f21",
+        0x85 => "f22",
+        0x86 => "f23",
+        0x87 => "f24",
+        _ => return None,
+    })
+}
+
+/// ⇧ と組むと gpui が「⇧ を足した字面 + ⇧ なし」へ正規化するキー（記号・数字の列）
+/// （gpui_windows rev `cafbf4b` の `keyboard.rs` の `need_to_convert_to_shifted_key` の写し）
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn win32_shifts_to_symbol(vk: u32) -> bool {
+    matches!(
+        vk,
+        0xC0 // VK_OEM_3
+            | 0xBD // VK_OEM_MINUS
+            | 0xBB // VK_OEM_PLUS
+            | 0xDB // VK_OEM_4
+            | 0xDC // VK_OEM_5
+            | 0xDD // VK_OEM_6
+            | 0xBA // VK_OEM_1
+            | 0xDE // VK_OEM_7
+            | 0xBC // VK_OEM_COMMA
+            | 0xBE // VK_OEM_PERIOD
+            | 0xBF // VK_OEM_2
+            | 0xE2 // VK_OEM_102
+            | 0xDF // VK_OEM_8
+            | 0xC1 // VK_ABNT_C1
+            | 0x30..=0x39 // VK_0..VK_9
+    )
+}
+
+/// 修飾キーそのもの・打鍵として数えないキー（gpui_windows の `handle_key_event` が
+/// `ModifiersChanged` にする / 捨てるもの: Shift / Ctrl / Alt / Win / CapsLock / VK_PACKET）
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn win32_is_modifier_key(vk: u32) -> bool {
+    // VK_SHIFT / VK_CONTROL / VK_MENU・VK_LSHIFT..VK_RMENU・VK_LWIN / VK_RWIN・VK_CAPITAL・VK_PACKET
+    matches!(vk, 0x10..=0x12 | 0xA0..=0xA5 | 0x5B | 0x5C | 0x14 | 0xE7)
+}
+
 #[cfg(windows)]
 mod win32 {
     /// `RECT`（winuser.h）。OS が書く領域で、tako は読まない
@@ -204,6 +391,140 @@ mod win32 {
         fn IsChild(parent: isize, child: isize) -> i32;
         fn SetFocus(hwnd: isize) -> isize;
         fn GetClassNameW(hwnd: isize, buf: *mut u16, max: i32) -> i32;
+        fn GetKeyState(vk: i32) -> i16;
+        fn MapVirtualKeyW(code: u32, map_type: u32) -> u32;
+        fn ToUnicode(
+            vk: u32,
+            scan_code: u32,
+            key_state: *const u8,
+            buf: *mut u16,
+            buf_len: i32,
+            flags: u32,
+        ) -> i32;
+    }
+
+    // --- ページが宛先のあいだの tako のショートカット（#2948） ---
+
+    /// `AcceleratorKeyPressed` を付ける（[`super::watch_app_shortcuts`] の Windows の腕）
+    pub(super) fn watch_accelerators(
+        view: &wry::WebView,
+        steal: fn(gpui::Keystroke) -> bool,
+    ) -> bool {
+        use webview2_com::AcceleratorKeyPressedEventHandler;
+        use webview2_com::Microsoft::Web::WebView2::Win32::{
+            COREWEBVIEW2_KEY_EVENT_KIND, COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN,
+            COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN,
+        };
+        use wry::WebViewExtWindows;
+
+        let controller = view.controller();
+        let handler = AcceleratorKeyPressedEventHandler::create(Box::new(move |_, args| {
+            let Some(args) = args else {
+                return Ok(());
+            };
+            let mut kind = COREWEBVIEW2_KEY_EVENT_KIND::default();
+            let mut vk = 0u32;
+            let mut lparam = 0i32;
+            // SAFETY: WebView2 が呼び出しの間だけ有効な args から、自前の領域へ書かせる
+            unsafe {
+                args.KeyEventKind(&mut kind)?;
+                args.VirtualKey(&mut vk)?;
+                args.KeyEventLParam(&mut lparam)?;
+            }
+            // 押した瞬間だけ見る（先取りした打鍵を離すときは宛先が gpui へ戻った後なので gpui に届く）
+            if kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN
+                && kind != COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN
+            {
+                return Ok(());
+            }
+            let Some(keystroke) = keystroke(vk, lparam) else {
+                return Ok(());
+            };
+            if steal(keystroke) {
+                // SAFETY: 同上（ページ・ブラウザの既定の動作へ渡さない）
+                unsafe { args.SetHandled(true)? };
+            }
+            Ok(())
+        }));
+        let mut token = 0i64;
+        // SAFETY: controller は wry が持つ生きた WebView2 の controller。handler の参照は COM が持ち、
+        // controller が閉じるときに一緒に放す（Web ビューと同じ寿命なので外さない）
+        unsafe { controller.add_AcceleratorKeyPressed(&handler, &mut token) }.is_ok()
+    }
+
+    /// 打鍵（WebView2 の virtual key と lParam）を gpui の `Keystroke` にする。gpui_windows
+    /// （rev `cafbf4b`）が実キーの `WM_KEYDOWN` から作るのと同じ規則・同じ Win32 の呼び出し
+    /// （`handle_key_event` → `parse_normal_key` → `get_keystroke_key`）。修飾キーそのものは None。
+    /// `key_char` は持たない（先取りするのは割り当てに当たる打鍵だけで、文字入力には使わない）
+    fn keystroke(vk: u32, lparam: i32) -> Option<gpui::Keystroke> {
+        if super::win32_is_modifier_key(vk) {
+            return None;
+        }
+        let mut modifiers = gpui::Modifiers {
+            control: key_down(0x11),                    // VK_CONTROL
+            alt: key_down(0x12),                        // VK_MENU
+            shift: key_down(0x10),                      // VK_SHIFT
+            platform: key_down(0x5B) || key_down(0x5C), // VK_LWIN / VK_RWIN
+            function: false,
+        };
+        let scan_code = ((lparam as u32) >> 16) & 0xFF;
+        let key = match super::win32_named_key(vk) {
+            Some(name) => name.to_string(),
+            None if modifiers.shift && super::win32_shifts_to_symbol(vk) => {
+                let shifted = shifted_key(vk, scan_code)?;
+                modifiers.shift = false;
+                shifted
+            }
+            None => key_from_vkey(vk)?,
+        };
+        Some(gpui::Keystroke {
+            modifiers,
+            key,
+            key_char: None,
+        })
+    }
+
+    /// いま押されているか（gpui_windows の `is_virtual_key_pressed` と同じ `GetKeyState`。
+    /// WebView2 の子窓は親子関係で gpui の窓と入力の状態を共有する = #2430 と同じ前提）
+    fn key_down(vk: i32) -> bool {
+        // SAFETY: GetKeyState は任意の値を受け取り、状態を返すだけ
+        unsafe { GetKeyState(vk) < 0 }
+    }
+
+    /// ⇧ だけを押した状態の字面（gpui_windows の `get_shifted_key` = `generate_key_char` の写し）
+    fn shifted_key(vk: u32, scan_code: u32) -> Option<String> {
+        let mut state = [0u8; 256];
+        state[0x10] = 0x80; // VK_SHIFT
+        let mut buf = [0u16; 8];
+        // SAFETY: 長さを渡した自前の領域へ書かせる。0x5 = キーボードの状態を変えない（gpui と同じ）
+        let len = unsafe {
+            ToUnicode(
+                vk,
+                scan_code,
+                state.as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len() as i32,
+                0x5,
+            )
+        };
+        match len {
+            len if len > 0 => String::from_utf16(&buf[..len as usize])
+                .ok()
+                .filter(|s| s.chars().next().is_some_and(|c| !c.is_control())),
+            len if len < 0 => String::from_utf16(&buf[..(-len) as usize]).ok(),
+            _ => None,
+        }
+    }
+
+    /// 修飾なしの字面（gpui_windows の `get_key_from_vkey` の写し。英字は小文字）
+    fn key_from_vkey(vk: u32) -> Option<String> {
+        // SAFETY: MapVirtualKeyW は任意の値を受け取り、対応が無ければ 0 を返すだけ。2 = MAPVK_VK_TO_CHAR
+        let data = unsafe { MapVirtualKeyW(vk, 2) };
+        if data == 0 {
+            return None;
+        }
+        let c = char::from_u32(data & 0xFFFF)?;
+        Some(c.to_ascii_lowercase().to_string())
     }
 
     /// `parent` を持つスレッドのキー入力の宛先（読めなければ 0）
@@ -324,6 +645,105 @@ mod tests {
             .log_line()
             .unwrap()
             .contains(LEGACY_2429_ENV));
+    }
+
+    /// #2948 の前の macOS の表（#326 の `WEBVIEW_PASSTHROUGH_KEYS` の写し。比較の基準として凍結）
+    const LEGACY_326_PASSTHROUGH: [u16; 10] =
+        [0x00, 0x08, 0x03, 0x25, 0x23, 0x0F, 0x01, 0x09, 0x07, 0x06];
+
+    /// #2948 の前の macOS の判定（`monitor_invoke`: ⌘ なし → ページ、表のキー → ページ、
+    /// それ以外 → 宛先を tako へ戻す）
+    fn legacy_326_routes_to_page(key_code: u16, flags: u64) -> bool {
+        flags & NS_COMMAND_KEY_MASK == 0 || LEGACY_326_PASSTHROUGH.contains(&key_code)
+    }
+
+    /// 受け入れ条件 2: macOS の Web ビューの振る舞いは #2948 の前後で同じ。virtual key code の
+    /// 全域 × 修飾の全組み合わせ（CapsLock・テンキー・fn の印も混ぜる）で 1 つも違わない
+    #[test]
+    fn macosの判定は326の表と全キーコードで一致する() {
+        let extra = [0u64, 1 << 16, 1 << 21, 1 << 23];
+        let mut checked = 0usize;
+        for code in 0u16..=0x7F {
+            for bits in 0u64..16 {
+                let mut flags = 0u64;
+                for (i, mask) in [
+                    NS_SHIFT_KEY_MASK,
+                    NS_CONTROL_KEY_MASK,
+                    NS_ALTERNATE_KEY_MASK,
+                    NS_COMMAND_KEY_MASK,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    if bits & (1 << i) != 0 {
+                        flags |= mask;
+                    }
+                }
+                for e in extra {
+                    let f = flags | e;
+                    assert_eq!(
+                        macos_key_routes_to_page(code, f),
+                        legacy_326_routes_to_page(code, f),
+                        "key_code={code:#04x} flags={f:#x}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 128 * 16 * 4);
+    }
+
+    /// ANSI の英字の位置は 26 文字ちょうどで重ならない（#326 の 10 文字もここから引く）
+    #[test]
+    fn macosの英字の位置は26文字で重ならない() {
+        let mut letters: Vec<&str> = (0u16..=0x7F).filter_map(macos_ansi_letter).collect();
+        assert_eq!(letters.len(), 26);
+        letters.sort();
+        letters.dedup();
+        assert_eq!(letters.len(), 26);
+        for (code, letter) in LEGACY_326_PASSTHROUGH
+            .into_iter()
+            .zip(["a", "c", "f", "l", "p", "r", "s", "v", "x", "z"])
+        {
+            assert_eq!(macos_ansi_letter(code), Some(letter), "{code:#04x}");
+        }
+    }
+
+    /// Win32 の写し（gpui_windows の `parse_immutable` / `need_to_convert_to_shifted_key`）:
+    /// tako の Windows の割り当てに出てくるキーの名前が gpui と同じに引ける
+    #[test]
+    fn win32のキー名はgpuiと同じ規則() {
+        for (vk, name) in [
+            (0x09, "tab"),
+            (0x25, "left"),
+            (0x27, "right"),
+            (0x26, "up"),
+            (0x28, "down"),
+            (0x2D, "insert"),
+            (0x7A, "f11"),
+            (0x1B, "escape"),
+            (0x08, "backspace"),
+        ] {
+            assert_eq!(win32_named_key(vk), Some(name), "{vk:#04x}");
+        }
+        // 英字・数字・記号は名前で呼ばない（字面を MapVirtualKeyW / ToUnicode で引く）
+        for vk in (0x41..=0x5A).chain(0x30..=0x39).chain([0xBB, 0xBD, 0xBC]) {
+            assert_eq!(win32_named_key(vk), None, "{vk:#04x}");
+        }
+        // ⇧ と組むと字面へ正規化されるのは数字と記号の列だけ（英字は ⇧ を残す = ctrl-shift-t）
+        for vk in (0x30..=0x39).chain([0xBB, 0xBD, 0xBC, 0xC0, 0xDB, 0xDD]) {
+            assert!(win32_shifts_to_symbol(vk), "{vk:#04x}");
+        }
+        for vk in 0x41..=0x5A {
+            assert!(!win32_shifts_to_symbol(vk), "{vk:#04x}");
+        }
+        // 修飾キーそのものは打鍵として数えない
+        for vk in [0x10, 0x11, 0x12, 0xA0, 0xA3, 0xA5, 0x5B, 0x5C, 0x14, 0xE7] {
+            assert!(win32_is_modifier_key(vk), "{vk:#04x}");
+        }
+        for vk in [0x41, 0x54, 0x09, 0x2D, 0x7A] {
+            assert!(!win32_is_modifier_key(vk), "{vk:#04x}");
+        }
     }
 
     /// macOS / その他では宛先の Win32 の腕は何も読まない・何も動かさない（呼ばれても偽 / 空）

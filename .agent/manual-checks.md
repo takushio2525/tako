@@ -555,6 +555,20 @@ tako-app で見る。修正前の形は同じバイナリで `TAKO_724_LEGACY=1`
 - [ ] 窓のリサイズ（枠をつかんで動かす・最大化 ⇔ 元に戻す）で、描画がちらつかない・Web ビューが追従する。
   窓の枠と影は修正前と同じ
 
+### Windows でページが宛先のあいだも tako のショートカットが効く（#2948）
+
+どの打鍵を先取りするかの判定（macOS の #326 と同じ 1 実装）は単体（両 OS の CI）で固定済み。残るのは
+WebView2 の `AcceleratorKeyPressed` を通る実キーの到達。隔離インスタンスで、keydown を記録するページ
+（`window.__keys` に `e.key` を積む）を `tako web open file:///…/page.html` で開いて行う。修正前の形は
+同じバイナリで `TAKO_2948_LEGACY=1`（Ctrl+Shift+T がページに飲まれ、タブは増えない）。
+
+- [ ] ページの本文を実マウスでクリック → 実キーで Ctrl+Shift+T → **新しいタブが開く**（`tako list` の
+  タブが 1 つ増える）。ページの記録（`tako web eval` / `eval-result` で読む）に `T` が載らない。宛先は
+  tako へ戻る（続けて打った文字はページに入らない）
+- [ ] 同じくページをクリック → Ctrl+Shift+P → パレットが開く。Ctrl+Tab → 次のタブ。Alt+← → 隣のペインへ
+- [ ] ページの入力欄で Ctrl+C / Ctrl+V / Ctrl+A / Ctrl+Z / Ctrl+Shift+Z / Shift+Insert → **ページで効く**
+  （tako の貼り付け・取り消しは起きない）。Ctrl+← / Ctrl+Backspace もページで効く（ターミナルへ流れない）
+
 ### Windows の器（psmux）のペインで Shift+Enter が改行になる（#729）
 
 器のペインの修飾付き Enter を `ESC CR` へ落とす判定と符号化は単体（両 OS の CI）、macOS の tmux の器で

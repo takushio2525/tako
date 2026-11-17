@@ -47,6 +47,9 @@ raw-window-handle.workspace = true
 windows.workspace = true
 # PDF 構造パーサ（#693）。ラスタライズは WinRT、リンク注釈・目次は lopdf で補う
 lopdf.workspace = true
+# Web ビューのページが宛先のあいだの tako のショートカット（#2948。platform/webview_host.rs）。
+# wry が引いている版そのもの = 依存の木は増えない
+webview2-com.workspace = true
 
 # two-face に無い構文（#1954）の YAML をビルド時に構文定義へ読む（build.rs の
 # `compile_extra_syntaxes`）。YAML のパーサ（yaml-rust）はビルドスクリプトにだけ入り、

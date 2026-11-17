@@ -147,13 +147,13 @@ pub mod notes {
     );
 
     /// Windows の Web ビュー。落ちない（#724 / #2445）・中身が見える（#2429）・ターミナルへ戻れば打鍵が
-    /// 戻る（#2430）ことは 11/16 の実機で確かめた。残る縮退は 2 つ: ページが宛先のあいだ tako の
-    /// ショートカットがページに飲まれる（macOS の #326 に当たる口が無い = #2948）と、タイトル・URL の
-    /// 更新が 2 秒ごと（ipc を付けない = #724 の W2）。#2431: WebView2 ランタイムが要る
-    /// （macOS の WKWebView は OS に含まれる）
+    /// 戻る（#2430）ことは 11/16 の実機で確かめた。ページが宛先のあいだ tako のショートカットが
+    /// ページに飲まれていた（macOS の #326 に当たる口が無い）のは #2948 で WebView2 の
+    /// AcceleratorKeyPressed から先取りする形にした。残る縮退はタイトル・URL の更新が 2 秒ごと
+    /// （ipc を付けない = #724 の W2）。#2431: WebView2 ランタイムが要る（macOS の WKWebView は OS に含まれる）
     pub const WIN_WEBVIEW_DEGRADED: Note = Note::new(
-        "Web ビューは開けて中身が見え、ターミナルのペインをクリックすれば打鍵はターミナルへ戻る（#2429 / #2430）。ただしページが宛先のあいだは tako のショートカット（Ctrl+Shift+T 等）がページに飲まれる（#2948。ターミナルのペインをクリックすれば戻る）。タイトル・URL はページからの即時の通知を付けていないので 2 秒ごとに更新する（#724）。WebView2 ランタイム（145.0.3800.47 以上）が要り、無い・古い PC では生成の失敗が入れ方を案内する（版は check-health の webview2。ユーザーデータは %LOCALAPPDATA%\\tako\\WebView2。#2431）",
-        "Web views open, their content is visible, and clicking a terminal pane sends typing back to the terminal (#2429 / #2430). While a page holds the key focus, though, tako's shortcuts (Ctrl+Shift+T and others) go to the page (#2948; clicking a terminal pane brings them back). Titles and URLs refresh every 2 seconds because the page does not push them immediately (#724). The WebView2 Runtime (145.0.3800.47 or later) is required; on a PC without it or with an older one, the creation failure explains how to install it (the version is under webview2 in check-health; user data lives in %LOCALAPPDATA%\\tako\\WebView2. #2431)",
+        "Web ビューは開けて中身が見え、ターミナルのペインをクリックすれば打鍵はターミナルへ戻る（#2429 / #2430）。ページが宛先のあいだも tako のショートカット（Ctrl+Shift+T 等）は tako へ届き、ページの編集系（Ctrl+C / Ctrl+V 等）はページへ渡る（#2948）。タイトル・URL はページからの即時の通知を付けていないので 2 秒ごとに更新する（#724）。WebView2 ランタイム（145.0.3800.47 以上）が要り、無い・古い PC では生成の失敗が入れ方を案内する（版は check-health の webview2。ユーザーデータは %LOCALAPPDATA%\\tako\\WebView2。#2431）",
+        "Web views open, their content is visible, and clicking a terminal pane sends typing back to the terminal (#2429 / #2430). While a page holds the key focus, tako's shortcuts (Ctrl+Shift+T and others) still reach tako, and the page's editing keys (Ctrl+C / Ctrl+V and others) stay with the page (#2948). Titles and URLs refresh every 2 seconds because the page does not push them immediately (#724). The WebView2 Runtime (145.0.3800.47 or later) is required; on a PC without it or with an older one, the creation failure explains how to install it (the version is under webview2 in check-health; user data lives in %LOCALAPPDATA%\\tako\\WebView2. #2431)",
     );
 
     /// #528。daemon の起動が `setsid` / シグナルマスク前提のまま。
@@ -2051,13 +2051,13 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_web",
         macos: Support::Supported,
-        // #2429 / #2430（11/16）で Pending（#724）から上げた。ショートカットの飲み込み（#2948）と
+        // #2429 / #2430（11/16）で Pending（#724）から上げた。ショートカットの飲み込みは #2948 で直した。
         // タイトル・URL の 2 秒ごとの更新（#724 の W2）が残るので Supported にはしない（過大申告しない）
         windows: Support::Degraded {
             note: notes::WIN_WEBVIEW_DEGRADED,
         },
         windows_evidence: Evidence::Measured(
-            "2026-11-16 の Windows 11 実機（表示倍率 125%・WebView2 152）。同じバイナリの A/B で、修正後は Web ビューの本文の 95.8% がページの地の色（TAKO_2429_LEGACY=1 = DirectComposition のままでは 0%）。実マウス・実キーでページ → ターミナルの順にクリックした後の打鍵はターミナルへ入る（TAKO_2430_LEGACY=1 ではページへ流れる）。セルフテスト項目 71（#1481 群を含む）と 155（パレット・アドレスバー・dock の URL 欄）を Windows で走らせて中の失敗 0 件（手前の項目の既存の落ちは #2949 に記録して流した）。生成で落ちないことは #2445 の実機の確認。ページが宛先のあいだの Ctrl+Shift+T はページに飲まれる（#2948）",
+            "2026-11-16 の Windows 11 実機（表示倍率 125%・WebView2 152）。同じバイナリの A/B で、修正後は Web ビューの本文の 95.8% がページの地の色（TAKO_2429_LEGACY=1 = DirectComposition のままでは 0%）。実マウス・実キーでページ → ターミナルの順にクリックした後の打鍵はターミナルへ入る（TAKO_2430_LEGACY=1 ではページへ流れる）。セルフテスト項目 71（#1481 群を含む）と 155（パレット・アドレスバー・dock の URL 欄）を Windows で走らせて中の失敗 0 件（手前の項目の既存の落ちは #2949 に記録して流した）。生成で落ちないことは #2445 の実機の確認。ページが宛先のあいだの先取り（#2948）は、どの打鍵を先取りするかの判定を単体（両 OS の CI）で固定し、WebView2 の AcceleratorKeyPressed を通る実キーの到達は実機で確かめる（未実測）",
         ),
     },
     Feature {
