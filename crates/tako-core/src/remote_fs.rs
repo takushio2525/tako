@@ -1641,7 +1641,11 @@ impl Liveness {
 /// ホストへの接続の生死（[`Liveness`] の doc を参照）。
 ///
 /// ControlPath の置き場が無いホスト（#2855）も、多重化の無いプラットフォームと同じく
-/// `Unknown`。`Dead` で埋めると自動再接続（#1040）が撃ち続ける
+/// `Unknown`。`Dead` で埋めると自動再接続（#1040）が撃ち続ける。
+///
+/// **ソケットの stat 1 回ではない**: unix は ssh の実体をログインシェルの `command -v ssh` で引き
+/// （上限 `login_shell_timeout`）、ソケットが在れば `ssh -O check` を起こして上限 `mux_control_timeout`
+/// まで待つ。GUI の UI スレッドから呼ばない（自動再接続の見張りは背景の段で呼ぶ = #2976）
 pub fn liveness(host: &str) -> Liveness {
     liveness_checked(host).unwrap_or(Liveness::Dead)
 }

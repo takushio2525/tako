@@ -2236,6 +2236,7 @@ lid-guard.json が使う）:
   #2961 の番犬の `KNOWN` は空になった。グラフの外の tako-app の着地は番犬の `TAKO_APP_UI_LANDINGS` が本文で見る。
   状態の照会は今の claude の版を覚えから使う（#2966。`stale_status_versions`）（FR-2.14.29）
 - **MCP の登録とリモートフォルダの外部コマンドは上限つきで待つ**（#2967 / #2973）: #2961 で UI スレッドからは出したが、background の待ち自体に上限が無かった（返らない CLI で応答と setup の書き込みの錠が止まる）。エージェント CLI の書き込み（`claude mcp remove` / `add`・`codex mcp list` / `add`・`agy mcp add`）は門番 `agent_probe::command_with_timeout`（組み立て済みの `Command` = cwd を持てる・名札を呼び手が決める = 実体のパスを載せない。上限 `probe_timeout`・孫まで止める）、ssh / sftp は `remote_fs::spawn_capture` が `probe::wait_with_timeout` で待つ（上限は `remote_timeout` 30 秒・`ssh -O` 5 秒・転送は大きさから）。打ち切りは `SetupRefusal::ClaudeMcpTimedOut` / `AgentMcpError::TimedOut` / `RemoteErrorKind::NoResponse` で理由と次の一手を返す。番犬 `issue2967_unbounded_cli_wait_watchdog.rs` が入口から辿って上限なしの `.output()` / `.wait_with_output()` を名指す（FR-2.14.30）
+- **リモートフォルダの自動復帰の見張りも UI スレッドで ssh を待たない**（#2976）: 定期の tick の `drive_remote_recovery` は積み込みだけ（判定の最中の印の無いホストを選び、ホストごとの背景の仕事を切り離して投げる）。生死の判定 `remote_fs::liveness`（ログインシェルで ssh を引き `ssh -O check`）は背景の `judge_remote_host`、着地 `land_remote_liveness` が修正前と同じ判断の 1 実装 `advance_recovery` で進める。同じホストの判定は重ねない。tako-app の着地なので番犬 #2956 の `TAKO_APP_UI_LANDINGS` が本文で見る（FR-2.14.31）
 - **照会 1 回の中では `ps` / `tmux list-panes -a` を 1 回だけ起こす**（#1968）: 状態照会は
   `has_running_children` と claude / codex / agy の会話 ID 解決が**それぞれ** `ps` と
   `tmux list-panes -a` を起こしていた（報告 1 回で `ps` 3 本）。`agents::with_shared_scan` の

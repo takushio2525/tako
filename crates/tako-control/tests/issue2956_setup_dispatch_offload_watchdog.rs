@@ -1106,15 +1106,41 @@ fn 修正前の形を名指しできる() {
 /// tako-app の UI スレッドで回る着地（`(ファイル, 関数の頭)`。#2961）。呼び出しのグラフは tako-control /
 /// tako-core しか辿らないので、ここに挙げた関数の本文に外部プロセスの起動・待ち（#1984 の葉）と、版の読み
 /// （`extract_version_from_path(` = パスに版が無ければ `claude --version`）が直に書かれていないかを字面で見る。
-/// A/B の旧経路の腕（`if …legacy() {` の then 側）は除く
-const TAKO_APP_UI_LANDINGS: &[(&str, &str)] =
-    &[("crates/tako-app/src/main.rs", "fn apply_stale_binary_scan(")];
+/// A/B の旧経路の腕（`if …legacy() {` の then 側）は除く。
+/// #2976: リモートフォルダの自動復帰の見張り（定期の tick の積み込み `drive_remote_recovery` と、背景の
+/// 生死の判定の着地 `land_remote_liveness`）も挙げる
+const TAKO_APP_UI_LANDINGS: &[(&str, &str)] = &[
+    ("crates/tako-app/src/main.rs", "fn apply_stale_binary_scan("),
+    (
+        "crates/tako-app/src/ssh_folders.rs",
+        "fn drive_remote_recovery(",
+    ),
+    (
+        "crates/tako-app/src/ssh_folders.rs",
+        "fn land_remote_liveness(",
+    ),
+];
 
 /// tako-app の着地で名指す綴りのうち、#1984 の葉に無いもの（`(綴り, 理由)`）
-const TAKO_APP_EXTRA_LEAVES: &[(&str, &str)] = &[(
-    "extract_version_from_path(",
-    "claude の版を読む（パスにも版リソースにも版が無ければ `claude --version` を上限まで待つ。#2961）",
-)];
+const TAKO_APP_EXTRA_LEAVES: &[(&str, &str)] = &[
+    (
+        "extract_version_from_path(",
+        "claude の版を読む（パスにも版リソースにも版が無ければ `claude --version` を上限まで待つ。#2961）",
+    ),
+    (
+        "remote_fs::liveness(",
+        "接続の生死を判定する（unix は ssh の実体をログインシェルで引き、ソケットが在れば `ssh -O check` を\
+         上限 5 秒まで待つ。背景の段 `judge_remote_host` で呼ぶ。#2976）",
+    ),
+    (
+        "remote_fs::liveness_checked(",
+        "接続の生死を打ち切りの理由つきで判定する（`ssh -O check` を待つ。#2976）",
+    ),
+    (
+        "master_alive(",
+        "ControlMaster の生死を `ssh -O check` で確かめる（#2976）",
+    ),
+];
 
 /// `text`（テスト領域を潰した本文）の関数 `head` の中で、A/B の旧経路の腕の外に書かれた葉（`(行, 綴り, 理由)`）
 fn ui_landing_offenders(text: &str, head: &str) -> Option<Vec<(usize, String, String)>> {
@@ -1203,4 +1229,53 @@ fn tako_appの着地で版を読む修正前の形を名指しできる() {
         ui_landing_offenders(&text, "fn apply_stale_binary_scan("),
         Some(Vec::new())
     );
+}
+
+#[test]
+fn tako_appの自動復帰の見張りでsshの生死を待つ修正前の形を名指しできる() {
+    // #2976: 見張りの A/B の門を外す（定期の tick = UI スレッドで `remote_fs::liveness` を待つ修正前の形）
+    let file = "crates/tako-app/src/ssh_folders.rs";
+    let text = read(file);
+    // 字下げ込みで探す（門の doc が同じ綴りを例に挙げているので、コードの行だけに当てる）
+    let fixed = "        if crate::ssh_folders::issue2976_legacy() {\n";
+    assert_eq!(
+        text.matches(fixed).count(),
+        1,
+        "注入の元（A/B の門つきの生死の判定）が本文にちょうど 1 つ無い（形を変えたなら注入も追うこと）"
+    );
+    let injected = text.replacen(fixed, "        if true {\n", 1);
+    let found = ui_landing_offenders(&injected, "fn drive_remote_recovery(")
+        .expect("注入した本文にも関数がある");
+    assert!(
+        found.iter().any(|(_, n, _)| n == "remote_fs::liveness("),
+        "門を外した注入（UI スレッドで `ssh -O check` を待つ `remote_fs::liveness`）を名指ししない: {found:?}"
+    );
+    // 着地の本体へ生死の判定を直に書き足す形も名指す
+    let anchor =
+        "        let _s = tako_control::diag::perf_span(\"periodic_land:remote_liveness\");\n";
+    assert!(
+        text.contains(anchor),
+        "注入の位置（`land_remote_liveness` の頭）が本文に無い（形を変えたなら注入も追うこと）"
+    );
+    for call in [
+        "tako_core::remote_fs::liveness(host)",
+        "tako_core::remote_fs::liveness_checked(host)",
+        "tako_core::remote_fs::master_alive(host)",
+    ] {
+        let injected = text.replacen(anchor, &format!("{anchor}        let _ = {call};\n"), 1);
+        let found = ui_landing_offenders(&injected, "fn land_remote_liveness(")
+            .expect("注入した本文にも関数がある");
+        assert!(
+            !found.is_empty(),
+            "着地で生死を判定する注入（`{call}`）を名指ししない"
+        );
+    }
+    // 今の形は名指さない
+    for head in ["fn drive_remote_recovery(", "fn land_remote_liveness("] {
+        assert_eq!(
+            ui_landing_offenders(&text, head),
+            Some(Vec::new()),
+            "{file} {head}"
+        );
+    }
 }
