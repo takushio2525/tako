@@ -771,6 +771,41 @@ pub fn platform_modifier_active(modifiers: &Modifiers) -> bool {
     )
 }
 
+/// Web ビューのページがキー入力の宛先のあいだ、この打鍵をページへ渡すか tako が先取りするか
+/// （Issue #326 / #2948）。
+///
+/// 判定の表と規則は `tako_core::platform::keys::webview_key_route`（純粋関数・macOS の NSEvent の
+/// local monitor と Windows の WebView2 の AcceleratorKeyPressed が通る 1 実装）で、ここは
+/// 「いまの OS の tako のキーバインド表（[`key_bindings`] = GPUI へ実際に登録している表）に
+/// そのまま当たるか」を GPUI 自身の照合（`KeyBinding::match_keystrokes`）で求めて渡すだけの
+/// 薄い層。**分岐をここへ書かない**
+pub(crate) fn webview_key_route(ks: &Keystroke) -> tako_core::platform::keys::WebviewKeyRoute {
+    webview_key_route_in(Platform::current(), &key_bindings(), ks)
+}
+
+/// [`webview_key_route`] の本体（表を引数で受ける = macOS 上から Windows の表で検証できる。#1203）
+fn webview_key_route_in(
+    platform: Platform,
+    bindings: &[KeyBinding],
+    ks: &Keystroke,
+) -> tako_core::platform::keys::WebviewKeyRoute {
+    // 1 打鍵のバインドに丸ごと当たる（Some(false)）ものだけを tako の割り当てとして数える
+    let app_bound = bindings
+        .iter()
+        .any(|b| b.match_keystrokes(std::slice::from_ref(ks)) == Some(false));
+    tako_core::platform::keys::webview_key_route(
+        platform,
+        &ks.key,
+        tako_core::platform::keys::WebviewKeyMods {
+            platform_key: ks.modifiers.platform,
+            control: ks.modifiers.control,
+            alt: ks.modifiers.alt,
+            shift: ks.modifiers.shift,
+        },
+        app_bound,
+    )
+}
+
 /// アプリ内の入力欄のキー処理が「貼り付け」として受ける打鍵か（Issue #2844）。
 ///
 /// **入力欄の `"v"` の腕は全部ここを通す**（タスクの返答欄・git のブランチ名欄・設定窓の
@@ -2853,6 +2888,148 @@ mod tests {
                 "{platform:?}: バインド表は {label:?} と書くのに shift の案内は {:?}",
                 keys::shift(platform)
             );
+        }
+    }
+
+    // --- Web ビューのページが宛先のあいだの打鍵（#326 / #2948） ---
+
+    fn web_route(platform: Platform, spec: &str) -> tako_core::platform::keys::WebviewKeyRoute {
+        let ks = Keystroke::parse(spec).expect(spec);
+        webview_key_route_in(platform, &bindings_for(platform), &ks)
+    }
+
+    /// 受け入れ条件 1（Windows）: 実際のバインド表で、tako の割り当ては先取り、
+    /// ページの編集系と修飾なしの文字・割り当ての無い Ctrl の打鍵はページへ
+    #[test]
+    fn windowsのwebビューはtakoの割り当てだけを先取りする() {
+        use tako_core::platform::keys::WebviewKeyRoute::{App, Page};
+        let w = Platform::Windows;
+        for spec in [
+            "ctrl-shift-t",
+            "ctrl-shift-w",
+            "ctrl-shift-p",
+            "ctrl-shift-k",
+            "ctrl-shift-d",
+            "ctrl-shift-e",
+            "ctrl-tab",
+            "ctrl-shift-tab",
+            "ctrl-1",
+            "ctrl-9",
+            "alt-left",
+            "alt-shift-right",
+            "f11",
+            "ctrl-=",
+            "ctrl--",
+            "ctrl-0",
+            "ctrl-,",
+            "ctrl-shift-n",
+            "ctrl-shift-q",
+            "ctrl-shift-b",
+            "ctrl-shift-r",
+            "ctrl-shift-g",
+            "ctrl-alt-left",
+        ] {
+            assert_eq!(web_route(w, spec), App, "{spec} は tako が先取りする");
+        }
+        for spec in [
+            // ページの編集系（tako も割り当てているが、ページを見ているときはページのもの）
+            "ctrl-v",
+            "ctrl-shift-v",
+            "shift-insert",
+            "ctrl-shift-z",
+            "ctrl-shift-c",
+            "ctrl-shift-a",
+            // tako の割り当てに無い打鍵（奪うと端末へバイトで漏れる）
+            "ctrl-c",
+            "ctrl-a",
+            "ctrl-z",
+            "ctrl-y",
+            "ctrl-x",
+            "ctrl-p",
+            "ctrl-r",
+            "ctrl-left",
+            "ctrl-backspace",
+            "ctrl-enter",
+            "alt-f4",
+            // 修飾なし・shift だけの文字
+            "t",
+            "shift-t",
+            "escape",
+        ] {
+            assert_eq!(web_route(w, spec), Page, "{spec} はページへ渡す");
+        }
+    }
+
+    /// Windows の tako の割り当てのうち、ページに残す（先取りしない）のはこの 8 本だけ。
+    /// バインドを足して表の行に当たったら、ここで気づく（黙ってページへ流さない）。
+    /// 両 OS 共通の `cmd-` の行（Windows では Win キー = OS が先に奪い届かない。#585）は数えない
+    /// （[`shortcut_hint_for`] が案内に出さないのと同じ線引き）
+    #[test]
+    fn windowsのtakoの割り当てでページに残すのはページの編集系だけ() {
+        use tako_core::platform::keys::WebviewKeyRoute::Page;
+        let w = Platform::Windows;
+        let mut kept: Vec<String> = bindings_for(w)
+            .iter()
+            .filter(|b| b.keystrokes().len() == 1)
+            .map(|b| b.keystrokes()[0].inner().clone())
+            .filter(|ks| !ks.modifiers.platform)
+            .filter(|ks| webview_key_route_in(w, &bindings_for(w), ks) == Page)
+            .map(|ks| ks.unparse())
+            .collect();
+        kept.sort();
+        kept.dedup();
+        assert_eq!(
+            kept,
+            [
+                "ctrl-shift-a",
+                "ctrl-shift-c",
+                "ctrl-shift-f",
+                "ctrl-shift-s",
+                "ctrl-shift-v",
+                "ctrl-shift-z",
+                "ctrl-v",
+                "shift-insert",
+            ]
+        );
+    }
+
+    /// 受け入れ条件 2（macOS は #326 の答えのまま）: ⌘ + 表に無いキーは tako（割り当ての
+    /// 有無を問わない）、表のキーは ⇧ が付いてもページ、⌘ なしはページ
+    #[test]
+    fn macosのwebビューは326の答えのまま() {
+        use tako_core::platform::keys::WebviewKeyRoute::{App, Page};
+        let m = Platform::MacOs;
+        for spec in [
+            "cmd-k",
+            "cmd-t",
+            "cmd-w",
+            "cmd-d",
+            "cmd-1",
+            "cmd-=",
+            "cmd-alt-left",
+            "cmd-left",
+            "cmd-y",
+        ] {
+            assert_eq!(web_route(m, spec), App, "{spec}");
+        }
+        for spec in [
+            "cmd-c",
+            "cmd-v",
+            "cmd-a",
+            "cmd-z",
+            "cmd-shift-z",
+            "cmd-shift-f",
+            "cmd-f",
+            "cmd-l",
+            "cmd-p",
+            "cmd-r",
+            "cmd-s",
+            "cmd-x",
+            "k",
+            "ctrl-c",
+            "ctrl--",
+        ] {
+            assert_eq!(web_route(m, spec), Page, "{spec}");
         }
     }
 }

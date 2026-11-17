@@ -625,6 +625,18 @@ impl WebViewEntry {
             .map_err(|e| create_failure_reason(&e.to_string(), shared))?;
         // #2445: 要素の全画面表示は切る（理由は `element_fullscreen_enabled`）
         apply_element_fullscreen(&view);
+        // #2948: 親が Win32 の窓なら、ページが宛先のあいだ tako の割り当てに当たる打鍵を
+        // WebView2 の AcceleratorKeyPressed で先取りする（macOS は #326 の NSEvent の local monitor
+        // = `key_monitor` が受け持つ）。付けられなくても Web ビューは開く（ページへ流れるだけ）
+        if window.win32_hwnd().is_some()
+            && !legacy_2948()
+            && !crate::platform::webview_host::watch_app_shortcuts(&view, steal_app_shortcut)
+        {
+            crate::persist_diag(
+                "Web ビューの打鍵の先取り（#2948）を付けられなかった: ページが宛先のあいだ \
+                 tako のショートカットはページへ流れる（ターミナルをクリックすれば戻る）",
+            );
+        }
         Ok(view)
     }
 
@@ -1170,26 +1182,13 @@ mod key_monitor {
         HAS_WEBVIEW.store(v, Ordering::Relaxed);
     }
 
-    const NS_COMMAND_KEY_MASK: u64 = 1 << 20;
+    const NS_COMMAND_KEY_MASK: u64 = crate::platform::webview_host::NS_COMMAND_KEY_MASK;
 
-    /// webview で処理させるキー（⌘C/⌘V 等）の virtual key code 集合。
-    /// これに含まれるキーは first responder を切り替えず webview にそのまま渡す
-    const WEBVIEW_PASSTHROUGH_KEYS: &[u16] = &[
-        0x00, // A  (⌘A select all)
-        0x08, // C  (⌘C copy)
-        0x03, // F  (⌘F find)
-        0x25, // L  (⌘L address bar)
-        0x23, // P  (⌘P print)
-        0x0F, // R  (⌘R reload)
-        0x01, // S  (⌘S save)
-        0x09, // V  (⌘V paste)
-        0x07, // X  (⌘X cut)
-        0x06, // Z  (⌘Z undo / ⌘Shift+Z redo)
-    ];
-
-    /// NSEvent の virtual key code が webview 用かどうか
-    fn is_webview_key(key_code: u16, _flags: u64) -> bool {
-        WEBVIEW_PASSTHROUGH_KEYS.contains(&key_code)
+    /// 打鍵（NSEvent の virtual key code と修飾）をページへ渡すか（#326 / #2948）。
+    /// 判定は Windows の AcceleratorKeyPressed と同じ 1 実装（`keybindings::webview_key_route` と
+    /// 同じ `tako_core::platform::keys::webview_key_route`。表は `WEBVIEW_PAGE_KEYS`）
+    fn routes_to_page(key_code: u16, flags: u64) -> bool {
+        crate::platform::webview_host::macos_key_routes_to_page(key_code, flags)
     }
 
     // ── キー入力の宛先（first responder）を読む・戻す 1 実装（#326 / #1481） ──
@@ -1458,7 +1457,7 @@ mod key_monitor {
             std::mem::transmute(objc_msgSend as *const c_void);
         let key_code = f_kc(event, kc_sel);
 
-        if is_webview_key(key_code, flags) {
+        if routes_to_page(key_code, flags) {
             return event;
         }
         // NSApp.keyWindow
@@ -1594,6 +1593,43 @@ pub fn return_key_focus_to_app(handle: &WindowHandleBox) -> bool {
 /// クリックしても打鍵がページへ流れ続ける
 fn legacy_2430() -> bool {
     std::env::var_os("TAKO_2430_LEGACY").is_some_and(|v| !v.is_empty())
+}
+
+/// #2948 の修正前へ戻す（`TAKO_2948_LEGACY=1`。Windows の実機の A/B 用）。
+/// 1 の間は Web ビューを作るときに打鍵の先取り（WebView2 の AcceleratorKeyPressed）を付けない =
+/// ページが宛先のあいだ Ctrl+Shift+T などの tako のショートカットがページに飲まれる
+fn legacy_2948() -> bool {
+    std::env::var_os("TAKO_2948_LEGACY").is_some_and(|v| !v.is_empty())
+}
+
+/// ページが先取りした tako の打鍵の送り先（#2948）。WebView2 のコールバック（UI スレッド・
+/// gpui の App に触れない）から gpui の前景タスク（`main.rs` の `spawn_webview_shortcut_relay`）へ渡す。
+/// 前景タスクが宛先を tako へ戻し（#1481 の 1 実装）、同じ打鍵を `dispatch_keystroke` で配る
+static APP_SHORTCUT_SINK: Mutex<Option<futures::channel::mpsc::UnboundedSender<gpui::Keystroke>>> =
+    Mutex::new(None);
+
+/// 先取りした打鍵を受ける前景タスクの口を差し替える（#2948。tako の本体を作るたびに 1 回）
+pub fn set_app_shortcut_sink(tx: futures::channel::mpsc::UnboundedSender<gpui::Keystroke>) {
+    if let Ok(mut sink) = APP_SHORTCUT_SINK.lock() {
+        *sink = Some(tx);
+    }
+}
+
+/// ページが宛先のあいだに押された打鍵を tako が先取りするか（#2948。WebView2 のコールバックから
+/// 呼ばれる）。判定は macOS の #326 と同じ 1 実装（`keybindings::webview_key_route`）。
+/// 先取りするなら前景タスクへ渡して true（= ページへ渡さない）。渡せなければ false（ページへ流す =
+/// 修正前と同じ。打鍵をどこにも届けないことはしない）
+fn steal_app_shortcut(keystroke: gpui::Keystroke) -> bool {
+    if crate::keybindings::webview_key_route(&keystroke)
+        != tako_core::platform::keys::WebviewKeyRoute::App
+    {
+        return false;
+    }
+    let Ok(sink) = APP_SHORTCUT_SINK.lock() else {
+        return false;
+    };
+    sink.as_ref()
+        .is_some_and(|tx| tx.unbounded_send(keystroke).is_ok())
 }
 
 /// ナビゲーションのタイムアウト秒数。

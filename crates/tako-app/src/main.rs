@@ -6513,6 +6513,10 @@ impl TakoApp {
         if webview::async_build_enabled() {
             app.webview_build_wake = Some(Self::spawn_webview_builder(cx));
         }
+        // #2948: Web ビューのページが先取りした tako の打鍵を配る常駐タスク（Windows の
+        // WebView2 の AcceleratorKeyPressed から届く。macOS は #326 の monitor が AppKit の
+        // イベントをそのまま gpui へ通すので、このタスクには何も届かない）
+        Self::spawn_webview_shortcut_relay(cx);
 
         // IPC リクエストを UI スレッドで dispatch するループ。
         // 操作セマンティクスは tako-control::dispatch に一元化されている（設計原則 5）
@@ -24194,6 +24198,41 @@ impl TakoApp {
         })
         .detach();
         wake_tx
+    }
+
+    /// Web ビューのページが先取りした tako の打鍵を配る常駐タスク（#2948）。
+    ///
+    /// Windows の WebView2 は、ページがキー入力の宛先のあいだの打鍵を `AcceleratorKeyPressed` で
+    /// tako へ見せる。そこで tako の割り当てに当たると判定した打鍵（判定は macOS の #326 と同じ
+    /// 1 実装 `keybindings::webview_key_route`）はページへ渡さず（`Handled`）、ここへ届く。
+    /// macOS の #326 が「宛先を gpui の描画ビューへ戻し、同じイベントを gpui へ通す」のと同じく、
+    /// ①宛先を tako へ戻す（#1481 の 1 実装 `return_webview_key_focus`。tako のショートカットを
+    /// 押した = ページを離れる操作なので、フォーカスペインが可視の Web ビューでも戻す = `force`）
+    /// ②同じ打鍵を Web ビューの親の窓へ `dispatch_keystroke` で配る（GPUI のキーバインド判定 →
+    /// アクション。Ctrl+Shift+T なら新しいタブ）。
+    ///
+    /// どちらも WebView2 のコールバックの**外**（この前景タスク）で行う: コールバックの中で
+    /// `SetFocus` を呼ぶと、答えを待って打鍵を止めている WebView2 の窓への同期送信になる
+    fn spawn_webview_shortcut_relay(cx: &mut Context<Self>) {
+        let (tx, mut rx) = unbounded::<Keystroke>();
+        webview::set_app_shortcut_sink(tx);
+        cx.spawn(async move |this, cx| {
+            while let Some(keystroke) = rx.next().await {
+                let Ok(owner) = this.update(cx, |app, _| {
+                    app.return_webview_key_focus(true);
+                    app.window_raw_handle.as_ref().map(|h| h.owner())
+                }) else {
+                    return;
+                };
+                let Some(owner) = owner else {
+                    continue;
+                };
+                let _ = owner.update(cx, |_, window, cx| {
+                    window.dispatch_keystroke(keystroke, cx);
+                });
+            }
+        })
+        .detach();
     }
 
     /// 生成待ちがあれば生成タスクを起こす（#724。生成タスクが無い = 同期で生成する環境では何もしない）
