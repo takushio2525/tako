@@ -102,6 +102,10 @@ toml = { version = "1.1", default-features = false, features = ["std", "parse", 
 # Web ビューペイン（FR-3.8）: OS ネイティブ webview（macOS = WKWebView / Windows = WebView2）を
 # GPUI ウィンドウの子ビューとして統合する。Apache-2.0 OR MIT。追加ランタイム同梱不要（NFR-3/7）
 wry = { version = "0.57.1", default-features = false, features = ["os-webview"] }
+# WebView2 の COM の型と event handler（#2948。wry 0.57.1 が公開していない `AcceleratorKeyPressed` を
+# `WebViewExtWindows::controller()` から直に付ける）。**wry 0.57.1 が引いている版そのもの**なので
+# 依存の木は増えない（版が wry とずれると controller の型が一致せず Windows のビルドが落ちて気づく）
+webview2-com = "0.39.1"
 # GPUI ウィンドウから wry へ渡す親ウィンドウハンドル（gpui と同じ 0.6 系）
 raw-window-handle = "0.6"
 # リモート接続の WS 画面プッシュ（tako-control::remote）

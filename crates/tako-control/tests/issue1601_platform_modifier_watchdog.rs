@@ -498,6 +498,13 @@ const KNOWN_PLATFORM_READS: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "crates/tako-app/src/keybindings.rs",
+        "webview_key_route_in",
+        1,
+        "薄い層: GPUI の Keystroke を正本 keys::webview_key_route の引数へ落とすだけ（主修飾の選び分けは \
+         正本が keys::platform_modifier_active で行う。#2948）",
+    ),
+    (
+        "crates/tako-app/src/keybindings.rs",
         "shortcut_hint_for",
         1,
         "バインド表（張る側の定義）の読み取り: Windows で Win キーのバインドを案内に出さない",

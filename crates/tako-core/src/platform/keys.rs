@@ -535,6 +535,168 @@ pub fn tree_clip_hint(platform: Platform, key: TreeClipKey) -> String {
     }
 }
 
+// --- Web ビューのページが宛先のあいだの打鍵の行き先（Issue #326 / #2948） ---------------
+
+/// Web ビューのページがキー入力の宛先のあいだ、ページに残す打鍵の押し方
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebviewPageChord {
+    /// 主修飾（macOS = ⌘ / Windows = Ctrl）+ キー。⇧ を足した形もページの操作
+    /// （⌘⇧Z / Ctrl+Shift+Z = やり直し、Ctrl+Shift+V = 書式なしで貼り付け など）
+    PrimaryWithShift,
+    /// 主修飾 + キー。**Windows の ⇧ 付きは tako の段**（#585 で tako の割り当てを
+    /// Ctrl+Shift の段へ逃がしたので、Ctrl+Shift+P = コマンドパレットはページへ渡さない）。
+    /// macOS は #326 の答えのまま ⇧ を問わない
+    Primary,
+    /// ⇧ + キー（主修飾・alt なし。Windows の CUA の貼り付け Shift+Insert）
+    ShiftOnly,
+}
+
+/// Web ビューのページに残す打鍵の 1 行
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebviewPageKey {
+    /// gpui のキー名（英字は小文字）
+    pub key: &'static str,
+    pub chord: WebviewPageChord,
+    /// ページ側の操作（表を読む人と単体テストのため）
+    pub what: &'static str,
+}
+
+/// Web ビューのページがキー入力の宛先のあいだ、**tako の割り当てに当たっても**ページに残す
+/// 打鍵の表（Issue #326 / #2948）。**macOS と Windows が引く 1 つの表**（OS ごとに 2 つ持たない）。
+///
+/// 英字の 10 行は #326 の表（macOS の NSEvent の local monitor が virtual key code で
+/// 持っていた `WEBVIEW_PASSTHROUGH_KEYS`）をキー名へ移したもので、行も意味も変えていない。
+/// 判定は [`webview_key_route`] の 1 実装が行う
+pub const WEBVIEW_PAGE_KEYS: [WebviewPageKey; 11] = {
+    use WebviewPageChord::{Primary, PrimaryWithShift, ShiftOnly};
+    [
+        WebviewPageKey {
+            key: "a",
+            chord: PrimaryWithShift,
+            what: "全選択",
+        },
+        WebviewPageKey {
+            key: "c",
+            chord: PrimaryWithShift,
+            what: "コピー",
+        },
+        WebviewPageKey {
+            key: "f",
+            chord: PrimaryWithShift,
+            what: "ページ内の検索",
+        },
+        WebviewPageKey {
+            key: "l",
+            chord: PrimaryWithShift,
+            what: "アドレスバー",
+        },
+        WebviewPageKey {
+            key: "p",
+            chord: Primary,
+            what: "印刷",
+        },
+        WebviewPageKey {
+            key: "r",
+            chord: Primary,
+            what: "再読み込み",
+        },
+        WebviewPageKey {
+            key: "s",
+            chord: PrimaryWithShift,
+            what: "保存",
+        },
+        WebviewPageKey {
+            key: "v",
+            chord: PrimaryWithShift,
+            what: "貼り付け",
+        },
+        WebviewPageKey {
+            key: "x",
+            chord: PrimaryWithShift,
+            what: "切り取り",
+        },
+        WebviewPageKey {
+            key: "z",
+            chord: PrimaryWithShift,
+            what: "取り消し / やり直し",
+        },
+        WebviewPageKey {
+            key: "insert",
+            chord: ShiftOnly,
+            what: "貼り付け（Shift+Insert）",
+        },
+    ]
+};
+
+/// 打鍵の修飾（gpui の `Modifiers` の写し。GPUI に依存しない形で受ける）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WebviewKeyMods {
+    /// macOS = ⌘ / Windows = Win キー（gpui の `Modifiers::platform`）
+    pub platform_key: bool,
+    pub control: bool,
+    pub alt: bool,
+    pub shift: bool,
+}
+
+/// Web ビューのページが宛先のあいだの打鍵の行き先
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebviewKeyRoute {
+    /// ページへそのまま渡す
+    Page,
+    /// tako が先取りする（宛先を tako へ戻し、同じ打鍵を tako のキーバインドへ配る）
+    App,
+}
+
+/// 打鍵が [`WEBVIEW_PAGE_KEYS`] のどの行に当たるか（当たらなければ None）
+pub fn webview_page_key(
+    platform: Platform,
+    key: &str,
+    mods: WebviewKeyMods,
+) -> Option<&'static WebviewPageKey> {
+    let primary = platform_modifier_active(platform, mods.platform_key, mods.control);
+    WEBVIEW_PAGE_KEYS.iter().find(|row| {
+        row.key == key
+            && match row.chord {
+                WebviewPageChord::PrimaryWithShift => primary,
+                WebviewPageChord::Primary => {
+                    primary && (platform == Platform::MacOs || !mods.shift)
+                }
+                WebviewPageChord::ShiftOnly => mods.shift && !primary && !mods.alt,
+            }
+    })
+}
+
+/// Web ビューのページがキー入力の宛先のあいだ、打鍵をページへ渡すか tako が先取りするか
+/// （Issue #326 / #2948）。**macOS の NSEvent の local monitor と Windows の WebView2 の
+/// AcceleratorKeyPressed が通る 1 実装**。
+///
+/// `key` は gpui のキー名（英字は小文字）、`app_bound` は打鍵がいまの OS の tako の
+/// キーバインド表（`keybindings::key_bindings()`）のどれかにそのまま当たるか。
+///
+/// - **macOS（#326 の答えのまま）**: ⌘ が立っていて [`WEBVIEW_PAGE_KEYS`] に当たらなければ
+///   tako。`app_bound` は問わない — ⌘ の付く打鍵は PTY へ 1 バイトも送らないので、割り当ての
+///   無い ⌘ を gpui へ回しても端末へは漏れない（gpui が捨てるだけ）
+/// - **Windows**: tako の割り当てに当たり、かつ表に当たらないときだけ tako。割り当ての無い
+///   Ctrl / Alt の打鍵（Ctrl+← / Ctrl+Backspace / Ctrl+Y / Ctrl+B …）はページの編集の打鍵で、
+///   gpui へ回すと端末へバイトで送られる（ページで打った単語削除がターミナルの行を消す）ので
+///   奪わない。主修飾は [`platform_modifier_active`]（Windows = Ctrl。Win キーは数えない）
+pub fn webview_key_route(
+    platform: Platform,
+    key: &str,
+    mods: WebviewKeyMods,
+    app_bound: bool,
+) -> WebviewKeyRoute {
+    let candidate = match platform {
+        Platform::MacOs => platform_modifier_active(platform, mods.platform_key, mods.control),
+        Platform::Windows => app_bound,
+    };
+    if candidate && webview_page_key(platform, key, mods).is_none() {
+        WebviewKeyRoute::App
+    } else {
+        WebviewKeyRoute::Page
+    }
+}
+
 /// 修飾キーの表記。日本語 UI は記号（`⌘`）、英語 UI は語（`Cmd`）を使う
 /// （既存の文言がそう書き分けているので、macOS 側の見た目を 1 文字も変えない）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -995,5 +1157,143 @@ mod tests {
         let m = platform_modifier(Platform::Windows);
         assert_eq!(m.symbol, "Ctrl");
         assert_eq!(m.word, "Ctrl");
+    }
+
+    // --- Web ビューの打鍵の行き先（#326 / #2948） ---
+
+    fn mods(spec: &str) -> WebviewKeyMods {
+        WebviewKeyMods {
+            platform_key: spec.contains("cmd") || spec.contains("win"),
+            control: spec.contains("ctrl"),
+            alt: spec.contains("alt"),
+            shift: spec.contains("shift"),
+        }
+    }
+
+    fn route(platform: Platform, key: &str, spec: &str, bound: bool) -> WebviewKeyRoute {
+        webview_key_route(platform, key, mods(spec), bound)
+    }
+
+    /// 表は #326 の 10 文字（A/C/F/L/P/R/S/V/X/Z）+ Windows の Shift+Insert。行が増減したら
+    /// macOS の振る舞いが変わるので、意図して変えるときはここも直す
+    #[test]
+    fn ページに残す表は326の10文字とshift_insert() {
+        let keys: Vec<&str> = WEBVIEW_PAGE_KEYS.iter().map(|r| r.key).collect();
+        assert_eq!(
+            keys,
+            ["a", "c", "f", "l", "p", "r", "s", "v", "x", "z", "insert"]
+        );
+        for row in WEBVIEW_PAGE_KEYS {
+            assert!(!row.what.is_empty(), "{} の操作名が空", row.key);
+        }
+    }
+
+    /// Windows: tako の割り当て（Ctrl+Shift+T ほか）は先取り、ページの編集系
+    /// （Ctrl+C / V / A / Z ほか）と修飾なしの文字は通す（受け入れ条件 1）
+    #[test]
+    fn windowsはtakoの割り当てだけを先取りし編集系と文字は通す() {
+        use WebviewKeyRoute::{App, Page};
+        let w = Platform::Windows;
+        // tako の割り当て（bound = true）で表に当たらないもの → 先取り
+        for (key, spec) in [
+            ("t", "ctrl-shift"),  // 新しいタブ
+            ("w", "ctrl-shift"),  // ペインを閉じる
+            ("p", "ctrl-shift"),  // コマンドパレット（表の p は ⇧ なしの印刷だけ）
+            ("r", "ctrl-shift"),  // リポジトリを開く（⇧ なしの再読み込みはページ）
+            ("k", "ctrl-shift"),  // コマンドパレット
+            ("d", "ctrl-shift"),  // 分割
+            ("tab", "ctrl"),      // 次のタブ
+            ("1", "ctrl"),        // タブ 1
+            ("left", "alt"),      // ペイン間の移動
+            ("f11", ""),          // 全画面
+            ("=", "ctrl"),        // 拡大
+            ("left", "ctrl-alt"), // ジャンプ履歴を戻る
+        ] {
+            assert_eq!(route(w, key, spec, true), App, "{spec}-{key}");
+        }
+        // tako の割り当てでもページの編集系 → 通す
+        for (key, spec) in [
+            ("v", "ctrl"),       // 貼り付け（tako も Ctrl+V に貼り付けを張っている）
+            ("v", "ctrl-shift"), // 書式なしで貼り付け
+            ("z", "ctrl-shift"), // やり直し
+            ("a", "ctrl-shift"),
+            ("c", "ctrl-shift"),
+            ("f", "ctrl-shift"),
+            ("s", "ctrl-shift"),
+            ("insert", "shift"), // CUA の貼り付け
+        ] {
+            assert_eq!(route(w, key, spec, true), Page, "{spec}-{key}");
+        }
+        // tako の割り当てに無いもの → 修飾があっても通す（奪うと端末へバイトで漏れる）
+        for (key, spec) in [
+            ("c", "ctrl"),
+            ("a", "ctrl"),
+            ("z", "ctrl"),
+            ("y", "ctrl"),
+            ("x", "ctrl"),
+            ("p", "ctrl"),
+            ("r", "ctrl"),
+            ("left", "ctrl"),
+            ("backspace", "ctrl"),
+            ("b", "ctrl"),
+            ("t", ""),
+            ("t", "shift"),
+            ("f4", "alt"),
+            ("escape", ""),
+        ] {
+            assert_eq!(route(w, key, spec, false), Page, "{spec}-{key}");
+        }
+    }
+
+    /// Windows の主修飾は Ctrl。Win キーだけで表の文字を押しても表の行には当たらない
+    /// （Win+V は OS のクリップボード履歴。#1601 / #2844 と同じ決まり）
+    #[test]
+    fn windowsの表の主修飾はctrlでwinキーは数えない() {
+        let w = Platform::Windows;
+        assert!(webview_page_key(w, "v", mods("ctrl")).is_some());
+        assert!(webview_page_key(w, "v", mods("win")).is_none());
+        // Shift+Insert は主修飾・alt が混ざると表の行ではない
+        assert!(webview_page_key(w, "insert", mods("shift")).is_some());
+        assert!(webview_page_key(w, "insert", mods("ctrl-shift")).is_none());
+        assert!(webview_page_key(w, "insert", mods("alt-shift")).is_none());
+        assert!(webview_page_key(w, "insert", mods("")).is_none());
+    }
+
+    /// macOS は #326 の答えのまま: ⌘ + 表に無いキーは tako、表のキーは ⇧ / ⌥ / ⌃ が
+    /// 混ざってもページ、⌘ なしはページ。tako の割り当てかどうかは問わない
+    #[test]
+    fn macosは326の答えのまま() {
+        use WebviewKeyRoute::{App, Page};
+        let m = Platform::MacOs;
+        for bound in [false, true] {
+            for (key, spec) in [
+                ("k", "cmd"),
+                ("t", "cmd"),
+                ("left", "cmd"),
+                ("left", "cmd-alt"),
+                ("1", "cmd"),
+                ("y", "cmd"),
+                ("b", "cmd"),
+            ] {
+                assert_eq!(route(m, key, spec, bound), App, "{spec}-{key}");
+            }
+            for row in &WEBVIEW_PAGE_KEYS[..10] {
+                for spec in [
+                    "cmd",
+                    "cmd-shift",
+                    "cmd-alt",
+                    "cmd-ctrl",
+                    "cmd-ctrl-alt-shift",
+                ] {
+                    assert_eq!(route(m, row.key, spec, bound), Page, "{spec}-{}", row.key);
+                }
+            }
+            for (key, spec) in [("k", ""), ("t", "ctrl"), ("v", "ctrl"), ("left", "alt")] {
+                assert_eq!(route(m, key, spec, bound), Page, "{spec}-{key}");
+            }
+        }
+        // ⌘⇧P / ⌘⇧R も #326 のときのままページ（Windows だけ ⇧ 付きを tako の段にした）
+        assert_eq!(route(m, "p", "cmd-shift", true), Page);
+        assert_eq!(route(m, "r", "cmd-shift", true), Page);
     }
 }
