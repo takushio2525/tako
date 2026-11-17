@@ -8,7 +8,7 @@
 #      修正前（`TAKO_2961_LEGACY=1`）は `tako list` が要求の終わりまで待たされ、perf.log に専有が出る。
 #      返る偽物では修正前後で MCP の応答の本文が同じ
 #   対象の要求は組ごと（SUITE）: setup（SetupMcp / SetupRun / ConfigShare）・remote（RemoteSetup /
-#   RemoteScrollback / OpenRemote）
+#   RemoteScrollback / OpenRemote）・folder（RemoteFolder の open / ls / list / pending / open-file / close）
 #
 # **本物の claude / codex / agy / tako setup / git は起こさない**: 偽の claude は `cc` で作り、codex / agy は
 # シェルの偽物。`tako setup` の子は検証プロセスでだけ読む注入 `TAKO_2961_INJECT_SETUP_BIN` で偽物を指す
@@ -20,7 +20,7 @@
 # （一時 HOME・偽物だけが居る PATH・ログインシェルにしない SHELL = #2956 のスクリプトと同じ作り）で動かす。
 # 落とすのは自分で起こした pid だけ。窓は常設の仮想ディスプレイ（tako-vd）へ出る。
 #
-# 選んで回す: ONLY=gui|legacy（既定は両方）・SUITE=setup|remote（既定は両方）。
+# 選んで回す: ONLY=gui|legacy（既定は両方）・SUITE=setup|remote|folder（既定は全部）。
 # CI には登録しない（GUI と cc が要る）。CI 側の担保は単体テスト（dispatch.rs の `issue2961_*`）と番犬
 # （`crates/tako-control/tests/issue2956_setup_dispatch_offload_watchdog.rs` の `TARGETS`）。
 #
@@ -203,11 +203,48 @@ case "$1" in
 esac
 exit 0
 SH
-# 偽の ssh（SSH ペインが起こす。どこへも繋がない）
+# 偽の ssh。ControlMaster の `-O check` / `-O exit` と張る形（`-N -f`）には ControlPath のファイルで答え、
+# それ以外（SSH ペイン）はどこへも繋がずに終わる。止まる印があればその形で止まる
 cat > "$TMP/stubs/ssh" <<'SH'
 #!/bin/sh
+cp=""; op=""; master=0; prev=""
+for a in "$@"; do
+  case "$a" in
+    ControlPath=*) cp="${a#ControlPath=}"; cp="${cp#\"}"; cp="${cp%\"}" ;;
+    -N) master=1 ;;
+  esac
+  [ "$prev" = "-O" ] && op="$a"
+  prev="$a"
+done
+hang() { : > "$FAKE_DIR/pids/$$"; exec /bin/sleep 600; }
+case "$op" in
+  check) [ -e "$FAKE_DIR/hang-ssh-check" ] && hang; [ -n "$cp" ] && [ -e "$cp" ] && exit 0; exit 255 ;;
+  exit) [ -e "$FAKE_DIR/hang-ssh-exit" ] && hang; [ -n "$cp" ] && rm -f "$cp"; exit 0 ;;
+esac
+if [ "$master" = 1 ]; then
+  [ -e "$FAKE_DIR/hang-ssh-master" ] && hang
+  [ -n "$cp" ] && : > "$cp"
+  exit 0
+fi
 echo "fake ssh (#2961): $*"
 exit 255
+SH
+# 偽の sftp（バッチの `pwd` と `ls -la` に決まった形で答える。どこへも繋がない）
+cat > "$TMP/stubs/sftp" <<'SH'
+#!/bin/sh
+[ -e "$FAKE_DIR/hang-sftp" ] && { : > "$FAKE_DIR/pids/$$"; exec /bin/sleep 600; }
+while IFS= read -r line; do
+  echo "sftp> $line"
+  case "$line" in
+    pwd) echo "Remote working directory: /home/fake2961" ;;
+    "ls -la"*)
+      echo 'drwxr-xr-x    3 fake     staff          96 Nov 17 10:00 .'
+      echo 'drwxr-xr-x    3 fake     staff          96 Nov 17 10:00 ..'
+      echo '-rw-r--r--    1 fake     staff          12 Nov 17 10:00 hello.txt'
+      echo 'drwxr-xr-x    2 fake     staff          64 Nov 17 10:00 sub' ;;
+  esac
+done
+exit 0
 SH
 # 器の tmux の包み（本物へ渡す。スクロールバックの採取 `-S -4321` だけ止まる）
 cat > "$TMP/stubs/tmux-wrap" <<SH
@@ -225,12 +262,13 @@ case "\$*" in
   *"command -v ssh"*)
     if [ -e "\$FAKE_DIR/hang-shell" ]; then : > "\$FAKE_DIR/pids/\$\$"; exec /bin/sleep 600; fi
     echo "$TMP/stubs/ssh"; exit 0 ;;
+  *"command -v sftp"*) echo "$TMP/stubs/sftp"; exit 0 ;;
 esac
 exec /bin/sh "\$@"
 SH
 # 実行権は空打ちの補助が付ける（素の chmod にしない = #2222 / #2228）
 fake_exec_warm "$TMP/stubs/codex" "$TMP/stubs/agy" "$TMP/stubs/fake-tako" "$TMP/stubs/fake-git" \
-  "$TMP/stubs/tailscale" "$TMP/stubs/ssh" "$TMP/stubs/tmux-wrap" "$TMP/stubs/isosh" || exit 1
+  "$TMP/stubs/tailscale" "$TMP/stubs/ssh" "$TMP/stubs/sftp" "$TMP/stubs/tmux-wrap" "$TMP/stubs/isosh" || exit 1
 SANDBOX_PATH="$HOME_DIR/.local/bin:$TMP/stubs:/usr/bin:/bin:/usr/sbin:/sbin"
 # 砂場の env（GUI と CLI で同じ）
 sandbox_env() {
@@ -518,6 +556,57 @@ hanging_remote_calls() {
   check_eq "$phase: 返らないログインシェル: 上限で MCP が返る（ペインは素の ssh で立つ）" "0" "$MCP_HUNG"
 }
 
+# folder 系: 返る偽物で 1 回ずつ答えさせる（A/B の突き合わせ用）。最後にフォルダを開き直して残す（止まる段で使う）
+FOLDER_HOST="fakehost2961"
+returning_folder_calls() {
+  local phase="$1"
+  set_flags
+  mcp_call tako_remote_folder "{\"action\":\"open\",\"host\":\"$FOLDER_HOST\",\"path\":\"/home/fake2961\",\"focus\":false}" "$phase-fopen" 60
+  check_eq "$phase: 返る ssh / sftp: MCP の remote folder（open）が返る" "0" "$MCP_HUNG"
+  mcp_call tako_remote_folder "{\"action\":\"ls\",\"host\":\"$FOLDER_HOST\"}" "$phase-fls" 60
+  mcp_call tako_remote_folder '{"action":"list"}' "$phase-flist" 60
+  mcp_call tako_remote_folder '{"action":"pending"}' "$phase-fpending" 60
+  mcp_call tako_remote_folder "{\"action\":\"open-file\",\"host\":\"$FOLDER_HOST\",\"path\":\"/home/fake2961/hello.txt\"}" "$phase-ffile" 60
+  mcp_call tako_remote_folder "{\"action\":\"close\",\"host\":\"$FOLDER_HOST\"}" "$phase-fclose" 60
+  check_eq "$phase: 返る ssh: MCP の remote folder（close）が返る" "0" "$MCP_HUNG"
+  # 止まる段のために開き直す（突き合わせない）
+  mcp_call tako_remote_folder "{\"action\":\"open\",\"host\":\"$FOLDER_HOST\",\"path\":\"/home/fake2961\",\"terminal\":false,\"focus\":false}" "$phase-freopen" 60
+}
+
+# folder 系: 返らない偽物の 4 本（期待 = fast / blocked）。sftp と `ssh -O` は上限なしなので偽物を落として返す
+hanging_folder_calls() {
+  local phase="$1" expect="$2" limit="$3"
+  set_flags hang-sftp
+  mcp_start tako_remote_folder "{\"action\":\"ls\",\"host\":\"$FOLDER_HOST\"}" "$phase-fls-hang"
+  list_during "${phase}・返らない sftp（remote folder ls）" "$expect" "$limit"
+  kill_fakes
+  mcp_wait 30
+  check_eq "$phase: 返らない sftp（ls）: 偽物を落とすと MCP が返る" "0" "$MCP_HUNG"
+
+  set_flags hang-sftp
+  mcp_start tako_remote_folder "{\"action\":\"open-file\",\"host\":\"$FOLDER_HOST\",\"path\":\"/home/fake2961/hello.txt\"}" "$phase-ffile-hang"
+  list_during "${phase}・返らない sftp（remote folder open-file）" "$expect" "$limit"
+  kill_fakes
+  mcp_wait 30
+  check_eq "$phase: 返らない sftp（open-file）: 偽物を落とすと MCP が返る" "0" "$MCP_HUNG"
+
+  set_flags hang-ssh-check
+  mcp_start tako_remote_folder '{"action":"list"}' "$phase-flist-hang"
+  list_during "${phase}・返らない ssh -O check（remote folder list）" "$expect" "$limit"
+  kill_fakes
+  mcp_wait 30
+  check_eq "$phase: 返らない ssh -O check（list）: 偽物を落とすと MCP が返る" "0" "$MCP_HUNG"
+
+  set_flags hang-ssh-exit
+  mcp_start tako_remote_folder "{\"action\":\"close\",\"host\":\"$FOLDER_HOST\"}" "$phase-fclose-hang"
+  list_during "${phase}・返らない ssh -O exit（remote folder close）" "$expect" "$limit"
+  kill_fakes
+  mcp_wait 30
+  check_eq "$phase: 返らない ssh -O exit（close）: 偽物を落とすと MCP が返る" "0" "$MCP_HUNG"
+  check_eq "$phase: close の応答（外したフォルダ）" "[\"$FOLDER_HOST:/home/fake2961\"]" \
+    "$(jf closed < "$TMP/out/$phase-fclose-hang.out")"
+}
+
 report_holds() {
   local phase="$1" want_hold="$2" kind ms kinds="${3:-SetupMcp SetupRun ConfigShare}"
   for kind in $kinds; do
@@ -531,7 +620,7 @@ report_holds() {
       fail "$phase: A/B: dispatch:$kind の専有が出ない（${ms}ms）"
     fi
   done
-  grep -h "メインスレッド専有: dispatch:\(SetupMcp\|SetupRun\|ConfigShare\|RemoteSetup\|RemoteScrollback\|OpenRemote\)" \
+  grep -h "メインスレッド専有: dispatch:\(SetupMcp\|SetupRun\|ConfigShare\|RemoteSetup\|RemoteScrollback\|OpenRemote\|RemoteFolder\)" \
     "$TAKO_DATA_DIR/perf.log" 2>/dev/null | sed 's/^/      /' | head -12
 }
 
@@ -572,6 +661,15 @@ phase_gui() {
     hanging_remote_calls gui fast 20
     report_holds gui 0 "RemoteSetup RemoteScrollback OpenRemote"
   fi
+  if suite folder; then
+    returning_folder_calls gui
+    check_eq "gui: 返る ssh / sftp: フォルダを開いた（opened / entries）" "true/2" \
+      "$(jf opened < "$TMP/out/gui-fopen.out")/$(jf entries < "$TMP/out/gui-fopen.out")"
+    check_eq "gui: 返る ssh: 開いたフォルダは繋がっている（list の connected）" "true" \
+      "$(jf tabs/0/remote_folders/0/connected < "$TMP/out/gui-flist.out")"
+    hanging_folder_calls gui fast 20
+    report_holds gui 0 "RemoteFolder"
+  fi
   stop_app
 }
 
@@ -591,6 +689,12 @@ phase_legacy() {
     compare_bodies rsetup scroll open
     hanging_remote_calls legacy blocked 6
     report_holds legacy 1 "RemoteSetup RemoteScrollback OpenRemote"
+  fi
+  if suite folder; then
+    returning_folder_calls legacy
+    compare_bodies fopen fls flist fpending ffile fclose
+    hanging_folder_calls legacy blocked 6
+    report_holds legacy 1 "RemoteFolder"
   fi
   stop_app
 }

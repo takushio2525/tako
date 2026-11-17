@@ -265,6 +265,14 @@ const UI_PATHS: &[&str] = &[
     "pub fn user_task_respond_deliver(",
     "pub fn user_task_launch_land(",
     "fn launch_master_for_response(",
+    // #2961: リモートフォルダの段のうち UI スレッドで回るもの（準備・着地・外部プロセスを待たない action）
+    "fn remote_folder_plan(",
+    "fn remote_folder_prepare(",
+    "fn remote_folder_list_snapshot(",
+    "fn remote_folder_open_land(",
+    "fn remote_file_fetched_land(",
+    "fn remote_folder_close_place(",
+    "fn remote_folder_inline(",
 ];
 
 /// 読む側の関数（子プロセスの口は `Probed::Outside` の腕でだけ呼ぶ）

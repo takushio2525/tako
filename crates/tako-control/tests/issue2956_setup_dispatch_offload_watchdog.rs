@@ -108,12 +108,9 @@ const PARTIAL: &[(&str, &str)] = &[
 /// （`(要求の名前, 理由)`）。#2956 の範囲外（setup の導入・モデル一覧以外）なので #2961 で扱う。
 /// 直したら外すこと（届かなくなると [`既知の残りはまだ届く`] が落ちる）。
 /// `SetupMcp` / `SetupRun` / `ConfigShare` は #2961 の 1 本目、`RemoteSetup` / `RemoteScrollback` は 2 本目で
-/// 外した（[`TARGETS`]）。`OpenRemote` は 2 本目で先取り（[`PROBE_TARGETS`]）へ寄せた
+/// 外した（[`TARGETS`]）。`OpenRemote` は 2 本目で先取り（[`PROBE_TARGETS`]）へ寄せた。`RemoteFolder` は 3 本目で
+/// action ごとの段（[`STAGED_TARGETS`]）へ寄せた
 const KNOWN: &[(&str, &str)] = &[
-    (
-        "RemoteFolder",
-        "#2961: `ssh -O exit` とログインシェル（`dispatch_remote_folder` → `close_master`）",
-    ),
     (
         "SleepGuard",
         "#2961: sudoers の書き込み（蓋閉じの準備・片付け = `install_sudoers_typed` / `remove_sudoers_done`）",
@@ -820,6 +817,52 @@ fn 直した要求はbackgroundから答える() {
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
+/// action ごとに段を分ける準備の関数へ寄せた要求（#2961）。`prepare_offload` の腕（A/B の門つき）が準備の関数を呼ぶ。
+/// 準備・着地（UI スレッドで回る段）が外部プロセスへ届かないことは #1984 の番犬の `UI_PATHS` が見る。
+/// `(要求, prepare_offload の腕の頭, 腕が呼ぶ準備の関数, 注入で消す腕の全文)`
+const STAGED_TARGETS: &[(&str, &str, &str, &str)] = &[(
+    "RemoteFolder",
+    "Request::RemoteFolder { .. } if !sync_arm_offload_legacy() =>",
+    "remote_folder_prepare(host, request)",
+    "        Request::RemoteFolder { .. } if !sync_arm_offload_legacy() => {\n            remote_folder_prepare(host, request)\n        }\n",
+)];
+
+#[test]
+fn 段へ寄せた要求は準備の関数を通る() {
+    let problems = staged_target_problems(dispatch_text());
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// [`STAGED_TARGETS`] の検査（本文の字面で見る）
+fn staged_target_problems(text: &str) -> Vec<String> {
+    let code = production_range::code_view::code_view(text);
+    let line_of = |at: usize| code[..at].matches('\n').count() + 1;
+    let mut out = Vec::new();
+    let prepare = code.find("pub fn prepare_offload(");
+    for (variant, arm, call, _) in STAGED_TARGETS {
+        match prepare.and_then(|at| code[at..].find(arm).map(|i| at + i)) {
+            None => out.push(format!(
+                "{DISPATCH}:{} `prepare_offload` に `{arm}` の腕が無い。`Request::{variant}` の外部プロセスを \
+                 UI スレッドで待つ（#2961）。`{call}` で action ごとに段へ分ける",
+                prepare.map_or(1, line_of)
+            )),
+            Some(at) => {
+                let from = at + arm.len();
+                let arm_end = code[from..]
+                    .find("Request::")
+                    .map_or(code.len(), |i| from + i);
+                if !code[from..arm_end].contains(call) {
+                    out.push(format!(
+                        "{DISPATCH}:{} `{arm}` の腕が `{call}` を呼ばない（#2961）",
+                        line_of(at)
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
 #[test]
 fn 先取りへ寄せた要求はその答えで組む() {
     let problems = probe_target_problems(dispatch_text());
@@ -875,6 +918,12 @@ fn probe_target_problems(text: &str) -> Vec<String> {
 
 #[test]
 fn 直した要求はknownに残っていない() {
+    for (variant, ..) in STAGED_TARGETS {
+        assert!(
+            !KNOWN.iter().any(|(v, _)| v == variant),
+            "`{variant}` は段へ寄せた（#2961）のに KNOWN に残っている"
+        );
+    }
     for (variant, ..) in PROBE_TARGETS {
         assert!(
             !KNOWN.iter().any(|(v, _)| v == variant),
@@ -999,6 +1048,25 @@ fn 修正前の形を名指しできる() {
         let problems = target_problems(&injected);
         assert!(
             problems.iter().any(|p| p.contains(t.prepare_arm)),
+            "`prepare_offload` の `{variant}` の腕を消した注入を 2 が名指ししない: {problems:#?}"
+        );
+    }
+    // 段へ寄せた要求: `prepare_offload` の腕を消すと、同期の腕（全 action が UI スレッドで待つ）を 1 が、腕が無いことを 2 が名指す
+    for (variant, arm, _, whole) in STAGED_TARGETS {
+        assert!(
+            text.contains(whole),
+            "注入の元の `{variant}` の腕が本文に無い（形を変えたなら注入も追うこと）"
+        );
+        let injected = text.replacen(whole, "", 1);
+        let graph = graph_with(&[(DISPATCH, &injected)]);
+        let findings = scan(&graph);
+        assert!(
+            findings.iter().any(|f| f.variant == *variant),
+            "`prepare_offload` の `{variant}` の腕を消した注入で、同期の腕が名指しされない: {findings:#?}"
+        );
+        let problems = staged_target_problems(&injected);
+        assert!(
+            problems.iter().any(|p| p.contains(arm)),
             "`prepare_offload` の `{variant}` の腕を消した注入を 2 が名指ししない: {problems:#?}"
         );
     }
