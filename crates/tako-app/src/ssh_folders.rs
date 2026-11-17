@@ -450,16 +450,24 @@ pub(crate) struct RemoteRecovery {
 
 impl RemoteRecovery {
     fn new() -> Self {
+        Self::new_at(std::time::Instant::now())
+    }
+
+    /// `now` に切断を観測した待ち（#2976: 判断の関数は「今」を引数で受ける = テストが時刻を未来へ
+    /// 進めて確かめられる。`Instant` を過去へずらす形は起動直後のマシン（CI の Windows）で作れない）
+    fn new_at(now: std::time::Instant) -> Self {
         Self {
-            since: std::time::Instant::now(),
+            since: now,
             last_probe: None,
             probes: 0,
             in_flight: false,
         }
     }
 
-    fn waited_secs(&self) -> u64 {
-        self.last_probe.unwrap_or(self.since).elapsed().as_secs()
+    /// 前の試行（無ければ切断の観測）から `now` までの秒数
+    fn waited_secs_at(&self, now: std::time::Instant) -> u64 {
+        now.saturating_duration_since(self.last_probe.unwrap_or(self.since))
+            .as_secs()
     }
 }
 
@@ -491,11 +499,13 @@ pub(crate) enum RecoveryStep {
 /// 生死の判定の結果で 1 ホストの復帰待ちを進める（#1040）。
 ///
 /// **修正前（UI スレッドで判定する A/B）と修正後（背景で判定して着地で進める）の両方が通る 1 実装**（#2976）。
-/// 判断は修正前の `drive_remote_recovery` のループの本体そのまま（メモリ操作だけ）
+/// 判断は修正前の `drive_remote_recovery` のループの本体そのまま（メモリ操作だけ）。`now` は判定が
+/// 済んだ時刻（呼び手は `Instant::now()` を渡す。修正前の `elapsed()` と同じ）
 pub(crate) fn advance_recovery(
     waits: &mut HashMap<String, RemoteRecovery>,
     host: &str,
     liveness: tako_core::remote_fs::Liveness,
+    now: std::time::Instant,
 ) -> RecoveryStep {
     match liveness {
         tako_core::remote_fs::Liveness::Live => {
@@ -517,16 +527,16 @@ pub(crate) fn advance_recovery(
     }
     let entry = waits
         .entry(host.to_string())
-        .or_insert_with(RemoteRecovery::new);
+        .or_insert_with(|| RemoteRecovery::new_at(now));
     if entry.in_flight {
         return RecoveryStep::Idle;
     }
-    if !tako_core::ssh_reconnect::folder_should_probe(entry.probes, entry.waited_secs()) {
+    if !tako_core::ssh_reconnect::folder_should_probe(entry.probes, entry.waited_secs_at(now)) {
         return RecoveryStep::Idle;
     }
     entry.in_flight = true;
     entry.probes += 1;
-    entry.last_probe = Some(std::time::Instant::now());
+    entry.last_probe = Some(now);
     RecoveryStep::Probe
 }
 
@@ -556,12 +566,13 @@ pub(crate) fn land_liveness(
     host: &str,
     liveness: tako_core::remote_fs::Liveness,
     in_tree: bool,
+    now: std::time::Instant,
 ) -> RecoveryStep {
     judging.remove(host);
     if !in_tree {
         return RecoveryStep::Idle;
     }
-    advance_recovery(waits, host, liveness)
+    advance_recovery(waits, host, liveness, now)
 }
 
 /// **background 専用**: ホストの接続の生死を判定する（#2976）。
@@ -658,7 +669,8 @@ impl TakoApp {
             let mut restored: Vec<String> = Vec::new();
             for host in hosts {
                 let liveness = tako_core::remote_fs::liveness(&host);
-                match advance_recovery(&mut self.remote_recovery, &host, liveness) {
+                let now = std::time::Instant::now();
+                match advance_recovery(&mut self.remote_recovery, &host, liveness, now) {
                     RecoveryStep::Probe => jobs.push(host),
                     RecoveryStep::Restored => restored.push(host),
                     RecoveryStep::Idle => {}
@@ -710,6 +722,7 @@ impl TakoApp {
             host,
             liveness,
             in_tree,
+            std::time::Instant::now(),
         ) {
             RecoveryStep::Probe => self.start_remote_recovery_probes(vec![host.to_string()], cx),
             RecoveryStep::Restored => {
@@ -812,17 +825,21 @@ mod tests {
     use tako_core::remote_fs::Liveness;
     use tako_core::ssh_reconnect::{folder_probe_secs, FOLDER_MAX_PROBES};
 
-    /// 前の試行（無ければ切断の観測）から `secs` 秒たった待ち
-    fn aged(probes: u32, secs: u64, in_flight: bool) -> RemoteRecovery {
-        let at = Instant::now()
-            .checked_sub(Duration::from_secs(secs))
-            .expect("起動からの時間より短い");
+    /// 基準の時刻 `t0` に切断を観測し、`probes` 回試した待ち（試していれば前の試行も `t0`）。
+    /// 経過は判断の関数へ渡す「今」（[`after`]）で表す = `Instant` を過去へずらさない（起動直後の
+    /// マシン = CI の Windows ではずらせない）
+    fn waiting(t0: Instant, probes: u32, in_flight: bool) -> RemoteRecovery {
         RemoteRecovery {
-            since: at,
-            last_probe: (probes > 0).then_some(at),
+            since: t0,
+            last_probe: (probes > 0).then_some(t0),
             probes,
             in_flight,
         }
+    }
+
+    /// `t0` から `secs` 秒後
+    fn after(t0: Instant, secs: u64) -> Instant {
+        t0 + Duration::from_secs(secs)
     }
 
     fn hosts(v: &[&str]) -> Vec<String> {
@@ -831,42 +848,44 @@ mod tests {
 
     #[test]
     fn issue2976_生きている接続は待ちを畳んで戻ったと言う() {
+        let t0 = Instant::now();
         let mut waits = HashMap::new();
         // 待ちが無ければ何もしない（平常時）
         assert_eq!(
-            advance_recovery(&mut waits, "h", Liveness::Live),
+            advance_recovery(&mut waits, "h", Liveness::Live, t0),
             RecoveryStep::Idle
         );
         assert!(waits.is_empty(), "平常時に待ちを作らない");
         // 待っていたものが戻った
-        waits.insert("h".to_string(), aged(2, 3, false));
+        waits.insert("h".to_string(), waiting(t0, 2, false));
         assert_eq!(
-            advance_recovery(&mut waits, "h", Liveness::Live),
+            advance_recovery(&mut waits, "h", Liveness::Live, after(t0, 3)),
             RecoveryStep::Restored
         );
         assert!(waits.is_empty());
         // 試行の最中に戻っても戻ったと言う（ペインの再接続で戻る形 = 修正前と同じ）
-        waits.insert("h".to_string(), aged(1, 0, true));
+        waits.insert("h".to_string(), waiting(t0, 1, true));
         assert_eq!(
-            advance_recovery(&mut waits, "h", Liveness::Live),
+            advance_recovery(&mut waits, "h", Liveness::Live, t0),
             RecoveryStep::Restored
         );
     }
 
     #[test]
     fn issue2976_判定できないホストは繋ぎ直しに行かない() {
+        let t0 = Instant::now();
         let mut waits = HashMap::new();
-        for _ in 0..3 {
+        for i in 0..3 {
             assert_eq!(
-                advance_recovery(&mut waits, "h", Liveness::Unknown),
+                advance_recovery(&mut waits, "h", Liveness::Unknown, after(t0, i)),
                 RecoveryStep::Idle
             );
             assert!(waits.is_empty(), "Unknown で待ちを作らない（#1090）");
         }
         // 待ちがあっても畳む（間隔が過ぎていても試さない）
-        waits.insert("h".to_string(), aged(1, 600, false));
+        waits.insert("h".to_string(), waiting(t0, 1, false));
         assert_eq!(
-            advance_recovery(&mut waits, "h", Liveness::Unknown),
+            advance_recovery(&mut waits, "h", Liveness::Unknown, after(t0, 600)),
             RecoveryStep::Idle
         );
         assert!(waits.is_empty());
@@ -874,43 +893,51 @@ mod tests {
 
     #[test]
     fn issue2976_切断は間隔の後に繋ぎ直しを試し上限で止まる() {
+        let t0 = Instant::now();
         let mut waits = HashMap::new();
         // 初めて切断を見た tick は待ちを作るだけ（最初の間隔 5 秒がまだ）
         assert_eq!(
-            advance_recovery(&mut waits, "h", Liveness::Dead),
+            advance_recovery(&mut waits, "h", Liveness::Dead, t0),
             RecoveryStep::Idle
         );
         assert_eq!(waits["h"].probes, 0);
         assert!(!waits["h"].in_flight);
-        // 間隔が過ぎたら試す（印・回数・時刻を立てる）
-        waits.insert("h".to_string(), aged(0, folder_probe_secs(0), false));
+        // 間隔の手前は待つ・過ぎたら試す（印・回数・時刻を立てる）
+        let first = folder_probe_secs(0);
         assert_eq!(
-            advance_recovery(&mut waits, "h", Liveness::Dead),
+            advance_recovery(&mut waits, "h", Liveness::Dead, after(t0, first - 1)),
+            RecoveryStep::Idle
+        );
+        let t1 = after(t0, first);
+        assert_eq!(
+            advance_recovery(&mut waits, "h", Liveness::Dead, t1),
             RecoveryStep::Probe
         );
         assert!(waits["h"].in_flight);
         assert_eq!(waits["h"].probes, 1);
+        assert_eq!(waits["h"].last_probe, Some(t1));
         // 試行の最中は重ねない
         assert_eq!(
-            advance_recovery(&mut waits, "h", Liveness::Dead),
+            advance_recovery(&mut waits, "h", Liveness::Dead, after(t1, 600)),
             RecoveryStep::Idle
         );
         assert_eq!(waits["h"].probes, 1);
-        // 次の間隔の手前は待つ・過ぎたら試す
-        waits.insert("h".to_string(), aged(1, folder_probe_secs(1) - 1, false));
+        // 試行が戻らなかった（`apply_remote_recovery` が印を外す）。次の間隔は前の試行から数える
+        waits.get_mut("h").expect("待ちは残る").in_flight = false;
+        let second = folder_probe_secs(1);
         assert_eq!(
-            advance_recovery(&mut waits, "h", Liveness::Dead),
+            advance_recovery(&mut waits, "h", Liveness::Dead, after(t1, second - 1)),
             RecoveryStep::Idle
         );
-        waits.insert("h".to_string(), aged(1, folder_probe_secs(1), false));
         assert_eq!(
-            advance_recovery(&mut waits, "h", Liveness::Dead),
+            advance_recovery(&mut waits, "h", Liveness::Dead, after(t1, second)),
             RecoveryStep::Probe
         );
+        assert_eq!(waits["h"].probes, 2);
         // 上限まで試したら静かに止まる（待ちは残る = 行の「切断」バッジ）
-        waits.insert("h".to_string(), aged(FOLDER_MAX_PROBES, 100_000, false));
+        waits.insert("h".to_string(), waiting(t0, FOLDER_MAX_PROBES, false));
         assert_eq!(
-            advance_recovery(&mut waits, "h", Liveness::Dead),
+            advance_recovery(&mut waits, "h", Liveness::Dead, after(t0, 100_000)),
             RecoveryStep::Idle
         );
         assert!(waits.contains_key("h"));
@@ -918,6 +945,7 @@ mod tests {
 
     #[test]
     fn issue2976_判定の最中のホストは次のtickで出さない() {
+        let t0 = Instant::now();
         let mut judging = HashSet::new();
         assert_eq!(
             begin_liveness_judging(&mut judging, hosts(&["a", "b"])),
@@ -936,7 +964,7 @@ mod tests {
         // a が着地したら次の tick で a だけ出す
         let mut waits = HashMap::new();
         assert_eq!(
-            land_liveness(&mut waits, &mut judging, "a", Liveness::Live, true),
+            land_liveness(&mut waits, &mut judging, "a", Liveness::Live, true, t0),
             RecoveryStep::Idle
         );
         assert_eq!(
@@ -953,11 +981,12 @@ mod tests {
 
     #[test]
     fn issue2976_判定の間にツリーから外れたホストは進めない() {
+        let t0 = Instant::now();
         let mut waits = HashMap::new();
         let mut judging = HashSet::new();
         begin_liveness_judging(&mut judging, hosts(&["h"]));
         assert_eq!(
-            land_liveness(&mut waits, &mut judging, "h", Liveness::Dead, false),
+            land_liveness(&mut waits, &mut judging, "h", Liveness::Dead, false, t0),
             RecoveryStep::Idle
         );
         assert!(waits.is_empty(), "外れたホストの待ちを作らない");
@@ -966,10 +995,17 @@ mod tests {
             "印は外す（戻ってきたら次の tick で判定する）"
         );
         // 待ちがあっても繋ぎ直しに行かない（畳むのは次の tick の retain = 修正前と同じ）
-        waits.insert("h".to_string(), aged(0, 600, false));
+        waits.insert("h".to_string(), waiting(t0, 0, false));
         begin_liveness_judging(&mut judging, hosts(&["h"]));
         assert_eq!(
-            land_liveness(&mut waits, &mut judging, "h", Liveness::Dead, false),
+            land_liveness(
+                &mut waits,
+                &mut judging,
+                "h",
+                Liveness::Dead,
+                false,
+                after(t0, 600)
+            ),
             RecoveryStep::Idle
         );
         assert!(!waits["h"].in_flight);
@@ -987,27 +1023,27 @@ mod tests {
             &[("a", Dead), ("b", Live), ("c", Dead)],
             &[("a", Live), ("b", Live), ("c", Unknown)],
         ];
+        let t0 = Instant::now();
         let mut legacy_waits: HashMap<String, RemoteRecovery> = HashMap::new();
         let mut waits: HashMap<String, RemoteRecovery> = HashMap::new();
         let mut judging = HashSet::new();
         for (tick, results) in script.iter().enumerate() {
-            // 間隔の判断を満たすため、毎 tick 前に待ちを十分古くする（両方に同じ操作）
+            // tick の間を 600 秒あける（間隔の判断を満たす）。前の tick の試行は戻らなかった
+            // （`apply_remote_recovery` が印を外す）とする。両方に同じ操作
+            let now = after(t0, 600 * (tick as u64 + 1));
             for w in legacy_waits.values_mut().chain(waits.values_mut()) {
-                let old = aged(w.probes, 600, false);
-                w.since = old.since;
-                w.last_probe = w.last_probe.map(|_| old.since);
                 w.in_flight = false;
             }
             let legacy: Vec<RecoveryStep> = results
                 .iter()
-                .map(|(h, l)| advance_recovery(&mut legacy_waits, h, *l))
+                .map(|(h, l)| advance_recovery(&mut legacy_waits, h, *l, now))
                 .collect();
             let names: Vec<String> = results.iter().map(|(h, _)| h.to_string()).collect();
             let out = begin_liveness_judging(&mut judging, names.clone());
             assert_eq!(out, names, "tick {tick}: 着地済みなら全ホストを判定に出す");
             let fixed: Vec<RecoveryStep> = results
                 .iter()
-                .map(|(h, l)| land_liveness(&mut waits, &mut judging, h, *l, true))
+                .map(|(h, l)| land_liveness(&mut waits, &mut judging, h, *l, true, now))
                 .collect();
             assert_eq!(legacy, fixed, "tick {tick}: 進め方が修正前と違う");
             let view = |m: &HashMap<String, RemoteRecovery>| {
