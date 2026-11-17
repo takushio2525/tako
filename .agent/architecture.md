@@ -1638,10 +1638,39 @@ gpui_windows のマウス押下は `SetCapture` だけで `SetFocus` を呼ば�
 - 11/16 の実機: 実マウス・実キーでページ → ターミナルの順にクリックした後の打鍵はターミナルへ入る
   （`TAKO_2430_LEGACY=1` ではページへ流れる）。セルフテスト項目 71 / 155 も Windows で通る。
   WebView2 の `MoveFocus` は実測では呼び出しの中で着地した（待ちは 0.0 秒）
-- **残り（#2948）**: ページが宛先のあいだ、tako のショートカット（Ctrl+Shift+T 等）はページに飲まれる。
-  macOS の #326（NSEvent の local monitor）に当たる口が Windows に無いため。ターミナルのペインを
-  クリックすれば戻る。対応表 `tako_web` の Windows は、これとタイトル・URL の 2 秒ごとの更新（#724 の W2）で
-  `Degraded`
+
+### ページが宛先のあいだの tako のショートカット（#326 / #2948）
+
+ページ（WKWebView / WebView2）がキー入力の宛先のあいだに押された tako のショートカットを先取りし、宛先を
+gpui へ戻して同じ打鍵を tako のキーバインドへ配る。macOS は #326 の NSEvent の local monitor、Windows は
+#2948 で WebView2 の `AcceleratorKeyPressed`（修正前は口が無く、Ctrl+Shift+T がページに飲まれた）。
+
+- **判定は 1 実装**: `tako_core::platform::keys::webview_key_route`（表 `WEBVIEW_PAGE_KEYS` = #326 の
+  A/C/F/L/P/R/S/V/X/Z をキー名へ移した 10 行 + Windows の Shift+Insert）。OS ごとに表を持たない。
+  macOS の monitor は境界の `macos_key_routes_to_page`（virtual key code は ANSI の英字の位置 =
+  `macos_ansi_letter` で名前へ）、WebView2 の側は `keybindings::webview_key_route`（いまの OS の
+  キーバインド表に GPUI 自身の照合 `match_keystrokes` で当たるかを添える）を通る
+- **macOS は #326 の答えのまま**: ⌘ + 表に無いキーは tako（割り当ての有無を問わない。⌘ の打鍵は PTY へ
+  届かないので、割り当ての無い ⌘ を gpui へ回しても端末へ漏れない）。旧表との一致は virtual key code の
+  全域 × 修飾の全組み合わせの単体テストで固定
+- **Windows は tako の割り当てに当たる打鍵だけ**を先取りする。割り当ての無い Ctrl / Alt の打鍵（Ctrl+← /
+  Ctrl+Backspace / Ctrl+Y …）はページの編集の打鍵で、gpui へ回すと端末へバイトで送られるため。割り当てに
+  当たってもページの編集系（Ctrl+V・Ctrl+Shift+V / Z / A / C / F / S・Shift+Insert）はページへ。表の P / R は
+  ⇧ なしだけをページの行にし、Ctrl+Shift+P（パレット）/ Ctrl+Shift+R は tako の段（#585 で tako の割り当てを
+  Ctrl+Shift の段へ逃がしたため。macOS は ⇧ を問わない）
+- **Windows の流れ**: wry 0.57.1 は `AcceleratorKeyPressed` を公開していないので、`WebViewExtWindows::controller()`
+  から直に付ける（`webview2-com` は wry が引いている版そのものを名指すだけ = 依存の木は増えない）。
+  コールバック（境界 B11 `watch_app_shortcuts`）は、打鍵を gpui_windows（rev `cafbf4b`）と同じ規則・同じ
+  Win32 の呼び出しでキー名へ直し（`win32_named_key` / `win32_shifts_to_symbol`）、判定して tako のものだけ
+  `Handled` にして前景タスクへ渡す。前景タスク（`main.rs` の `spawn_webview_shortcut_relay`）が #1481 の
+  `return_webview_key_focus(true)` で宛先を戻し、`dispatch_keystroke` で同じ打鍵を配る。
+  コールバックの中で `SetFocus` を呼ばないのは、答えを待って打鍵を止めている WebView2 の窓への同期送信に
+  なるため。窓へ `WM_KEYDOWN` を投げ直さないのは、gpui が届いた時点の修飾キーの状態を読み直すので、
+  その前に指を離すと修飾の無い文字としてターミナルへ流れるため
+- A/B は `TAKO_2948_LEGACY=1`（先取りを付けない = 修正前）。番犬は `issue2948_webview_shortcut_watchdog`
+  （Windows の腕が空に戻らない・作る口が付ける・判定が 1 実装を通り表が 1 つ・前景タスクが戻して配る・
+  A/B の口が 1 か所）
+- 対応表 `tako_web` の Windows は、タイトル・URL の 2 秒ごとの更新（#724 の W2）で `Degraded`
 
 ## AI 誘導・注釈レイヤ（FR-2.6、後段フェーズ）
 
