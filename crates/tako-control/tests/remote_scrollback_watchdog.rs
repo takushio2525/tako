@@ -114,8 +114,11 @@ fn dispatchはipc解決を含まない入口を使う() {
         !without_comments(&arm).contains("AppIpcClient"),
         "dispatch の解決が IPC を張っている（#972）"
     );
+    // #2961: 採取は同期の腕と background の腕が通る 1 実装（`remote_scrollback_reply`）へ移った。
+    // そこが IPC 解決なしの入口を通り、解決済みのセッション名を受けること
+    let reply = function_body(&dispatch, "fn remote_scrollback_reply(session: &str");
     assert!(
-        dispatch.contains("remote::scrollback_session(&session"),
+        without_comments(&reply).contains("remote::scrollback_session(session"),
         "dispatch が IPC 解決なしの入口（scrollback_session）を通っていない（#972）"
     );
     assert!(
