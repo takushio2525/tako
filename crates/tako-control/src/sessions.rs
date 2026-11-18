@@ -1192,6 +1192,7 @@ pub fn resume_worker_mcp(
     agent: Agent,
     id: &str,
     entry: &SessionEntry,
+    tako_bin: &str,
 ) -> Option<(
     crate::orchestrator::agent::WorkerAgent,
     crate::worker_mcp::WorkerMcp,
@@ -1226,6 +1227,7 @@ pub fn resume_worker_mcp(
         entry.cwd.as_deref(),
         &env,
         &[],
+        Some(tako_bin),
     );
     Some((worker, mcp))
 }
@@ -1241,6 +1243,7 @@ pub fn resume_mcp_args(
         agent,
         Some(tako_bin),
         mcp.settings_file.as_deref(),
+        mcp.tako_config_file(),
         &mcp.codex_off,
         dialect,
     )
@@ -1683,7 +1686,8 @@ fn restore_worker_mcp_args(input: &RestoreInput<'_>) -> Option<String> {
         return None;
     }
     let entry = launch_record(input, id, resume.agent)?;
-    let (worker, mcp) = resume_worker_mcp(resume.agent, id, &entry)?;
+    let tako_bin = crate::dispatch::resolve_tako_binary();
+    let (worker, mcp) = resume_worker_mcp(resume.agent, id, &entry, &tako_bin)?;
     let mcp = mcp.materialized();
     for w in &mcp.warnings {
         crate::diag::persist_log(&format!(
@@ -1697,7 +1701,7 @@ fn restore_worker_mcp_args(input: &RestoreInput<'_>) -> Option<String> {
     Some(resume_mcp_args(
         worker,
         &mcp,
-        &crate::dispatch::resolve_tako_binary(),
+        &tako_bin,
         crate::launch_cmd::launch_dialect(),
     ))
 }
@@ -2712,6 +2716,7 @@ mod tests {
             WorkerAgent::Codex,
             Some(tako_bin),
             None,
+            None,
             &mcp.codex_off,
             ShellDialect::Posix,
         );
@@ -2818,7 +2823,7 @@ mod tests {
                 ..Default::default()
             };
             assert!(
-                resume_worker_mcp(Agent::Codex, id, &entry).is_none(),
+                resume_worker_mcp(Agent::Codex, id, &entry, "/opt/tako").is_none(),
                 "{kind} に MCP の判断が付いた"
             );
         }
@@ -2828,7 +2833,7 @@ mod tests {
             agent: Some("local".into()),
             ..Default::default()
         };
-        assert!(resume_worker_mcp(Agent::Local, id, &local).is_none());
+        assert!(resume_worker_mcp(Agent::Local, id, &local, "/opt/tako").is_none());
     }
 
     /// カタログの記録の系統が layout と食い違っても、**実際に動いていた系統**の

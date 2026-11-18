@@ -534,6 +534,9 @@ fn assemble(bootstrap: BootstrapList, answers: Answers, lang: Lang) -> Report {
         answers.claude_mcp,
         &answers.codex_mcp,
         &answers.agy_mcp,
+        // アカウントごとの設定 dir の登録（#2912。ファイルを読むだけ = 背景の問い合わせを待たない）
+        &crate::agent_mcp::account_mcp_states(),
+        !crate::worker_mcp::issue2912_legacy(),
         lang,
     );
     items.extend(mcp);
@@ -1059,6 +1062,51 @@ fn webview2_item(runtime: &tako_core::platform::webview2::Runtime, lang: Lang) -
 
 // --- MCP 登録（#979） -------------------------------------------------------
 
+/// accounts.yaml の 1 アカウントの tako の MCP の項目（#2912。キーは `mcp.claude.account.<名前>`）。
+///
+/// `launch` = tako が起こす claude（master / solo / worker）へ起動の行で tako の MCP を渡すか
+/// （`TAKO_2912_LEGACY=1` でないか）。渡すなら設定 dir の登録が無くても tako のツールは見えるので、
+/// 登録の有無は「手で開いた claude」の話として添えるだけにする（警告は登録のパスが消えているときだけ）。
+/// 渡さない旧経路では、登録が無い = そのアカウントで起こした claude から tako が見えない
+fn account_mcp_item(account: &crate::agent_mcp::AccountMcp, launch: bool, lang: Lang) -> Item {
+    use crate::agent_mcp::AccountMcpState as S;
+    let status = match (launch, account.state) {
+        (_, S::PathGone) | (false, S::Missing | S::Unreadable) => Status::Warn,
+        _ => Status::Ok,
+    };
+    let mut item = Item::new(
+        format!("mcp.claude.account.{}", account.name),
+        status,
+        HealthText::McpAccount {
+            account: account.name.clone(),
+            launch,
+            state: account.state,
+        }
+        .text_in(lang),
+        lang,
+    );
+    if account.state == S::PathGone {
+        if let Some(cmd) = &account.command {
+            item = item.line(HealthText::McpRegisteredPath(cmd.clone()).text_in(lang));
+        }
+    }
+    if matches!(
+        (launch, account.state),
+        (_, S::PathGone) | (false, S::Missing)
+    ) {
+        item = item.line(
+            HealthText::McpAccountRegisterHint {
+                config_dir: account
+                    .config_dir
+                    .as_deref()
+                    .map(tako_core::paths::shorten_home),
+            }
+            .text_in(lang),
+        );
+    }
+    item
+}
+
 /// 問い合わせの答え（`claude` = `agent_mcp::claude_health_now`・`codex` / `agy` = `agent_mcp::state`）は
 /// 導入状況を待たずに背景で採ったもの（#1622）。**未導入の系統の答えはここで捨てる**（項目の集合は
 /// 今まで通り導入状況だけで決まる）
@@ -1067,6 +1115,8 @@ fn mcp_items(
     claude: ClaudeMcp,
     codex: &crate::agent_mcp::McpState,
     agy: &crate::agent_mcp::McpState,
+    accounts: &[crate::agent_mcp::AccountMcp],
+    launch: bool,
     lang: Lang,
 ) -> (Vec<Item>, Vec<tako_core::probe::TimeoutNotice>) {
     use crate::agent_mcp::McpState;
@@ -1137,6 +1187,14 @@ fn mcp_items(
                 lang,
             ))
         });
+        // アカウントごとの設定 dir（#2912）。上の項目が見るのはこのプロセスの `CLAUDE_CONFIG_DIR` の
+        // 1 か所だけで、accounts.yaml のアカウントの設定 dir の登録とは別物（そこが無いと、#2912 の前は
+        // そのアカウントで起こした claude から tako のツールが 0 本なのに「登録済み」と言っていた）
+        items.extend(
+            accounts
+                .iter()
+                .map(|account| account_mcp_item(account, launch, lang)),
+        );
     }
     for (kind, agent, state) in [
         (AgentKind::Codex, WorkerAgent::Codex, codex),
@@ -1677,6 +1735,57 @@ fn ipc_item(lang: Lang) -> Item {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2912: アカウントごとの tako の MCP の項目。起動の行で渡すなら登録の有無は添えるだけで、
+    /// 警告は登録のパスが消えているときだけ。渡さない旧経路では登録が無いと警告して登録の手順を出す
+    #[test]
+    fn issue2912_アカウントごとの項目は起動の行で渡すかと登録で決まる() {
+        use crate::agent_mcp::{AccountMcp, AccountMcpState as S};
+        let acct = |state, config_dir: Option<&str>| AccountMcp {
+            name: "univ".into(),
+            config_dir: config_dir.map(str::to_string),
+            state,
+            command: (state == S::Registered || state == S::PathGone).then(|| "/gone/tako".into()),
+        };
+        let cases = [
+            (true, S::Registered, Status::Ok, 1),
+            (true, S::Missing, Status::Ok, 1),
+            (true, S::Unreadable, Status::Ok, 1),
+            (true, S::PathGone, Status::Warn, 3),
+            (false, S::Registered, Status::Ok, 1),
+            (false, S::Missing, Status::Warn, 2),
+            (false, S::Unreadable, Status::Warn, 1),
+            (false, S::PathGone, Status::Warn, 3),
+        ];
+        for (launch, state, status, lines) in cases {
+            let item = account_mcp_item(&acct(state, Some("/x/.claude-b")), launch, Lang::Ja);
+            assert_eq!(item.key, "mcp.claude.account.univ");
+            assert_eq!(item.status, status, "{launch} {state:?}");
+            assert_eq!(
+                item.lines.len(),
+                lines,
+                "{launch} {state:?}: {:?}",
+                item.lines
+            );
+            // 先頭は「[ラベル] 要約」の 1 行（続きは登録パス・登録の手順）
+            assert!(item.summary.contains("アカウント univ"), "{}", item.summary);
+            let en = account_mcp_item(&acct(state, Some("/x/.claude-b")), launch, Lang::En);
+            assert!(en.summary.contains("account univ"), "{}", en.summary);
+        }
+        // 登録の手順は設定 dir を指す（inherit は CLAUDE_CONFIG_DIR を外して打つ）
+        let item = account_mcp_item(&acct(S::Missing, Some("/x/.claude-b")), false, Lang::Ja);
+        assert!(
+            item.lines[1].ends_with("CLAUDE_CONFIG_DIR=/x/.claude-b tako setup-mcp"),
+            "{:?}",
+            item.lines
+        );
+        let item = account_mcp_item(&acct(S::Missing, None), false, Lang::Ja);
+        assert!(
+            item.lines[1].ends_with("env -u CLAUDE_CONFIG_DIR tako setup-mcp"),
+            "{:?}",
+            item.lines
+        );
+    }
 
     /// #2798: codex の指示ファイルの項目は、空・空白だけの `CODEX_HOME` でも `~/.codex/AGENTS.md` を見る
     /// （前は空のパスへ join して作業 dir の `AGENTS.md` を見ていた）。空でない値は手を加えない

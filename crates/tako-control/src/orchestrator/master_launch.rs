@@ -191,9 +191,16 @@ pub fn plan(profile_name: &str) -> Result<MasterLaunchPlan, String> {
     let role_env = tako_core::handoff::master_role_env(profile_name);
     let pane_role = tako_core::handoff::master_pane_role(profile_name);
     let tako_bin = crate::dispatch::resolve_tako_binary();
-    let command =
-        orchestrator::build_master_cmd_typed(&role_env, &profile, &prompt_path, &tako_bin)
-            .map_err(|e| e.text_in(lang))?;
+    // tako の MCP を起動の行で渡す（#2912。書けなければ付けず、設定 dir の登録に頼る）
+    let mcp_config = crate::worker_mcp::ready_tako_launch_config(&tako_bin, "master");
+    let command = orchestrator::build_master_cmd_typed(
+        &role_env,
+        &profile,
+        &prompt_path,
+        &tako_bin,
+        mcp_config.as_deref(),
+    )
+    .map_err(|e| e.text_in(lang))?;
     let remote_control = orchestrator::master_remote_control_decision_typed(&profile)
         .map_err(|e| e.text_in(lang))?;
 

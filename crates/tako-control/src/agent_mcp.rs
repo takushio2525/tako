@@ -1122,6 +1122,106 @@ pub fn claude_user_config_json_with(
     tako_core::claude_config::global_json(dir.as_deref(), home)
 }
 
+// --- アカウントごとの tako の MCP（Issue #2912） ---------------------------------
+
+/// アカウントの設定 dir の user scope にある tako の登録（診断用。#2912）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountMcpState {
+    /// 登録があり、登録パスの実行ファイルもある
+    Registered,
+    /// 登録はあるが登録パスの実行ファイルが無い
+    PathGone,
+    /// 登録が無い（`.claude.json` が無い・`mcpServers` に tako のブリッジが無い）
+    Missing,
+    /// `.claude.json` を読めない・JSON として解釈できない
+    Unreadable,
+}
+
+/// accounts.yaml の 1 アカウントの tako の MCP（診断の材料。#2912）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountMcp {
+    /// accounts.yaml のキー
+    pub name: String,
+    /// アカウントの設定 dir（`inherit: true` = `None` = `CLAUDE_CONFIG_DIR` を設定しない既定の資格情報）
+    pub config_dir: Option<String>,
+    pub state: AccountMcpState,
+    /// 登録の command（登録があるときだけ）
+    pub command: Option<String>,
+}
+
+/// `.claude.json` の中身から tako の登録を読む（**純関数**。`text` = `None` はファイルが無い）。
+///
+/// tako のブリッジの見分け方は #2412 の絞り込みと同じ `worker_mcp::is_tako_server`
+/// （名前が `tako`、または中身が `<…>/tako mcp serve` = 別名で登録した場合）
+pub fn account_registration_in(
+    text: Option<&str>,
+    path_alive: impl Fn(&str) -> bool,
+) -> (AccountMcpState, Option<String>) {
+    let Some(text) = text else {
+        return (AccountMcpState::Missing, None);
+    };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(text) else {
+        return (AccountMcpState::Unreadable, None);
+    };
+    let found = root
+        .get("mcpServers")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|servers| {
+            servers
+                .iter()
+                .find(|(name, def)| crate::worker_mcp::is_tako_server(name, def))
+        })
+        .map(|(_, def)| {
+            def.get("command")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        });
+    match found {
+        None => (AccountMcpState::Missing, None),
+        Some(cmd) if path_alive(&cmd) => (AccountMcpState::Registered, Some(cmd)),
+        Some(cmd) => (AccountMcpState::PathGone, Some(cmd)),
+    }
+}
+
+/// accounts.yaml の全アカウントについて、その設定 dir の user scope の tako の登録を読む（**読むだけ**。#2912）。
+///
+/// 置き場の規則は `tako_core::claude_config::global_json`（`CLAUDE_CONFIG_DIR=X` なら `X/.claude.json`・
+/// inherit はホーム直下 = #2906）。inherit のホームは検証プロセスでは検証用のホーム（本物を読まない）。
+/// accounts.yaml が読めない・壊れたエントリは飛ばす（診断の付随情報なので、ここで失敗させない）
+pub fn account_mcp_states() -> Vec<AccountMcp> {
+    let Ok(accounts) = crate::orchestrator::AccountsConfig::load() else {
+        return Vec::new();
+    };
+    let home = crate::orchestrator::agent_config_home();
+    accounts
+        .list_resolved_typed()
+        .into_iter()
+        .filter_map(|(name, resolved)| {
+            let config_dir = resolved.ok()?.config_dir.path().map(str::to_string);
+            let file = tako_core::claude_config::global_json(
+                config_dir.as_deref().map(std::path::Path::new),
+                home.as_deref(),
+            );
+            let alive = |cmd: &str| std::path::Path::new(cmd).is_file();
+            let (state, command) = match file.map(std::fs::read_to_string) {
+                Some(Ok(text)) => account_registration_in(Some(&text), alive),
+                // 無いのは「登録が無い」、権限などで読めないのは「確かめられない」
+                Some(Err(e)) if e.kind() != std::io::ErrorKind::NotFound => {
+                    (AccountMcpState::Unreadable, None)
+                }
+                _ => account_registration_in(None, alive),
+            };
+            Some(AccountMcp {
+                name,
+                config_dir,
+                state,
+                command,
+            })
+        })
+        .collect()
+}
+
 /// いまの登録状態を読む（CLI を 1 回だけ起こす）
 pub fn state(agent: WorkerAgent) -> McpState {
     if !handled_here(agent) {
@@ -1149,6 +1249,46 @@ pub fn state(agent: WorkerAgent) -> McpState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2912: アカウントの設定 dir の `.claude.json` から tako の登録を読む（名前 `tako` か `<…>/tako mcp serve`）
+    #[test]
+    fn issue2912_アカウントの設定dirの登録を読む() {
+        let alive = |cmd: &str| cmd == "/opt/tako";
+        let reg = |text: Option<&str>| account_registration_in(text, alive);
+        assert_eq!(
+            reg(None),
+            (AccountMcpState::Missing, None),
+            "ファイルが無い"
+        );
+        assert_eq!(reg(Some("{ broken")), (AccountMcpState::Unreadable, None));
+        assert_eq!(
+            reg(Some(
+                r#"{"mcpServers":{"github":{"command":"npx","args":["-y","g"]}}}"#
+            )),
+            (AccountMcpState::Missing, None),
+            "ほかの server だけ"
+        );
+        assert_eq!(reg(Some("{}")), (AccountMcpState::Missing, None));
+        assert_eq!(
+            reg(Some(
+                r#"{"mcpServers":{"tako":{"command":"/opt/tako","args":["mcp","serve"]}}}"#
+            )),
+            (AccountMcpState::Registered, Some("/opt/tako".into()))
+        );
+        assert_eq!(
+            reg(Some(
+                r#"{"mcpServers":{"tako":{"command":"/gone/tako","args":["mcp","serve"]}}}"#
+            )),
+            (AccountMcpState::PathGone, Some("/gone/tako".into()))
+        );
+        // 別名で登録したブリッジも tako と見る（#2412 の見分け方と同じ）
+        assert_eq!(
+            reg(Some(
+                r#"{"mcpServers":{"tako-dev":{"command":"/opt/tako","args":["mcp","serve"]}}}"#
+            )),
+            (AccountMcpState::Registered, Some("/opt/tako".into()))
+        );
+    }
 
     /// #2906: claude の MCP の書き先は `CLAUDE_CONFIG_DIR` に従う（空は未設定と同じ）
     #[test]

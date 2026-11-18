@@ -133,6 +133,17 @@ pub enum HealthText {
     McpReinstall(String),
     /// codex / agy の登録状態を確認できない
     McpUnknown(String),
+    /// `Claude MCP（アカウント <account>）: …`（#2912。`launch` = tako が起こす claude へ起動の行で
+    /// tako の MCP を渡すか = `TAKO_2912_LEGACY=1` でないか。`state` はそのアカウントの設定 dir の登録）
+    McpAccount {
+        account: String,
+        launch: bool,
+        state: crate::agent_mcp::AccountMcpState,
+    },
+    /// そのアカウントの設定 dir へ登録する手順（字下げ込み。`config_dir` = `None` は inherit。#2912）
+    McpAccountRegisterHint {
+        config_dir: Option<String>,
+    },
 
     // ---- 診断: セットアップと追従 ----
     /// config.yaml の置き場を特定できない
@@ -665,6 +676,103 @@ impl HealthText {
             (Self::McpUnknown(name), En) => format!(
                 "{name} MCP: cannot check the registration (check {name} mcp list by hand)"
             ),
+            (
+                Self::McpAccount {
+                    account,
+                    launch,
+                    state,
+                },
+                Ja,
+            ) => {
+                use crate::agent_mcp::AccountMcpState as S;
+                let detail = match (launch, state) {
+                    (true, S::Registered) => {
+                        "tako が起こす claude には起動の行で渡す（この設定 dir の登録もある）"
+                    }
+                    (true, S::Missing) => {
+                        "tako が起こす claude には起動の行で渡す（この設定 dir に登録は無いので、\
+                         手で開いた claude には tako のツールが出ない）"
+                    }
+                    (true, S::PathGone) => {
+                        "tako が起こす claude には起動の行で渡すが、この設定 dir の登録はパスが\
+                         消えている（手で開いた claude の tako が起きない）"
+                    }
+                    (true, S::Unreadable) => {
+                        "tako が起こす claude には起動の行で渡す（この設定 dir の .claude.json は読めない）"
+                    }
+                    (false, S::Registered) => "この設定 dir に tako が登録済み",
+                    (false, S::Missing) => {
+                        "この設定 dir に tako が未登録 = このアカウントで起こした claude から \
+                         tako のツールが見えない"
+                    }
+                    (false, S::PathGone) => {
+                        "この設定 dir の登録はパスが消えている = このアカウントで起こした claude の \
+                         tako が起きない"
+                    }
+                    (false, S::Unreadable) => {
+                        "この設定 dir の .claude.json を読めない（tako の登録を確かめられない）"
+                    }
+                };
+                format!("Claude MCP（アカウント {account}）: {detail}")
+            }
+            (
+                Self::McpAccount {
+                    account,
+                    launch,
+                    state,
+                },
+                En,
+            ) => {
+                use crate::agent_mcp::AccountMcpState as S;
+                let detail = match (launch, state) {
+                    (true, S::Registered) => {
+                        "passed on the launch line to the claude tako starts (this settings \
+                         directory is registered too)"
+                    }
+                    (true, S::Missing) => {
+                        "passed on the launch line to the claude tako starts (this settings \
+                         directory has no registration, so a claude you open by hand gets no tako tools)"
+                    }
+                    (true, S::PathGone) => {
+                        "passed on the launch line to the claude tako starts, but the registration \
+                         in this settings directory points to a path that is gone (a claude you \
+                         open by hand cannot start tako)"
+                    }
+                    (true, S::Unreadable) => {
+                        "passed on the launch line to the claude tako starts (cannot read \
+                         .claude.json in this settings directory)"
+                    }
+                    (false, S::Registered) => "tako is registered in this settings directory",
+                    (false, S::Missing) => {
+                        "tako is not registered in this settings directory = a claude started with \
+                         this account cannot see tako's tools"
+                    }
+                    (false, S::PathGone) => {
+                        "the registration in this settings directory points to a path that is gone \
+                         = a claude started with this account cannot start tako"
+                    }
+                    (false, S::Unreadable) => {
+                        "cannot read .claude.json in this settings directory (cannot check tako's \
+                         registration)"
+                    }
+                };
+                format!("Claude MCP (account {account}): {detail}")
+            }
+            (Self::McpAccountRegisterHint { config_dir }, Ja) => match config_dir {
+                Some(dir) => format!(
+                    "         この設定 dir へ登録するには: CLAUDE_CONFIG_DIR={dir} tako setup-mcp"
+                ),
+                None => "         この設定 dir へ登録するには: env -u CLAUDE_CONFIG_DIR tako setup-mcp"
+                    .into(),
+            },
+            (Self::McpAccountRegisterHint { config_dir }, En) => match config_dir {
+                Some(dir) => format!(
+                    "         to register in this settings directory: CLAUDE_CONFIG_DIR={dir} tako setup-mcp"
+                ),
+                None => "         to register in this settings directory: env -u CLAUDE_CONFIG_DIR \
+                         tako setup-mcp"
+                    .into(),
+            },
 
             // ---- セットアップと追従 ----
             (Self::ConfigNoHome, Ja) => "config.yaml: 置き場を特定できません（HOME が未設定）".into(),
