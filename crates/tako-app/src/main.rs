@@ -2695,6 +2695,8 @@ struct TakoApp {
     ssh_links: HashMap<String, ssh_folders::SshAutoLink>,
     /// ホスト → リモートフォルダの復帰待ち（#1040。**切断中だけ**存在する）
     remote_recovery: HashMap<String, ssh_folders::RemoteRecovery>,
+    /// 生死の判定を背景で待っているホスト（#2976。着地で外す = 同じホストへ 2 本目の `ssh -O check` を起こさない）
+    remote_liveness_judging: std::collections::HashSet<String>,
     /// 却下済みの (ペイン, ポート)。ポートが消えるまで再提案しない
     dismissed_ports: std::collections::HashSet<(PaneId, u16)>,
     /// tmux バックエンド永続化（Phase 5.5 / FR-5）の有効状態（dispatch から切替）
@@ -5518,6 +5520,7 @@ impl TakoApp {
             ssh_skip_log: tako_control::ssh_detect::SshSkipLog::default(),
             ssh_links: HashMap::new(),
             remote_recovery: HashMap::new(),
+            remote_liveness_judging: std::collections::HashSet::new(),
             dismissed_ports: std::collections::HashSet::new(),
             tmux_persist,
             scrollback_lines: initial_scrollback_lines(),
@@ -7608,26 +7611,18 @@ impl TakoApp {
                         })
                         .detach();
                     }
-                    // #1040: 切断したリモートフォルダの自動復帰。判定（`remote_fs::liveness` =
-                    // ソケットの stat）は UI で、**繋ぎ直しと保留の押し出しは background**。
-                    // 待ちが 1 件も無ければジョブは出ない = 平常時のコストはゼロ
-                    let Ok(recovery_jobs) =
-                        this.update(cx, |app: &mut TakoApp, _cx| app.drive_remote_recovery())
-                    else {
-                        break;
-                    };
-                    for host in recovery_jobs {
-                        let this = this.clone();
-                        cx.spawn(async move |cx| {
-                            let outcome = cx
-                                .background_executor()
-                                .spawn(async move { ssh_folders::probe_and_push(&host) })
-                                .await;
-                            let _ = this.update(cx, |app: &mut TakoApp, cx| {
-                                app.apply_remote_recovery(outcome, cx);
-                            });
+                    // #1040: 切断したリモートフォルダの自動復帰。生死の判定（`remote_fs::liveness` =
+                    // ログインシェルで ssh を引き `ssh -O check` を待つ）も、繋ぎ直しと保留の押し出しも
+                    // **background**（#2976。修正前は判定を UI で待った）。ここは仕事の積み込みだけで、
+                    // 判定はこの tick で待たない（着地は `land_remote_liveness`）
+                    if this
+                        .update(cx, |app: &mut TakoApp, cx| {
+                            let _s = tako_control::diag::perf_span("periodic_prep:remote_recovery");
+                            app.drive_remote_recovery(cx);
                         })
-                        .detach();
+                        .is_err()
+                    {
+                        break;
                     }
                 }
                 // ② background: GUI モードのチャット読み取り（#702）。sleep_guard の
