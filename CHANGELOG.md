@@ -10,6 +10,15 @@ change-type tag. Entries without a platform tag apply to every platform.
 
 ## [Unreleased]
 
+## [0.8.42] - 2026-11-19
+
+Nightly patch release (automated). Changes since v0.8.41:
+夜間パッチリリース（自動）。v0.8.41 以降の変更:
+
+- [修正] ssh / sftp の実体を覚え、リモートフォルダの見張りの tick ごとにログインシェルを起こさない (#2980) (#2983)
+- [修正] GUI の背景の段から起こした待つ子にも打ち切りの SIGTERM が届くよう、子を既定のシグナルマスクで起こす (#2979) (#2982)
+- [修正] リモートフォルダの自動復帰の見張りの生死の判定（ssh -O check）を背景の段へ出し、UI は結果だけを受けて復帰待ちを進める (#2976) (#2981)
+
 ## [0.8.41] - 2026-11-18
 
 Nightly patch release (automated). Changes since v0.8.40:
