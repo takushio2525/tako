@@ -23,6 +23,12 @@
 #   4. master（tako master --tab・master_account acct-a）: tako の MCP が呼べるか
 #   5. check-health のアカウントごとの項目（mcp.claude.account.acct-a / acct-b）
 #
+# 前提の注意:
+#   - claude 2.1 系は既定で MCP のツールを遅延読み込み（tool search）にし、要求の tools に載せない。偽 API は
+#     tools から tako_show_command を探すので、GUI へ `ENABLE_TOOL_SEARCH=false` を渡して載せる
+#   - `tako master --tab` の新しいタブは GUI の既定のフォルダ（砂場の HOME）で開く（プロファイルの cwd を渡さない =
+#     #2912 の範囲外）。信頼の確認が出たままだと MCP が起きないので、砂場の HOME も信頼済みにしておく
+#
 # 本物の設定（~/.claude*・アカウントの設定 dir・projects.yaml）には触らない: 一時の HOME と CLAUDE_CONFIG_DIR、
 # 隔離の data / orchestrator / discovery / tmux ソケット。**CI には登録しない**（実物の claude と tako-vd が要る）。
 #
@@ -168,11 +174,13 @@ setup_sandbox() {
     if [ "$dir" = "$ACC_B" ]; then
       user="$(printf '%s' "$user" | jq --arg tako "$TAKO_BIN" '.tako = { type: "stdio", command: $tako, args: ["mcp", "serve"], env: {} }')"
     fi
-    jq -n --arg key "$LAST20" --arg p1 "$P1" --argjson user "$user" '{
+    jq -n --arg key "$LAST20" --arg p1 "$P1" --arg gh "$GHOME" --argjson user "$user" '{
         hasCompletedOnboarding: true, theme: "dark",
         customApiKeyResponses: { approved: [$key], rejected: [] },
         mcpServers: $user,
-        projects: { ($p1): { hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true } }
+        projects: {
+          ($p1): { hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true },
+          ($gh): { hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true } }
       }' >"$dir/.claude.json"
     printf '%s\n' '{"permissions":{"allow":["mcp__tako"]}}' >"$dir/settings.json"
   done
@@ -213,6 +221,20 @@ card_done() {
   echo 0
 }
 
+# claude の起動の行に `--mcp-config=` があるか（1 / 0）
+argv_mcp() {
+  local args
+  args="$(ps -o args= -p "$1" 2>/dev/null)"
+  if [[ "$args" == *"--mcp-config="* ]]; then echo 1; else echo 0; fi
+}
+
+# ペインの画面の頭（ブリッジが 0 本のときの手がかり。一時 dir は伏せる）
+screen_head() {
+  local scr
+  scr="$(cli read --pane "$1" 2>/dev/null)"
+  printf '%s\n' "$scr" | sed "s#$TMP#<tmp>#g" | grep -v '^[[:space:]]*$' | sed -n '1,12p' | sed 's/^/      | /'
+}
+
 # claude の子の tako のブリッジ（`… mcp serve`）を「実行ファイル」で並べる
 bridges_of() {
   descendants "$1" | awk '$0 ~ / mcp serve/ { for (i = 4; i <= NF; i++) if ($(i+1) == "mcp" && $(i+2) == "serve") { print $i; break } }'
@@ -220,7 +242,7 @@ bridges_of() {
 
 SEEN=""
 measure_worker() {
-  local arm="$1" acct="$2" resp pane cpid i br n
+  local arm="$1" acct="$2" resp pane cpid i br n av
   : >"$TMP/mcp.log"
   resp="$(cli orchestrator spawn --project p1 --account "$acct" --pane "$MASTER_PANE" --label "w-${acct}" \
     --prompt "Reply with exactly one word: READY" 2>&1)"
@@ -242,15 +264,18 @@ measure_worker() {
   sleep "$SETTLE"
   br="$(bridges_of "$cpid" | sed "s#$TAKO_BIN#<この木の tako>#; s#/Applications/tako.app/Contents/MacOS/tako#<入れた本体の tako>#")"
   n="$(printf '%s' "$br" | grep -c . | tr -d ' ')"
-  echo "  [${acct}] claude pid=${cpid} の tako のブリッジ ${n} 本: $(printf '%s' "$br" | tr '\n' ' ')"
+  av="$(argv_mcp "$cpid")"
+  echo "  [${acct}] claude pid=${cpid} の起動の行の --mcp-config: $([ "$av" = 1 ] && echo あり || echo なし)・tako のブリッジ ${n} 本: $(printf '%s' "$br" | tr '\n' ' ')"
   echo "  [${acct}] 起きた偽 MCP: $(sort -u "$TMP/mcp.log" | tr '\n' ' ')"
   printf '%s\n' "$br" >"$TMP/bridges-${acct}.txt"
   sort -u "$TMP/mcp.log" | tr '\n' ' ' >"$TMP/fakemcp-${acct}.txt"
   CARD="$(card_done "$pane")"
   echo "  [${acct}] tako_show_command: $([ "$CARD" = 1 ] && echo 呼べた || echo 呼べない)"
-  echo "${arm} ${acct} card=${CARD} bridges=${n}" >>"$API_TMP/summary.txt"
+  [ "$CARD" = 1 ] || screen_head "$pane"
+  echo "${arm} ${acct} card=${CARD} bridges=${n} argv=${av}" >>"$API_TMP/summary.txt"
   cp "$TMP/plan-${acct}.json" "$API_TMP/plan-${arm}-${acct}.json"
   cp "$TMP/fakemcp-${acct}.txt" "$API_TMP/fakemcp-${arm}-${acct}.txt"
+  bridges_of "$cpid" >"$API_TMP/bridges-${arm}-${acct}.txt"
   cli close --pane "$pane" --force >/dev/null 2>&1
   for i in $(seq 1 40); do
     kill -0 "$cpid" 2>/dev/null || break
@@ -279,11 +304,13 @@ measure_master() {
   [ -n "$cpid" ] || { bad "[${arm}/master] master の claude が見つからない"; return; }
   SEEN="$SEEN $cpid"
   sleep "$SETTLE"
-  local n
+  local n av
   n="$(bridges_of "$cpid" | grep -c . | tr -d ' ')"
+  av="$(argv_mcp "$cpid")"
   CARD="$(card_done "$pane")"
-  echo "  [master] pane=${pane} claude pid=${cpid} の tako のブリッジ ${n} 本・tako_show_command: $([ "$CARD" = 1 ] && echo 呼べた || echo 呼べない)"
-  echo "${arm} master card=${CARD} bridges=${n}" >>"$API_TMP/summary.txt"
+  echo "  [master] pane=${pane} claude pid=${cpid} の起動の行の --mcp-config: $([ "$av" = 1 ] && echo あり || echo なし)・tako のブリッジ ${n} 本・tako_show_command: $([ "$CARD" = 1 ] && echo 呼べた || echo 呼べない)"
+  [ "$CARD" = 1 ] || screen_head "$pane"
+  echo "${arm} master card=${CARD} bridges=${n} argv=${av}" >>"$API_TMP/summary.txt"
   cli close --pane "$pane" --force >/dev/null 2>&1
   for i in $(seq 1 40); do
     kill -0 "$cpid" 2>/dev/null || break
@@ -307,7 +334,7 @@ run_arm() {
   launch_isolated_gui "$TMP/app.log" "HOME=$GHOME" "CLAUDE_CONFIG_DIR=$CCD0" \
     "ANTHROPIC_BASE_URL=http://127.0.0.1:$API_PORT" "ANTHROPIC_API_KEY=$API_KEY" \
     "DISABLE_AUTOUPDATER=1" "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1" \
-    "MCP_LOG=$TMP/mcp.log" "TAKO_PERSIST=0" "SHELL=/bin/zsh" "ISOLATED_GUI_NONE=1" \
+    "ENABLE_TOOL_SEARCH=false" "MCP_LOG=$TMP/mcp.log" "TAKO_PERSIST=0" "SHELL=/bin/zsh" "ISOLATED_GUI_NONE=1" \
     ${ARM_ENV:+"$ARM_ENV"} "PATH=$CLAUDE_DIR:$(dirname "$NODE"):/opt/homebrew/bin:/usr/bin:/bin" || exit $?
   if ! wait_isolated_gui "$TMP/app.log"; then
     stop_isolated_gui "$ISOLATED_GUI_PID"
@@ -339,16 +366,22 @@ S="$API_TMP/summary.txt"
 sed 's/^/  /' "$S"
 val() { grep "^$1 $2 " "$S" | sed -n "s/.*$3=\([0-9]*\).*/\1/p" | head -1; }
 case " $ARMS " in *" new "*)
+  check "$([ "$(val new acct-a argv)" = 1 ] && echo 1 || echo 0)" "修正後: 登録の無いアカウントの worker の起動の行に --mcp-config がある"
   check "$([ "$(val new acct-a card)" = 1 ] && echo 1 || echo 0)" "修正後: 登録の無いアカウントの worker が tako の MCP を呼べる"
   check "$([ "$(val new acct-a bridges)" = 1 ] && echo 1 || echo 0)" "修正後: その worker の tako のブリッジは 1 本"
   check "$([ "$(val new acct-b card)" = 1 ] && echo 1 || echo 0)" "修正後: 登録済みのアカウントの worker も tako の MCP を呼べる"
   check "$([ "$(val new acct-b bridges)" = 1 ] && echo 1 || echo 0)" "修正後: 登録済みでもブリッジは 1 本（二重に起きない）"
+  check "$([ "$(val new master argv)" = 1 ] && echo 1 || echo 0)" "修正後: master の起動の行に --mcp-config がある"
+  check "$([ "$(val new master bridges)" = 1 ] && echo 1 || echo 0)" "修正後: master の tako のブリッジは 1 本"
   check "$([ "$(val new master card)" = 1 ] && echo 1 || echo 0)" "修正後: 登録の無いアカウントの master が tako の MCP を呼べる"
   check "$(jq -e '[.[] | select(.key == "mcp.claude.account.acct-a" and .status == "ok")] | length == 1' "$API_TMP/health-new.json" >/dev/null && echo 1 || echo 0)" \
     "修正後: check-health の acct-a は ok（起動の行で渡す）"
   ;;
 esac
 case " $ARMS " in *" legacy "*)
+  check "$([ "$(val legacy acct-a argv)" = 0 ] && echo 1 || echo 0)" "A/B 修正前: worker の起動の行に --mcp-config は無い"
+  check "$([ "$(val legacy master argv)" = 0 ] && echo 1 || echo 0)" "A/B 修正前: master の起動の行にも無い"
+  check "$([ "$(val legacy master bridges)" = 0 ] && echo 1 || echo 0)" "A/B 修正前: 登録の無いアカウントの master に tako のブリッジは無い"
   check "$([ "$(val legacy acct-a card)" = 0 ] && echo 1 || echo 0)" "A/B 修正前: 登録の無いアカウントの worker は tako の MCP を呼べない（元の症状）"
   check "$([ "$(val legacy acct-a bridges)" = 0 ] && echo 1 || echo 0)" "A/B 修正前: その worker に tako のブリッジは無い"
   check "$([ "$(val legacy master card)" = 0 ] && echo 1 || echo 0)" "A/B 修正前: 登録の無いアカウントの master も呼べない"
@@ -357,15 +390,16 @@ case " $ARMS " in *" legacy "*)
     "A/B 修正前の形: check-health の acct-a は warn（登録が無い = 見えない）"
   ;;
 esac
-case " $ARMS " in *" new "*" legacy "* | *" legacy "*" new "*)
+if [[ " $ARMS " == *" new "* && " $ARMS " == *" legacy "* ]]; then
   for acct in acct-a acct-b; do
     check "$(cmp -s "$API_TMP/plan-new-${acct}.json" "$API_TMP/plan-legacy-${acct}.json" && echo 1 || echo 0)" \
       "#2412: ${acct} の止める / 持ち込む名前が前後で同じ（$(cat "$API_TMP/plan-new-${acct}.json")）"
     check "$(cmp -s "$API_TMP/fakemcp-new-${acct}.txt" "$API_TMP/fakemcp-legacy-${acct}.txt" && echo 1 || echo 0)" \
       "#2412: ${acct} で起きた user scope の MCP が前後で同じ（$(cat "$API_TMP/fakemcp-new-${acct}.txt")）"
   done
-  ;;
-esac
+  check "$([ "$(cat "$API_TMP/bridges-new-acct-b.txt")" != "$TAKO_BIN" ] && [ "$(cat "$API_TMP/bridges-legacy-acct-b.txt")" = "$TAKO_BIN" ] && echo 1 || echo 0)" \
+    "登録済みのアカウント: 修正後は起動の行の側・修正前は登録の側（この木の tako）のブリッジが起きる"
+fi
 echo
 echo "PASS=${PASS} FAIL=${FAIL}"
 [ "$FAIL" = 0 ]
