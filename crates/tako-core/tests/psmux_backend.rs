@@ -869,6 +869,142 @@ fn 素のペインのシェルは包みのpwshを挟まずに起きる() {
     let _ = f.backend.kill(&name);
 }
 
+/// #2954 の材料: 偽の置き場（中身は要らない。PATH に載るかだけを見る）を先頭に置いた PATH で
+/// 器のペインを開き、`probe`（PowerShell の式）の結果を `TAKO-2954-<tag>=<値>` の 1 行で読む。
+/// 打鍵のエコーは `'TAKO-2954-<tag>=' + …` なので、`=` の直後が `'` の行は当たらない。
+/// 戻り値は（読んだ値, ペインのシェルの親のプロセス名）。シェルは自分の `$PID` を添えて答えるので、
+/// 器の `#{pane_pid}` が包みの pwsh と内側のどちらを指すかに依らない
+#[cfg(windows)]
+fn open_with_fake_path(
+    f: &Fixture,
+    name: &SessionRef,
+    tag: &str,
+    extra_env: &[(&str, &str)],
+    probe: &dyn Fn(&str) -> String,
+) -> (String, String) {
+    let fake = std::env::temp_dir()
+        .join(format!("tako-2954-fake-{}-{tag}", std::process::id()))
+        .display()
+        .to_string();
+    let mut env: Vec<(String, String)> = extra_env
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    env.push((
+        "Path".into(),
+        format!("{fake};{}", std::env::var("PATH").unwrap_or_default()),
+    ));
+    let options = SpawnOptions {
+        command: None,
+        cwd: Some(std::env::temp_dir()),
+        env,
+        scrollback_lines: None,
+    };
+    let (mut term, mut rx) =
+        tako_core::TerminalSession::spawn(160, 24, f.backend.wrap_spawn(options, name))
+            .expect("psmux クライアントを spawn できる");
+    let line = format!(
+        "Write-Output ('TAKO-2954-{tag}=' + ({}) + '/' + $PID)\r",
+        probe(&fake)
+    );
+    let head = format!("TAKO-2954-{tag}=");
+    let value_in = |l: &str| -> Option<String> {
+        let at = l.find(&head)?;
+        let rest = &l[at + head.len()..];
+        (!rest.starts_with('\'')).then(|| rest.trim().to_string())
+    };
+    let got = pump_until_typed(&mut term, &mut rx, MARKER_BASE, line.as_bytes(), |l| {
+        value_in(l).is_some()
+    });
+    let lines = term.visible_lines();
+    assert!(
+        got.ok,
+        "器のペインの値を読めない。{}",
+        got.diag(&head, &lines.join("\n"))
+    );
+    let answer = lines.iter().find_map(|l| value_in(l)).unwrap_or_default();
+    let (value, shell) = answer.rsplit_once('/').unwrap_or((&answer, ""));
+    let (value, shell) = (value.to_string(), shell.parse::<u32>().unwrap_or(0));
+    let procs = tako_core::platform::procinfo::snapshot();
+    let parent = procs
+        .iter()
+        .find(|p| p.pid == shell)
+        .map(|p| p.ppid)
+        .unwrap_or(0);
+    let parent_name = procs
+        .iter()
+        .find(|p| p.pid == parent)
+        .map(|p| p.name.to_ascii_lowercase())
+        .unwrap_or_default();
+    drop(term);
+    let _ = f.backend.kill(name);
+    (value, parent_name)
+}
+
+/// #2954: 器（psmux 3.3.x）はペインの PATH をレジストリの `Path` で置き換える。器なしのペインと同じ PATH
+/// （ここでは呼び手の明示 = 偽の置き場が先頭）を `-e` で固定すると、器のペインのシェルの PATH に届く。
+/// A/B（`TAKO_2954_LEGACY=1`）は psmux の版で分かれる（3.3.x は届かない・3.4.0 = 上流 #773 は継いだ値を
+/// 残すので届く）ので、結果を出すだけにする
+#[cfg(windows)]
+#[test]
+fn issue2954_器のペインのpathは器なしのペインと同じ() {
+    let f = fixture!("path2954");
+    let name = session("tako-m2path2954");
+    let (value, _) = open_with_fake_path(&f, &name, "PATH", &[], &|fake| {
+        format!("[int](($env:Path -split ';') -contains '{fake}')")
+    });
+    let legacy = tako_core::backend::psmux::issue2954_legacy();
+    eprintln!("TAKO_2954_PATH: 偽の置き場が器のペインの PATH に在る={value} legacy={legacy}");
+    if !legacy {
+        assert_eq!(
+            value, "1",
+            "器のペインへ tako の PATH が届かない（器がレジストリの PATH で置き換えた）"
+        );
+    }
+}
+
+/// #2954: `PSMUX_BARE_ENV=1`（psmux #167 の逃げ道）が立っていれば、素のペインのシェルも包みの経路で起き
+/// （シェルの親が包みの pwsh = 逃げ道を効かせる `build_command` の経路）、ペインの env は最小限
+/// （クライアントにだけ載せた変数が消える）で、PATH は固定した値。A/B（直接の argv）は逃げ道が効かない
+#[cfg(windows)]
+#[test]
+fn issue2954_bare_envの逃げ道が素のペインのシェルでも効く() {
+    let f = fixture!("bare2954");
+    let name = session("tako-m2bare2954");
+    let (value, parent) = open_with_fake_path(
+        &f,
+        &name,
+        "BARE",
+        &[("PSMUX_BARE_ENV", "1"), ("TAKO_2954_PROBE", "client-only")],
+        &|fake| {
+            format!(
+                "[string][int](($env:Path -split ';') -contains '{fake}') + '/' + \
+                 [string][int][bool]$env:TAKO_2954_PROBE"
+            )
+        },
+    );
+    let legacy = tako_core::backend::psmux::issue2954_legacy();
+    eprintln!(
+        "TAKO_2954_BARE: 偽の置き場/クライアントだけの変数={value} シェルの親={parent} legacy={legacy}"
+    );
+    if legacy {
+        // 直接の argv（#2484 の段 2）は逃げ道を見ない = クライアントの env がそのまま残る
+        assert!(
+            value.ends_with("/1"),
+            "A/B: 逃げ道が効かない形のはず: {value}"
+        );
+    } else {
+        assert_eq!(
+            value, "1/0",
+            "逃げ道が効いていない（クライアントだけの変数が残る）か、PATH が固定どおりでない"
+        );
+        assert!(
+            parent.starts_with("pwsh") || parent.starts_with("powershell"),
+            "逃げ道が立っているのに素のペインのシェルの親が包みの pwsh でない: {parent}"
+        );
+    }
+}
+
 /// **要件 2**: `show-environment` が名前指定を無視して全変数を返しても、
 /// 目的の 1 本を取り出せる（`-e` で注入した TAKO_PANE_ID が読める）
 #[test]

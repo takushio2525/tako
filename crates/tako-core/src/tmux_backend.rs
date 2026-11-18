@@ -692,6 +692,8 @@ pub fn wrap_options(options: SpawnOptions, socket: &str, session: &str) -> Spawn
         crate::tmux::tmux_bin(),
         caps.quotes_program,
         caps.direct_inner_argv && !crate::backend::psmux::issue2484_legacy(),
+        // tmux の器はペインの PATH を組み直さない（継いだ PATH + ログインシェルの profile。#2954）
+        None,
         socket,
         session,
     )
@@ -699,7 +701,8 @@ pub fn wrap_options(options: SpawnOptions, socket: &str, session: &str) -> Spawn
 
 /// [`wrap_options`] の組み立ての本体。器のクライアントの実行ファイル（`program`）と、
 /// 内側コマンドの第 1 語の書き方（`quotes_program` = 器の能力。#881）と、素のペインのシェルを
-/// 器のシェルで包まずに起こさせるか（`direct_argv` = 器の能力 `direct_inner_argv`。#2484 の段 2）を
+/// 器のシェルで包まずに起こさせるか（`direct_argv` = 器の能力 `direct_inner_argv`。#2484 の段 2）と、
+/// 器のペインへ固定する PATH（`pane_path` = 器の能力 `rebuilds_pane_path` の器でだけ `Some`。#2954）を
 /// 呼び出し側が決める。
 ///
 /// tmux と psmux で argv の形を分けない 1 実装（#885）。`PsmuxBackend::wrap_spawn` が
@@ -710,6 +713,7 @@ pub(crate) fn wrap_options_for(
     program: &str,
     quotes_program: bool,
     direct_argv: bool,
+    pane_path: Option<(String, String)>,
     socket: &str,
     session: &str,
 ) -> SpawnOptions {
@@ -744,6 +748,8 @@ pub(crate) fn wrap_options_for(
         args.push("-e".to_string());
         args.push(format!("{key}={val}"));
     }
+    // #2954: PATH の固定はセッションへ固定する env の並びの最後へ入れる（長さの検査は argv が揃った後）
+    let path_at = args.len();
     if let Some(cwd) = &options.cwd {
         args.push("-c".to_string());
         args.push(cwd.display().to_string());
@@ -765,6 +771,23 @@ pub(crate) fn wrap_options_for(
         None => crate::shell_integration::pane_shell(),
     };
     args.extend(inner_args(explicit, shell, quotes_program, direct_argv));
+    // #2954: 器がペインの PATH をレジストリで組み直す（psmux 3.3.x）なら、器なしのペインと同じ値を
+    // `-e` で固定する（器は `-e` をその置き換えの後に当てる）。値は呼び手が
+    // `user_path::container_pane_path` で決めたもの。コマンドラインの上限を超えるなら固定せず
+    // 修正前（器のレジストリの PATH）へ倒す = ペインは起きる。記録に PATH の値は出さない
+    if let Some((key, val)) = pane_path {
+        let pin = ["-e".to_string(), format!("{key}={val}")];
+        match pane_path_pin_fits(program, &args, &pin) {
+            Ok(()) => {
+                args.splice(path_at..path_at, pin);
+            }
+            Err(need) => eprintln!(
+                "warning: 器 {session} のペインへ PATH を固定しない（器のコマンドラインが上限を超える: \
+                 見積もり {need} / {} 要素）。器のペインの PATH は器が組むレジストリの値になる（#2954）",
+                crate::platform::shell::COMMAND_LINE_MAX
+            ),
+        }
+    }
     SpawnOptions {
         command: Some(SpawnCommand {
             program: program.to_string(),
@@ -773,6 +796,30 @@ pub(crate) fn wrap_options_for(
         ..options
     }
 }
+
+/// 器のクライアントのコマンドライン（`program` + `args`）へ PATH の固定（`pin` = `-e K=V`）を足しても
+/// Windows のコマンドラインの上限に収まるか（#2954。**純関数**）。`Err` は足したときの見積もりの長さ。
+///
+/// 器のクライアントは同じ `-e` を器のサーバーのコマンドライン（`psmux server -s … -e K=V … -- argv`）へ
+/// 写すので、両者の差（`new-session -A -D` と `server`・実行ファイルのパス）のぶんの余白
+/// [`PANE_PATH_PIN_MARGIN`] を見込む。長さは上界（`platform::shell::command_line_len_upper`）で数える
+pub(crate) fn pane_path_pin_fits(
+    program: &str,
+    args: &[String],
+    pin: &[String],
+) -> Result<(), usize> {
+    let with_pin: Vec<String> = args.iter().chain(pin).cloned().collect();
+    let need = crate::platform::shell::command_line_len_upper(program, &with_pin);
+    if need + PANE_PATH_PIN_MARGIN <= crate::platform::shell::COMMAND_LINE_MAX {
+        Ok(())
+    } else {
+        Err(need)
+    }
+}
+
+/// [`pane_path_pin_fits`] の余白（UTF-16 の要素数）。器のサーバーのコマンドラインがクライアントより
+/// 長くなりうるぶん（`server` の引数・`-x` / `-y`・実行ファイルのパス）。実物の差は数十〜数百
+pub(crate) const PANE_PATH_PIN_MARGIN: usize = 2_048;
 
 /// 器のクライアントの argv の末尾 = 器の中で動かすもの（[`wrap_options_for`] の判断部。**純関数**に近い:
 /// 読む env は fd の上限の段 = #2367 だけ）。`explicit` は呼び手の明示のコマンド、`shell` は素のペインの
@@ -2645,6 +2692,105 @@ set -gq copy-mode-position-format ''
             tail.chunks(2).all(|c| c.len() == 2 && c[0] == "-e"),
             "セッション名の後に内側コマンドが足されている: {tail:?}"
         );
+    }
+
+    fn has_path_pin(args: &[String]) -> bool {
+        args.iter().any(|a| {
+            a.split_once('=')
+                .is_some_and(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+        })
+    }
+
+    /// #2954: tmux の器は PATH を固定しない（継いだ PATH + ログインシェルの profile）。
+    /// 呼び手が PATH を明示しても `-e` に載らず、`wrap_options` の argv は PATH を渡さない組み立てと 1 語も違わない
+    #[test]
+    fn issue2954_tmuxの器はpathを固定しない() {
+        use crate::backend::SessionBackend as _;
+        let options = SpawnOptions {
+            command: None,
+            cwd: Some("/tmp".into()),
+            env: vec![
+                ("TAKO_PANE_ID".into(), "3".into()),
+                ("PATH".into(), "/fake/bin:/usr/bin".into()),
+            ],
+            scrollback_lines: None,
+        };
+        let args = wrap_options(options.clone(), "tako-test", "tako-295400000004")
+            .command
+            .unwrap()
+            .args;
+        assert!(
+            !has_path_pin(&args),
+            "tmux の器へ PATH を固定した: {args:?}"
+        );
+        let caps = crate::backend::capabilities();
+        let unpinned = wrap_options_for(
+            options,
+            crate::tmux::tmux_bin(),
+            caps.quotes_program,
+            caps.direct_inner_argv && !crate::backend::psmux::issue2484_legacy(),
+            None,
+            "tako-test",
+            "tako-295400000004",
+        );
+        assert_eq!(args, unpinned.command.unwrap().args);
+        assert!(
+            !crate::backend::TmuxBackend::new()
+                .capabilities()
+                .rebuilds_pane_path
+        );
+    }
+
+    /// #2954: PATH の固定は器のコマンドラインの上限（32767 から余白を引いたもの）に収まるときだけ。
+    /// 超えるなら固定せず修正前（器が組むレジストリの PATH）へ倒す = ペインは起きる・他の組み立ては変わらない
+    #[test]
+    fn issue2954_pathの固定はコマンドラインの上限に収まるときだけ() {
+        use crate::platform::shell::{command_line_len_upper, COMMAND_LINE_MAX};
+        let args: Vec<String> = vec!["-u".into(), "-L".into(), "s".into()];
+        let pin = |len: usize| vec!["-e".to_string(), format!("Path={}", "a".repeat(len))];
+        let base = command_line_len_upper("psmux", &[args.clone(), pin(0)].concat());
+        let room = COMMAND_LINE_MAX - PANE_PATH_PIN_MARGIN - base;
+        // 境界: 見積もり + 余白 == 上限は収まり、1 要素でも超えると収まらない
+        assert_eq!(pane_path_pin_fits("psmux", &args, &pin(room)), Ok(()));
+        assert_eq!(
+            pane_path_pin_fits("psmux", &args, &pin(room + 1)),
+            Err(base + room + 1)
+        );
+        // 実物の組み立て: 収まる PATH は `-c` の直前に載り、長すぎる PATH は載らずに固定なしと 1 語も違わない
+        let options = SpawnOptions {
+            command: None,
+            cwd: Some("C:\\work".into()),
+            env: vec![("TAKO_PANE_ID".into(), "7".into())],
+            scrollback_lines: None,
+        };
+        let build = |path: Option<(String, String)>| {
+            wrap_options_for(
+                options.clone(),
+                "psmux",
+                false,
+                true,
+                path,
+                "tako-test",
+                "tako-295400000003",
+            )
+            .command
+            .unwrap()
+            .args
+        };
+        let none = build(None);
+        let short = build(Some(("Path".into(), "C:\\a;C:\\b".into())));
+        let at = short
+            .iter()
+            .position(|a| a == "Path=C:\\a;C:\\b")
+            .expect("収まる PATH は固定する");
+        assert_eq!(short[at - 1], "-e");
+        assert_eq!(short[at + 1], "-c");
+        let mut without = short.clone();
+        without.drain(at - 1..=at);
+        assert_eq!(without, none, "PATH の固定のほかは同じ組み立て");
+        let long = build(Some(("Path".into(), "C:\\x;".repeat(8_000))));
+        assert!(!has_path_pin(&long), "上限を超える PATH を固定した");
+        assert_eq!(long, none);
     }
 
     /// Issue #113 回帰: 「detached だが直近までアクティブ」なセッション（多重起動事故で

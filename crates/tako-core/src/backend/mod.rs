@@ -351,6 +351,17 @@ pub struct BackendCapabilities {
     /// 包む: 包みの pwsh が `.cmd` / `.ps1` のシムの解決と利用者の `$PROFILE` の環境を担っている）。
     /// tmux は従来どおりシェルを渡さない（default-shell を直接ログインシェルで起こす）ので false
     pub direct_inner_argv: bool,
+    /// **器が中のペインの PATH を自分で組み直し、クライアントから継いだ PATH を捨てるか**（#2954）。
+    ///
+    /// psmux 3.3.x は同梱の portable-pty（`cmdbuilder.rs` の `get_base_env`）が、ペインの env を
+    /// レジストリの `Path`（マシン + `;` + ユーザー）で丸ごと置き換える（上流 psmux #773。3.4.0 で
+    /// 「継いだ値は触らない」へ直ったが、tako が検証した 3.3.7 は置き換える）。そのため tako が
+    /// 組んだ PATH（#2428 の読み直しを含む・検証で先頭に置いた偽の CLI の置き場も）が器のペインへ
+    /// 届かなかった。true の器へは器なしのペインと同じ PATH を `new-session -e` で固定する
+    /// （psmux は `-e` をレジストリの上書きの**後**に当てる = `apply_user_environment`）。
+    /// tmux は継いだ PATH をそのまま使い、ペインはログインシェルとして profile を読むので false。
+    /// 器が無いときも false（tako がペインを直接起こす）
+    pub rebuilds_pane_path: bool,
     /// UI・診断・system prompt に出す名前
     pub label: &'static str,
 }
@@ -399,6 +410,8 @@ impl BackendCapabilities {
             // #2484: 器の先読みのシェルを止めるか・素のペインのシェルを包まずに起こすか
             "disables_shell_prewarm": self.disables_shell_prewarm,
             "direct_inner_argv": self.direct_inner_argv,
+            // #2954: 器のペインへ PATH を固定するか（器がレジストリの PATH で置き換える）
+            "rebuilds_pane_path": self.rebuilds_pane_path,
             "note": self.degraded_note(),
         })
     }
@@ -1457,6 +1470,27 @@ pub(crate) fn strip_claude_mod_env(args: &mut Vec<String>) -> Vec<String> {
     removed
 }
 
+/// 器のペインへ固定した PATH（#2954）を `-e <PATH>=<value>` ごと取り出す（名前の大小を問わない）。
+///
+/// 値はテストを走らせたプロセスの PATH に依るのでスナップショットに書けない。
+/// [`strip_integration_env`] と同じ作法で外し、外した値そのものを返す
+#[cfg(test)]
+pub(crate) fn strip_pane_path_env(args: &mut Vec<String>) -> Vec<String> {
+    let mut removed = Vec::new();
+    while let Some(at) = args
+        .iter()
+        .position(|a| {
+            a.split_once('=')
+                .is_some_and(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+        })
+        .filter(|at| *at > 0 && args[at - 1] == "-e")
+    {
+        removed.push(args.remove(at));
+        args.remove(at - 1);
+    }
+    removed
+}
+
 /// 注入しないペインで [`strip_claude_mod_env`] が取り出すはずの値（テスト用）
 #[cfg(test)]
 pub(crate) fn expected_neutral_claude_mod_env() -> Vec<String> {
@@ -2009,6 +2043,7 @@ mod tests {
             keeps_empty_server: true,
             disables_shell_prewarm: false,
             direct_inner_argv: false,
+            rebuilds_pane_path: false,
             label: "tmux",
         };
         assert!(with_container.degraded_note().is_none());
@@ -2028,6 +2063,7 @@ mod tests {
             keeps_empty_server: true,
             disables_shell_prewarm: false,
             direct_inner_argv: false,
+            rebuilds_pane_path: false,
             label: "none",
         };
         let note = without.degraded_note().expect("縮退の説明が要る");
@@ -2053,6 +2089,7 @@ mod tests {
             keeps_empty_server: true,
             disables_shell_prewarm: false,
             direct_inner_argv: false,
+            rebuilds_pane_path: false,
             label: "none",
         };
         let v = caps.describe();
@@ -2077,6 +2114,7 @@ mod tests {
             keeps_empty_server: true,
             disables_shell_prewarm: false,
             direct_inner_argv: false,
+            rebuilds_pane_path: false,
             label: "tmux",
         };
         assert_eq!(tmux.describe()["scrollback"], "backend");
@@ -2102,6 +2140,7 @@ mod tests {
             keeps_empty_server: false,
             disables_shell_prewarm: false,
             direct_inner_argv: false,
+            rebuilds_pane_path: false,
             label: "psmux",
         };
         let v = psmux.describe();
@@ -2156,6 +2195,7 @@ mod tests {
                 keeps_empty_server: true,
                 disables_shell_prewarm: false,
                 direct_inner_argv: false,
+                rebuilds_pane_path: false,
                 label: "session-host",
             }
         }
@@ -2383,6 +2423,7 @@ mod tests {
             keeps_empty_server: true,
             disables_shell_prewarm: false,
             direct_inner_argv: false,
+            rebuilds_pane_path: false,
             label: "session-host",
         };
         assert!(b1.full_restore());
@@ -2459,6 +2500,7 @@ mod tests {
                 keeps_empty_server: true,
                 disables_shell_prewarm: false,
                 direct_inner_argv: false,
+                rebuilds_pane_path: false,
                 label: "capture-only",
             }
         }
