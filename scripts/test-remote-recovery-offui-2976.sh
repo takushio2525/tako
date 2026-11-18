@@ -18,7 +18,11 @@
 # GUI と CLI は砂場（一時 HOME・偽物だけが居る PATH）で動かす。落とすのは自分で起こした pid だけ。
 # 窓は常設の仮想ディスプレイ（tako-vd）へ出る。
 #
-# 選んで回す: ONLY=fixed|legacy（既定は両方）。
+# 選んで回す: ONLY=fixed|legacy（既定は両方）。段の GUI へ env を足すなら PHASE_ENV（空白区切りの
+# `名前=値`。#2980 の A/B は `PHASE_ENV=TAKO_2980_LEGACY=1`）。
+#
+# #2980: 段ごとに、偽のログインシェルが `command -v ssh` を聞かれた回数を出す。PHASE_ENV が無ければ
+# ssh の実体の覚え（`remote_fs::SSH_BIN_MEMO`）が効いて 3 回以下になること（修正前は窓の間に 18 回）も見る。
 # CI には登録しない（GUI が要る）。CI 側の担保は単体テスト（`ssh_folders::tests::issue2976_*`）と番犬
 # （`crates/tako-control/tests/issue2956_setup_dispatch_offload_watchdog.rs` の `TAKO_APP_UI_LANDINGS`）。
 #
@@ -29,7 +33,7 @@ export TAKO_LANG=ja
 
 # **本番 GUI を指す env を最初に落とす**（#1449 / #1450 で本番にペインが漏れた実例が 2 件）
 unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_ORCHESTRATOR_ROLE TAKO_MCP_URL \
-  CLAUDE_CODE_PLUGIN_DIRS TAKO_CLI TAKO_2976_LEGACY TAKO_2973_LEGACY TAKO_2961_LEGACY \
+  CLAUDE_CODE_PLUGIN_DIRS TAKO_CLI TAKO_2976_LEGACY TAKO_2973_LEGACY TAKO_2961_LEGACY TAKO_2980_LEGACY \
   TAKO_IPC_TIMEOUT_SECS TAKO_PERF_LOG CLAUDE_CONFIG_DIR TAKO_TMUX_BIN TAKO_TMUX_SOCKET \
   TAKO_SETUP_PROBE_TIMEOUT_SECS TAKO_REMOTE_TIMEOUT_SECS
 unset CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ID CLAUDECODE
@@ -454,14 +458,25 @@ phase() {
   esac
   local lsh
   lsh="$(wc -l < "$FAKE_DIR/loginsh-ssh.log" 2>/dev/null | tr -d ' ')"
-  echo "    （参考）この段でログインシェルへ command -v ssh を聞いた回数: ${lsh:-0}"
+  lsh="${lsh:-0}"
+  echo "    この段でログインシェルへ command -v ssh を聞いた回数: ${lsh}（PHASE_ENV: ${PHASE_ENV:-なし}）"
+  # #2980: 覚えが効いていれば、フォルダを開いたときの 1 回（+ 余裕）で済む
+  if [ -z "${PHASE_ENV:-}" ]; then
+    if [ "$lsh" -ge 1 ] && [ "$lsh" -le 3 ]; then
+      pass "$name: ログインシェルへ ssh の実体を聞いたのは ${lsh} 回（覚えが効いている。#2980）"
+    else
+      fail "$name: ログインシェルへ ssh の実体を聞いた回数が ${lsh} 回（覚えが効いていれば 1〜3 回。#2980）"
+    fi
+  fi
   stop_app
 }
 
 RECOVER_fixed=""
 RECOVER_legacy=""
-want fixed && phase fixed
-want legacy && phase legacy TAKO_2976_LEGACY=1
+# shellcheck disable=SC2086
+want fixed && phase fixed ${PHASE_ENV:-}
+# shellcheck disable=SC2086
+want legacy && phase legacy TAKO_2976_LEGACY=1 ${PHASE_ENV:-}
 
 # 2. 繋ぎ直しの振る舞いが修正前後で同じ（復帰の行の本文と、かかった秒数の差が tick 2 本ぶん以内）
 if [ -f "$TMP/out/fixed-recover.line" ] && [ -f "$TMP/out/legacy-recover.line" ]; then
