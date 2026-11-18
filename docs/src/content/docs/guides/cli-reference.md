@@ -1732,6 +1732,8 @@ tako orchestrator accounts add work --inherit
 tako orchestrator accounts remove work
 ```
 
+アカウントごとに `tako setup-mcp` を打つ必要はありません。tako が起こす claude（master / solo / worker）は、起動のたびに tako の MCP を受け取ります。`tako setup-mcp` の登録が効くのは、そのアカウントの設定ディレクトリで手で開いた claude だけです。各アカウントの状態は `tako check-health` の「Claude MCP（アカウント <名前>）」の行で確かめられます。
+
 ### tako orchestrator spawn / run
 
 子 worker をペインに起動し、プロンプトを渡します。

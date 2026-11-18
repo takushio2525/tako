@@ -664,6 +664,10 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
 
   以後はどのプロジェクト・どのペインでも設定なしでペイン操作ツールが使える。
   ブリッジが毎回環境変数を読むため URL / トークンの変動に強く、tako 外では 0 ツールで邪魔しない
+- **tako が起こす claude（master / solo / worker）は登録に頼らず起動の行で受け取る**（#2912）:
+  `--mcp-config=<data_dir>/worker-mcp/tako-<hash>.json` を 1 語で渡す（`--strict-mcp-config` は付けない）。
+  登録は打ったシェルの `CLAUDE_CONFIG_DIR` の 1 か所にしか入らず、アカウント（#504）の設定 dir では
+  tako のツールが 0 本になっていた。詳細は `.agent/orchestrator.md`「tako の MCP は起動の行で渡す」
 - 実機検証は `scripts/verify-claude-mcp.sh`（GUI なしで IPC + MCP + dispatch を立てる
   `tako-control` の example `mcp_host` 内で実物の `claude -p` を実行。stdio / HTTP の両経路。
   ユーザーのグローバル claude 設定は変更しない `--mcp-config --strict-mcp-config` 方式）

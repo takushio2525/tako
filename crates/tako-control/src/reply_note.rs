@@ -368,6 +368,10 @@ pub enum ReplyNote {
     McpCodexKeepMissing(String),
     /// worker の MCP（codex）: `-c` で表せない名前 `<name>` は止めずに持ち込む
     McpCodexNameInexpressible(String),
+    /// claude の起動の行で渡す tako の MCP（#2912）: 設定ファイルを書けなかった（`why` は同じ言語で組む）
+    McpLaunchUnwritable(SessionRefusal),
+    /// claude の起動の行で渡す tako の MCP（#2912）: 設定ファイルの置き場（データディレクトリ）が決まらない
+    McpLaunchNoDataDir,
 
     // ---- orchestrator の応答の warnings に並ぶ別モジュールの注記 ----
     /// 引き継ぎファイルの移行: projects.yaml が読めないので見送った（`handoff_store::ensure_migrated`）
@@ -2018,6 +2022,28 @@ impl ReplyNote {
                 "codex's -c cannot express names with '.', spaces and the like, so '{name}' is \
                  brought in without being turned off"
             ),
+            (Self::McpLaunchUnwritable(why), Ja) => format!(
+                "tako の MCP を起動の行で渡す設定ファイルを書けなかったので、今回は claude の設定 dir の\
+                 登録に頼って起動する（登録が無ければ tako のツールが出ない）: {}",
+                why.text_in(lang)
+            ),
+            (Self::McpLaunchUnwritable(why), En) => format!(
+                "could not write the file that passes tako's MCP on the launch line, so this launch \
+                 relies on the registration in claude's settings directory (without one, tako's \
+                 tools do not appear): {}",
+                why.text_in(lang)
+            ),
+            (Self::McpLaunchNoDataDir, Ja) => {
+                "tako の MCP を起動の行で渡す設定ファイルの置き場が無いので、今回は claude の設定 dir の\
+                 登録に頼って起動する（登録が無ければ tako のツールが出ない）: データディレクトリを特定できない"
+                    .into()
+            }
+            (Self::McpLaunchNoDataDir, En) => {
+                "there is no place for the file that passes tako's MCP on the launch line, so this \
+                 launch relies on the registration in claude's settings directory (without one, \
+                 tako's tools do not appear): cannot determine the data directory"
+                    .into()
+            }
 
             (Self::HandoffMigrationDeferred(e), Ja) => format!(
                 "projects.yaml が読めないため移行を見送った: {}",

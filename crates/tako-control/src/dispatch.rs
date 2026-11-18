@@ -17320,6 +17320,7 @@ pub fn dispatch_orchestrator_projects_mcp(
         &orchestrator::EMPTY_ENV_PLAN,
         &keep,
         &[],
+        None,
     );
     // 警告は表示言語（#2365。文は `ReplyNote` の 1 か所）
     let mut warnings: Vec<String> = plan.warnings.iter().map(ToString::to_string).collect();
@@ -17341,6 +17342,7 @@ pub fn dispatch_orchestrator_projects_mcp(
                 &codex_env,
                 &keep,
                 &[],
+                None,
             )
         });
     if let Some(c) = &codex {
@@ -20763,9 +20765,16 @@ fn dispatch_orchestrator_handoff(
         .map_err(|e| Reason::SystemPromptWriteFailed(e.to_string()).operation())?;
     let tako_bin = tako_binary();
     // ペインを分割する**前**に組み立てる（失敗したときに空ペインだけ残さない）
-    let master_cmd =
-        orchestrator::build_master_cmd_typed(&role_env, &profile, &prompt_path, &tako_bin)
-            .map_err(ConfigError::operation)?;
+    // tako の MCP を起動の行で渡す（#2912。後任も前任と同じ形で立てる。書けなければ付けない）
+    let mcp_config = crate::worker_mcp::ready_tako_launch_config(&tako_bin, "handoff");
+    let master_cmd = orchestrator::build_master_cmd_typed(
+        &role_env,
+        &profile,
+        &prompt_path,
+        &tako_bin,
+        mcp_config.as_deref(),
+    )
+    .map_err(ConfigError::operation)?;
 
     // #1055: 起動フォルダは **プロファイルの cwd → 前任 master の cwd → ホーム** の順。
     // 以前はホーム決め打ちで、プロファイルの `cwd` すら読んでいなかった。master の動作環境は
@@ -21029,6 +21038,7 @@ fn dispatch_git_resolve_agent(
             .map(|c| crate::worker_mcp::keep_for_cwd(&c, &repo))
             .unwrap_or_default(),
         &launch.extra_args,
+        Some(&tako_bin),
     )
     .materialized();
     for w in &worker_mcp.warnings {
@@ -21051,6 +21061,7 @@ fn dispatch_git_resolve_agent(
         extra_args: &launch.extra_args,
         tako_bin: Some(&tako_bin),
         mcp_settings: worker_mcp.settings_file.as_deref(),
+        mcp_config: worker_mcp.tako_config_file(),
         mcp_codex_off: &worker_mcp.codex_off,
         env: &profile_env,
         resume: None,
@@ -21866,6 +21877,7 @@ impl SpawnPlaced {
             &profile_env,
             &mcp_keep,
             &launch.extra_args,
+            Some(&tako_bin),
         )
         .materialized();
         let worker_cmd =
@@ -21882,6 +21894,7 @@ impl SpawnPlaced {
                 extra_args: &launch.extra_args,
                 tako_bin: Some(&tako_bin),
                 mcp_settings: worker_mcp.settings_file.as_deref(),
+                mcp_config: worker_mcp.tako_config_file(),
                 mcp_codex_off: &worker_mcp.codex_off,
                 env: &profile_env,
                 // 新しい会話（再開は resume_launch::worker_resume_launch が同じ関数へ会話 ID を渡す = #2473）
