@@ -1859,6 +1859,14 @@ stderr の読み手が先に閉じたパイプなら EPIPE で同じことが起
   `tako_core::platform::process`（`signal_own_group` / `await_group_or_kill` / `kill_group`。#2860）が持ち、
   probe は A/B のゲートと猶予の値を渡して呼ぶだけ。番犬 `crates/tako-control/tests/issue2633_probe_group_term_watchdog.rs`、
   実経路 `bash scripts/measure-shutdown-hup-2633.sh`（`ONLY=c`）、A/B `TAKO_2633_LEGACY=1`
+- **待つ子は既定のシグナルマスク（空）で起こす**（#2979）。子のマスクは起こしたスレッドから受け継がれ、
+  GUI の背景の段（GCD のスレッド）は TERM / INT / HUP ほか 20 種をブロックしているので、そのまま起こすと
+  上の打ち切りの SIGTERM が届かず、いつも猶予の後の SIGKILL になる。`probe::spawn_for_wait` は境界 B5 の
+  `spawn_with_default_sigmask` の中で起こす（`spawn` の間だけスレッドのマスクを空にしてガードの drop で戻す。
+  `pre_exec` で戻すと std が fork 経路へ落ちて spawn 1 回が約 0.65 ms 重くなる）。打ち切りで TERM を受ける子
+  （`lead_own_group` で起こす子）は `spawn_for_wait` で起こし、素の `.spawn()` / `.output()` にしない。番犬
+  `crates/tako-control/tests/issue2979_child_sigmask_watchdog.rs`、実経路 `bash scripts/test-child-sigmask-2979.sh`、
+  A/B `TAKO_2979_LEGACY=1`
 - **ログインシェルの起こし方はシェル種別の表 `platform::exe::login_invocation` の 1 実装で決める**（#2577）。
   tcsh / csh は `-l` を唯一の引数としてしか受け付けず、`$SHELL -l -c …` が毎回 `Unknown option: '-l'` で
   落ちていた（探索・PATH の読み取り・CLI の子のすべて。修正前の砂場の check-health でログインシェルでだけ

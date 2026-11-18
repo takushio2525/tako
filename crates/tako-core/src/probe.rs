@@ -104,6 +104,14 @@
 //! 猶予（[`GROUP_TERM_GRACE`]）の間グループを見張って、残っていれば SIGKILL で畳む。頭（直接の子）は
 //! 判定が済むまで刈り取らないので、グループの番号は別のグループへ使い回されない。
 //! A/B は [`issue2633_legacy`]（`TAKO_2633_LEGACY=1` = 猶予を置かずにグループごと SIGKILL）の 1 か所
+//!
+//! ## 背景の段から起こした子にも TERM を届ける（Issue #2979）
+//!
+//! 子のシグナルマスクは起こしたスレッドから受け継がれる。GUI の背景の段（GPUI の macOS の dispatcher =
+//! GCD のスレッド）は TERM / INT / HUP ほか 20 種をブロックしているので、そこから起こした子には上の
+//! SIGTERM が届かず、いつも猶予の後の SIGKILL で trap なしに消えていた（#2976 で生死の判定を背景へ出して
+//! 実測）。待つ子は [`spawn_for_wait`] が境界（`platform::process::spawn_with_default_sigmask`）を通して
+//! 既定のマスク（空）で起こす。A/B は [`issue2979_legacy`]（`TAKO_2979_LEGACY=1` = マスクを受け継ぐ）の 1 か所
 
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -640,6 +648,19 @@ pub fn issue2633_legacy() -> bool {
     })
 }
 
+/// #2979 の A/B（`TAKO_2979_LEGACY=1`）。待つ子（[`spawn_for_wait`]）を起こすスレッドのマスクを外さない =
+/// GUI の背景の段（GCD のスレッド）から起こした子は TERM / INT / HUP をブロックしたまま動き、打ち切りの
+/// SIGTERM（#2633）は届かずに猶予の後の SIGKILL で消える（修正前の形）。**ゲートはこの 1 か所**
+pub fn issue2979_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_2979_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
 /// コマンドを起こして、上限つきで待つ。
 ///
 /// **`Command` の組み立てごとここが持つ**（呼び手に `Command::new` を書かせない）。
@@ -799,12 +820,21 @@ impl From<Child> for Spawned {
 /// 起こした孫が外に残った）。器の CLI は入れない（[`admits`]）。
 ///
 /// 作成フラグは付け直すので、コンソールウィンドウは出さない（呼び手の雛形が `no_console_window` を
-/// 通している前提と同じ = #586）。unix は素の `spawn`
+/// 通している前提と同じ = #586）。unix は素の `spawn`。
+///
+/// 子は**既定のシグナルマスク（空）で**起こす（#2979。境界 [`spawn_with_default_sigmask`]）。GUI の
+/// 背景の段（GCD のスレッド）は TERM / INT / HUP をブロックしているので、そのまま起こすと子が受け継ぎ、
+/// 打ち切りの SIGTERM（#2633）が届かない。A/B は [`issue2979_legacy`]。起こし済みの子（`From<Child>` =
+/// 器の CLI）はマスクを直さない（グループを率いないので、打ち切りは直接の子への SIGKILL = TERM を使わない）
 ///
 /// [`KillScope::spawn`]: crate::platform::job::KillScope::spawn
+/// [`spawn_with_default_sigmask`]: crate::platform::process::spawn_with_default_sigmask
 pub fn spawn_for_wait(command: &mut Command) -> std::io::Result<Spawned> {
     use crate::platform::job::{Console, KillScope};
-    let (child, descendants) = KillScope::spawn(command, Console::NoWindow, admits)?;
+    let (child, descendants) =
+        crate::platform::process::spawn_with_default_sigmask(issue2979_legacy, || {
+            KillScope::spawn(command, Console::NoWindow, admits)
+        })?;
     Ok(Spawned { child, descendants })
 }
 
