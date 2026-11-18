@@ -180,7 +180,18 @@ mcp_call() {
     next unless defined $m->{id} && $m->{id} == 2;
     binmode STDOUT, ":utf8";
     for my $c (@{ $m->{result}{content} || [] }) { print $c->{text}, "\n" if $c->{type} eq "text" }
+    print "error: ", $m->{error}{message}, "\n" if ref $m->{error} eq "HASH";
     last;' "$TMP/out/$3-raw.out" > "$TMP/out/$3.out"
+}
+
+# 最初のタブの最初のペインの id（分割の元。MCP の split は呼び出し元のペインを env から特定できないので明示する）
+first_pane() {
+  # shellcheck disable=SC2046
+  env $(sandbox_env) TAKO_SOCKET="$(gui_socket)" TAKO_TOKEN="$(cat "$TAKO_DATA_DIR/token")" \
+    "$TAKO_BIN" list < /dev/null 2>/dev/null | perl -MJSON::PP -e '
+      local $/; my $v = eval { JSON::PP->new->utf8->decode(<STDIN>) } or exit;
+      my $id = $v->{tabs}[0]{panes}[0]{id};
+      print "$id\n" if defined $id;'
 }
 
 # `tako list` の中で、宛先 HOST の ssh を引き取ったペインの `ssh_connect.reconnect.source`（無ければ空）
@@ -238,8 +249,14 @@ fake_started() {
 # 手打ちの ssh に見えるペインを作り、引き取りまで待つ（上限 30 秒）。結果: ADOPTED（source）・HOLD_MS・ASKED（ログインシェルに聞いた回数）
 adopt_case() {
   local phase="$1" i
+  local pane
   rm -f "${FAKE_DIR:?}"/asked-ssh-*
-  mcp_call tako_split_pane "{\"command\":[\"$TMP/bin/ssh\",\"$HOST\"],\"focus\":false}" "$phase-split" 30
+  pane="$(first_pane)"
+  if [ -z "$pane" ]; then
+    fail "$phase: 分割の元のペインを tako list から読めない"
+    return 1
+  fi
+  mcp_call tako_split_pane "{\"pane\":$pane,\"command\":[\"$TMP/bin/ssh\",\"$HOST\"],\"focus\":false}" "$phase-split" 30
   for i in $(seq 1 100); do
     fake_started && break
     sleep 0.1
@@ -260,6 +277,8 @@ adopt_case() {
   ASKED="$(command ls "$FAKE_DIR" | grep -c '^asked-ssh-' || true)"
   echo "    引き取り: source=${ADOPTED:-（なし）}・着地 periodic_land:ssh_scan の専有の最大 ${HOLD_MS}ms・ログインシェルに聞いた回数 ${ASKED}"
   grep -h "periodic_land:ssh_scan\|UI ストール" "$TAKO_DATA_DIR/perf.log" 2>/dev/null | sed 's/^/      /' | head -4
+  # 専有の行が無い（= 修正後の期待どおり）と上の grep は非ゼロ。pipefail の下でそれを段の失敗と読ませない
+  return 0
 }
 
 phase_gui() {
@@ -273,7 +292,19 @@ phase_gui() {
   else
     fail "gui: ssh の実体を引いていない（ログインシェルに聞いた回数 ${ASKED:-0}）"
   fi
-  # 引き取った後の tick（ssh が生きている間）はログインシェルを起こさない
+  # 引き取った後の tick（ssh が生きている間）はログインシェルを起こさない。
+  # #976 の自動追加（`probe_remote_home`。background で ssh の実体を引いて接続を確かめる = 設計どおりで
+  # UI スレッドではない）が終わるまで待ってから数える（重ねると、その問い合わせを tick のものと数えてしまう）
+  local i
+  for i in $(seq 1 300); do
+    grep -q "ssh 自動追加[^:]*: $HOST" "$TAKO_DATA_DIR/persist.log" 2>/dev/null && break
+    sleep 0.1
+  done
+  if ! grep -q "ssh 自動追加[^:]*: $HOST" "$TAKO_DATA_DIR/persist.log" 2>/dev/null; then
+    fail "gui: #976 の自動追加の結果が 30 秒で persist.log に出ない"
+    stop_app
+    return
+  fi
   rm -f "${FAKE_DIR:?}"/asked-ssh-*
   sleep 8
   check_eq "gui: 引き取り済みのペインだけの tick はログインシェルを起こさない（8 秒の間に聞いた回数）" "0" \
