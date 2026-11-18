@@ -25,7 +25,8 @@
 //! ## プロセスグループ・打ち切り・終了シグナル（#2860。#1538 の表の S5）
 //!
 //! tako-core の呼び手（`probe` / `backend_reattach` / `tmux_cleanup`）が使う OS 差もここに置く:
-//! 子を**自分のプロセスグループの頭として起こす**（[`lead_own_group`]）・**グループへ終了要求を送る**
+//! 子を**自分のプロセスグループの頭として起こす**（[`lead_own_group`]）・**子を既定のシグナルマスクで
+//! 起こす**（[`spawn_with_default_sigmask`]。#2979）・**グループへ終了要求を送る**
 //! （[`signal_own_group`]）・**猶予の後に畳む**（[`await_group_or_kill`] / [`kill_group`]）・
 //! **終了シグナルを読む**（[`exit_signal`]）・**pid を名指しして強制終了する**（[`force_kill_pid`]）。
 //! 呼び手は OS を見ずに 1 本の経路で呼び、`cfg` はこの境界の中の実装の選択だけに置く。
@@ -273,6 +274,70 @@ pub fn lead_own_group(command: &mut Command) {
     #[cfg(not(unix))]
     {
         let _ = command;
+    }
+}
+
+/// 子を**既定のシグナルマスク（何もブロックしない）で**起こす（#2979）。`spawn` の間だけ、起こす
+/// スレッドのマスクを空にし、終わったら元のマスクへ戻す。
+///
+/// 子のマスクは起こしたスレッドのマスクを受け継ぐ（Rust 1.95 の std は posix_spawn 経路も fork 経路も
+/// 戻さない）。GUI の背景の段（GPUI の macOS の dispatcher = GCD のスレッド）は TERM / INT / HUP / QUIT /
+/// CHLD / WINCH / USR1 ほか 20 種をブロックしているので、そこから起こした子は打ち切りの SIGTERM
+/// （[`signal_own_group`]。#2633）を受けられず、猶予の後の SIGKILL で trap なしに消えていた。
+/// UI スレッド（マスクは空）から起こす子は前後で同じ（空 → 空）。
+///
+/// 起こし方は posix_spawn のまま。子の中（`pre_exec`）で戻すと std が fork 経路へ落ち、Metal と AppKit を
+/// 載せたプロセスの実測で 1 回 0.11 → 0.76 ms になる。外している間（spawn の 0.1 ms ほど）は、
+/// プロセス宛てのシグナルがこのスレッドへ届きうる。GUI が握るハンドラ（SIGTERM = quit 要求のフラグ・
+/// SIGCHLD = alacritty のパイプ）はどのスレッドで走っても同じで、ほかは既定の動作（プロセス単位）なので
+/// 振る舞いは変わらない。元へ戻すのは `spawn` が panic しても走るガードの drop。
+/// `issue2979_legacy()` が真（A/B の旧経路。呼び手の `probe::issue2979_legacy` を渡す）なら外さない =
+/// 修正前の形。unix 以外にシグナルマスクは無いので、そのまま `spawn` を呼ぶ
+pub fn spawn_with_default_sigmask<T>(
+    issue2979_legacy: impl FnOnce() -> bool,
+    spawn: impl FnOnce() -> T,
+) -> T {
+    #[cfg(unix)]
+    {
+        if issue2979_legacy() {
+            return spawn();
+        }
+        let _restore = SigmaskRestore::unblock_all();
+        spawn()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = issue2979_legacy;
+        spawn()
+    }
+}
+
+/// 起こすスレッドのシグナルマスクを空にし、drop で外す前のマスクへ戻すガード
+/// （#2979。[`spawn_with_default_sigmask`] の中だけで作る）
+#[cfg(unix)]
+struct SigmaskRestore(libc::sigset_t);
+
+#[cfg(unix)]
+impl SigmaskRestore {
+    fn unblock_all() -> Self {
+        // SAFETY: このスレッドのシグナルマスクを読み書きするだけ（集合は値で持ち、ポインタは引数の間だけ）
+        unsafe {
+            let mut empty: libc::sigset_t = std::mem::zeroed();
+            let mut before: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut empty);
+            libc::pthread_sigmask(libc::SIG_SETMASK, &empty, &mut before);
+            SigmaskRestore(before)
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SigmaskRestore {
+    fn drop(&mut self) {
+        // SAFETY: 同上（外す前に読んだマスクへ戻す）
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut());
+        }
     }
 }
 
@@ -702,5 +767,157 @@ mod tests {
             .expect("子プロセスを起動できない");
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "tako");
+    }
+
+    /// GCD のワーカースレッドがブロックしているシグナル（macOS の `dispatch_async` の上で読んだ組から、
+    /// macOS にしか無い SIGINFO を外したもの。#2979）
+    #[cfg(unix)]
+    const GCD_BLOCKED: [libc::c_int; 19] = [
+        libc::SIGHUP,
+        libc::SIGINT,
+        libc::SIGQUIT,
+        libc::SIGABRT,
+        libc::SIGALRM,
+        libc::SIGTERM,
+        libc::SIGURG,
+        libc::SIGTSTP,
+        libc::SIGCONT,
+        libc::SIGCHLD,
+        libc::SIGTTIN,
+        libc::SIGTTOU,
+        libc::SIGIO,
+        libc::SIGXCPU,
+        libc::SIGXFSZ,
+        libc::SIGVTALRM,
+        libc::SIGWINCH,
+        libc::SIGUSR1,
+        libc::SIGUSR2,
+    ];
+
+    /// このスレッドのマスクに入っているシグナル（1〜31・昇順）
+    #[cfg(unix)]
+    fn blocked_now() -> Vec<libc::c_int> {
+        // SAFETY: このスレッドのマスクを読むだけ
+        unsafe {
+            let mut cur: libc::sigset_t = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut cur);
+            (1..32)
+                .filter(|&s| libc::sigismember(&cur, s) == 1)
+                .collect()
+        }
+    }
+
+    /// このスレッドのマスクを `sigs` の組にする
+    #[cfg(unix)]
+    fn set_thread_mask(sigs: &[libc::c_int]) {
+        // SAFETY: このスレッドのマスクを書くだけ
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            for &sig in sigs {
+                libc::sigaddset(&mut set, sig);
+            }
+            libc::pthread_sigmask(libc::SIG_SETMASK, &set, std::ptr::null_mut());
+        }
+    }
+
+    /// GCD のスレッドと同じ組をブロックした新しいスレッドで `f` を走らせる（GUI の背景の段の代役。#2979）
+    #[cfg(unix)]
+    fn on_gcd_like_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::spawn(move || {
+            set_thread_mask(&GCD_BLOCKED);
+            f()
+        })
+        .join()
+        .expect("代役のスレッドが panic しない")
+    }
+
+    #[cfg(unix)]
+    fn sorted_gcd_blocked() -> Vec<libc::c_int> {
+        let mut want = GCD_BLOCKED.to_vec();
+        want.sort_unstable();
+        want
+    }
+
+    /// 子の sh が自分へ TERM / INT / HUP を送り、trap が走ったシグナルの名前を返す（昇順に並べ直す）。
+    /// 子のマスクが空なら 3 つとも走り、受け継いだ組がブロックしていれば保留のまま何も走らない
+    #[cfg(unix)]
+    fn child_traps(legacy: bool) -> String {
+        let mut cmd = Command::new("/bin/sh");
+        // unix では何もしない（境界 B14 を素通りしない形に揃える = #628 の番犬の数を増やさない）
+        no_console_window(&mut cmd)
+            .arg("-c")
+            .arg(
+                "trap 'echo TERM' TERM; trap 'echo INT' INT; trap 'echo HUP' HUP; \
+                 kill -TERM $$; kill -INT $$; kill -HUP $$; sleep 0.2",
+            )
+            .stdout(std::process::Stdio::piped());
+        let child = spawn_with_default_sigmask(|| legacy, || cmd.spawn()).expect("sh を起こせる");
+        let out = child.wait_with_output().expect("sh を待てる");
+        let mut names: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        names.sort();
+        names.join(" ")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue2979_ブロックしたスレッドから起こしても子はterm_int_hupを受ける() {
+        let (got, after) = on_gcd_like_thread(|| (child_traps(false), blocked_now()));
+        assert_eq!(
+            got, "HUP INT TERM",
+            "子は既定のマスク（空）で生まれ、trap が 3 つとも走る"
+        );
+        assert_eq!(
+            after,
+            sorted_gcd_blocked(),
+            "起こした後、起こしたスレッドのマスクは元の組へ戻る"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue2979_旧経路では子が起こしたスレッドのマスクを受け継ぐ() {
+        let (got, after) = on_gcd_like_thread(|| (child_traps(true), blocked_now()));
+        assert_eq!(
+            got, "",
+            "A/B の旧経路 = 子は TERM / INT / HUP をブロックしたまま（修正前の再現）"
+        );
+        assert_eq!(after, sorted_gcd_blocked());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue2979_マスクが空のスレッドから起こす子は前後で同じ() {
+        // UI スレッド（マスクは空）の代役
+        let (fixed, legacy, after) = std::thread::spawn(|| {
+            set_thread_mask(&[]);
+            (child_traps(false), child_traps(true), blocked_now())
+        })
+        .join()
+        .expect("代役のスレッドが panic しない");
+        assert_eq!(fixed, "HUP INT TERM");
+        assert_eq!(legacy, fixed, "修正前後で同じ");
+        assert!(after.is_empty(), "スレッドのマスクは空のまま: {after:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue2979_spawnがpanicしてもスレッドのマスクは戻る() {
+        let (caught, after) = on_gcd_like_thread(|| {
+            let caught = std::panic::catch_unwind(|| {
+                spawn_with_default_sigmask(|| false, || panic!("起こす途中の panic（注入）"))
+            })
+            .is_err();
+            (caught, blocked_now())
+        });
+        assert!(caught, "注入した panic が外へ出る");
+        assert_eq!(
+            after,
+            sorted_gcd_blocked(),
+            "panic で抜けても、ガードの drop がマスクを元の組へ戻す"
+        );
     }
 }
