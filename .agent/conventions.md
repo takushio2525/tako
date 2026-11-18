@@ -1447,7 +1447,10 @@ AppleSystemPolicy が読めずに 1 本ずつ拒否する。記録されるパ�
   - 縛らない口: ユーザー操作で 1 回（`open` / `osascript` / Code Runner / LSP の起動）・1 日 1 回
     （アプリ内更新の `brew`）・オプトインの送信（telemetry の `hostname` 等）・macOS で届かない落ち先
     （`agents` の `ps` は libproc が先に答える）・既に絶対パスかログインシェルで引く口（claude・ssh・
-    ffmpeg・`/bin/ps`・`/usr/bin/ditto`）。remote daemon の `hostname` はスマホの要求ごと（#2518 の範囲）。
+    ffmpeg・`/bin/ps`・`/usr/bin/ditto`）。ログインシェルで引く口を周期の経路から呼ぶなら、答え（絶対パス）を
+    覚えて毎回ログインシェルを起こさない（claude = #1968 の `stale_binary::WHICH_MEMO`・ssh / sftp = #2980 の
+    `remote_fs::SSH_BIN_MEMO`。まだ実行できる限り使い回し・600 秒で引き直し・見つからないは 60 秒。
+    #2980 はログインシェルの打ち切りを覚えない = `exe::find_noting_timeout` で見分ける）。remote daemon の `hostname` はスマホの要求ごと（#2518 の範囲）。
     起動時に 1 回だけの口（`bin_resolve` の素の名前の `--version`・`backend` の `psmux -V`）は
     install の差し替えより前に終わるので縛らない
   - **洗い出しは実測で裏を取る**: 静的な洗い出し（#2522）は「どの状態で周期に乗るか」（remote daemon の

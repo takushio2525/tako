@@ -80,6 +80,30 @@ pub fn find(name: &str) -> Option<String> {
     }
 }
 
+/// [`find`] と同じ探し方・同じ打ち切りの記録（persist.log へ名前ごとに 1 回）で、打ち切ったかも返す版（#2980）。
+///
+/// 答えを覚える呼び手（`remote_fs::ssh_bin` の覚え）のための口: 「見つからない」は覚えてよいが、
+/// 打ち切り（確かめられなかった）を覚えると、rc が一時的に固まっただけで以後しばらく「無い」と答えてしまう。
+/// 本文は [`find`] と同じ形（[`find`] の形は #1533 の番犬が縛っているので、委ねずに並べて置く）。
+/// Windows は PATH の走査だけ（子プロセスを起こさない）なので打ち切りは無い
+pub fn find_noting_timeout(name: &str) -> BoundedFind {
+    #[cfg(unix)]
+    {
+        let found = find_bounded(name);
+        if let Some(notice) = &found.timeout {
+            report_find_timeout(name, notice);
+        }
+        found
+    }
+    #[cfg(not(unix))]
+    {
+        BoundedFind {
+            path: imp::find(name),
+            timeout: None,
+        }
+    }
+}
+
 /// [`find`] の打ち切りを**呼び手まで運ぶ**版（#1532 / #1533）。
 ///
 /// 上限は `probe::login_shell_timeout()`（既定 5 秒・env で変えられるが外せない）。

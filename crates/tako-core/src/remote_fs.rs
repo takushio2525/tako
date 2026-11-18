@@ -31,7 +31,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::i18n::Lang;
 use crate::platform::support::Note;
@@ -876,18 +877,105 @@ pub fn split_batch_sections(stdout: &str) -> Vec<(String, String)> {
 
 // --- 子プロセス -------------------------------------------------------------
 
-/// `ssh` の実体（見つからなければ None）
+/// `ssh` の実体（見つからなければ None）。答えは [`SSH_BIN_MEMO`] で覚える（#2980）
 pub fn ssh_bin() -> Option<String> {
-    resolve_bin("ssh")
+    resolve_bin("ssh", &SSH_BIN_MEMO)
 }
 
-/// `sftp` の実体
+/// `sftp` の実体。答えは [`SFTP_BIN_MEMO`] で覚える（#2980）
 pub fn sftp_bin() -> Option<String> {
-    resolve_bin("sftp")
+    resolve_bin("sftp", &SFTP_BIN_MEMO)
 }
 
-fn resolve_bin(name: &str) -> Option<String> {
-    crate::platform::exe::find(name)
+/// #2980 の A/B の env（`1` = 修正前と同じく、呼ばれるたびにログインシェルで引き直す）
+pub const ISSUE2980_LEGACY_ENV: &str = "TAKO_2980_LEGACY";
+
+/// #2980 の A/B が立っているか（**門はここ 1 か所**。値を覚えない）
+pub fn issue2980_legacy() -> bool {
+    matches!(
+        std::env::var(ISSUE2980_LEGACY_ENV).ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
+/// ssh の実体の覚え（#2980）。
+///
+/// unix の [`crate::platform::exe::find`] は覚えを持たず、呼ばれるたびにログインシェル
+/// （`$SHELL -l -c 'command -v ssh'` = 利用者の rc を毎回読む）を起こす。リモートフォルダを出している間は
+/// 自動復帰の見張り（2 秒 tick ごと・ホストごとの `liveness`）とツリーの読み（`ensure_master`）が
+/// ここを通るので、#2976 の実経路の約 25 秒の窓でログインシェルが 18 本起きていた。
+/// 失効の決め方は claude の保険の探索の覚え（#1968 の `stale_binary::WHICH_MEMO`）と同じ: 見つかった
+/// パスは**まだ実行できる限り**（使うたびに stat 1 回）使い回し、[`BIN_HIT_TTL`] ごとに引き直す
+/// （ログインシェルの PATH の変化を拾う）。見つからなかった答えは [`BIN_MISS_TTL`] だけ覚える
+/// （後から入れた ssh を拾うまでの最長）。打ち切り（確かめられなかった）は覚えない
+static SSH_BIN_MEMO: Mutex<Option<BinMemo>> = Mutex::new(None);
+
+/// sftp の実体の覚え（#2980。扱いは [`SSH_BIN_MEMO`] と同じ）
+static SFTP_BIN_MEMO: Mutex<Option<BinMemo>> = Mutex::new(None);
+
+/// 見つかったパスを引き直す間隔（ログインシェルの PATH の手前へ別の ssh が入った = 入れ直しを拾う）
+pub const BIN_HIT_TTL: Duration = Duration::from_secs(600);
+/// 見つからなかった答えを覚える長さ（入れたばかりの ssh を拾うまでの最長）
+pub const BIN_MISS_TTL: Duration = Duration::from_secs(60);
+
+/// 引いた答えと、引いた時刻（#2980）
+struct BinMemo {
+    at: Instant,
+    found: Option<String>,
+}
+
+/// 実体を覚えを通して引く（#2980）。A/B の旧経路は覚えを通さずに毎回引く（= 修正前）
+fn resolve_bin(name: &str, memo: &Mutex<Option<BinMemo>>) -> Option<String> {
+    if issue2980_legacy() {
+        return crate::platform::exe::find(name);
+    }
+    memoized_bin(
+        memo,
+        Instant::now(),
+        |path| crate::platform::exe::is_executable_file(Path::new(path)),
+        || crate::platform::exe::find_noting_timeout(name),
+    )
+}
+
+/// 覚えを通して引く（純粋な判定。テストで時計・在るかの確かめ・探索を差し替える。#2980）。
+///
+/// - 覚えたパスが [`BIN_HIT_TTL`] より新しく、まだ実行できる（`still_valid`）→ 引かずに返す
+/// - 覚えた「見つからない」が [`BIN_MISS_TTL`] より新しい → 引かずに `None`
+/// - それ以外は引く。見つかった / 見つからなかったは覚え直す。**打ち切り（確かめられなかった）は覚えない**
+///   = 次の呼び手が引き直す（修正前と同じ）。このとき前に覚えたパスがまだ実行できるなら、それを返して
+///   次に引き直すのは [`BIN_HIT_TTL`] の後にする（rc が固まっている間に毎回打ち切りを待たない）
+///
+/// 引いている間もロックを持つ = 同時に呼ばれてもログインシェルは 1 本だけ
+fn memoized_bin(
+    memo: &Mutex<Option<BinMemo>>,
+    now: Instant,
+    still_valid: impl Fn(&str) -> bool,
+    find: impl FnOnce() -> crate::platform::exe::BoundedFind,
+) -> Option<String> {
+    let mut memo = memo.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(held) = memo.as_ref() {
+        let age = now.saturating_duration_since(held.at);
+        match &held.found {
+            Some(path) if age < BIN_HIT_TTL && still_valid(path) => return Some(path.clone()),
+            None if age < BIN_MISS_TTL => return None,
+            _ => {}
+        }
+    }
+    let found = find();
+    if found.timeout.is_some() {
+        if let Some(held) = memo.as_mut() {
+            if let Some(path) = held.found.clone().filter(|p| still_valid(p)) {
+                held.at = now;
+                return Some(path);
+            }
+        }
+        return None;
+    }
+    *memo = Some(BinMemo {
+        at: now,
+        found: found.path.clone(),
+    });
+    found.path
 }
 
 /// ControlMaster のソケット置き場（`<data_dir>/ssh/`）
@@ -2512,6 +2600,234 @@ pub fn is_cached_remote(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- #2980: ssh / sftp の実体の覚え（純粋な判定。時計・在るかの確かめ・探索を差し替える） ----
+
+    use crate::platform::exe::BoundedFind;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const SSH_PATH: &str = "/opt/fake/bin/ssh";
+
+    fn found(path: Option<&str>) -> BoundedFind {
+        BoundedFind {
+            path: path.map(str::to_string),
+            timeout: None,
+        }
+    }
+
+    fn timed_out() -> BoundedFind {
+        BoundedFind {
+            path: None,
+            timeout: Some(crate::probe::TimeoutNotice {
+                label: "sh -l -c command -v ssh".to_string(),
+                waited_secs: 5,
+            }),
+        }
+    }
+
+    /// 探索の回数を数えながら `answer` を返す探索
+    fn counting<'a>(
+        calls: &'a AtomicUsize,
+        answer: impl Fn() -> BoundedFind + 'a,
+    ) -> impl FnOnce() -> BoundedFind + 'a {
+        move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            answer()
+        }
+    }
+
+    #[test]
+    fn issue2980_見つかったパスは実行できる限り引き直さない() {
+        let memo = Mutex::new(None);
+        let calls = AtomicUsize::new(0);
+        let t0 = Instant::now();
+        let valid = |_: &str| true;
+        assert_eq!(
+            memoized_bin(&memo, t0, valid, counting(&calls, || found(Some(SSH_PATH)))),
+            Some(SSH_PATH.to_string())
+        );
+        // 2 秒 tick を 299 回（≒ 10 分の手前まで）呼んでも引かない
+        for tick in 1..300u64 {
+            let now = t0 + Duration::from_secs(tick * 2);
+            assert_eq!(
+                memoized_bin(
+                    &memo,
+                    now,
+                    valid,
+                    counting(&calls, || found(Some(SSH_PATH)))
+                ),
+                Some(SSH_PATH.to_string())
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "引いたのは最初の 1 回だけ");
+        // BIN_HIT_TTL を過ぎたら引き直す（ログインシェルの PATH の変化を拾う）
+        let later = t0 + BIN_HIT_TTL;
+        assert_eq!(
+            memoized_bin(
+                &memo,
+                later,
+                valid,
+                counting(&calls, || found(Some("/usr/bin/ssh")))
+            ),
+            Some("/usr/bin/ssh".to_string()),
+            "引き直した答えへ替わる"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn issue2980_覚えたパスが消えたらその場で引き直す() {
+        let memo = Mutex::new(None);
+        let calls = AtomicUsize::new(0);
+        let t0 = Instant::now();
+        memoized_bin(
+            &memo,
+            t0,
+            |_| true,
+            counting(&calls, || found(Some(SSH_PATH))),
+        );
+        // ssh を消した（stat が通らない）→ 次の呼び出しで引き直す。消えたままなら「見つからない」
+        let gone = |p: &str| p != SSH_PATH;
+        let now = t0 + Duration::from_secs(2);
+        assert_eq!(
+            memoized_bin(&memo, now, gone, counting(&calls, || found(None))),
+            None
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "消えたのでその場で引き直した"
+        );
+    }
+
+    #[test]
+    fn issue2980_見つからない答えは_miss_ttl_だけ覚えて入れ直しを拾う() {
+        let memo = Mutex::new(None);
+        let calls = AtomicUsize::new(0);
+        let t0 = Instant::now();
+        let valid = |_: &str| true;
+        assert_eq!(
+            memoized_bin(&memo, t0, valid, counting(&calls, || found(None))),
+            None
+        );
+        // BIN_MISS_TTL の内は引かない（2 秒 tick ごとにログインシェルを起こさない）
+        let mut tick = 1u64;
+        while Duration::from_secs(tick * 2) < BIN_MISS_TTL {
+            let now = t0 + Duration::from_secs(tick * 2);
+            assert_eq!(
+                memoized_bin(
+                    &memo,
+                    now,
+                    valid,
+                    counting(&calls, || found(Some(SSH_PATH)))
+                ),
+                None
+            );
+            tick += 1;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // 過ぎたら引き直し、入れ直した ssh を拾う
+        assert_eq!(
+            memoized_bin(
+                &memo,
+                t0 + BIN_MISS_TTL,
+                valid,
+                counting(&calls, || found(Some(SSH_PATH)))
+            ),
+            Some(SSH_PATH.to_string())
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn issue2980_打ち切りは覚えず次の呼び手が引き直す() {
+        let memo = Mutex::new(None);
+        let calls = AtomicUsize::new(0);
+        let t0 = Instant::now();
+        let valid = |_: &str| true;
+        assert_eq!(
+            memoized_bin(&memo, t0, valid, counting(&calls, timed_out)),
+            None
+        );
+        // 覚えていないので、次の呼び出しは引き直す（修正前と同じ）
+        assert_eq!(
+            memoized_bin(
+                &memo,
+                t0 + Duration::from_secs(2),
+                valid,
+                counting(&calls, || found(Some(SSH_PATH)))
+            ),
+            Some(SSH_PATH.to_string())
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn issue2980_引き直しが打ち切られたら持っていたパスを使い続ける() {
+        let memo = Mutex::new(None);
+        let calls = AtomicUsize::new(0);
+        let t0 = Instant::now();
+        let valid = |_: &str| true;
+        memoized_bin(&memo, t0, valid, counting(&calls, || found(Some(SSH_PATH))));
+        // HIT_TTL を過ぎて引き直したが打ち切られた → 持っていた（まだ実行できる）パスを返す
+        let t1 = t0 + BIN_HIT_TTL;
+        assert_eq!(
+            memoized_bin(&memo, t1, valid, counting(&calls, timed_out)),
+            Some(SSH_PATH.to_string())
+        );
+        // 次に引き直すのは、そこから HIT_TTL の後（rc が固まっている間に毎回打ち切りを待たない）
+        assert_eq!(
+            memoized_bin(
+                &memo,
+                t1 + Duration::from_secs(2),
+                valid,
+                counting(&calls, timed_out)
+            ),
+            Some(SSH_PATH.to_string())
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // 持っていたパスも消えていれば「見つからない」（覚えは書き換えない = 次も引き直す）
+        let gone = |p: &str| p != SSH_PATH;
+        assert_eq!(
+            memoized_bin(&memo, t1 + BIN_HIT_TTL, gone, counting(&calls, timed_out)),
+            None
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn issue2980_同時に呼ばれてもログインシェルは1本だけ() {
+        let memo = std::sync::Arc::new(Mutex::new(None));
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (memo, calls, start) = (memo.clone(), calls.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    memoized_bin(
+                        &memo,
+                        Instant::now(),
+                        |_| true,
+                        || {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            // ログインシェルの代役（引いている間に他の呼び手が来る）
+                            std::thread::sleep(Duration::from_millis(50));
+                            found(Some(SSH_PATH))
+                        },
+                    )
+                })
+            })
+            .collect();
+        for h in handles {
+            assert_eq!(h.join().expect("呼び手"), Some(SSH_PATH.to_string()));
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "引いている間はロックを持つ"
+        );
+    }
 
     #[test]
     fn 引用符で包むと空白と_glob_が_literal_になる() {
