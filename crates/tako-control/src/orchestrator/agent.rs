@@ -195,6 +195,10 @@ pub struct WorkerLaunch<'a> {
     /// **claude だけが使う**（`--settings <path>`）。`None` は何も足さない = user scope を
     /// 全部持ち込む（#2412 前・止めるものが無い・`TAKO_2412_LEGACY=1`）
     pub mcp_settings: Option<&'a str>,
+    /// 起動の行で claude へ渡す tako の MCP の設定ファイル（`worker_mcp::prepare` が決め、materialize で書いたもの。
+    /// Issue #2912）。**claude だけが使う**（`--mcp-config=<path>` の 1 語）。`None` は何も足さない = その claude の
+    /// 設定 dir の user scope の登録に頼る（#2912 前・`TAKO_2912_LEGACY=1`・書けなかった）
+    pub mcp_config: Option<&'a str>,
     /// user 設定の MCP を止める codex の server（`worker_mcp::prepare` が決めたもの。Issue #2418）。
     /// **codex だけが使う**（`-c mcp_servers.<名>.enabled=false` + 目印 = `worker_mcp::codex_off_args`）。
     /// 空は何も足さない = user 設定を全部持ち込む（#2418 前・止めるものが無い・`TAKO_2418_LEGACY=1`）
@@ -223,6 +227,7 @@ impl Default for WorkerLaunch<'_> {
             extra_args: &[],
             tako_bin: None,
             mcp_settings: None,
+            mcp_config: None,
             mcp_codex_off: &[],
             env: &EMPTY_ENV_PLAN,
             resume: None,
@@ -393,6 +398,7 @@ pub fn build_worker_cmd_in(
         launch.agent,
         launch.tako_bin,
         launch.mcp_settings,
+        launch.mcp_config,
         launch.mcp_codex_off,
         dialect,
     ));
@@ -421,6 +427,7 @@ pub fn worker_mcp_args(
     agent: WorkerAgent,
     tako_bin: Option<&str>,
     mcp_settings: Option<&str>,
+    mcp_config: Option<&str>,
     mcp_codex_off: &[crate::worker_mcp::CodexOff],
     dialect: crate::launch_cmd::ShellDialect,
 ) -> String {
@@ -432,8 +439,16 @@ pub fn worker_mcp_args(
     if let (WorkerAgent::Claude, Some(path)) = (agent, mcp_settings) {
         s.push_str(&format!(" --settings {}", lc::quote(dialect, path)));
     }
-    // MCP の一時注入（#986）。**codex だけ**が `-c` で受け取れる。
-    // claude は恒久登録（`tako setup-mcp`）+ 親 env の継承で繋がり、agy は
+    // tako の MCP を起動の行で渡す（#2912）。claude だけ。設定 dir の user scope の登録に頼ると、
+    // アカウントの設定 dir（#504）に登録が無いとき tako のツールが 0 本になる。
+    // **`--mcp-config=<path>` の 1 語**にする（`--mcp-config` は値を何個でも取るので、離して書くと
+    // 後ろの語まで設定として読む = 実測）。同じ名前の user scope の `tako` は起きない（こちらが勝つ = 実測）
+    if let (WorkerAgent::Claude, Some(path)) = (agent, mcp_config) {
+        s.push(' ');
+        s.push_str(&lc::quote(dialect, &format!("--mcp-config={path}")));
+    }
+    // MCP の一時注入（#986）。codex は `-c` で受け取れる。
+    // claude は上の `--mcp-config`（#2912）+ 親 env の継承で繋がり、agy は
     // per-launch の注入手段が CLI に無い（`agy --help` に -c / --mcp-config が無い =
     // 実測 1.1.27）ので恒久登録に委ねる。詳細は `.agent/orchestrator.md`
     if let (WorkerAgent::Codex, Some(tako_bin)) = (agent, tako_bin) {
@@ -884,6 +899,83 @@ mod tests {
             POSIX,
         );
         assert!(cmd.ends_with("codex --search 'has space'"));
+    }
+
+    /// #2912: tako の MCP を起動の行で渡す `--mcp-config=<path>` は claude だけに 1 語で付き、
+    /// #2412 の `--settings` の後・プロファイルの args の前に置く（再開の会話 ID より前）
+    #[test]
+    fn i2912_起動の行のtakoのmcpはclaudeだけに1語で付く() {
+        let args = vec!["--permission-mode".to_string(), "auto".to_string()];
+        let deny = "/data/tako/worker-mcp/deny-0011.json";
+        let cfg = "/data/tako/worker-mcp/tako-0022.json";
+        let claude = build_worker_cmd_in(
+            &WorkerLaunch {
+                agent: WorkerAgent::Claude,
+                role: "worker:x",
+                extra_args: &args,
+                mcp_settings: Some(deny),
+                mcp_config: Some(cfg),
+                resume: Some("e16cde37-c0e0-4126-9ef4-9c6b0bfeccc4"),
+                ..Default::default()
+            },
+            POSIX,
+        );
+        assert!(
+            claude.ends_with(&format!(
+                "claude --settings {deny} '--mcp-config={cfg}' --permission-mode auto \
+                 --resume e16cde37-c0e0-4126-9ef4-9c6b0bfeccc4"
+            )),
+            "{claude}"
+        );
+        // `--mcp-config` は値を何個でも取るので、離した `--mcp-config <path>` の形を作らない（実測）
+        assert!(!claude.contains("--mcp-config "), "{claude}");
+        assert!(!claude.contains("--strict-mcp-config"), "{claude}");
+        // 空白を含む置き場（macOS の Application Support）も 1 語のまま。PowerShell も同じ
+        let spaced = "/Users/x/Library/Application Support/tako/worker-mcp/tako-1.json";
+        for dialect in [POSIX, crate::launch_cmd::ShellDialect::PowerShell] {
+            let cmd = build_worker_cmd_in(
+                &WorkerLaunch {
+                    agent: WorkerAgent::Claude,
+                    role: "worker:x",
+                    mcp_config: Some(spaced),
+                    ..Default::default()
+                },
+                dialect,
+            );
+            assert!(
+                cmd.ends_with(&format!(" '--mcp-config={spaced}'")),
+                "{dialect:?}: {cmd}"
+            );
+        }
+        // codex（`-c` の一時注入 = #986）/ agy（手段が無い）には付けない
+        for agent in [WorkerAgent::Codex, WorkerAgent::Agy] {
+            let cmd = build_worker_cmd_in(
+                &WorkerLaunch {
+                    agent,
+                    role: "worker:x",
+                    tako_bin: Some("/opt/tako"),
+                    mcp_config: Some(cfg),
+                    ..Default::default()
+                },
+                POSIX,
+            );
+            assert!(!cmd.contains("--mcp-config"), "{agent:?}: {cmd}");
+        }
+        // None は 1 バイトも足さない（#2912 前・TAKO_2912_LEGACY=1・書けなかった）
+        let base = WorkerLaunch {
+            agent: WorkerAgent::Claude,
+            role: "worker:x",
+            ..Default::default()
+        };
+        assert_eq!(
+            build_worker_cmd_in(&base, POSIX),
+            "TAKO_ORCHESTRATOR_ROLE='worker:x' claude"
+        );
+        // 復元の口（sessions::resume_mcp_args）も同じ断片
+        assert_eq!(
+            worker_mcp_args(WorkerAgent::Claude, None, None, Some(cfg), &[], POSIX),
+            format!(" '--mcp-config={cfg}'")
+        );
     }
 
     /// #2412: user scope の MCP を止める設定は claude だけに付き、プロファイルの args より前に置く

@@ -167,6 +167,8 @@ pub struct ResumeLaunch {
     prompt_file: Option<(PathBuf, String)>,
     /// worker の MCP の絞り込み（#2412。spawn と同じ判断）。設定ファイルも下見では書かない
     worker_mcp: Option<crate::worker_mcp::WorkerMcp>,
+    /// master / solo の起動の行で claude へ渡す tako の MCP（#2912。`tako master` と同じ）。下見では書かない
+    tako_config: Option<crate::worker_mcp::TakoMcpConfig>,
 }
 
 impl ResumeLaunch {
@@ -180,6 +182,9 @@ impl ResumeLaunch {
     pub fn materialize_typed(&self) -> Result<(), SessionRefusal> {
         if let Some(mcp) = &self.worker_mcp {
             mcp.materialize_typed()?;
+        }
+        if let Some(config) = &self.tako_config {
+            config.materialize_typed()?;
         }
         let Some((path, content)) = &self.prompt_file else {
             return Ok(());
@@ -281,7 +286,7 @@ pub fn resume_launch_in_typed(
     let catalog = || -> Result<ResumeLaunch, SessionRefusal> {
         // #2447: worker なら spawn と同じ MCP の断片（codex は `codex resume -c …`）。
         // 設定ファイルは下見では書かない（実行する側の materialize が書く）
-        let worker_mcp = crate::sessions::resume_worker_mcp(agent, session_id, entry);
+        let worker_mcp = crate::sessions::resume_worker_mcp(agent, session_id, entry, tako_bin);
         let mcp_args = worker_mcp
             .as_ref()
             .map(|(worker, mcp)| crate::sessions::resume_mcp_args(*worker, mcp, tako_bin, dialect))
@@ -297,6 +302,7 @@ pub fn resume_launch_in_typed(
             warnings,
             prompt_file: None,
             worker_mcp: worker_mcp.map(|(_, mcp)| mcp),
+            tako_config: None,
         })
     };
     // 旧挙動の A/B（#1967）
@@ -512,12 +518,22 @@ fn resume_profile_launch(
     let prompt_path = orchestrator::config_dir()
         .ok_or(orchestrator::ConfigError::HomeUnresolved)?
         .join(prompt_name);
+    // tako の MCP を起動の行で渡す（#2912。`tako master` と同じ）。下見では書かず materialize で書く。
+    // 置き場が決まらなければ付けない（設定 dir の登録に頼る）
+    let tako_config = match crate::worker_mcp::tako_launch_config(Some(tako_bin)) {
+        Ok(config) => config,
+        Err(note) => {
+            warnings.push(note);
+            None
+        }
+    };
     let launch = orchestrator::build_master_cmd_with_plan_in_typed(
         &role_env,
         &profile,
         &plan,
         &prompt_path,
         tako_bin,
+        tako_config.as_ref().map(|c| c.file.as_str()),
         dialect,
     )?;
     Ok(ResumeLaunch {
@@ -530,6 +546,7 @@ fn resume_profile_launch(
         warnings,
         prompt_file: Some((prompt_path, prompt_content)),
         worker_mcp: None,
+        tako_config,
     })
 }
 
@@ -595,6 +612,7 @@ fn resume_worker_launch(
         entry.cwd.as_deref(),
         &plan,
         &launch.extra_args,
+        Some(tako_bin),
     );
     warnings.extend(worker_mcp.warnings.iter().cloned());
     let cmd = orchestrator::agent::build_worker_cmd_in(
@@ -609,6 +627,7 @@ fn resume_worker_launch(
             extra_args: &launch.extra_args,
             tako_bin: Some(tako_bin),
             mcp_settings: worker_mcp.settings_file.as_deref(),
+            mcp_config: worker_mcp.tako_config_file(),
             mcp_codex_off: &worker_mcp.codex_off,
             env: &plan,
             resume: Some(session_id),
@@ -622,6 +641,7 @@ fn resume_worker_launch(
         warnings,
         prompt_file: None,
         worker_mcp: Some(worker_mcp),
+        tako_config: None,
     })
 }
 
@@ -804,12 +824,15 @@ mod tests {
             orchestrator::CLAUDE_CONFIG_DIR_ENV.into(),
             "/tmp/rl1967a-config".into(),
         ));
-        let original = orchestrator::build_master_cmd_with_plan_in(
+        // 起動の行で渡す tako の MCP（#2912）も `tako master` と同じ設定ファイル
+        let cfg = crate::worker_mcp::TakoMcpConfig::for_bin("/opt/tako").unwrap();
+        let original = orchestrator::build_master_cmd_with_plan_in_typed(
             "master:rl1967a",
             &profile,
             &plan,
             got.prompt_path().unwrap(),
             "/opt/tako",
+            Some(&cfg.file),
             ShellDialect::Posix,
         )
         .unwrap();
@@ -820,6 +843,7 @@ mod tests {
             "--effort xhigh",
             "--append-system-prompt-file",
             "_system_prompt_rl1967a.md",
+            "'--mcp-config=",
         ] {
             assert!(got.command.contains(needle), "{needle}: {}", got.command);
         }
@@ -832,6 +856,39 @@ mod tests {
             path.is_file(),
             "materialize で書き出す（消えていても起動できる）"
         );
+    }
+
+    /// #2912: master / solo の再開も起動の行で tako の MCP を渡し、設定ファイルは下見では書かず
+    /// materialize で書く（`--mcp-config` のファイルが無いと claude ごと起動しない）
+    #[test]
+    fn issue2912_masterの再開も起動の行でtakoのmcpを渡しmaterializeで書く() {
+        save_profile("rl2912a", "effort: high\n");
+        let loc = location("/tmp/rl2912a-config", false);
+        // 他のテストと設定ファイルを共有しない実行ファイルの名前（並走で消し合わない）
+        let bin = "/opt/tako-rl2912a";
+        let got = resume_launch_in(
+            ID,
+            &master_entry("rl2912a"),
+            &ResumeHints::default(),
+            Some(&loc),
+            None,
+            bin,
+            ShellDialect::Posix,
+            false,
+        )
+        .unwrap();
+        let cfg = crate::worker_mcp::TakoMcpConfig::for_bin(bin).unwrap();
+        assert!(
+            got.command
+                .contains(&format!("'--mcp-config={}' --resume {ID}", cfg.file)),
+            "{}",
+            got.command
+        );
+        let _ = std::fs::remove_file(&cfg.file);
+        assert!(!Path::new(&cfg.file).exists(), "下見では書かない");
+        got.materialize().unwrap();
+        let body = std::fs::read_to_string(&cfg.file).expect("materialize で書く");
+        assert_eq!(body, crate::worker_mcp::tako_mcp_config_json(bin));
     }
 
     /// 対照: 旧挙動（`TAKO_1967_LEGACY=1`）はカタログのメタだけ = 本番 10/9 の
@@ -1114,6 +1171,7 @@ mod tests {
             None,
             plan,
             &launch.extra_args,
+            Some("/opt/tako"),
         );
         orchestrator::agent::build_worker_cmd_in(
             &orchestrator::agent::WorkerLaunch {
@@ -1127,6 +1185,7 @@ mod tests {
                 extra_args: &launch.extra_args,
                 tako_bin: Some("/opt/tako"),
                 mcp_settings: mcp.settings_file.as_deref(),
+                mcp_config: mcp.tako_config_file(),
                 mcp_codex_off: &mcp.codex_off,
                 env: plan,
                 resume: None,

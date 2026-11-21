@@ -349,6 +349,119 @@ fn write_settings(path: &Path, body: &str) -> Result<(), crate::SessionRefusal> 
         .map_err(crate::SessionRefusal::McpSettingsWrite)
 }
 
+// --- 起動の行で渡す tako の MCP（Issue #2912） -------------------------------------
+
+/// #2912 の A/B（`TAKO_2912_LEGACY=1` で修正前 = claude の master / solo / worker へ tako の MCP を
+/// 起動の行で渡さず、その claude の設定 dir の user scope の登録に頼る）。**ゲートはここ 1 か所**
+pub fn issue2912_legacy() -> bool {
+    std::env::var("TAKO_2912_LEGACY")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// claude の `--mcp-config` に渡す JSON（tako の MCP ブリッジだけ）。
+///
+/// 形は `tako setup-mcp` の登録（`claude mcp add --scope user tako -- <tako> mcp serve` = 直書きと同じ
+/// `type` / `command` / `args`）にそろえる。`env` は書かない = ブリッジは claude の env をそのまま継ぐ
+/// （`TAKO_SOCKET` / `TAKO_PANE_ID` ほかペインごとの値が届く。登録の形と同じ = 実測）
+pub fn tako_mcp_config_json(tako_bin: &str) -> String {
+    let mut servers = serde_json::Map::new();
+    servers.insert(
+        crate::agent_mcp::SERVER_NAME.to_string(),
+        json!({ "type": "stdio", "command": tako_bin, "args": ["mcp", "serve"], "env": {} }),
+    );
+    let mut s = serde_json::to_string_pretty(&json!({ "mcpServers": servers }))
+        .unwrap_or_else(|_| "{}".to_string());
+    s.push('\n');
+    s
+}
+
+/// 起動の行で claude へ渡す tako の MCP の設定ファイル（Issue #2912）。
+///
+/// claude の master / solo / worker は、tako の MCP を**その claude の設定 dir の user scope の登録**
+/// （`<設定 dir>/.claude.json` の `mcpServers.tako`）に頼っていた。登録する側（`tako setup-mcp`）が見るのは
+/// そのプロセスの `CLAUDE_CONFIG_DIR` の 1 か所だけなので、accounts.yaml のアカウントの設定 dir がそれと
+/// 違うと、そのアカウントで起こした claude から tako のツールが 0 本になっていた。いまは起動の行で
+/// `--mcp-config=<このファイル>` を渡す（codex の `-c` の一時注入 = #986 と同じ考え方）。
+///
+/// 実測（claude 2.1.323・一時の CLAUDE_CONFIG_DIR + 偽 Messages API + 起動を記録する偽 MCP）:
+///
+/// - **同じ名前の `tako` が user scope / local scope / `.mcp.json` にあっても `--mcp-config` 側だけが起きる**
+///   （二重に起きない。ツールは `mcp__tako__*` の 1 組）
+/// - `--settings` の `deniedMcpServers`（#2412）はそのまま効き、`--mcp-config` の server も名前で止まる
+///   （#2412 は tako を止めないので当たらない）
+/// - `--strict-mcp-config` は**採らない**: `.mcp.json` と local scope まで止まる（#2412 と同じ理由）
+/// - `--mcp-config` は値を何個でも取る引数で、`--mcp-config <file> <次の語>` は次の語まで設定として読む
+///   （位置引数が来ると起動しない）。**`--mcp-config=<file>` の 1 語**で渡す
+/// - ファイルが無いと claude は起動しない（`MCP config file not found`）。だから**書けたときだけ**付ける
+///
+/// JSON をファイルにしてパスだけを載せるのは #2412 と同じ理由（引数の中の `"` の扱いがシェルと版で揺れる）。
+/// 名前は中身のハッシュ（同じ tako の実行ファイルは同じファイル）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TakoMcpConfig {
+    /// `--mcp-config=` に渡すファイル
+    pub file: String,
+    body: String,
+}
+
+impl TakoMcpConfig {
+    /// 置き場と中身を決める（**書かない**）
+    pub fn for_bin(tako_bin: &str) -> Result<Self, ReplyNote> {
+        use sha2::Digest;
+        let body = tako_mcp_config_json(tako_bin);
+        let digest = sha2::Sha256::digest(body.as_bytes());
+        let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+        let dir = tako_core::paths::data_dir()
+            .ok_or(ReplyNote::McpLaunchNoDataDir)?
+            .join(SETTINGS_DIR);
+        Ok(Self {
+            file: dir.join(format!("tako-{hex}.json")).display().to_string(),
+            body,
+        })
+    }
+
+    /// 書く（中身が同じなら書かない）
+    pub fn materialize_typed(&self) -> Result<(), crate::SessionRefusal> {
+        write_settings(Path::new(&self.file), &self.body)
+    }
+}
+
+/// 起動の行で渡すかを決める（書かない）。`Ok(None)` = 渡さない（A/B の旧経路・tako の実行ファイルが無い）
+pub fn tako_launch_config(tako_bin: Option<&str>) -> Result<Option<TakoMcpConfig>, ReplyNote> {
+    tako_launch_config_in(tako_bin, issue2912_legacy())
+}
+
+/// [`tako_launch_config`] の A/B の判定を引数で受ける版（テストは env を書き換えない = #2400）
+pub(crate) fn tako_launch_config_in(
+    tako_bin: Option<&str>,
+    legacy: bool,
+) -> Result<Option<TakoMcpConfig>, ReplyNote> {
+    match tako_bin.filter(|b| !b.is_empty()) {
+        Some(bin) if !legacy => TakoMcpConfig::for_bin(bin).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// master / solo の起動（その場で打つ）: 決めて書き、書けたファイルだけを返す。
+///
+/// 書けなければ `None` = 起動の行に付けず、設定 dir の登録に頼る修正前の形で起動する（起動は止めない。
+/// ファイルの無い `--mcp-config` は claude ごと起動しない）。理由は persist.log の `[<context>]` へ
+pub fn ready_tako_launch_config(tako_bin: &str, context: &str) -> Option<String> {
+    let note = match tako_launch_config(Some(tako_bin)) {
+        Ok(None) => return None,
+        Ok(Some(config)) => match config.materialize_typed() {
+            Ok(()) => return Some(config.file),
+            Err(e) => ReplyNote::McpLaunchUnwritable(e),
+        },
+        Err(note) => note,
+    };
+    crate::diag::persist_log(&format!(
+        "[{context}] {}",
+        note.text_in(tako_core::i18n::Lang::Ja)
+    ));
+    None
+}
+
 /// プロジェクトの `mcp_servers`（無ければ空 = tako だけ）
 pub fn keep_for_project(config: &ProjectsConfig, project: &str) -> Vec<String> {
     config
@@ -388,6 +501,9 @@ pub struct WorkerMcp {
     pub codex_off: Vec<CodexOff>,
     /// 読んだ codex の user 設定（応答の `config_file`。codex だけ）
     pub config_file: Option<String>,
+    /// 起動の行で claude へ渡す tako の MCP（`--mcp-config=<file>`。#2912）。claude だけ・A/B の旧経路では None。
+    /// 書けなかったら [`WorkerMcp::materialized`] が外す（ファイルの無い `--mcp-config` は claude ごと起動しない）
+    pub tako_config: Option<TakoMcpConfig>,
     /// 応答の warnings と persist.log へ出す知らせ（型。応答は表示言語・persist.log は日本語で組む = #2365）
     pub warnings: Vec<ReplyNote>,
 }
@@ -401,6 +517,11 @@ pub struct CodexOff {
 }
 
 impl WorkerMcp {
+    /// 起動の行の `--mcp-config=` に渡すファイル（#2912。`WorkerLaunch::mcp_config` へ渡す）
+    pub fn tako_config_file(&self) -> Option<&str> {
+        self.tako_config.as_ref().map(|c| c.file.as_str())
+    }
+
     /// 応答の `mcp` 欄
     pub fn to_json(&self) -> Value {
         let mut v = json!({
@@ -410,6 +531,7 @@ impl WorkerMcp {
             "missing": self.plan.missing,
             "shadowed": self.plan.shadowed,
             "settings_file": self.settings_file,
+            "tako_config_file": self.tako_config_file(),
         });
         // codex は読んだ config.toml を見せる（worker のシェルが別の CODEX_HOME を読む食い違いの手がかり）
         if let Some(file) = &self.config_file {
@@ -427,20 +549,37 @@ impl WorkerMcp {
 
     /// [`Self::materialize`] の型の口（会話の再開の断りを表示言語で返す dispatch が使う。#2365）
     pub fn materialize_typed(&self) -> Result<(), crate::SessionRefusal> {
+        self.materialize_settings()?;
+        self.materialize_tako_config()
+    }
+
+    fn materialize_settings(&self) -> Result<(), crate::SessionRefusal> {
         match (&self.settings_file, &self.settings_body) {
             (Some(path), Some(body)) => write_settings(Path::new(path), body),
             _ => Ok(()),
         }
     }
 
+    fn materialize_tako_config(&self) -> Result<(), crate::SessionRefusal> {
+        match &self.tako_config {
+            Some(config) => config.materialize_typed(),
+            None => Ok(()),
+        }
+    }
+
     /// spawn 用: 書いてから使う。書けなければ**絞り込みをやめて全部持ち込む**
-    /// （起動は止めない。理由は warnings へ）
+    /// （起動は止めない。理由は warnings へ）。起動の行で渡す tako の MCP（#2912）も、書けなければ
+    /// 付けずに設定 dir の登録に頼る修正前の形で起動する
     pub fn materialized(mut self) -> Self {
-        if let Err(e) = self.materialize_typed() {
+        if let Err(e) = self.materialize_settings() {
             self.mode = "unrestricted";
             self.settings_file = None;
             self.settings_body = None;
             self.warnings.push(ReplyNote::McpSettingsUnwritable(e));
+        }
+        if let Err(e) = self.materialize_tako_config() {
+            self.tako_config = None;
+            self.warnings.push(ReplyNote::McpLaunchUnwritable(e));
         }
         self
     }
@@ -457,6 +596,7 @@ pub fn prepare_for_resume(
     cwd: Option<&str>,
     env: &EnvPlan,
     extra_args: &[String],
+    tako_bin: Option<&str>,
 ) -> WorkerMcp {
     let config = ProjectsConfig::load().ok();
     let keep = match (&config, project) {
@@ -476,34 +616,45 @@ pub fn prepare_for_resume(
                 .map(|r| PathBuf::from(r.cwd))
         })
         .unwrap_or_else(|| PathBuf::from("."));
-    prepare(agent, &cwd, env, &keep, extra_args)
+    prepare(agent, &cwd, env, &keep, extra_args, tako_bin)
 }
 
 /// worker の MCP の構成を決める（ファイルは書かない。書くのは [`WorkerMcp::materialize`]）。
 ///
 /// `env` は起動する worker の env 計画（claude の config dir・codex の `CODEX_HOME` を引く）。
-/// `extra_args` はプロファイルの `worker_agents.claude.args`（`--settings` の重複の検査に使う）
+/// `extra_args` はプロファイルの `worker_agents.claude.args`（`--settings` の重複の検査に使う）。
+/// `tako_bin` は claude へ起動の行で渡す tako の MCP ブリッジ（#2912。codex の `-c` の一時注入は
+/// 起動コマンドの組み立てが同じ値から付ける）
 pub fn prepare(
     agent: WorkerAgent,
     cwd: &Path,
     env: &EnvPlan,
     keep: &[String],
     extra_args: &[String],
+    tako_bin: Option<&str>,
 ) -> WorkerMcp {
     match agent {
         WorkerAgent::Claude => {
-            if legacy() {
-                return WorkerMcp {
+            // user scope の絞り込み（#2412）と tako を起動の行で渡すこと（#2912）は別の判断。
+            // #2412 の旧経路（全部持ち込む）でも tako は起動の行で渡す
+            let mut out = if legacy() {
+                WorkerMcp {
                     mode: "legacy",
                     ..Default::default()
-                };
+                }
+            } else {
+                prepare_from(
+                    cwd,
+                    &user_scope_files(env.claude_config_dir().as_deref()),
+                    keep,
+                    extra_args,
+                )
+            };
+            match tako_launch_config(tako_bin) {
+                Ok(config) => out.tako_config = config,
+                Err(note) => out.warnings.push(note),
             }
-            prepare_from(
-                cwd,
-                &user_scope_files(env.claude_config_dir().as_deref()),
-                keep,
-                extra_args,
-            )
+            out
         }
         WorkerAgent::Codex => {
             if legacy() || legacy_codex() {
@@ -994,6 +1145,131 @@ mod tests {
         assert_eq!(p.denied, ["github", "playwright"]);
     }
 
+    // --- 起動の行で渡す tako の MCP（#2912） ---
+
+    #[test]
+    fn issue2912_起動の行で渡すjsonはtakoのブリッジだけで登録と同じ形() {
+        let bin = "/Applications/tako.app/Contents/MacOS/tako";
+        let v: Value = serde_json::from_str(&tako_mcp_config_json(bin)).unwrap();
+        let servers = v["mcpServers"].as_object().unwrap();
+        assert_eq!(servers.len(), 1, "tako だけ: {v}");
+        let tako = &servers[crate::agent_mcp::SERVER_NAME];
+        assert_eq!(tako["type"], "stdio");
+        assert_eq!(tako["command"], bin);
+        assert_eq!(tako["args"], json!(["mcp", "serve"]));
+        // env は書かない = claude の env（ペインごとの TAKO_*）をそのまま継ぐ
+        assert_eq!(tako["env"], json!({}));
+        assert!(
+            is_tako_server(crate::agent_mcp::SERVER_NAME, tako),
+            "#2412 の絞り込みが tako と見分ける形"
+        );
+        // Windows のパス（`\`）も JSON の中でそのまま読める
+        let win = r"C:\Program Files\tako\tako.exe";
+        let v: Value = serde_json::from_str(&tako_mcp_config_json(win)).unwrap();
+        assert_eq!(v["mcpServers"]["tako"]["command"], win);
+    }
+
+    #[test]
+    fn issue2912_設定ファイルは実行ファイルごとに1つで中身が同じなら書き直さない() {
+        let a = TakoMcpConfig::for_bin("/opt/a/tako").unwrap();
+        let a2 = TakoMcpConfig::for_bin("/opt/a/tako").unwrap();
+        let b = TakoMcpConfig::for_bin("/opt/b/tako").unwrap();
+        assert_eq!(
+            a, a2,
+            "同じ実行ファイルは同じファイル（worker の本数ぶん増えない）"
+        );
+        assert_ne!(a.file, b.file, "実行ファイルが違えば別のファイル");
+        let name = Path::new(&a.file).file_name().unwrap().to_string_lossy();
+        assert!(
+            name.starts_with("tako-") && name.ends_with(".json"),
+            "{name}"
+        );
+        assert_eq!(
+            Path::new(&a.file).parent().and_then(|p| p.file_name()),
+            Some(std::ffi::OsStr::new(SETTINGS_DIR)),
+            "置き場は #2412 の絞り込みと同じ data dir の下"
+        );
+
+        let t = tako_core::test_residue::ScratchDir::new("t2912-cfg");
+        let cfg = TakoMcpConfig {
+            file: t.path().join("tako-x.json").display().to_string(),
+            body: tako_mcp_config_json("/opt/a/tako"),
+        };
+        cfg.materialize_typed().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&cfg.file).unwrap(),
+            tako_mcp_config_json("/opt/a/tako")
+        );
+        let before = std::fs::metadata(&cfg.file).unwrap().modified().unwrap();
+        cfg.materialize_typed().unwrap();
+        assert_eq!(
+            std::fs::metadata(&cfg.file).unwrap().modified().unwrap(),
+            before,
+            "中身が同じなら書かない"
+        );
+    }
+
+    #[test]
+    fn issue2912_旧経路と実行ファイルが無いときは渡さない() {
+        assert!(tako_launch_config_in(Some("/opt/tako"), false)
+            .unwrap()
+            .is_some());
+        assert_eq!(tako_launch_config_in(Some("/opt/tako"), true), Ok(None));
+        assert_eq!(tako_launch_config_in(None, false), Ok(None));
+        assert_eq!(tako_launch_config_in(Some(""), false), Ok(None));
+    }
+
+    #[test]
+    fn issue2912_書けなければ外して登録に頼る_起動は止めない() {
+        let t = tako_core::test_residue::ScratchDir::new("t2912-unwritable");
+        // 置き場の親がファイル = dir を作れない
+        let blocker = t.path().join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        let mcp = WorkerMcp {
+            mode: "tako_only",
+            tako_config: Some(TakoMcpConfig {
+                file: blocker.join("tako-x.json").display().to_string(),
+                body: tako_mcp_config_json("/opt/tako"),
+            }),
+            ..Default::default()
+        };
+        assert!(
+            mcp.materialize_typed().is_err(),
+            "再開の materialize は断る"
+        );
+        let mcp = mcp.materialized();
+        assert_eq!(
+            mcp.tako_config_file(),
+            None,
+            "書けなければ起動の行に付けない"
+        );
+        assert_eq!(mcp.mode, "tako_only", "#2412 の絞り込みは別の判断");
+        assert!(
+            matches!(mcp.warnings.as_slice(), [ReplyNote::McpLaunchUnwritable(_)]),
+            "{:?}",
+            mcp.warnings
+        );
+        assert_eq!(mcp.to_json()["tako_config_file"], Value::Null);
+    }
+
+    #[test]
+    fn issue2912_応答のmcp欄に渡したファイルが載る() {
+        let t = tako_core::test_residue::ScratchDir::new("t2912-json");
+        let file = t.path().join("tako-x.json").display().to_string();
+        let mcp = WorkerMcp {
+            mode: "tako_only",
+            tako_config: Some(TakoMcpConfig {
+                file: file.clone(),
+                body: tako_mcp_config_json("/opt/tako"),
+            }),
+            ..Default::default()
+        }
+        .materialized();
+        assert!(mcp.warnings.is_empty(), "{:?}", mcp.warnings);
+        assert_eq!(mcp.to_json()["tako_config_file"], json!(file));
+        assert!(Path::new(&file).is_file(), "spawn は書いてから使う");
+    }
+
     /// user scope を書いた `.claude.json` を一時 dir に置く
     fn claude_json(dir: &Path, servers: &[&str]) -> PathBuf {
         let path = dir.join(".claude.json");
@@ -1103,9 +1379,14 @@ mod tests {
             &crate::orchestrator::EMPTY_ENV_PLAN,
             &[],
             &[],
+            Some("/opt/tako"),
         );
         assert_eq!(mcp.mode, "not_supported");
         assert!(mcp.settings_file.is_none() && mcp.codex_off.is_empty());
+        assert!(
+            mcp.tako_config.is_none(),
+            "agy には起動の行で渡す手段が無い（#2912 は claude だけ）"
+        );
     }
 
     // --- codex（#2418） ---

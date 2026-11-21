@@ -2836,28 +2836,36 @@ pub fn validate_master_agent_typed(name: &str) -> Result<WorkerAgent, ConfigErro
 /// master 起動用のコマンドを組み立てる（master_agent 対応。Issue #127）。
 /// claude の出力は従来の claude 固定実装と同一文字列（完全後方互換）。
 /// profile.model が None の場合は `--model` を付けずその CLI の既定に委ねる。
-/// `tako_bin` は codex の MCP stdio ブリッジ（`<tako_bin> mcp serve`）の起動パス
+/// `tako_bin` は codex の MCP stdio ブリッジ（`<tako_bin> mcp serve`）の起動パス。
+/// この口は起動の行で claude へ tako の MCP を渡さない（#2912 の前の形 = テストの比べる相手）。
+/// 本番の起動は [`build_master_cmd_typed`] へ `worker_mcp::ready_tako_launch_config` の答えを渡す
 pub fn build_master_cmd(
     role_env: &str,
     profile: &Profile,
     prompt_path: &Path,
     tako_bin: &str,
 ) -> Result<String, String> {
-    build_master_cmd_typed(role_env, profile, prompt_path, tako_bin).map_err(ConfigError::into_ja)
+    build_master_cmd_typed(role_env, profile, prompt_path, tako_bin, None)
+        .map_err(ConfigError::into_ja)
 }
 
-/// [`build_master_cmd`] の型の口（引き継ぎの後任を立てる dispatch が使う。#2365）
+/// [`build_master_cmd`] の型の口（引き継ぎの後任を立てる dispatch が使う。#2365）。
+///
+/// `claude_mcp_config` は起動の行で claude へ渡す tako の MCP の設定ファイル（#2912。
+/// `worker_mcp::ready_tako_launch_config` が書けたものだけ。`None` は付けない = 設定 dir の登録に頼る）
 pub fn build_master_cmd_typed(
     role_env: &str,
     profile: &Profile,
     prompt_path: &Path,
     tako_bin: &str,
+    claude_mcp_config: Option<&str>,
 ) -> Result<String, ConfigError> {
     build_master_cmd_in_typed(
         role_env,
         profile,
         prompt_path,
         tako_bin,
+        claude_mcp_config,
         crate::launch_cmd::launch_dialect(),
     )
 }
@@ -2870,7 +2878,7 @@ pub fn build_master_cmd_in(
     tako_bin: &str,
     dialect: crate::launch_cmd::ShellDialect,
 ) -> Result<String, String> {
-    build_master_cmd_in_typed(role_env, profile, prompt_path, tako_bin, dialect)
+    build_master_cmd_in_typed(role_env, profile, prompt_path, tako_bin, None, dialect)
         .map_err(ConfigError::into_ja)
 }
 
@@ -2880,6 +2888,7 @@ pub fn build_master_cmd_in_typed(
     profile: &Profile,
     prompt_path: &Path,
     tako_bin: &str,
+    claude_mcp_config: Option<&str>,
     dialect: crate::launch_cmd::ShellDialect,
 ) -> Result<String, ConfigError> {
     // env 検証（内部変数の上書きを拒否。Issue #500）
@@ -2888,7 +2897,15 @@ pub fn build_master_cmd_in_typed(
     // master_account があれば worker と同じ規則でアカウントの config dir を反映する
     // （未登録アカウントはここで Err = 起動前に落ちる。Issue #547）
     let plan = profile.resolved_env_plan_for_master_typed()?;
-    build_master_cmd_with_plan_in_typed(role_env, profile, &plan, prompt_path, tako_bin, dialect)
+    build_master_cmd_with_plan_in_typed(
+        role_env,
+        profile,
+        &plan,
+        prompt_path,
+        tako_bin,
+        claude_mcp_config,
+        dialect,
+    )
 }
 
 /// env 計画を呼び出し側が決めて組み立てる（#1967）。
@@ -2904,8 +2921,16 @@ pub fn build_master_cmd_with_plan_in(
     tako_bin: &str,
     dialect: crate::launch_cmd::ShellDialect,
 ) -> Result<String, String> {
-    build_master_cmd_with_plan_in_typed(role_env, profile, plan, prompt_path, tako_bin, dialect)
-        .map_err(ConfigError::into_ja)
+    build_master_cmd_with_plan_in_typed(
+        role_env,
+        profile,
+        plan,
+        prompt_path,
+        tako_bin,
+        None,
+        dialect,
+    )
+    .map_err(ConfigError::into_ja)
 }
 
 /// [`build_master_cmd_with_plan_in`] の型の口（会話の再開の断りを表示言語で返す dispatch が使う。#2365）
@@ -2915,6 +2940,7 @@ pub fn build_master_cmd_with_plan_in_typed(
     plan: &EnvPlan,
     prompt_path: &Path,
     tako_bin: &str,
+    claude_mcp_config: Option<&str>,
     dialect: crate::launch_cmd::ShellDialect,
 ) -> Result<String, ConfigError> {
     use crate::launch_cmd as lc;
@@ -2948,6 +2974,12 @@ pub fn build_master_cmd_with_plan_in_typed(
                 " --append-system-prompt-file {}",
                 lc::quote_always(dialect, &prompt_path.display().to_string())
             ));
+            // tako の MCP を起動の行で渡す（#2912。worker と同じ `--mcp-config=<path>` の 1 語）。
+            // master_account の設定 dir（#504 / #547）に登録が無くても tako のツールを持つ
+            if let Some(path) = claude_mcp_config {
+                cmd.push(' ');
+                cmd.push_str(&lc::quote_always(dialect, &format!("--mcp-config={path}")));
+            }
             // Remote Control（#1068）。opt-in が無ければ 1 バイトも変わらない
             if let Some(flag) = remote_control.flag {
                 cmd.push(' ');
@@ -6529,6 +6561,66 @@ prompt_blocks:
         assert!(!cmd.contains("--model"));
     }
 
+    /// #2912: claude の master / solo は書けた設定ファイルを起動の行で 1 語で受け取る
+    /// （master_account の設定 dir に登録が無くても tako のツールを持つ）。codex は `-c` の一時注入のまま
+    #[test]
+    fn i2912_masterとsoloは起動の行でtakoのmcpを受け取る() {
+        let cfg = "/data/tako/worker-mcp/tako-0022.json";
+        let p = Profile::default();
+        for (role, head) in [("master", "max"), ("solo", "max")] {
+            let cmd = build_master_cmd_in_typed(
+                role,
+                &p,
+                Path::new("/tmp/p.md"),
+                "tako",
+                Some(cfg),
+                POSIX,
+            )
+            .unwrap();
+            assert_eq!(
+                cmd,
+                format!(
+                    "TAKO_ORCHESTRATOR_ROLE='{role}' claude --effort {head} \
+                     --append-system-prompt-file '/tmp/p.md' '--mcp-config={cfg}'"
+                )
+            );
+        }
+        // None は #2912 前と 1 バイトも変わらない（上の master_cmd_without_model と同じ）
+        assert_eq!(
+            build_master_cmd_in_typed("master", &p, Path::new("/tmp/p.md"), "tako", None, POSIX)
+                .unwrap(),
+            "TAKO_ORCHESTRATOR_ROLE='master' claude --effort max --append-system-prompt-file '/tmp/p.md'"
+        );
+        // PowerShell も 1 語（空白を含む置き場を引用する）
+        let spaced = "C:\\Users\\x\\AppData\\Roaming\\tako data\\worker-mcp\\tako-1.json";
+        let ps = build_master_cmd_in_typed(
+            "master",
+            &p,
+            Path::new("C:\\t\\p.md"),
+            "tako.exe",
+            Some(spaced),
+            crate::launch_cmd::ShellDialect::PowerShell,
+        )
+        .unwrap();
+        assert!(ps.ends_with(&format!(" '--mcp-config={spaced}'")), "{ps}");
+        // codex の master は `-c mcp_servers.tako.*`（#986）のまま。claude の引数は付けない
+        let codex = Profile {
+            master_agent: Some("codex".into()),
+            ..Default::default()
+        };
+        let cmd = build_master_cmd_in_typed(
+            "master",
+            &codex,
+            Path::new("/tmp/p.md"),
+            "/usr/local/bin/tako",
+            Some(cfg),
+            POSIX,
+        )
+        .unwrap();
+        assert!(!cmd.contains("--mcp-config"), "{cmd}");
+        assert!(cmd.contains("mcp_servers.tako.command="), "{cmd}");
+    }
+
     #[test]
     fn master_cmd_with_model() {
         let p = Profile {
@@ -7312,6 +7404,7 @@ prompt_blocks:
                 // （注入そのものは #986 のテストが見る）
                 tako_bin: None,
                 mcp_settings: None,
+                mcp_config: None,
                 mcp_codex_off: &[],
                 env: &EMPTY_ENV_PLAN,
                 resume: None,

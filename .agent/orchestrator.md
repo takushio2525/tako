@@ -33,7 +33,8 @@ tako solo docs       # 旧形式サフィックス、role=solo:docs
 
 - tako がインストール済み（`tako` CLI が PATH に通っている）
 - `claude` CLI がインストール済み（`claude --version` で確認）
-- tako MCP が登録済み（`tako setup-mcp` で自動登録）
+- tako MCP が登録済み（`tako setup-mcp` で自動登録）。tako が起こす claude の master / solo / worker は
+  登録が無くても起動の行で tako の MCP を受け取る（#2912。下の「アカウント」）。登録が効くのは人が手で開いた claude
 - codex master / worker・agy worker を使う場合はそれぞれの CLI（`codex` / `agy`）がインストール済みであること（任意）
 
 ## セットアップ
@@ -122,6 +123,26 @@ tako が起こす **claude の worker**（spawn / run / git resolve / 会話を�
   能力マトリクス `worker_mcp_scope`（agy = unsupported。起動ごとの手段が CLI に無い = 1.5.3 の
   `--settings` は settings.json のキーだけを受け、MCP は別ファイルの `mcp_config.json`。#2831）
 - A/B は `TAKO_2412_LEGACY=1`（user scope を全部持ち込む #2412 前の起動。codex も戻る）
+
+#### tako の MCP は起動の行で渡す（Issue #2912）
+
+claude の master / solo / worker は、tako の MCP を**その claude の設定 dir の登録に頼らず**、起動の行で受け取る:
+`--mcp-config=<data_dir>/worker-mcp/tako-<hash>.json`（中身は tako のブリッジ 1 つ。`tako setup-mcp` の登録と
+同じ形で、`env` は書かず claude の env = ペインごとの `TAKO_*` を継ぐ）。#2912 の前は登録だけに頼っていたので、
+アカウント（下の「アカウント」）の設定 dir に登録が無いと、そのアカウントで起こした claude から tako のツールが 0 本だった。
+
+- **対象**: worker の spawn / run / git resolve / 会話を保った再起動 / 再起動をまたぐ復元（断片は `agent::worker_mcp_args` の
+  1 実装）と、`tako master` / `tako solo` / 引き継ぎの後任 / スマホからの master 起動 / 会話の再開
+  （`build_master_cmd_with_plan_in_typed`）。codex は #986 の `-c` の一時注入のまま、agy は手段が無いので登録のまま
+- **実測**（claude 2.1.323・一時の `CLAUDE_CONFIG_DIR` + 偽 Messages API + 起動を記録する偽 MCP）:
+  同じ名前の `tako` が user scope / local scope / `.mcp.json` にあっても `--mcp-config` 側だけが起きる（二重にならない）。
+  `--settings` の `deniedMcpServers`（#2412）はそのまま効く。`--strict-mcp-config` は `.mcp.json` と local scope まで
+  止めるので**使わない**。`--mcp-config` は値を何個でも取るので**`=` で 1 語**にする（離すと後ろの語まで設定として読む）
+- **書けたときだけ付ける**: ファイルが無い `--mcp-config` は claude ごと起動しない。worker は書けなければ外して
+  `warnings`（`McpLaunchUnwritable`）、master / solo は persist.log へ理由を残し、どちらも登録に頼る形で起動する。
+  会話の再開は下見では書かず `materialize` で書く。spawn の応答の `mcp.tako_config_file` に渡したファイルが載る
+- A/B は `TAKO_2912_LEGACY=1`（起動の行で渡さない = #2912 前）。番犬は `issue2912_claude_launch_mcp_watchdog`、
+  実経路は `scripts/test-account-mcp-2912.sh`
 
 #### 再開（resume）の worker（Issue #2447）
 
@@ -521,6 +542,12 @@ claude は `CLAUDE_CONFIG_DIR` が**設定されている**だけで Keychain �
 `inherit: true` の worker は起動コマンドの先頭で `unset CLAUDE_CONFIG_DIR;` を実行し、
 direnv 等が設定してくる値も確実に消す。既定パスを明示指定して登録しようとすると
 add が警告を返す。
+
+**アカウントの設定 dir に tako の MCP の登録は要らない**（#2912）。tako が起こす claude は起動の行で
+tako の MCP を受け取る（上の「tako の MCP は起動の行で渡す」）。`tako setup-mcp` が登録するのは打ったシェルの
+`CLAUDE_CONFIG_DIR` の 1 か所だけで、その登録が効くのは人が手で開いた claude。診断（`tako check-health` /
+`tako setup --check`）はアカウントごとに `mcp.claude.account.<名前>` の項目を出す（その設定 dir の登録の有無・
+パスが消えていれば警告と `CLAUDE_CONFIG_DIR=<dir> tako setup-mcp` の手順）。
 
 ## 基本的な使い方
 

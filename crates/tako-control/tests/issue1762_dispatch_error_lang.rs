@@ -18836,9 +18836,12 @@ fn reply_note_index(n: &ReplyNote) -> usize {
         // #2907: worker ポリシーの行を spawn の値から組む（上の段が決める / 解決できない）
         ReplyNote::WorkerPolicyResolved { .. } => 341,
         ReplyNote::WorkerPolicyUnresolved { .. } => 342,
+        // #2912: claude の起動の行で渡す tako の MCP の設定ファイルを書けない / 置き場が無い
+        ReplyNote::McpLaunchUnwritable(_) => 343,
+        ReplyNote::McpLaunchNoDataDir => 344,
     }
 }
-const REPLY_NOTE_VARIANTS: usize = 343;
+const REPLY_NOTE_VARIANTS: usize = 345;
 
 /// 見本の Remote Control の理由・次の一手（中身は `claude_remote` の日英の `Note`）
 const RC_REASON: tako_core::platform::support::Note =
@@ -21381,6 +21384,23 @@ fn reply_note_table() -> Vec<(ReplyNote, String)> {
             "worker モデルポリシー: fixed（worker の既定を決められない: アカウント 'acct' が accounts.yaml に見つからない）"
                 .into(),
         ),
+        // #2912: 新しい注記（#2365 より前の文は無いので今の日本語）
+        (
+            ReplyNote::McpLaunchUnwritable(SessionRefusal::McpSettingsDir {
+                dir: "/tmp/d".into(),
+                error: "Permission denied (os error 13)".into(),
+            }),
+            "tako の MCP を起動の行で渡す設定ファイルを書けなかったので、今回は claude の設定 dir の\
+             登録に頼って起動する（登録が無ければ tako のツールが出ない）: \
+             /tmp/d を作れない: Permission denied (os error 13)"
+                .into(),
+        ),
+        (
+            ReplyNote::McpLaunchNoDataDir,
+            "tako の MCP を起動の行で渡す設定ファイルの置き場が無いので、今回は claude の設定 dir の\
+             登録に頼って起動する（登録が無ければ tako のツールが出ない）: データディレクトリを特定できない"
+                .into(),
+        ),
     ]
 }
 
@@ -23338,9 +23358,12 @@ fn health_text_index(t: &HealthText) -> usize {
         H::AliveUnreachableNext { .. } => 144,
         H::SetupCheckTitle => 145,
         H::NoteSeparator => 146,
+        // #2912: アカウントごとの設定 dir の tako の MCP
+        H::McpAccount { .. } => 147,
+        H::McpAccountRegisterHint { .. } => 148,
     }
 }
-const HEALTH_TEXT_VARIANTS: usize = 147;
+const HEALTH_TEXT_VARIANTS: usize = 149;
 
 /// 見本と #2365 より前の固定文（diagnostics / dispatch / CLI `main.rs` / setup.rs が書いていた文を見本の値で展開）。
 /// 値は英語の検査が日本語の混入を値のせいにしないよう ASCII だけで書く。中身で腕を分けるバリアントは両方を並べる。
@@ -23525,6 +23548,17 @@ fn health_text_table() -> Vec<(HealthText, String)> {
         (H::AliveUnreachableNext { windows: false, secs: 2 }, s("tako は受け口を 2 秒ごとに確かめて張り直す。少し待って tako check-health をもう一度。戻らなければ tako を再起動する（#2002）")),
         (H::SetupCheckTitle, s("tako セットアップ 環境チェック")),
         (H::NoteSeparator, s("・")),
+        // #2912: 新しい文（#2365 より前の文は無いので今の日本語）。起動の行で渡す / 渡さない × 登録の 4 状態
+        (H::McpAccount { account: s("univ"), launch: true, state: tako_control::agent_mcp::AccountMcpState::Registered }, s("Claude MCP（アカウント univ）: tako が起こす claude には起動の行で渡す（この設定 dir の登録もある）")),
+        (H::McpAccount { account: s("univ"), launch: true, state: tako_control::agent_mcp::AccountMcpState::Missing }, s("Claude MCP（アカウント univ）: tako が起こす claude には起動の行で渡す（この設定 dir に登録は無いので、手で開いた claude には tako のツールが出ない）")),
+        (H::McpAccount { account: s("univ"), launch: true, state: tako_control::agent_mcp::AccountMcpState::PathGone }, s("Claude MCP（アカウント univ）: tako が起こす claude には起動の行で渡すが、この設定 dir の登録はパスが消えている（手で開いた claude の tako が起きない）")),
+        (H::McpAccount { account: s("univ"), launch: true, state: tako_control::agent_mcp::AccountMcpState::Unreadable }, s("Claude MCP（アカウント univ）: tako が起こす claude には起動の行で渡す（この設定 dir の .claude.json は読めない）")),
+        (H::McpAccount { account: s("univ"), launch: false, state: tako_control::agent_mcp::AccountMcpState::Registered }, s("Claude MCP（アカウント univ）: この設定 dir に tako が登録済み")),
+        (H::McpAccount { account: s("univ"), launch: false, state: tako_control::agent_mcp::AccountMcpState::Missing }, s("Claude MCP（アカウント univ）: この設定 dir に tako が未登録 = このアカウントで起こした claude から tako のツールが見えない")),
+        (H::McpAccount { account: s("univ"), launch: false, state: tako_control::agent_mcp::AccountMcpState::PathGone }, s("Claude MCP（アカウント univ）: この設定 dir の登録はパスが消えている = このアカウントで起こした claude の tako が起きない")),
+        (H::McpAccount { account: s("univ"), launch: false, state: tako_control::agent_mcp::AccountMcpState::Unreadable }, s("Claude MCP（アカウント univ）: この設定 dir の .claude.json を読めない（tako の登録を確かめられない）")),
+        (H::McpAccountRegisterHint { config_dir: Some(s("~/.claude-b")) }, s("         この設定 dir へ登録するには: CLAUDE_CONFIG_DIR=~/.claude-b tako setup-mcp")),
+        (H::McpAccountRegisterHint { config_dir: None }, s("         この設定 dir へ登録するには: env -u CLAUDE_CONFIG_DIR tako setup-mcp")),
     ]
 }
 

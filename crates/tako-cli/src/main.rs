@@ -5684,9 +5684,16 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     };
 
     let tako_bin = tako_control::dispatch::resolve_tako_binary();
-    let master_cmd =
-        orchestrator::build_master_cmd_typed(&role_env, &profile, &prompt_path, &tako_bin)
-            .map_err(|e| e.text_in(lang))?;
+    // tako の MCP を起動の行で渡す（#2912。書けなければ付けず、設定 dir の登録に頼る）
+    let mcp_config = tako_control::worker_mcp::ready_tako_launch_config(&tako_bin, "master");
+    let master_cmd = orchestrator::build_master_cmd_typed(
+        &role_env,
+        &profile,
+        &prompt_path,
+        &tako_bin,
+        mcp_config.as_deref(),
+    )
+    .map_err(|e| e.text_in(lang))?;
 
     // インライン起動（既定）: 現在のペインでコマンドを実行（新タブを作らない。#264）
     // --tab 指定時 / 呼び出し元ペインが解決できないとき（#567）: 新タブ起動
@@ -5910,8 +5917,16 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     };
 
     let tako_bin = tako_control::dispatch::resolve_tako_binary();
-    let solo_cmd = orchestrator::build_master_cmd_typed(&role, &profile, &prompt_path, &tako_bin)
-        .map_err(|e| e.text_in(lang))?;
+    // tako の MCP を起動の行で渡す（#2912。書けなければ付けず、設定 dir の登録に頼る）
+    let mcp_config = tako_control::worker_mcp::ready_tako_launch_config(&tako_bin, "solo");
+    let solo_cmd = orchestrator::build_master_cmd_typed(
+        &role,
+        &profile,
+        &prompt_path,
+        &tako_bin,
+        mcp_config.as_deref(),
+    )
+    .map_err(|e| e.text_in(lang))?;
 
     // --tab 指定時 / 呼び出し元ペインが解決できないとき（#567）は新タブ起動
     let target = resolve_launch_target(
