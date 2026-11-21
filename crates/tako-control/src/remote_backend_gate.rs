@@ -95,6 +95,7 @@ mod tests {
             keeps_empty_server: true,
             disables_shell_prewarm: false,
             direct_inner_argv: false,
+            rebuilds_pane_path: false,
             label,
         }
     }
