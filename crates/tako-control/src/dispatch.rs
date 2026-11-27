@@ -51909,7 +51909,8 @@ tako | pane 2 [ compact ]       [-]
         .unwrap();
         assert!(v["claude"].is_object());
         assert!(v["codex"].is_object());
-        assert_eq!(v["agy"]["status"], "unsupported");
+        assert!(v["agy"].is_object());
+        assert!(v["agy"]["5h"].is_null());
     }
 
     // --- OpenDir / OpenRemote / SshHosts / RecentItems テスト (#20) ---

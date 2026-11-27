@@ -2987,6 +2987,9 @@ struct TakoApp {
     /// 出さなくなった（実測: フッターはモデル名と cwd だけ / 数値は `/status` の
     /// モーダルの中）ため成立しない。ここが実データの出どころになる
     codex_limits: HashMap<PaneId, tako_control::codex_session::RateLimits>,
+    /// agy の利用枠（最後に画面へ出た `/usage` を読んだもの。リセットを過ぎた枠は出さない）。
+    /// agy は残量をディスクにもログにも書かないので、`/usage` の画面が唯一の出どころ
+    agy_limits: Option<tako_core::agy_quota::AgyLimitsMemory>,
     /// #1021: transcript から算出した ctx%（画面が黙っている master ペインぶん）。
     /// #749 の閾値判定が画面の値を補えるように background で控えておく
     transcript_ctx: HashMap<PaneId, u32>,
@@ -5606,6 +5609,7 @@ impl TakoApp {
             transcript_ctx_scan: handoff_ctx::TranscriptCtxScan::default(),
             codex_limits_scan: limit_autoresume::CodexLimitsScan::default(),
             codex_metrics: AgentMetrics::default(),
+            agy_limits: None,
             limit_service: tako_control::settings::load().limit_service(),
             lang_setting: {
                 // UI 表示言語を最初の render 前に確定する（Issue #435。既定 = OS ロケール）
@@ -19837,6 +19841,27 @@ impl TakoApp {
             .collect()
     }
 
+    /// agy の (5h, 7d) の使用率（ステータスバーと `tako limit-service --refresh` が同じ値を引く）
+    pub(crate) fn agy_limits_now(&self) -> (Option<u32>, Option<u32>) {
+        self.agy_limits
+            .map(|m| m.current(std::time::Instant::now()))
+            .unwrap_or((None, None))
+    }
+
+    /// `tako limit-service --refresh` の agy 欄。`observed_secs_ago` は `/usage` を読んでからの秒数
+    /// （null = まだ一度も `/usage` が画面に出ていない）
+    fn agy_limits_json(&self) -> serde_json::Value {
+        let (five_hour, week) = self.agy_limits_now();
+        let mem = self.agy_limits.as_ref();
+        serde_json::json!({
+            "5h": five_hour,
+            "7d": week,
+            "group": mem.map(|m| m.usage.active.as_str()),
+            "source": mem.map(|_| "usage_screen"),
+            "observed_secs_ago": mem.map(|m| m.observed_at.elapsed().as_secs()),
+        })
+    }
+
     /// 構造化ソースから codex のメトリクスを組む（#985）。
     ///
     /// **画面スクレイピング（#357）は codex 0.150.1 では成立しない**（実測: TUI の
@@ -19873,6 +19898,8 @@ impl TakoApp {
         use tick_screens::TickSource;
         let mut best_claude: Option<AgentMetrics> = None;
         let mut best_codex: Option<AgentMetrics> = None;
+        // agy の `/usage` が出ているペイン（フォーカス順で最初の 1 枚）
+        let mut best_agy: Option<tako_core::agy_quota::AgyUsage> = None;
         // フォーカスペインを優先し、なければ他のペインから取得
         let focused = self.workspace.active_tab().tree().focused();
         let pane_ids: Vec<PaneId> = std::iter::once(focused)
@@ -19893,6 +19920,9 @@ impl TakoApp {
             if let Some(session) = screens.source(&self.terminals, *pid) {
                 if gate_alt_screen && !session.is_alt_screen() {
                     continue;
+                }
+                if best_agy.is_none() {
+                    best_agy = session.agy_usage();
                 }
                 if let Some(m) = session.agent_metrics() {
                     let has_data =
@@ -19941,6 +19971,14 @@ impl TakoApp {
             .codex_metrics_from_limits()
             .or(best_codex)
             .unwrap_or_default();
+        // agy: `/usage` が画面に出ていれば読み直す。出ていなければ前に読んだ値を持ち越す
+        // （リセットを過ぎた枠を出さない判定は表示側の `AgyLimitsMemory::current`）
+        if let Some(usage) = best_agy {
+            self.agy_limits = Some(tako_core::agy_quota::AgyLimitsMemory {
+                observed_at: std::time::Instant::now(),
+                usage,
+            });
+        }
         // usage トークン推移の履歴（#217 スパークライン。取れたときだけ・変化時だけ積む）
         if let Some(tok) = self
             .agent_metrics
@@ -28011,7 +28049,7 @@ impl UiStateHost for TakoApp {
         serde_json::json!({
             "claude": claude,
             "codex": m(&self.codex_metrics, "primary", "secondary"),
-            "agy": { "status": "unsupported" },
+            "agy": self.agy_limits_json(),
         })
     }
 

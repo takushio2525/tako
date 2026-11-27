@@ -324,7 +324,7 @@
       "key": "limit_service_switch",
       "summary_ja": "ステータスバーの利用制限表示をこの系統へ切り替えられる（#217 / #357）",
       "evidence": "measured",
-      "evidence_detail": "#985: ステータスバーの codex 表示は rollout の構造化データ（`rate_limits`）を 読む形になり、有料プランの実データが出る。agy は取得不能を再確認して unsupported の明示表示のまま（#357 の判断は理由を差し替えて維持）。#1903（claude）: tako mod の報告があれば 5h / 7d はその値、無ければ画面 （取得元は tako limit-service --refresh の claude.source）",
+      "evidence_detail": "#985: ステータスバーの codex 表示は rollout の構造化データ（`rate_limits`）を 読む形になり、有料プランの実データが出る。#1903（claude）: tako mod の報告があれば 5h / 7d はその値、無ければ画面 （取得元は tako limit-service --refresh の claude.source）。agy 1.5.18 実測（2026-11-27）: `/usage`（見出し `Models & Quota`）に GEMINI MODELS / CLAUDE AND GPT MODELS の 2 系統ごとの `Five Hour Limit Remaining` / `Weekly Limit Remaining` が残りの % と `Refreshes in …` で出る。`~/.gemini/antigravity-cli/` の ファイルとログには値が無い（ログは `doRefreshQuota` の開始行だけ）。画面の読みは 単体テスト tako_core::agy_quota::tests::実測のusage画面から両系統の枠を読む",
       "agents": {
         "claude": {
           "status": "supported"
@@ -333,8 +333,8 @@
           "status": "supported"
         },
         "agy": {
-          "status": "unsupported",
-          "note_ja": "agy の残量は前払いの AI クレジット残高で、5h / 週のような枠とリセット時刻が無い。残高も対話の /credits モーダルの中にしか出ないので、worker の画面を乱さずに読む口が無い（#985 で agy 1.1.22 を再調査）"
+          "status": "degraded",
+          "note_ja": "agy 1.5 系は claude と同じく 5h / 週の枠を持つが、残量はディスクにもログにも残らず対話の /usage の画面にしか出ない。tako は agy のペインで /usage が開かれたときに読み、リセットまで覚えて出す（一度も開いていなければ --）"
         },
         "local": {
           "status": "pending",

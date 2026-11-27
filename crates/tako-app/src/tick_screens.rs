@@ -33,6 +33,7 @@ use std::collections::HashMap;
 
 use tako_control::limit_stop;
 use tako_control::net_stop::{self, NetScreen};
+use tako_core::agy_quota::AgyUsage;
 use tako_core::limit_resume::LimitStopKind;
 use tako_core::terminal::{agent_metrics_from_lines, c2_legacy, AGENT_TUI_TAIL_LINES};
 use tako_core::{AgentMetrics, InputStatus, PaneAccess, PaneId, TerminalSession};
@@ -95,6 +96,12 @@ pub(crate) trait TickSource {
             self.tail_lines(AGENT_TUI_TAIL_LINES)
         };
         agent_metrics_from_lines(&lines)
+    }
+
+    /// agy の `/usage` の画面（ステータスバーの agy 表示の材料。出ていなければ None）。
+    /// 上のメトリクスとは別に読む = claude / codex の値の読みは何も変えない
+    fn agy_usage(&self) -> Option<AgyUsage> {
+        tako_core::agy_quota::parse_usage_screen(&self.tail_lines(AGENT_TUI_TAIL_LINES))
     }
 
     /// キュー滞留のヒント（#572）が入力欄に出ているか。`legacy_c3` は `TAKO_1001_C3_LEGACY`
@@ -160,6 +167,7 @@ pub(crate) struct PaneTick {
     /// 可視行のすべて（`alt_and_lines` の 1 回のロック）
     lines: Vec<String>,
     metrics: Option<AgentMetrics>,
+    agy: Option<AgyUsage>,
     queued_pending: Option<bool>,
     limit: RefCell<Option<LimitRead>>,
     net: Option<NetRead>,
@@ -198,6 +206,9 @@ impl TickSource for PaneTick {
     }
     fn agent_metrics(&self) -> Option<AgentMetrics> {
         self.metrics.clone()
+    }
+    fn agy_usage(&self) -> Option<AgyUsage> {
+        self.agy
     }
     fn queued_hint_pending(&self, legacy_c3: bool) -> bool {
         self.queued_pending
@@ -255,6 +266,12 @@ impl TickSource for TickSrc<'_> {
         match self {
             Self::Live(s) => TickSource::agent_metrics(*s),
             Self::Captured(t) => t.agent_metrics(),
+        }
+    }
+    fn agy_usage(&self) -> Option<AgyUsage> {
+        match self {
+            Self::Live(s) => TickSource::agy_usage(*s),
+            Self::Captured(t) => t.agy_usage(),
         }
     }
     fn queued_hint_pending(&self, legacy_c3: bool) -> bool {
@@ -401,6 +418,7 @@ pub(crate) fn read(plan: TickPlan) -> TickScreens {
             alt,
             lines,
             metrics: None,
+            agy: None,
             queued_pending: None,
             limit: RefCell::new(None),
             net: None,
@@ -411,6 +429,7 @@ pub(crate) fn read(plan: TickPlan) -> TickScreens {
         // 行だけを持つ読み口として既定の実装を通す
         let raw = RawLines(&tick);
         let metrics = raw.agent_metrics();
+        let agy = raw.agy_usage();
         let queued_pending = item.queued.then(|| raw.queued_hint_pending(plan.legacy_c3));
         let limit = item.limit.then(|| raw.limit_read());
         let net = item.net.then(|| raw.net_read());
@@ -437,6 +456,7 @@ pub(crate) fn read(plan: TickPlan) -> TickScreens {
                 tick.access.lines_with_history(net_stop::OFFSCREEN_LINES)
             });
         tick.metrics = metrics;
+        tick.agy = agy;
         tick.queued_pending = queued_pending;
         tick.limit = RefCell::new(limit);
         tick.net = net;
