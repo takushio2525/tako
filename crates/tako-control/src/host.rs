@@ -837,7 +837,7 @@ pub trait UiStateHost {
         serde_json::json!({
             "claude": { "5h": null, "7d": null },
             "codex": { "primary": null, "secondary": null },
-            "agy": { "status": "unsupported" },
+            "agy": { "5h": null, "7d": null },
         })
     }
     /// AI コマンド提案カードの保管庫（FR-2.22 / #666）。

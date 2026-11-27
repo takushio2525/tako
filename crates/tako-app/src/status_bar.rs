@@ -90,6 +90,7 @@ impl TakoApp {
         let claude_week = self.agent_metrics.limit_week;
         let codex_primary = self.codex_metrics.limit_5h;
         let codex_secondary = self.codex_metrics.limit_week;
+        let (agy_5h, agy_week) = self.agy_limits_now();
         let selected_limit_service = self.limit_service;
         // #1962: フォーカス中のペインの mod が Claude Code の画面にバーを描いている = claude の
         // 5h / 7d / ctx の区画を出さない（サービスの選択チップは残す = codex へ切り替えられる）
@@ -100,7 +101,7 @@ impl TakoApp {
             LimitService::Claude if claude_yields => (None, None),
             LimitService::Claude => (claude_5h, claude_week),
             LimitService::Codex => (codex_primary, codex_secondary),
-            LimitService::Agy => (None, None),
+            LimitService::Agy => (agy_5h, agy_week),
         };
         // リミット表示があるとき、usage_text が同じ「Nh NN%」なら重複表示を避ける
         let usage_text = usage_text.filter(|t| {
@@ -607,16 +608,11 @@ impl TakoApp {
                     })
                     // #1962: mod が描いているときは「--」も出さない（データが無いのではない）
                     .when(!has_data && !claude_hidden, |d| {
-                        let label = if selected_limit_service == LimitService::Agy {
-                            "unsupported"
-                        } else {
-                            "--"
-                        };
                         d.child(
                             div()
                                 .text_size(px(10.5))
                                 .text_color(hsla(theme.text_faint))
-                                .child(SharedString::from(label)),
+                                .child(SharedString::from("--")),
                         )
                     })
                 // ドロップダウンメニューはルート div のオーバーレイとして描画
@@ -856,6 +852,7 @@ impl TakoApp {
         let claude_week = self.agent_metrics.limit_week;
         let codex_primary = self.codex_metrics.limit_5h;
         let codex_secondary = self.codex_metrics.limit_week;
+        let (agy_5h, agy_week) = self.agy_limits_now();
         let theme = self.theme.clone();
         let selected = self.limit_service;
 
@@ -863,8 +860,7 @@ impl TakoApp {
                    h5: Option<u32>,
                    w7: Option<u32>,
                    l1: &'static str,
-                   l2: &'static str,
-                   unsupported: bool| {
+                   l2: &'static str| {
             let is_selected = svc == selected;
             let svc_color = match svc {
                 LimitService::Claude => theme.accent,
@@ -967,17 +963,8 @@ impl TakoApp {
                         })
                         .child(svc.as_str()),
                 )
-                .when(unsupported, |d| {
-                    d.child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(hsla(theme.text_faint))
-                            .child("unsupported"),
-                    )
-                })
-                .when(!unsupported, |d| {
-                    d.child(meter_inline(l1, h5)).child(meter_inline(l2, w7))
-                })
+                .child(meter_inline(l1, h5))
+                .child(meter_inline(l2, w7))
         };
 
         let menu_w: f32 = 340.0;
@@ -1070,7 +1057,6 @@ impl TakoApp {
                                     claude_week,
                                     "5h",
                                     "7d",
-                                    false,
                                 ))
                                 .child(row(
                                     LimitService::Codex,
@@ -1078,9 +1064,8 @@ impl TakoApp {
                                     codex_secondary,
                                     "P",
                                     "S",
-                                    false,
                                 ))
-                                .child(row(LimitService::Agy, None, None, "5h", "7d", true)),
+                                .child(row(LimitService::Agy, agy_5h, agy_week, "5h", "7d")),
                         )
                         // #2203: 何に使ったかの内訳（右パネルの usage ビュー）。mod がバーを描いていて
                         // ステータスバーに 5h / 7d が出ていないときも、ここから開ける

@@ -11,6 +11,7 @@ pub mod stdio;
 pub mod acceptance_gate;
 pub mod agent_resume;
 pub mod agent_support;
+pub mod agy_quota;
 pub mod app_bundle;
 pub mod backend;
 pub mod backend_reattach;

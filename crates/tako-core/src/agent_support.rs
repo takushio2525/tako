@@ -437,6 +437,12 @@ pub mod notes {
         "agy's live log (brain/<id>/.system_generated/logs/transcript.jsonl) carries no token counts equivalent to codex's token_count, and the headroom is not permanently on screen either, so there is no way to read it (all step types verified on agy 1.1.27 in #1033)",
     );
 
+    /// agy 1.5 系は 5h / 週の枠を持つが、値は対話の `/usage` の画面にしか出ない
+    pub const AGY_LIMITS_FROM_USAGE_SCREEN: Note = Note::new(
+        "agy 1.5 系は claude と同じく 5h / 週の枠を持つが、残量はディスクにもログにも残らず対話の /usage の画面にしか出ない。tako は agy のペインで /usage が開かれたときに読み、リセットまで覚えて出す（一度も開いていなければ --）",
+        "agy 1.5.x has 5h and weekly windows like claude, but the remaining quota is neither written to disk nor logged and only appears on the interactive /usage screen. tako reads it whenever /usage is open in an agy pane and keeps showing it until the reset (-- if /usage has never been opened)",
+    );
+
     /// #985 の再調査（agy 1.1.22）。**窓つきの利用上限という概念自体が無い**
     pub const AGY_CREDITS_NOT_WINDOWED: Note = Note::new(
         "agy の残量は前払いの AI クレジット残高で、5h / 週のような枠とリセット時刻が無い。残高も対話の /credits モーダルの中にしか出ないので、worker の画面を乱さずに読む口が無い（#985 で agy 1.1.22 を再調査）",
@@ -1027,14 +1033,18 @@ pub const MATRIX: &[AgentFeature] = &[
         ),
         claude: S::Supported,
         codex: S::Supported,
-        agy: unsupported(notes::AGY_CREDITS_NOT_WINDOWED),
+        agy: degraded(notes::AGY_LIMITS_FROM_USAGE_SCREEN),
         local: local_pending(),
         evidence: AgentEvidence::Measured(
             "#985: ステータスバーの codex 表示は rollout の構造化データ（`rate_limits`）を \
-             読む形になり、有料プランの実データが出る。agy は取得不能を再確認して \
-             unsupported の明示表示のまま（#357 の判断は理由を差し替えて維持）。\
+             読む形になり、有料プランの実データが出る。\
              #1903（claude）: tako mod の報告があれば 5h / 7d はその値、無ければ画面 \
-             （取得元は tako limit-service --refresh の claude.source）",
+             （取得元は tako limit-service --refresh の claude.source）。\
+             agy 1.5.18 実測（2026-11-27）: `/usage`（見出し `Models & Quota`）に \
+             GEMINI MODELS / CLAUDE AND GPT MODELS の 2 系統ごとの `Five Hour Limit Remaining` / \
+             `Weekly Limit Remaining` が残りの % と `Refreshes in …` で出る。`~/.gemini/antigravity-cli/` の \
+             ファイルとログには値が無い（ログは `doRefreshQuota` の開始行だけ）。画面の読みは \
+             単体テスト tako_core::agy_quota::tests::実測のusage画面から両系統の枠を読む",
         ),
     },
     AgentFeature {
